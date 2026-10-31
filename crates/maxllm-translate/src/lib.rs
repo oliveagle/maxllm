@@ -17,6 +17,7 @@ pub mod gemini;
 pub mod gemini_stream;
 pub mod openai;
 pub mod openai_compat;
+pub mod opencode;
 pub mod responses;
 
 #[derive(Debug, thiserror::Error)]

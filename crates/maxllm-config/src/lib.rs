@@ -155,6 +155,10 @@ pub enum ProviderKind {
     /// Generic OpenAI-compatible provider.
     #[serde(rename = "openai_compat")]
     OpenaiCompat,
+    /// opencode.ai ("zen") provider — OpenAI-compatible with stricter
+    /// validation (session header, tool_choice, tool call arguments).
+    #[serde(rename = "opencode")]
+    OpenCode,
 }
 
 #[derive(Debug, Deserialize, Clone)]

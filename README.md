@@ -226,6 +226,7 @@ curl http://localhost:8080/passthrough/openai/v1/embeddings \
 | DeepSeek | `deepseek` | OpenAI-compatible | Bearer token |
 | Ollama | `ollama` | OpenAI-compatible | None (local) |
 | Cohere | `cohere` | Full translation | Bearer token |
+| OpenCode | `opencode` | OpenAI-compatible + strict schema | Bearer token |
 | Custom | `openai_compat` | OpenAI-compatible | Configurable |
 
 ## Configuration

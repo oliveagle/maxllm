@@ -88,6 +88,7 @@ fn well_known_models(kind: ProviderKind) -> &'static [&'static str] {
         ProviderKind::Ollama => &["llama3.2", "mistral", "codellama"],
         ProviderKind::Cohere => &["command-r-plus", "command-r", "command-light"],
         ProviderKind::OpenaiCompat => &[],
+        ProviderKind::OpenCode => &["deepseek-v4.1-flash", "kimi-k2.5", "glm-5.2"],
     }
 }
 
@@ -109,6 +110,7 @@ fn provider_owned_by(kind: ProviderKind) -> &'static str {
         ProviderKind::Ollama => "ollama",
         ProviderKind::Cohere => "cohere",
         ProviderKind::OpenaiCompat => "custom",
+        ProviderKind::OpenCode => "opencode",
     }
 }
 
@@ -209,6 +211,16 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
                         maxllm_translate::openai_compat::AuthStyle::Bearer,
                     ),
                 )
+            }
+            ProviderKind::OpenCode => {
+                let path = conf
+                    .upstream_path
+                    .as_deref()
+                    .unwrap_or("/zen/go/v1/chat/completions");
+                Box::new(maxllm_translate::opencode::OpenCodeTranslator::new(
+                    name.clone(),
+                    path.to_string(),
+                ))
             }
         };
 
@@ -848,6 +860,33 @@ impl ProxyHttp for AiGateway {
 
         // Set Host header
         upstream_request.insert_header("Host", &provider.host)?;
+
+        // opencode.ai requires an `x-opencode-session` header on every request
+        // for upstream routing / prompt-cache affinity; without it the
+        // upstream rejects the call with 400 MissingSessionID. The opencode
+        // CLI always sends it (and Pingora forwards client headers verbatim);
+        // third-party clients often don't, so inject one:
+        // prefer the client's own session-affinity id so cache routing stays
+        // sticky across turns, otherwise generate a fresh UUID per request.
+        if provider.kind == ProviderKind::OpenCode
+            && upstream_request
+                .headers
+                .get(maxllm_translate::opencode::SESSION_HEADER)
+                .is_none()
+        {
+            let session_id = session
+                .req_header()
+                .headers
+                .get("x-session-affinity")
+                .or_else(|| session.req_header().headers.get("x-opencode-session-id"))
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            upstream_request.insert_header(
+                maxllm_translate::opencode::SESSION_HEADER,
+                &session_id,
+            )?;
+        }
 
         // Body framing strategy:
         // - Passthrough endpoints: keep original Content-Length (body forwarded as-is)
