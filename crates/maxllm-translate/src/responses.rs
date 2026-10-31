@@ -127,6 +127,13 @@ pub fn responses_request_to_chat(body: &[u8]) -> Result<TranslatedRequest, Trans
     }
     if req.stream == Some(true) {
         chat.insert("stream".into(), Value::Bool(true));
+        // Responses clients expect usage on `response.completed`; many
+        // OpenAI-compatible providers only include usage in a stream when
+        // asked. Spec-compliant (OpenAI, ollama, vLLM, Groq, DeepSeek, …).
+        chat.insert(
+            "stream_options".into(),
+            json!({ "include_usage": true }),
+        );
     }
     if let Some(tools) = req.tools.as_ref() {
         chat.insert("tools".into(), responses_tools_to_chat(tools));
@@ -1151,6 +1158,9 @@ mod tests {
         assert_eq!(v["max_tokens"], 128);
         assert_eq!(v["stop"][0], "END");
         assert_eq!(v["seed"], 42);
+        // Streaming asks the upstream for usage so `response.completed` can
+        // carry token counts.
+        assert_eq!(v["stream_options"]["include_usage"], true);
     }
 
     #[test]
