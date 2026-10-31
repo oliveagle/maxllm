@@ -195,6 +195,10 @@ fn default_retry_backoff_ms() -> u64 {
 pub enum EndpointType {
     #[default]
     ChatCompletions,
+    /// OpenAI Responses API — the client speaks the Responses contract
+    /// (`input`/`output`/`instructions`); the gateway translates to and
+    /// from chat completions for any provider kind.
+    Responses,
     Embeddings,
     ImageGenerations,
     AudioTranscriptions,

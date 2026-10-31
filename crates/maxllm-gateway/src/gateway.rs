@@ -760,6 +760,22 @@ impl ProxyHttp for AiGateway {
 
         // Set upstream path based on endpoint type
         let path = match ctx.endpoint_type {
+            EndpointType::Responses => {
+                // Responses is translated into chat completions for the
+                // upstream call, so it uses the provider's chat path.
+                if provider.kind == ProviderKind::Gemini {
+                    let model = provider
+                        .default_model
+                        .as_deref()
+                        .unwrap_or("gemini-2.5-flash");
+                    format!(
+                        "/v1beta/models/{}:generateContent?key={}",
+                        model, provider.api_key
+                    )
+                } else {
+                    provider.translator.upstream_path().to_string()
+                }
+            }
             EndpointType::Passthrough => {
                 // Use the suffix path captured from the client request
                 ctx.passthrough_path
@@ -1004,6 +1020,35 @@ impl ProxyHttp for AiGateway {
 
         if end_of_stream && !ctx.body_translated {
             ctx.body_translated = true;
+
+            // ── RESPONSES: convert to chat completions before the normal ──
+            // path runs, so model extraction, guardrails, and compaction
+            // all see the canonical chat format they already understand.
+            if ctx.endpoint_type == EndpointType::Responses {
+                match maxllm_translate::responses::responses_request_to_chat(
+                    &ctx.request_body_buf,
+                ) {
+                    Ok(translated) => {
+                        if translated.is_streaming {
+                            ctx.is_streaming = true;
+                        }
+                        ctx.request_body_buf = translated.body;
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Failed to translate Responses request to chat format");
+                        Self::send_error_response(
+                            session,
+                            400,
+                            &format!("invalid Responses request: {e}"),
+                        )
+                        .await?;
+                        return Err(pingora::Error::explain(
+                            pingora::ErrorType::HTTPStatus(400),
+                            "invalid Responses request",
+                        ));
+                    }
+                }
+            }
 
             let hot = self.hot.load();
             let provider = match hot.providers.get(&ctx.provider_name) {
@@ -1340,7 +1385,14 @@ impl ProxyHttp for AiGateway {
                             ctx.is_streaming = true;
                             match ctx.stream_translator.lock() {
                                 Ok(mut guard) => {
-                                    *guard = Some(provider.translator.streaming_translator());
+                                    let inner = provider.translator.streaming_translator();
+                                    if ctx.endpoint_type == EndpointType::Responses {
+                                        *guard = Some(Box::new(
+                                            maxllm_translate::responses::ResponsesStreamTranslator::new(inner),
+                                        ));
+                                    } else {
+                                        *guard = Some(inner);
+                                    }
                                 }
                                 Err(e) => {
                                     warn!("stream_translator mutex poisoned: {e}");
@@ -1381,11 +1433,14 @@ impl ProxyHttp for AiGateway {
         }
 
         // Only remove Content-Length when the body will be translated (changes size).
-        // Passthrough, native, and OpenAI providers keep the original Content-Length.
+        // Passthrough, native, and Embeddings keep the original Content-Length.
+        // OpenAI providers skip chat-format translation, but Responses mode
+        // always converts the body, so its Content-Length is removed too.
         let skip_response_translation = ctx.endpoint_type == EndpointType::Passthrough
             || ctx.endpoint_type == EndpointType::Native
             || ctx.endpoint_type == EndpointType::Embeddings
-            || provider.is_some_and(|p| p.translator.name() == "openai");
+            || (provider.is_some_and(|p| p.translator.name() == "openai")
+                && ctx.endpoint_type != EndpointType::Responses);
         if !skip_response_translation {
             let _ = upstream_response.remove_header("Content-Length");
         }
@@ -1402,6 +1457,13 @@ impl ProxyHttp for AiGateway {
         let is_gemini_streaming =
             ctx.is_streaming && provider.is_some_and(|p| p.kind == ProviderKind::Gemini);
         if is_gemini_streaming {
+            upstream_response.insert_header("Content-Type", "text/event-stream")?;
+            let _ = upstream_response.remove_header("Content-Length");
+        }
+
+        // Responses streaming always emits SSE.
+        if ctx.endpoint_type == EndpointType::Responses && ctx.is_streaming && !is_gemini_streaming
+        {
             upstream_response.insert_header("Content-Type", "text/event-stream")?;
             let _ = upstream_response.remove_header("Content-Length");
         }
@@ -1579,6 +1641,146 @@ impl ProxyHttp for AiGateway {
 
                     // Forward native response body as-is
                     *body = Some(Bytes::from(std::mem::take(&mut ctx.response_body_buf)));
+                }
+            }
+
+            // Run plugin chains
+            hot.global_chain.run_response_body(
+                session,
+                body,
+                end_of_stream,
+                &mut ctx.plugin_ctx,
+            )?;
+            if let Some(idx) = ctx.route_index {
+                hot.route_chains[idx].run_response_body(
+                    session,
+                    body,
+                    end_of_stream,
+                    &mut ctx.plugin_ctx,
+                )?;
+            }
+            return Ok(None);
+        }
+
+        // ── RESPONSES: translate provider chat → Responses format ─────────
+        if ctx.endpoint_type == EndpointType::Responses {
+            let provider = hot.providers.get(&ctx.provider_name);
+            let is_gemini = provider.is_some_and(|p| p.kind == ProviderKind::Gemini);
+
+            if ctx.is_streaming && is_gemini {
+                // Gemini answered generateContent with a single JSON body;
+                // convert it to Responses SSE events.
+                if let Some(data) = body.take() {
+                    ctx.response_body_buf.extend_from_slice(&data);
+                }
+                if end_of_stream && !ctx.response_body_buf.is_empty() {
+                    if let Some(p) = provider {
+                        match p.translator.translate_response(&ctx.response_body_buf) {
+                            Ok(chat_bytes) => {
+                                match maxllm_translate::responses::chat_response_to_responses_sse(
+                                    &chat_bytes,
+                                ) {
+                                    Some(sse) => {
+                                        *body = Some(Bytes::from(sse));
+                                    }
+                                    None => {
+                                        warn!("Failed to convert Gemini chat response to Responses SSE");
+                                        *body = Some(Bytes::from(std::mem::take(
+                                            &mut ctx.response_body_buf,
+                                        )));
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "Failed to translate Gemini response for Responses mode");
+                                *body = Some(Bytes::from(std::mem::take(
+                                    &mut ctx.response_body_buf,
+                                )));
+                            }
+                        }
+                    }
+                }
+            } else if ctx.is_streaming {
+                // Non-Gemini: stream_translator is already a
+                // ResponsesStreamTranslator wrapping the provider's chat
+                // stream translator, so chunks flow through as Responses SSE.
+                if let Some(data) = body.as_ref() {
+                    match ctx.stream_translator.lock() {
+                        Ok(mut guard) => {
+                            if let Some(translator) = guard.as_mut() {
+                                let translated =
+                                    translator.process_chunk(data, end_of_stream);
+                                drop(guard);
+                                *body = Some(Bytes::from(translated));
+                            }
+                        }
+                        Err(e) => {
+                            warn!("stream_translator mutex poisoned in responses streaming: {e}");
+                        }
+                    }
+                }
+            } else {
+                // Non-streaming: buffer, extract usage, convert chat → responses.
+                if let Some(data) = body.take() {
+                    ctx.response_body_buf.extend_from_slice(&data);
+                }
+
+                if end_of_stream && !ctx.response_body_buf.is_empty() {
+                    if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(
+                        &ctx.response_body_buf,
+                    ) {
+                        extract_usage(&parsed, ctx);
+                    }
+
+                    // Normalize error responses to OpenAI format, then to Responses.
+                    if ctx.upstream_status >= 400 {
+                        if let Some(p) = provider {
+                            if let Some(normalized) = normalize_error_response(
+                                &ctx.response_body_buf,
+                                ctx.upstream_status,
+                                p.kind,
+                            ) {
+                                *body = Some(Bytes::from(normalized));
+                                hot.global_chain.run_response_body(
+                                    session, body, end_of_stream, &mut ctx.plugin_ctx,
+                                )?;
+                                if let Some(idx) = ctx.route_index {
+                                    hot.route_chains[idx].run_response_body(
+                                        session, body, end_of_stream, &mut ctx.plugin_ctx,
+                                    )?;
+                                }
+                                return Ok(None);
+                            }
+                        }
+                    }
+
+                    if let Some(p) = provider {
+                        match p.translator.translate_response(&ctx.response_body_buf) {
+                            Ok(chat_bytes) => {
+                                match maxllm_translate::responses::chat_response_to_responses(
+                                    &chat_bytes,
+                                ) {
+                                    Ok(responses_bytes) => {
+                                        *body = Some(Bytes::from(responses_bytes));
+                                    }
+                                    Err(e) => {
+                                        warn!(error = %e, "Failed to convert chat response to Responses format");
+                                        *body = Some(Bytes::from(std::mem::take(
+                                            &mut ctx.response_body_buf,
+                                        )));
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "Failed to translate provider response for Responses mode");
+                                *body = Some(Bytes::from(std::mem::take(
+                                    &mut ctx.response_body_buf,
+                                )));
+                            }
+                        }
+                    } else {
+                        *body = Some(Bytes::from(std::mem::take(&mut ctx.response_body_buf)));
+                    }
                 }
             }
 
