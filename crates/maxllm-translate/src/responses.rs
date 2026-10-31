@@ -89,11 +89,7 @@ pub fn responses_request_to_chat(body: &[u8]) -> Result<TranslatedRequest, Trans
     let mut messages: Vec<Value> = Vec::new();
 
     // `instructions` is the Responses spelling of a system prompt.
-    if let Some(instructions) = req
-        .instructions
-        .as_deref()
-        .filter(|s| !s.is_empty())
-    {
+    if let Some(instructions) = req.instructions.as_deref().filter(|s| !s.is_empty()) {
         messages.push(json!({ "role": "system", "content": instructions }));
     }
 
@@ -130,10 +126,7 @@ pub fn responses_request_to_chat(body: &[u8]) -> Result<TranslatedRequest, Trans
         // Responses clients expect usage on `response.completed`; many
         // OpenAI-compatible providers only include usage in a stream when
         // asked. Spec-compliant (OpenAI, ollama, vLLM, Groq, DeepSeek, …).
-        chat.insert(
-            "stream_options".into(),
-            json!({ "include_usage": true }),
-        );
+        chat.insert("stream_options".into(), json!({ "include_usage": true }));
     }
     if let Some(tools) = req.tools.as_ref() {
         chat.insert("tools".into(), responses_tools_to_chat(tools));
@@ -255,14 +248,11 @@ fn content_to_text(content: &Value) -> String {
         Value::String(text) => text.clone(),
         Value::Array(parts) => parts
             .iter()
-            .filter_map(|part| {
-                match part.get("type").and_then(|t| t.as_str()) {
-                    Some("text") | Some("input_text") | Some("output_text") | None => part
-                        .get("text")
-                        .and_then(|t| t.as_str())
-                        .map(String::from),
-                    _ => None,
+            .filter_map(|part| match part.get("type").and_then(|t| t.as_str()) {
+                Some("text") | Some("input_text") | Some("output_text") | None => {
+                    part.get("text").and_then(|t| t.as_str()).map(String::from)
                 }
+                _ => None,
             })
             .collect::<Vec<_>>()
             .join("\n"),
@@ -283,7 +273,8 @@ fn responses_tools_to_chat(tools: &Value) -> Value {
         items
             .iter()
             .map(|tool| {
-                let is_flat_function = tool.get("type").and_then(|t| t.as_str()) == Some("function")
+                let is_flat_function = tool.get("type").and_then(|t| t.as_str())
+                    == Some("function")
                     && tool.get("function").is_none();
                 if !is_flat_function {
                     return tool.clone();
@@ -689,7 +680,10 @@ impl ResponsesStreamTranslator {
         let delta = choice.and_then(|c| c.get("delta"));
 
         // Assistant text.
-        if let Some(text) = delta.and_then(|d| d.get("content")).and_then(|c| c.as_str()) {
+        if let Some(text) = delta
+            .and_then(|d| d.get("content"))
+            .and_then(|c| c.as_str())
+        {
             if !text.is_empty() {
                 if !self.text_open {
                     self.text_open = true;
@@ -736,7 +730,10 @@ impl ResponsesStreamTranslator {
         }
 
         // Function calls.
-        if let Some(calls) = delta.and_then(|d| d.get("tool_calls")).and_then(|t| t.as_array()) {
+        if let Some(calls) = delta
+            .and_then(|d| d.get("tool_calls"))
+            .and_then(|t| t.as_array())
+        {
             for call in calls {
                 let index = call.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
                 let slot = match self.tool_calls.iter_mut().find(|(i, _)| *i == index) {
@@ -756,7 +753,10 @@ impl ResponsesStreamTranslator {
                     slot.call_id = id.to_string();
                 }
                 let function = call.get("function");
-                if let Some(name) = function.and_then(|f| f.get("name")).and_then(|v| v.as_str()) {
+                if let Some(name) = function
+                    .and_then(|f| f.get("name"))
+                    .and_then(|v| v.as_str())
+                {
                     slot.name = name.to_string();
                 }
                 if let Some(arguments) = function
@@ -939,9 +939,10 @@ impl StreamTranslator for ResponsesStreamTranslator {
             let event: String = buffer[..boundary].to_string();
             self.buffer = self.buffer[boundary + 2..].to_vec();
 
-            let data_line = event
-                .lines()
-                .find_map(|line| line.strip_prefix("data:").map(|d| d.trim_start().to_string()));
+            let data_line = event.lines().find_map(|line| {
+                line.strip_prefix("data:")
+                    .map(|d| d.trim_start().to_string())
+            });
             let Some(data_line) = data_line else {
                 continue;
             };
@@ -1003,7 +1004,10 @@ pub fn chat_response_to_responses_sse(body: &[u8]) -> Option<Vec<u8>> {
     let mut translator = ResponsesStreamTranslator::new(Box::new(crate::NativePassthroughStream));
     let mut chunk = chat.clone();
     if let Some(obj) = chunk.as_object_mut() {
-        obj.insert("object".into(), Value::String("chat.completion.chunk".into()));
+        obj.insert(
+            "object".into(),
+            Value::String("chat.completion.chunk".into()),
+        );
     }
     // A complete chat completion stores the assistant turn as `message`;
     // the stream translator reads `delta`, so move it across.

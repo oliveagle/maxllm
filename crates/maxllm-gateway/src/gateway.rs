@@ -882,10 +882,8 @@ impl ProxyHttp for AiGateway {
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-            upstream_request.insert_header(
-                maxllm_translate::opencode::SESSION_HEADER,
-                &session_id,
-            )?;
+            upstream_request
+                .insert_header(maxllm_translate::opencode::SESSION_HEADER, &session_id)?;
         }
 
         // Body framing strategy:
@@ -1064,9 +1062,8 @@ impl ProxyHttp for AiGateway {
             // path runs, so model extraction, guardrails, and compaction
             // all see the canonical chat format they already understand.
             if ctx.endpoint_type == EndpointType::Responses {
-                match maxllm_translate::responses::responses_request_to_chat(
-                    &ctx.request_body_buf,
-                ) {
+                match maxllm_translate::responses::responses_request_to_chat(&ctx.request_body_buf)
+                {
                     Ok(translated) => {
                         if translated.is_streaming {
                             ctx.is_streaming = true;
@@ -1732,9 +1729,8 @@ impl ProxyHttp for AiGateway {
                             }
                             Err(e) => {
                                 warn!(error = %e, "Failed to translate Gemini response for Responses mode");
-                                *body = Some(Bytes::from(std::mem::take(
-                                    &mut ctx.response_body_buf,
-                                )));
+                                *body =
+                                    Some(Bytes::from(std::mem::take(&mut ctx.response_body_buf)));
                             }
                         }
                     }
@@ -1747,8 +1743,7 @@ impl ProxyHttp for AiGateway {
                     match ctx.stream_translator.lock() {
                         Ok(mut guard) => {
                             if let Some(translator) = guard.as_mut() {
-                                let translated =
-                                    translator.process_chunk(data, end_of_stream);
+                                let translated = translator.process_chunk(data, end_of_stream);
                                 drop(guard);
                                 *body = Some(Bytes::from(translated));
                             }
@@ -1765,9 +1760,9 @@ impl ProxyHttp for AiGateway {
                 }
 
                 if end_of_stream && !ctx.response_body_buf.is_empty() {
-                    if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(
-                        &ctx.response_body_buf,
-                    ) {
+                    if let Ok(parsed) =
+                        serde_json::from_slice::<serde_json::Value>(&ctx.response_body_buf)
+                    {
                         extract_usage(&parsed, ctx);
                     }
 
@@ -1788,11 +1783,17 @@ impl ProxyHttp for AiGateway {
                             .unwrap_or_else(|| ctx.response_body_buf.clone());
                         *body = Some(Bytes::from(error_body));
                         hot.global_chain.run_response_body(
-                            session, body, end_of_stream, &mut ctx.plugin_ctx,
+                            session,
+                            body,
+                            end_of_stream,
+                            &mut ctx.plugin_ctx,
                         )?;
                         if let Some(idx) = ctx.route_index {
                             hot.route_chains[idx].run_response_body(
-                                session, body, end_of_stream, &mut ctx.plugin_ctx,
+                                session,
+                                body,
+                                end_of_stream,
+                                &mut ctx.plugin_ctx,
                             )?;
                         }
                         return Ok(None);
@@ -1817,9 +1818,8 @@ impl ProxyHttp for AiGateway {
                             }
                             Err(e) => {
                                 warn!(error = %e, "Failed to translate provider response for Responses mode");
-                                *body = Some(Bytes::from(std::mem::take(
-                                    &mut ctx.response_body_buf,
-                                )));
+                                *body =
+                                    Some(Bytes::from(std::mem::take(&mut ctx.response_body_buf)));
                             }
                         }
                     } else {

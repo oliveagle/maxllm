@@ -78,8 +78,7 @@ pub fn normalize_request(body: &[u8]) -> Vec<u8> {
 }
 
 fn messages_mut(root: &mut Value) -> Option<&mut Vec<Value>> {
-    root.get_mut("messages")
-        .and_then(|m| m.as_array_mut())
+    root.get_mut("messages").and_then(|m| m.as_array_mut())
 }
 
 /// Map `role: "developer"` back to `"system"` (codex-cli / o-series SDKs).
@@ -135,10 +134,7 @@ pub fn normalize_tool_call_arguments(root: &mut Value) -> bool {
                 continue;
             };
             for tc in tool_calls.iter_mut() {
-                let Some(args) = tc
-                    .get_mut("function")
-                    .and_then(|f| f.get_mut("arguments"))
-                else {
+                let Some(args) = tc.get_mut("function").and_then(|f| f.get_mut("arguments")) else {
                     continue;
                 };
                 if !args.is_string() {
@@ -189,7 +185,9 @@ pub fn repair_tool_call_ids(root: &mut Value) -> bool {
         if messages[i].get("role").and_then(|r| r.as_str()) != Some("assistant") {
             continue;
         }
-        let Some(tool_calls) = messages[i].get_mut("tool_calls").and_then(|t| t.as_array_mut())
+        let Some(tool_calls) = messages[i]
+            .get_mut("tool_calls")
+            .and_then(|t| t.as_array_mut())
         else {
             continue;
         };
@@ -416,10 +414,7 @@ pub fn normalize_reasoning_content(root: &mut Value) -> bool {
                     // Drop the placeholder and tidy the whitespace it left
                     // behind, so the echoed marker cannot accumulate.
                     let stripped = rc.replace(REASONING_PLACEHOLDER, " ");
-                    let collapsed = stripped
-                        .split_whitespace()
-                        .collect::<Vec<_>>()
-                        .join(" ");
+                    let collapsed = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
                     if collapsed.is_empty() {
                         obj.insert("reasoning_content".into(), Value::Null);
                     } else {
@@ -492,20 +487,14 @@ impl ProviderTranslator for OpenCodeTranslator {
             if let Some(obj) = req.as_object_mut() {
                 obj.insert("model".into(), Value::String(model.to_string()));
             }
-            let is_streaming = req
-                .get("stream")
-                .and_then(|s| s.as_bool())
-                .unwrap_or(false);
+            let is_streaming = req.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
             Ok(TranslatedRequest {
                 body: serde_json::to_vec(&req)?,
                 is_streaming,
             })
         } else {
             let req: serde_json::Value = serde_json::from_slice(&normalized)?;
-            let is_streaming = req
-                .get("stream")
-                .and_then(|s| s.as_bool())
-                .unwrap_or(false);
+            let is_streaming = req.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
             Ok(TranslatedRequest {
                 body: normalized,
                 is_streaming,
@@ -596,7 +585,9 @@ mod tests {
             assert_eq!(out["tool_choice"], ok);
         }
         // Object is left untouched.
-        out = norm(json!({"model":"m","messages":[],"tool_choice":{"type":"function","function":{"name":"f"}}}));
+        out = norm(
+            json!({"model":"m","messages":[],"tool_choice":{"type":"function","function":{"name":"f"}}}),
+        );
         assert!(out["tool_choice"].is_object());
     }
 
@@ -605,7 +596,9 @@ mod tests {
         let out = norm(json!({"model":"m","messages":[
             {"role":"assistant","content":"","tool_calls":[
                 {"id":"c1","type":"function","function":{"name":"f","arguments":{"city":"BJ"}}}]}]}));
-        let args = out["messages"][0]["tool_calls"][0]["function"]["arguments"].as_str().unwrap();
+        let args = out["messages"][0]["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .unwrap();
         let parsed: Value = serde_json::from_str(args).unwrap();
         assert_eq!(parsed["city"], "BJ");
     }
@@ -617,7 +610,10 @@ mod tests {
             "messages":[
             {"role":"assistant","content":"","tool_calls":[
                 {"id":"c1","type":"function","function":{"name":"","arguments":"{}"}}]}]}));
-        assert_eq!(out["messages"][0]["tool_calls"][0]["function"]["name"], "get_weather");
+        assert_eq!(
+            out["messages"][0]["tool_calls"][0]["function"]["name"],
+            "get_weather"
+        );
     }
 
     #[test]
@@ -628,8 +624,14 @@ mod tests {
             {"role":"assistant","content":"","tool_calls":[
                 {"id":"c1","type":"function","function":{"name":"","arguments":"{}"}},
                 {"id":"c2","type":"function","function":{"name":"","arguments":"{}"}}]}]}));
-        assert_eq!(out["messages"][0]["tool_calls"][0]["function"]["name"], "unknown_tool_1");
-        assert_eq!(out["messages"][0]["tool_calls"][1]["function"]["name"], "unknown_tool_2");
+        assert_eq!(
+            out["messages"][0]["tool_calls"][0]["function"]["name"],
+            "unknown_tool_1"
+        );
+        assert_eq!(
+            out["messages"][0]["tool_calls"][1]["function"]["name"],
+            "unknown_tool_2"
+        );
     }
 
     #[test]
@@ -674,7 +676,10 @@ mod tests {
             {"role":"assistant","content":"","tool_calls":[
                 {"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}}]},
             {"role":"tool","tool_call_id":"c1","content":"a"}]}));
-        assert_eq!(out["messages"][1]["reasoning_content"], REASONING_PLACEHOLDER);
+        assert_eq!(
+            out["messages"][1]["reasoning_content"],
+            REASONING_PLACEHOLDER
+        );
     }
 
     #[test]
@@ -693,7 +698,10 @@ mod tests {
             {"role":"assistant","content":"","reasoning_content":REASONING_PLACEHOLDER,
              "tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}}]}]}));
         // Re-injected once (placeholder-only collapses to empty → injected).
-        assert_eq!(out["messages"][0]["reasoning_content"], REASONING_PLACEHOLDER);
+        assert_eq!(
+            out["messages"][0]["reasoning_content"],
+            REASONING_PLACEHOLDER
+        );
     }
 
     #[test]
@@ -730,7 +738,9 @@ mod tests {
         let t = OpenCodeTranslator::new("test", "/zen/go/v1/chat/completions");
         let body = json!({"model":"orig","messages":[{"role":"user","content":"hi"}]});
         let bytes = serde_json::to_vec(&body).unwrap();
-        let result = t.translate_request(&bytes, Some("deepseek-v4.1-flash")).unwrap();
+        let result = t
+            .translate_request(&bytes, Some("deepseek-v4.1-flash"))
+            .unwrap();
         let parsed: Value = serde_json::from_slice(&result.body).unwrap();
         assert_eq!(parsed["model"], "deepseek-v4.1-flash");
     }
@@ -739,7 +749,9 @@ mod tests {
     fn test_translator_headers() {
         let t = OpenCodeTranslator::new("test", "/zen/go/v1/chat/completions");
         let headers = t.upstream_headers("oc_sk_x");
-        assert!(headers.iter().any(|(k, v)| k == "Authorization" && v == "Bearer oc_sk_x"));
+        assert!(headers
+            .iter()
+            .any(|(k, v)| k == "Authorization" && v == "Bearer oc_sk_x"));
     }
 
     #[test]
