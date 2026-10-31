@@ -237,6 +237,17 @@ provider = "mock"
 timeout_secs = 10
 plugins = []
 
+# --- Responses API Endpoint ---
+# OpenAI Responses contract (input/instructions/output) — the gateway
+# translates bidirectionally to chat completions for any provider kind.
+
+# [[routes]]
+# path = "/v1/responses"
+# provider = "openai"
+# endpoint_type = "responses"
+# timeout_secs = 120
+# plugins = ["rate_limiter", "cors"]
+
 # --- Native Provider Endpoints ---
 # Accept provider-native request format directly (no translation).
 # Clients use the provider's own SDK/format, gateway adds auth + logging.

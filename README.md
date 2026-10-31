@@ -250,7 +250,7 @@ default_model = "claude-sonnet-4-20250514"
 
 ### Routes
 
-Routes support three endpoint types:
+Routes support four endpoint types:
 
 | Type | Config Value | Description |
 |------|-------------|-------------|
@@ -268,6 +268,14 @@ strategy = "fallback"
 timeout_secs = 120
 plugins = ["rate_limiter", "cors"]
 guardrails = ["injection-guard"]
+
+# Responses — OpenAI Responses API contract (input/instructions/output);
+# gateway translates to/from chat completions for any provider
+[[routes]]
+path = "/v1/responses"
+provider = "openai"
+endpoint_type = "responses"
+plugins = ["rate_limiter", "cors"]
 
 # Native — Anthropic Messages API format directly
 [[routes]]

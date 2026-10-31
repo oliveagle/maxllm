@@ -436,8 +436,9 @@ Client Request (OpenAI format)
     '-- Run plugin chains on upstream request
     |
     v
-[request_body_filter] (3 modes based on endpoint_type)
+[request_body_filter] (4 modes based on endpoint_type)
     |-- Translated: buffer body, extract model, translate OpenAI -> provider
+    |-- Responses: translate Responses -> chat, then chat -> provider
     |-- Native: buffer body, extract metadata from native format, forward as-is
     '-- Passthrough: skip entirely (zero processing)
     |
@@ -457,8 +458,9 @@ Client Request (OpenAI format)
     '-- Run plugin chains on response
     |
     v
-[upstream_response_body_filter] (3 modes based on endpoint_type)
+[upstream_response_body_filter] (4 modes based on endpoint_type)
     |-- Translated: streaming via StreamTranslator, non-streaming via translate_response()
+    |-- Responses: translate provider chat -> Responses (JSON or SSE events)
     |-- Native: extract usage from native format, forward body as-is
     |-- Passthrough: skip translation (run plugin chains only)
     '-- Run plugin chains on response body
