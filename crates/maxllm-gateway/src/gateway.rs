@@ -1732,26 +1732,31 @@ impl ProxyHttp for AiGateway {
                         extract_usage(&parsed, ctx);
                     }
 
-                    // Normalize error responses to OpenAI format, then to Responses.
+                    // Error responses are delivered as-is (normalized to the
+                    // OpenAI error shape when the provider uses another one).
+                    // They are never converted into a Responses object — a
+                    // failed upstream call must not look like a completed
+                    // response with empty output.
                     if ctx.upstream_status >= 400 {
-                        if let Some(p) = provider {
-                            if let Some(normalized) = normalize_error_response(
-                                &ctx.response_body_buf,
-                                ctx.upstream_status,
-                                p.kind,
-                            ) {
-                                *body = Some(Bytes::from(normalized));
-                                hot.global_chain.run_response_body(
-                                    session, body, end_of_stream, &mut ctx.plugin_ctx,
-                                )?;
-                                if let Some(idx) = ctx.route_index {
-                                    hot.route_chains[idx].run_response_body(
-                                        session, body, end_of_stream, &mut ctx.plugin_ctx,
-                                    )?;
-                                }
-                                return Ok(None);
-                            }
+                        let error_body = provider
+                            .and_then(|p| {
+                                normalize_error_response(
+                                    &ctx.response_body_buf,
+                                    ctx.upstream_status,
+                                    p.kind,
+                                )
+                            })
+                            .unwrap_or_else(|| ctx.response_body_buf.clone());
+                        *body = Some(Bytes::from(error_body));
+                        hot.global_chain.run_response_body(
+                            session, body, end_of_stream, &mut ctx.plugin_ctx,
+                        )?;
+                        if let Some(idx) = ctx.route_index {
+                            hot.route_chains[idx].run_response_body(
+                                session, body, end_of_stream, &mut ctx.plugin_ctx,
+                            )?;
                         }
+                        return Ok(None);
                     }
 
                     if let Some(p) = provider {
