@@ -2303,6 +2303,24 @@ fn normalize_error_response(
         }
         // Mistral and other OpenAI-compat may already be in format, but handle gracefully
         _ => {
+            // Nested error objects (opencode.ai, Anthropic-style envelope):
+            // {"type":"error","error":{"type":"MissingSessionID","message":"…"}}
+            // — surface the real message instead of "Unknown provider error".
+            if let Some(err) = parsed.get("error") {
+                if let Some(msg) = err.get("message").and_then(|m| m.as_str()) {
+                    let etype = err
+                        .get("type")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("api_error");
+                    return Some(
+                        serde_json::json!({
+                            "error": {"message": msg, "type": etype, "code": status}
+                        })
+                        .to_string()
+                        .into_bytes(),
+                    );
+                }
+            }
             // Try to extract any "message" or "error" string
             let msg = parsed
                 .get("message")
