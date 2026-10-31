@@ -995,9 +995,27 @@ pub fn chat_response_to_responses_sse(body: &[u8]) -> Option<Vec<u8>> {
     let chat: Value = serde_json::from_slice(body).ok()?;
     let mut translator = ResponsesStreamTranslator::new(Box::new(crate::NativePassthroughStream));
     let mut chunk = chat.clone();
-    // A complete chat completion is shaped like a chunk with one choice.
     if let Some(obj) = chunk.as_object_mut() {
         obj.insert("object".into(), Value::String("chat.completion.chunk".into()));
+    }
+    // A complete chat completion stores the assistant turn as `message`;
+    // the stream translator reads `delta`, so move it across.
+    if let Some(choices) = chunk.get_mut("choices").and_then(|c| c.as_array_mut()) {
+        for choice in choices {
+            let Some(obj) = choice.as_object_mut() else {
+                continue;
+            };
+            let Some(message) = obj.get("message") else {
+                continue;
+            };
+            let delta = json!({
+                "role": message.get("role"),
+                "content": message.get("content"),
+                "tool_calls": message.get("tool_calls"),
+            });
+            obj.insert("delta".into(), delta);
+            obj.remove("message");
+        }
     }
     let mut sse = Vec::new();
     sse.extend_from_slice(b"data: ");
@@ -1335,6 +1353,27 @@ mod tests {
         assert!(collected.contains(r#""delta":"hi""#));
         assert!(collected.contains("event: response.completed"));
         assert!(collected.contains("data: [DONE]"));
+    }
+
+    #[test]
+    fn test_chat_response_to_responses_sse_bridge() {
+        // Gemini answers a streaming request with a single JSON body; the
+        // bridge converts it into Responses SSE events.
+        let chat = br#"{
+            "id":"chatcmpl-g","object":"chat.completion","created":1700000000,
+            "model":"gemini-2.5-flash","choices":[{"index":0,"finish_reason":"stop",
+                "message":{"role":"assistant","content":"hello"}}],
+            "usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}
+        }"#;
+        let sse = chat_response_to_responses_sse(chat).unwrap();
+        let s = String::from_utf8(sse).unwrap();
+        assert!(s.contains("event: response.created"));
+        assert!(s.contains(r#""delta":"hello""#));
+        assert!(s.contains("event: response.output_text.done"));
+        assert!(s.contains(r#""text":"hello""#));
+        assert!(s.contains("event: response.completed"));
+        assert!(s.contains(r#""input_tokens":3"#));
+        assert!(s.contains("data: [DONE]"));
     }
 
     #[test]
