@@ -2844,3 +2844,64 @@ async fn test_opencode_large_request_body_reaches_upstream_intact() {
         .unwrap();
     assert_eq!(resp.status(), 200);
 }
+
+#[tokio::test]
+async fn test_native_responses_large_body_records_usage() {
+    let mock = MockServer::start().await;
+
+    let sse = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_s\",\"object\":\"response\",\"status\":\"in_progress\"}}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_s\",\"object\":\"response\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":11,\"output_tokens\":5}}}\n\n",
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/zen/go/v1/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(sse, "text/event-stream"),
+        )
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let gw = TestGateway::start(NATIVE_RESPONSES_CONFIG, &mock.uri()).await;
+    let c = client();
+
+    // A body larger than pingora's 64 KiB read chunk: it arrives at the
+    // gateway in several `request_body_filter` calls.
+    let padding = "context-padding-".repeat(12 * 1024); // ~100 KiB
+    let resp = c
+        .post(gw.url("/v1/responses"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&json!({
+            "model": "deepseek-v4.1-flash",
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": padding}]}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let text = resp.text().await.unwrap();
+    assert!(text.contains("event: response.completed"), "{text}");
+
+    let metrics = c
+        .get(gw.url("/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let line = metrics
+        .lines()
+        .find(|l| l.starts_with("maxllm_tokens_in_total") && l.contains("deepseek-v4.1-flash"))
+        .unwrap_or_else(|| panic!("no tokens_in metric for the model:\n{metrics}"));
+    assert!(
+        line.trim_end().ends_with("11"),
+        "expected 11 input tokens, got: {line}"
+    );
+}

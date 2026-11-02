@@ -2915,12 +2915,26 @@ fn extract_stream_usage(chunk: &[u8], ctx: &mut RequestCtx, end_of_stream: bool)
                 parse_usage_line(line, ctx);
             }
         }
+        // A terminal event's `data:` line can be very large: the Responses API
+        // echoes the whole output array into `response.completed`, so the line
+        // can exceed the 16 KiB tail cap and its `data:` prefix gets dropped
+        // with the tail. The usage object sits at the very end of that line and
+        // stays intact, so recover it directly from whatever we buffered — the
+        // line-oriented scan above cannot see a line that no longer starts
+        // with `data:`.
+        extract_usage_object(&buf, ctx);
         ctx.sse_tail.clear();
     } else {
         let rest_len = buf.len() - last_complete_end;
         // Bounded: a stream that never emits complete lines (not SSE) must not
         // grow the tail without limit.
         if rest_len > 16 * 1024 {
+            // The partial line already exceeds the cap and is about to be
+            // dropped; recover any usage object it already contains in full
+            // before that (the Responses terminal event's usage object sits at
+            // the end of a huge data: line, so it may be fully present here
+            // even though the line's `data:` prefix will be lost).
+            extract_usage_object(&buf[last_complete_end..], ctx);
             ctx.sse_tail = Vec::new();
         } else {
             buf.copy_within(last_complete_end.., 0);
@@ -2939,23 +2953,100 @@ fn parse_usage_line(line: &[u8], ctx: &mut RequestCtx) {
             .get("usage")
             .or_else(|| value.get("response").and_then(|r| r.get("usage")));
         if let Some(u) = usage {
-            if let Some(pt) = u.get("prompt_tokens").and_then(|v| v.as_u64()) {
-                ctx.tokens_in = pt;
+            copy_usage_tokens(u, ctx);
+        }
+    }
+}
+
+/// Copy token usage (and, once, the upstream cost) from a usage object into
+/// `ctx`. Accepts both the chat `prompt_tokens` / `completion_tokens` and the
+/// Responses `input_tokens` / `output_tokens` accounting.
+fn copy_usage_tokens(usage: &serde_json::Value, ctx: &mut RequestCtx) {
+    if let Some(pt) = usage.get("prompt_tokens").and_then(|v| v.as_u64()) {
+        ctx.tokens_in = pt;
+    }
+    if let Some(ct) = usage.get("completion_tokens").and_then(|v| v.as_u64()) {
+        ctx.tokens_out = ct;
+    }
+    // Responses accounting (input_tokens / output_tokens).
+    if let Some(it) = usage.get("input_tokens").and_then(|v| v.as_u64()) {
+        ctx.tokens_in = it;
+    }
+    if let Some(ot) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
+        ctx.tokens_out = ot;
+    }
+    if ctx.upstream_cost_usd.is_none() {
+        ctx.upstream_cost_usd = extract_usage_cost(usage);
+    }
+}
+
+/// Find the byte index of the first occurrence of `needle` in `haystack`
+/// at or after `from`.
+fn find_bytes(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+    if from >= haystack.len() || needle.is_empty() {
+        return None;
+    }
+    haystack[from..]
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .map(|i| from + i)
+}
+
+/// Find the index of the `}` that closes the JSON object opened at `open`
+/// (`buf[open] == b'{'`), skipping string contents and backslash escapes.
+/// Returns `None` when the object is not yet complete in `buf`.
+fn find_json_object_end(buf: &[u8], open: usize) -> Option<usize> {
+    if buf.get(open) != Some(&b'{') {
+        return None;
+    }
+    let mut depth = 0u32;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, &b) in buf.iter().enumerate().skip(open) {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
             }
-            if let Some(ct) = u.get("completion_tokens").and_then(|v| v.as_u64()) {
-                ctx.tokens_out = ct;
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
             }
-            // Responses accounting (input_tokens / output_tokens).
-            if let Some(it) = u.get("input_tokens").and_then(|v| v.as_u64()) {
-                ctx.tokens_in = it;
-            }
-            if let Some(ot) = u.get("output_tokens").and_then(|v| v.as_u64()) {
-                ctx.tokens_out = ot;
-            }
-            if ctx.upstream_cost_usd.is_none() {
-                ctx.upstream_cost_usd = extract_usage_cost(u);
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Recover token usage from a buffer that may only hold the TAIL of an SSE
+/// event. The Responses API's terminal `response.completed` event carries the
+/// whole output array, so its `data:` line can exceed the streaming tail cap
+/// and lose its `data:` prefix; the usage object itself sits at the very end
+/// of that line and is small. Scans for every `"usage":{` object and copies
+/// the tokens of the last one that parses. Occurrences inside JSON strings
+/// (e.g. tool descriptions) either fail to parse or carry no token fields, so
+/// they cannot corrupt the accounting.
+fn extract_usage_object(buf: &[u8], ctx: &mut RequestCtx) {
+    let marker = b"\"usage\":{";
+    let mut pos = 0;
+    while let Some(rel) = find_bytes(buf, marker, pos) {
+        let open = rel + marker.len() - 1; // index of the '{'
+        if let Some(close) = find_json_object_end(buf, open) {
+            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&buf[open..=close]) {
+                copy_usage_tokens(&value, ctx);
             }
         }
+        pos = rel + marker.len();
     }
 }
 
@@ -3173,5 +3264,66 @@ mod stream_usage_tests {
         extract_stream_usage(b"data: {\"choices\":[]}\n\n", &mut c, true);
         assert_eq!(c.tokens_in, 9);
         assert_eq!(c.tokens_out, 3);
+    }
+    #[test]
+    fn test_giant_responses_terminal_event_usage_is_extracted() {
+        // The Responses API's terminal event echoes the whole output array, so
+        // its `data:` line is far larger than the 16 KiB streaming tail cap:
+        // the line's `data:` prefix is dropped with the tail and the
+        // line-oriented scan can never see it again. The usage object sits at
+        // the very end of the line and must still be recovered.
+        let mut c = ctx();
+        let huge = "x".repeat(120 * 1024);
+        let line = format!(
+            "data: {{\"response\":{{\"id\":\"r1\",\"output\":[\"{}\"],\"usage\":{{\"input_tokens\":26356,\"output_tokens\":3,\"total_tokens\":26359,\"cost\":0,\"opencode\":{{\"allowance\":0.00391757}}}}}},\"type\":\"response.completed\"}}\n\n",
+            huge
+        );
+        assert!(line.len() > 16 * 1024);
+        let bytes = line.as_bytes();
+
+        // Feed it the way pingora delivers it: 16 KiB pieces.
+        let mut pos = 0;
+        while pos < bytes.len() {
+            let end = (pos + 16 * 1024).min(bytes.len());
+            let eos = end == bytes.len();
+            extract_stream_usage(&bytes[pos..end], &mut c, eos);
+            pos = end;
+        }
+        assert_eq!(c.tokens_in, 26356);
+        assert_eq!(c.tokens_out, 3);
+    }
+
+    #[test]
+    fn test_giant_terminal_event_usage_is_found_without_the_data_prefix() {
+        // Same scenario, but the tail cap has already dropped the line's
+        // `data:` prefix, so only the tail of the event is buffered.
+        let mut c = ctx();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"data: {\"response\":{\"output\":[");
+        buf.extend(std::iter::repeat_n(b'y', 40 * 1024));
+        buf.extend_from_slice(
+            b"],\"usage\":{\"input_tokens\":7,\"output_tokens\":2}},\"type\":\"response.completed\"}\n\n",
+        );
+        // Skip the first 16 KiB: that is what the tail cap drops.
+        let mut pos = 16 * 1024;
+        while pos < buf.len() {
+            let end = (pos + 16 * 1024).min(buf.len());
+            let eos = end == buf.len();
+            extract_stream_usage(&buf[pos..end], &mut c, eos);
+            pos = end;
+        }
+        assert_eq!(c.tokens_in, 7);
+        assert_eq!(c.tokens_out, 2);
+    }
+
+    #[test]
+    fn test_usage_marker_inside_a_string_is_ignored() {
+        // A tool description may literally contain `"usage":{`. Such an
+        // occurrence is not a usage object and must not corrupt the counts.
+        let mut c = ctx();
+        let chunk = b"data: {\"description\":\"see \"usage\":{\"x\":1} here\",\"usage\":{\"input_tokens\":4,\"output_tokens\":1}}\n\n";
+        extract_stream_usage(chunk, &mut c, true);
+        assert_eq!(c.tokens_in, 4);
+        assert_eq!(c.tokens_out, 1);
     }
 }
