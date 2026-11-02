@@ -2471,6 +2471,62 @@ async fn test_chat_only_responses_streaming_error_is_surfaced() {
 }
 
 #[tokio::test]
+async fn test_chat_only_responses_mid_stream_error_becomes_response_failed() {
+    // The chat upstream answers 200 but fails *inside* the SSE stream with an
+    // `{"error": {...}}` chunk. The gateway must translate that into a
+    // terminal `response.failed` event with the reason — never end the stream
+    // with a fake `response.completed` that hides the failure.
+    let mock = MockServer::start().await;
+    let chat_sse = concat!(
+        "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"part of an answer\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"error\":{\"message\":\"context length exceeded\",\"type\":\"invalid_request_error\",\"code\":\"context_length_exceeded\"}}\n\n",
+        "data: [DONE]\n\n",
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(chat_sse, "text/event-stream"),
+        )
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let gw = TestGateway::start(CHAT_ONLY_RESPONSES_CONFIG, &mock.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/responses"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&json!({
+            "model": "gpt-4o",
+            "stream": true,
+            "input": "hi"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "the upstream answered 200");
+    let text = resp.text().await.unwrap();
+
+    assert!(
+        !text.contains("response.completed"),
+        "a failed stream must not end with completed: {text}"
+    );
+    assert!(text.contains("event: response.failed"), "{text}");
+    assert!(
+        text.contains("\"message\":\"context length exceeded\""),
+        "the upstream error message must reach the client: {text}"
+    );
+    assert!(
+        text.contains("\"code\":\"context_length_exceeded\""),
+        "the upstream error code must reach the client: {text}"
+    );
+    assert!(text.contains("part of an answer"), "{text}");
+}
+
+#[tokio::test]
 async fn test_native_responses_fallback_to_non_native_provider_translates_body() {
     // The native (opencode) primary is unreachable, so the request is retried
     // on a chat-only (openai) fallback. The fallback speaks the chat

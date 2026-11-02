@@ -675,6 +675,8 @@ enum ResponseStatus {
     InProgress,
     Completed,
     Incomplete,
+    /// The upstream failed while producing the answer.
+    Failed,
 }
 
 impl ResponseStatus {
@@ -683,6 +685,7 @@ impl ResponseStatus {
             ResponseStatus::InProgress => "in_progress",
             ResponseStatus::Completed => "completed",
             ResponseStatus::Incomplete => "incomplete",
+            ResponseStatus::Failed => "failed",
         }
     }
 }
@@ -1021,6 +1024,24 @@ impl ResponsesStreamTranslator {
 
     /// Handle one chat completion chunk.
     fn handle_chunk(&mut self, chunk: &Value, out: &mut Vec<u8>) {
+        if self.finished {
+            // The stream already ended (a failure was reported); anything
+            // after it is noise and must not resurrect the terminal event.
+            return;
+        }
+
+        // A chat upstream can fail *inside* a 200 SSE stream by emitting an
+        // `{"error": {...}}` chunk: rate limits, context-length overflows and
+        // upstream server errors all land there. Such a chunk must end the
+        // stream with the real reason — ending it with a
+        // `response.completed` would hide the failure behind an empty answer.
+        if let Some(error) = chunk.get("error") {
+            if !error.is_null() {
+                self.fail_stream(error, out);
+                return;
+            }
+        }
+
         if let Some(model) = chunk.get("model").and_then(|v| v.as_str()) {
             if !model.is_empty() {
                 self.model = model.to_string();
@@ -1262,6 +1283,66 @@ impl ResponsesStreamTranslator {
         }
     }
 
+    /// End the stream with the upstream's error, as a terminal
+    /// `response.failed` event.
+    ///
+    /// The Responses API has no other way to say "the upstream answered 200
+    /// but the answer failed": `response.failed` is the terminal event a
+    /// client looks for, and it carries the reason in `response.error`. The
+    /// partial output collected so far is kept in the response object so the
+    /// client can show what was produced before the failure.
+    fn fail_stream(&mut self, error: &Value, out: &mut Vec<u8>) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+
+        if !self.started {
+            self.started = true;
+            emit_event(
+                out,
+                "response.created",
+                json!({
+                    "type": "response.created",
+                    "response": self.response_object(ResponseStatus::InProgress),
+                }),
+            );
+        }
+
+        // The chat error is OpenAI-shaped: {"message", "type", "code",
+        // "param"}. Some upstreams send a bare string or nest the object one
+        // level deeper, so the fields are read defensively.
+        let message = match error {
+            Value::String(text) => text.clone(),
+            other => error_text(other, "message"),
+        };
+        let code = error_text(error, "code");
+        let kind = error_text(error, "type");
+        let param = error.get("param").cloned().unwrap_or(Value::Null);
+
+        let mut response = self.response_object(ResponseStatus::Failed);
+        if let Some(obj) = response.as_object_mut() {
+            obj.insert(
+                "error".to_string(),
+                json!({
+                    "code": optional_text(&code),
+                    "message": optional_text(&message),
+                    "param": param,
+                    "type": optional_text(&kind),
+                }),
+            );
+        }
+        emit_event(
+            out,
+            "response.failed",
+            json!({
+                "type": "response.failed",
+                "response": response
+            }),
+        );
+        out.extend_from_slice(b"data: [DONE]\n\n");
+    }
+
     /// Emit the terminal events.
     fn finalize(&mut self, out: &mut Vec<u8>) {
         if self.finished {
@@ -1497,6 +1578,25 @@ impl StreamTranslator for ResponsesStreamTranslator {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Read a text field out of an upstream error object. The field may be a
+/// string, a number, or absent.
+fn error_text(error: &Value, key: &str) -> String {
+    match error.get(key) {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Number(number)) => number.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// An empty error field is reported as null, not as an empty string.
+fn optional_text(text: &str) -> Value {
+    if text.is_empty() {
+        Value::Null
+    } else {
+        Value::String(text.to_string())
+    }
+}
 
 /// Serialize one Responses SSE event.
 fn emit_event(out: &mut Vec<u8>, event: &str, payload: Value) {
@@ -2479,6 +2579,101 @@ mod tests {
     fn test_invalid_json_passthrough() {
         let out = normalize_responses_request(b"not json");
         assert_eq!(out, b"not json");
+    }
+
+    #[test]
+    fn test_mid_stream_error_ends_with_response_failed() {
+        // A chat upstream can fail inside a 200 SSE stream with an
+        // `{"error": {...}}` chunk. It must end the stream with a terminal
+        // `response.failed` carrying the reason — never a fake completed.
+        let chunks = [
+            r#"{"id":"chatcmpl-e","object":"chat.completion.chunk","created":1700000000,"model":"gpt-4o","choices":[{"index":0,"delta":{"content":"part of an answer"},"finish_reason":null}]}"#,
+            r#"{"error":{"message":"context length exceeded","type":"invalid_request_error","code":"context_length_exceeded"}}"#,
+        ];
+        let sse = chat_sse(&chunks);
+        let mut t = ResponsesStreamTranslator::new(Box::new(crate::NativePassthroughStream));
+        let out = t.process_chunk(sse.as_bytes(), true);
+        let s = String::from_utf8(out).unwrap();
+
+        assert!(
+            !s.contains("event: response.completed"),
+            "a failed stream must not end with completed: {s}"
+        );
+        let events = sse_payloads(&s);
+        let failed = events
+            .iter()
+            .find(|e| e["type"] == "response.failed")
+            .expect("response.failed event expected");
+        assert_eq!(failed["response"]["status"], "failed");
+        assert_eq!(
+            failed["response"]["error"]["message"],
+            "context length exceeded"
+        );
+        assert_eq!(
+            failed["response"]["error"]["code"],
+            "context_length_exceeded"
+        );
+        assert_eq!(failed["response"]["error"]["type"], "invalid_request_error");
+        // The partial answer produced before the failure is kept.
+        assert_eq!(
+            failed["response"]["output"][0]["content"][0]["text"],
+            "part of an answer"
+        );
+        assert!(s.contains("data: [DONE]"));
+    }
+
+    #[test]
+    fn test_mid_stream_error_before_any_output() {
+        // The error may be the very first chunk; the stream still emits
+        // response.created before the terminal response.failed so the client
+        // has a response object to attach the failure to.
+        let chunks = [
+            r#"{"error":{"message":"upstream down","type":"server_error","code":"server_error"}}"#,
+        ];
+        let sse = chat_sse(&chunks);
+        let mut t = ResponsesStreamTranslator::new(Box::new(crate::NativePassthroughStream));
+        let out = t.process_chunk(sse.as_bytes(), true);
+        let s = String::from_utf8(out).unwrap();
+
+        let events = sse_payloads(&s);
+        let types: Vec<&str> = events.iter().map(|e| e["type"].as_str().unwrap()).collect();
+        assert_eq!(types, vec!["response.created", "response.failed"]);
+        let failed = events.last().unwrap();
+        assert_eq!(failed["response"]["status"], "failed");
+        assert_eq!(failed["response"]["error"]["message"], "upstream down");
+        assert!(!s.contains("event: response.completed"));
+    }
+
+    #[test]
+    fn test_bare_string_error_is_used_as_message() {
+        // Some upstreams send {"error": "just a message"}.
+        let sse = chat_sse(&[r#"{"error":"kaboom"}"#]);
+        let mut t = ResponsesStreamTranslator::new(Box::new(crate::NativePassthroughStream));
+        let out = t.process_chunk(sse.as_bytes(), true);
+        let s = String::from_utf8(out).unwrap();
+        let events = sse_payloads(&s);
+        let failed = events
+            .iter()
+            .find(|e| e["type"] == "response.failed")
+            .expect("response.failed event expected");
+        assert_eq!(failed["response"]["error"]["message"], "kaboom");
+        assert!(failed["response"]["error"]["code"].is_null());
+    }
+
+    #[test]
+    fn test_null_error_chunk_is_ignored() {
+        // Some providers carry "error": null on ordinary chunks; that must
+        // not terminate the stream.
+        let chunks = [
+            r#"{"id":"chatcmpl-e","object":"chat.completion.chunk","created":1700000000,"model":"gpt-4o","error":null,"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}]}"#,
+            r#"{"id":"chatcmpl-e","object":"chat.completion.chunk","created":1700000000,"model":"gpt-4o","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        ];
+        let sse = chat_sse(&chunks);
+        let mut t = ResponsesStreamTranslator::new(Box::new(crate::NativePassthroughStream));
+        let out = t.process_chunk(sse.as_bytes(), true);
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("event: response.completed"));
+        assert!(!s.contains("event: response.failed"));
     }
 
     #[test]
