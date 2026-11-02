@@ -665,6 +665,17 @@ fn buffer_request_body_chunk(ctx: &mut RequestCtx, body: &mut Option<Bytes>, end
     }
 }
 
+/// Resolve the upstream time budget for a request: a route may declare
+/// `timeout_secs`, which overrides the hard-coded read/write defaults.
+/// Returns `None` when the route does not configure one (or is unmatched).
+fn route_timeout_secs(routes: &[RouteConfig], route_index: Option<usize>) -> Option<Duration> {
+    route_index
+        .and_then(|i| routes.get(i))
+        .and_then(|r| r.timeout_secs)
+        .filter(|secs| *secs > 0)
+        .map(Duration::from_secs)
+}
+
 #[async_trait]
 impl ProxyHttp for AiGateway {
     type CTX = RequestCtx;
@@ -881,8 +892,13 @@ impl ProxyHttp for AiGateway {
         let mut peer = HttpPeer::new(addr, provider.tls, provider.sni.clone());
         peer.options.connection_timeout = Some(provider.connect_timeout);
         peer.options.total_connection_timeout = provider.total_connect_timeout;
-        peer.options.read_timeout = Some(std::time::Duration::from_secs(120));
-        peer.options.write_timeout = Some(std::time::Duration::from_secs(30));
+        // A route may declare its own upstream time budget (`timeout_secs`).
+        // Honour it instead of silently ignoring the setting, otherwise a
+        // route configured for a slow upstream is still cut off by the
+        // hard-coded defaults below. Unset (or zero) keeps the defaults.
+        let route_timeout = route_timeout_secs(&hot.routes, ctx.route_index);
+        peer.options.read_timeout = Some(route_timeout.unwrap_or(Duration::from_secs(120)));
+        peer.options.write_timeout = Some(route_timeout.unwrap_or(Duration::from_secs(30)));
 
         Ok(Box::new(peer))
     }
@@ -3147,6 +3163,63 @@ api_key = "sk-test"
         let p = &state.providers["opencode"];
         assert_eq!(p.connect_timeout, Duration::from_secs(30));
         assert_eq!(p.total_connect_timeout, Some(Duration::from_secs(60)));
+    }
+}
+
+#[cfg(test)]
+mod route_timeout_tests {
+    use super::*;
+    use maxllm_config::Config;
+
+    const BASE: &str = r#"
+[server]
+listen = "0.0.0.0:8080"
+
+[providers.opencode]
+kind = "opencode"
+base_url = "https://opencode.ai"
+api_key = "sk-test"
+"#;
+
+    fn routes_from(toml: &str) -> Vec<RouteConfig> {
+        Config::parse(toml).unwrap().routes
+    }
+
+    #[test]
+    fn test_unmatched_route_has_no_timeout() {
+        let routes = routes_from(BASE);
+        assert_eq!(route_timeout_secs(&routes, None), None);
+        // Index outside the routes array is the same as unmatched.
+        assert_eq!(route_timeout_secs(&routes, Some(3)), None);
+    }
+
+    #[test]
+    fn test_unset_timeout_keeps_the_hardcoded_default() {
+        let toml = format!(
+            "{BASE}[[routes]]\npath = \"/v1/responses/opencode_go_1\"\nprovider = \"opencode\"\n"
+        );
+        let routes = routes_from(&toml);
+        assert_eq!(route_timeout_secs(&routes, Some(0)), None);
+    }
+
+    #[test]
+    fn test_route_timeout_is_honoured() {
+        let toml = format!(
+            "{BASE}[[routes]]\npath = \"/v1/responses/opencode_go_1\"\nprovider = \"opencode\"\ntimeout_secs = 300\n"
+        );
+        let routes = routes_from(&toml);
+        assert_eq!(
+            route_timeout_secs(&routes, Some(0)),
+            Some(Duration::from_secs(300))
+        );
+    }
+
+    #[test]
+    fn test_zero_timeout_is_treated_as_unset() {
+        let toml =
+            format!("{BASE}[[routes]]\npath = \"/a\"\nprovider = \"opencode\"\ntimeout_secs = 0\n");
+        let routes = routes_from(&toml);
+        assert_eq!(route_timeout_secs(&routes, Some(0)), None);
     }
 }
 
