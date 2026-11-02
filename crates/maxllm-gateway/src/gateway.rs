@@ -976,12 +976,19 @@ impl ProxyHttp for AiGateway {
         // third-party clients often don't, so inject one:
         // prefer the client's own session-affinity id so cache routing stays
         // sticky across turns, otherwise generate a fresh UUID per request.
-        if provider.kind == ProviderKind::OpenCode
-            && upstream_request
-                .headers
-                .get(maxllm_translate::opencode::SESSION_HEADER)
-                .is_none()
-        {
+        //
+        // A header that is PRESENT but EMPTY is treated exactly like a
+        // missing one: the upstream rejects an empty value with the same
+        // 400 MissingSessionID (verified live), and a client whose session
+        // template rendered to "" still sends the header. Only a non-blank
+        // client value is kept verbatim.
+        let client_session = upstream_request
+            .headers
+            .get(maxllm_translate::opencode::SESSION_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        if provider.kind == ProviderKind::OpenCode && client_session.is_none() {
             let session_id = session
                 .req_header()
                 .headers

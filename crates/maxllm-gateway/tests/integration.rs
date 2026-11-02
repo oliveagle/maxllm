@@ -1913,6 +1913,72 @@ async fn test_opencode_session_header_never_overwritten() {
 }
 
 #[tokio::test]
+async fn test_opencode_empty_session_header_replaced_with_affinity() {
+    let mock = MockServer::start().await;
+
+    // The client sent `x-opencode-session: ""` (its session template rendered
+    // empty) — the upstream rejects an empty value with 400 MissingSessionID,
+    // so the gateway must treat it as missing and inject the session-affinity
+    // id instead of forwarding the blank header.
+    Mock::given(method("POST"))
+        .and(path("/zen/go/v1/chat/completions"))
+        .and(header("x-opencode-session", "affinity-42"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"id":"c1","object":"chat.completion","choices":[]})),
+        )
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let gw = TestGateway::start(OPENCODE_CHAT_CONFIG, &mock.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .header("x-opencode-session", "")
+        .header("x-session-affinity", "affinity-42")
+        .json(&chat_body("deepseek-v4.1-flash", "hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn test_opencode_blank_session_header_replaced() {
+    let mock = MockServer::start().await;
+
+    // Whitespace-only session header is blank, not a session — inject the
+    // session-affinity id instead of forwarding the blank header.
+    Mock::given(method("POST"))
+        .and(path("/zen/go/v1/chat/completions"))
+        .and(header("x-opencode-session", "affinity-42"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"id":"c1","object":"chat.completion","choices":[]})),
+        )
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let gw = TestGateway::start(OPENCODE_CHAT_CONFIG, &mock.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .header("x-opencode-session", "   ")
+        .header("x-session-affinity", "affinity-42")
+        .json(&chat_body("deepseek-v4.1-flash", "hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
 async fn test_opencode_upstream_ua_injected_when_missing() {
     let mock = MockServer::start().await;
 
