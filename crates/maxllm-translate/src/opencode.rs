@@ -9,29 +9,41 @@
 //! OpenCode (opencode.ai "zen") compatibility translator.
 //!
 //! The opencode.ai gateway (`/zen/go/v1/chat/completions`) is OpenAI-compatible
-//! but has stricter validation than most providers:
+//! but has stricter validation than most providers. Every rule below was
+//! verified against the live endpoint (`deepseek-v4.1-flash`):
 //!
 //! * **Session header** — every request must carry an `x-opencode-session`
-//!   header (used for upstream routing / prompt-cache affinity). The opencode
-//!   CLI sends it; third-party clients often don't, and the upstream rejects
-//!   those with `400 MissingSessionID`. The gateway injects a session id when
-//!   the client did not provide one (see `SESSION_HEADER`).
+//!   header (used for upstream routing / prompt-cache affinity). Without it
+//!   the upstream rejects the call with `400 MissingSessionID`
+//!   (`{"type":"error","error":{"type":"MissingSessionID",…}}`). The opencode
+//!   CLI sends it; third-party clients often don't. The gateway injects a
+//!   session id when the client did not provide one (see `SESSION_HEADER`).
 //! * **tool_choice** — only `"none"` / `"auto"` / `"required"` or a tool
-//!   choice object; the non-standard `"any"` (sent by codex-cli) is rejected.
+//!   choice object; the non-standard `"any"` (sent by codex-cli) is rejected
+//!   with a 400 invalid-parameter error.
 //! * **tool call arguments** — `tool_calls[].function.arguments` must be a
-//!   JSON *string*; object/array values are rejected with an unmarshal error.
+//!   JSON *string*; object/array values are rejected with
+//!   `cannot unmarshal object into … function.arguments of type string`.
+//!   Missing `arguments` / `type` fields are also rejected.
 //! * **function names** — empty `tool_calls[].function.name` is rejected with
 //!   a missing-parameter 400 (a client can produce it when a streaming
 //!   `id: null` continuation fragment clobbers the captured name).
+//! * **tool_choice without tools** — a `tool_choice` sent while `tools` is
+//!   empty/absent is rejected by strict OpenAI-style upstreams; it is dropped.
 //!
 //! This module also carries the conversation-history repairs proven by the
 //! one-api opencode channel (tool_call id / orphan repair, reasoning_content
 //! echo collapse + placeholder injection). They are harmless against the
 //! upstream (all shapes are accepted) and protect clients whose persisted
 //! history was damaged by an earlier upstream.
+//!
+//! The Responses API is served natively: `/zen/go/v1/responses` accepts the
+//! OpenAI Responses contract (verified), so `kind = "opencode"` providers
+//! default to `native_responses = true` and `/v1/responses` requests are
+//! forwarded byte-for-byte.
 
 use crate::{ProviderTranslator, StreamTranslator, TranslateError, TranslatedRequest};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 /// Header opencode.ai requires on every `/zen` request.
 pub const SESSION_HEADER: &str = "x-opencode-session";
@@ -50,12 +62,25 @@ pub const SYNTHETIC_TOOL_CONTENT: &str = "Tool execution was not recorded";
 // Request normalisation
 // ---------------------------------------------------------------------------
 
-/// Apply every opencode-specific request repair to a chat completions body.
+/// Apply every opencode-specific request repair to a chat completions body,
+/// with reasoning-placeholder injection enabled (the safe default).
 ///
 /// Returns the (possibly unchanged) original bytes. A body that does not
 /// parse as JSON is returned as-is — the gateway forwards it and the upstream
 /// produces the (accurate) parse error rather than the gateway guessing.
 pub fn normalize_request(body: &[u8]) -> Vec<u8> {
+    normalize_request_opts(body, false)
+}
+
+/// Apply every opencode-specific request repair to a chat completions body.
+///
+/// `skip_reasoning_injection` disables the `reasoning_content` placeholder
+/// injection for thinking-mode turns (echo collapse always runs). Channels
+/// whose upstream does not require `reasoning_content` back can set it to
+/// avoid feeding a fake reasoning marker into the model context.
+///
+/// Returns the (possibly unchanged) original bytes.
+pub fn normalize_request_opts(body: &[u8], skip_reasoning_injection: bool) -> Vec<u8> {
     let Ok(mut root) = serde_json::from_slice::<Value>(body) else {
         return body.to_vec();
     };
@@ -68,7 +93,7 @@ pub fn normalize_request(body: &[u8]) -> Vec<u8> {
     changed |= repair_tool_call_ids(&mut root);
     changed |= repair_tool_call_function_names(&mut root);
     changed |= repair_orphaned_tool_calls(&mut root);
-    changed |= normalize_reasoning_content(&mut root);
+    changed |= normalize_reasoning_content(&mut root, skip_reasoning_injection);
 
     if changed {
         serde_json::to_vec(&root).unwrap_or_else(|_| body.to_vec())
@@ -123,9 +148,16 @@ pub fn normalize_content_part_types(root: &mut Value) -> bool {
     modified
 }
 
-/// Coerce every `tool_calls[].function.arguments` to a JSON string.
-/// codex-cli serialises them as objects; the upstream rejects that.
-/// Returns true if any arguments were rewritten.
+/// Make every `tool_calls[]` entry schema-complete for the strict upstream:
+///
+/// * `type` — insert `"function"` when missing (the OpenAI schema requires it
+///   and the upstream rejects entries without it).
+/// * `function.arguments` — must be a JSON *string*. codex-cli serialises
+///   them as objects; the upstream rejects that with an unmarshal 400. A
+///   missing field is inserted as `"{}"`; `null` becomes `"{}"` too (an
+///   explicit `"null"` would reach the model as JSON null arguments).
+///
+/// Returns true if any entry was rewritten.
 pub fn normalize_tool_call_arguments(root: &mut Value) -> bool {
     let mut modified = false;
     if let Some(messages) = messages_mut(root) {
@@ -134,13 +166,34 @@ pub fn normalize_tool_call_arguments(root: &mut Value) -> bool {
                 continue;
             };
             for tc in tool_calls.iter_mut() {
-                let Some(args) = tc.get_mut("function").and_then(|f| f.get_mut("arguments")) else {
+                let Some(obj) = tc.as_object_mut() else {
                     continue;
                 };
-                if !args.is_string() {
-                    let s = serde_json::to_string(&args).unwrap_or_default();
-                    *args = Value::String(s);
+                if !obj.contains_key("type") {
+                    obj.insert("type".into(), Value::String("function".into()));
                     modified = true;
+                }
+                let function = obj
+                    .entry("function")
+                    .or_insert_with(|| Value::Object(Map::new()));
+                let Some(fobj) = function.as_object_mut() else {
+                    continue;
+                };
+                match fobj.get("arguments") {
+                    None => {
+                        fobj.insert("arguments".into(), Value::String("{}".into()));
+                        modified = true;
+                    }
+                    Some(v) if !v.is_string() => {
+                        let s = if v.is_null() {
+                            "{}".to_string()
+                        } else {
+                            serde_json::to_string(v).unwrap_or_default()
+                        };
+                        fobj.insert("arguments".into(), Value::String(s));
+                        modified = true;
+                    }
+                    Some(_) => {}
                 }
             }
         }
@@ -151,6 +204,12 @@ pub fn normalize_tool_call_arguments(root: &mut Value) -> bool {
 /// Normalise `tool_choice` to a value the upstream accepts: `"none"`,
 /// `"auto"`, `"required"` or an object. Any other string (e.g. the
 /// non-standard `"any"` sent by codex-cli) is mapped to `"required"`.
+///
+/// A `tool_choice` sent while `tools` is empty or absent is dropped
+/// entirely — strict OpenAI-style upstreams reject `tool_choice` without
+/// any tool defined, and dropping it is semantically equivalent (there is
+/// nothing to call).
+///
 /// Returns true if it was rewritten.
 pub fn normalize_tool_choice(root: &mut Value) -> bool {
     let Some(obj) = root.as_object_mut() else {
@@ -159,8 +218,16 @@ pub fn normalize_tool_choice(root: &mut Value) -> bool {
     let Some(choice) = obj.get("tool_choice") else {
         return false;
     };
+    let has_tools = obj
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .is_some_and(|a| !a.is_empty());
+    if !has_tools {
+        obj.remove("tool_choice");
+        return true;
+    }
     if !choice.is_string() || choice.as_str().is_none() {
-        return false; // object / absent — leave as-is
+        return false; // object — leave as-is
     }
     let tc = choice.as_str().unwrap_or_default();
     if tc == "none" || tc == "auto" || tc == "required" {
@@ -286,24 +353,30 @@ pub fn repair_tool_call_function_names(root: &mut Value) -> bool {
 /// Fix conversation histories where tool calls and tool responses diverge:
 ///
 /// 1. Missing tool responses — insert a synthetic `"tool"` message for each
-///    `tool_call_id` the assistant issued but the client never answered.
+///    `tool_call_id` the assistant issued but the client never answered
+///    (counting duplicates, so N identical calls get N responses).
 /// 2. Orphaned tool responses — drop `"tool"` messages whose
-///    `tool_call_id` does not match any assistant call in the conversation.
+///    `tool_call_id` is empty, unknown, or references a call issued *later*
+///    in the conversation (a forward reference). Validity is positional:
+///    a tool response may only answer a call issued before it.
 ///
 /// Returns true if any messages were inserted or dropped.
 pub fn repair_orphaned_tool_calls(root: &mut Value) -> bool {
     let Some(messages) = messages_mut(root) else {
         return false;
     };
-    let mut repaired: Vec<Value> = Vec::with_capacity(messages.len());
+    let mut cleaned: Vec<Value> = Vec::with_capacity(messages.len());
+    // Ids issued by assistant messages seen so far — a tool response is only
+    // valid when it answers a call that precedes it.
+    let mut valid_ids: Vec<String> = Vec::new();
     let mut modified = false;
 
     let mut i = 0usize;
     while i < messages.len() {
         let msg = messages[i].clone();
-        repaired.push(msg.clone());
+        let role = msg.get("role").and_then(|r| r.as_str());
 
-        if msg.get("role").and_then(|r| r.as_str()) == Some("assistant") {
+        if role == Some("assistant") {
             let calls: Vec<String> = msg
                 .get("tool_calls")
                 .and_then(|t| t.as_array())
@@ -317,72 +390,74 @@ pub fn repair_orphaned_tool_calls(root: &mut Value) -> bool {
                 })
                 .unwrap_or_default();
 
-            if !calls.is_empty() {
-                // Consume the tool responses that immediately follow.
-                i += 1;
-                let tool_start = repaired.len();
-                while i < messages.len() {
-                    if messages[i].get("role").and_then(|r| r.as_str()) != Some("tool") {
-                        break;
-                    }
-                    repaired.push(messages[i].clone());
-                    i += 1;
-                }
-                // Which of the calls were answered?
-                let responded: Vec<String> = repaired[tool_start..]
-                    .iter()
-                    .filter_map(|m| {
-                        m.get("tool_call_id")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string())
-                    })
-                    .collect();
-                for id in &calls {
-                    if !responded.contains(id) {
-                        repaired.push(serde_json::json!({
-                            "role": "tool",
-                            "tool_call_id": id,
-                            "content": SYNTHETIC_TOOL_CONTENT,
-                        }));
-                        modified = true;
-                    }
-                }
-                continue;
+            cleaned.push(msg);
+            for id in &calls {
+                valid_ids.push(id.clone());
             }
-        }
-        i += 1;
-    }
 
-    // Drop orphaned tool responses whose tool_call_id matches no call.
-    let mut valid: Vec<String> = Vec::new();
-    for m in repaired.iter() {
-        if m.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+            // Consume the tool responses that immediately follow, keeping only
+            // those that answer a call issued so far.
+            i += 1;
+            let mut responded: Vec<String> = Vec::new();
+            while i < messages.len() {
+                let m = messages[i].clone();
+                if m.get("role").and_then(|r| r.as_str()) != Some("tool") {
+                    break;
+                }
+                let tid = m.get("tool_call_id").and_then(|v| v.as_str()).unwrap_or("");
+                if !tid.trim().is_empty() {
+                    responded.push(tid.to_string());
+                }
+                if valid_ids.contains(&tid.to_string()) {
+                    cleaned.push(m);
+                } else {
+                    modified = true; // empty / unknown / forward-reference id
+                }
+                i += 1;
+            }
+
+            // Insert synthetic responses for calls nobody answered. Counted
+            // per unique id: N identical ids need N responses, but the
+            // shortfall must be inserted once per id, not once per occurrence.
+            let mut seen: Vec<&String> = Vec::new();
+            for id in &calls {
+                if seen.contains(&id) {
+                    continue;
+                }
+                seen.push(id);
+                let needed = calls.iter().filter(|c| *c == id).count();
+                let have = responded.iter().filter(|r| *r == id).count();
+                for _ in have..needed {
+                    cleaned.push(serde_json::json!({
+                        "role": "tool",
+                        "tool_call_id": id,
+                        "content": SYNTHETIC_TOOL_CONTENT,
+                    }));
+                    modified = true;
+                }
+            }
             continue;
         }
-        if let Some(calls) = m.get("tool_calls").and_then(|t| t.as_array()) {
-            for tc in calls {
-                if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
-                    if !id.trim().is_empty() {
-                        valid.push(id.to_string());
-                    }
-                }
-            }
-        }
-    }
 
-    let before = repaired.len();
-    let cleaned: Vec<Value> = repaired
-        .into_iter()
-        .filter(|m| {
-            if m.get("role").and_then(|r| r.as_str()) != Some("tool") {
-                return true;
+        if role == Some("tool") {
+            // A tool message that does not immediately follow an assistant
+            // tool-call message. Keep it only if it answers a call already
+            // issued earlier in the conversation.
+            let tid = msg
+                .get("tool_call_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !tid.trim().is_empty() && valid_ids.contains(&tid.to_string()) {
+                cleaned.push(msg);
+            } else {
+                modified = true;
             }
-            let id = m.get("tool_call_id").and_then(|v| v.as_str()).unwrap_or("");
-            id.trim().is_empty() || valid.contains(&id.to_string())
-        })
-        .collect();
-    if cleaned.len() != before {
-        modified = true;
+            i += 1;
+            continue;
+        }
+
+        cleaned.push(msg);
+        i += 1;
     }
 
     if modified {
@@ -393,12 +468,28 @@ pub fn repair_orphaned_tool_calls(root: &mut Value) -> bool {
     modified
 }
 
-/// Ensure every thinking-mode assistant message (tool_calls + empty content)
-/// carries a `reasoning_content`, and collapse any echoes of the injected
-/// placeholder from the conversation history (clients persist the upstream's
-/// echoed placeholder and it would otherwise snowball turn over turn).
+/// Normalise `reasoning_content` on assistant messages for thinking-mode
+/// upstreams:
+///
+/// 1. **Echo collapse (always)** — strip every occurrence of the injected
+///    placeholder from `reasoning_content`. Thinking upstreams echo the
+///    placeholder back as part of their own reasoning, clients persist that,
+///    and each subsequent turn replays and re-echoes it (one measured
+///    session snowballed to 745 repeats). Content that was only placeholders
+///    is dropped to `null`.
+/// 2. **Dialect mirror** — the opencode client may carry reasoning under
+///    `reasoning` or `reasoning_text` (its chat schema accepts all three).
+///    When `reasoning_content` is empty but one of the other variants holds
+///    text, mirror it into `reasoning_content`, the field the strict
+///    upstream requires.
+/// 3. **Placeholder injection (unless `skip_injection`)** — every
+///    thinking-mode assistant message (tool_calls + no reasoning) gets a
+///    stable placeholder, because the strict upstream rejects thinking turns
+///    that lost their `reasoning_content` with
+///    `the reasoning_content in the thinking mode must be passed back`.
+///
 /// Returns true if any message was rewritten.
-pub fn normalize_reasoning_content(root: &mut Value) -> bool {
+pub fn normalize_reasoning_content(root: &mut Value, skip_injection: bool) -> bool {
     let mut modified = false;
     if let Some(messages) = messages_mut(root) {
         for msg in messages.iter_mut() {
@@ -423,7 +514,29 @@ pub fn normalize_reasoning_content(root: &mut Value) -> bool {
                     modified = true;
                 }
             }
+            // Mirror alternate reasoning dialects into `reasoning_content`.
+            let has_reasoning = match obj.get("reasoning_content") {
+                None | Some(Value::Null) => false,
+                Some(Value::String(s)) => !s.trim().is_empty(),
+                _ => true,
+            };
+            if !has_reasoning {
+                for variant in ["reasoning", "reasoning_text"] {
+                    if let Some(text) = obj
+                        .get(variant)
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.trim().is_empty())
+                    {
+                        obj.insert("reasoning_content".into(), Value::String(text.to_string()));
+                        modified = true;
+                        break;
+                    }
+                }
+            }
             // Placeholder injection for thinking turns without reasoning.
+            if skip_injection {
+                continue;
+            }
             let has_calls = obj
                 .get("tool_calls")
                 .and_then(|t| t.as_array())
@@ -456,13 +569,27 @@ pub fn normalize_reasoning_content(root: &mut Value) -> bool {
 pub struct OpenCodeTranslator {
     provider_name: String,
     upstream_path: String,
+    skip_reasoning_injection: bool,
 }
 
 impl OpenCodeTranslator {
     pub fn new(provider_name: impl Into<String>, upstream_path: impl Into<String>) -> Self {
+        Self::with_options(provider_name, upstream_path, false)
+    }
+
+    /// Construct with `skip_reasoning_injection`: when true the
+    /// `reasoning_content` placeholder is never injected (echo collapse still
+    /// runs). Set it on channels whose upstream does not require
+    /// `reasoning_content` back.
+    pub fn with_options(
+        provider_name: impl Into<String>,
+        upstream_path: impl Into<String>,
+        skip_reasoning_injection: bool,
+    ) -> Self {
         Self {
             provider_name: provider_name.into(),
             upstream_path: upstream_path.into(),
+            skip_reasoning_injection,
         }
     }
 }
@@ -481,7 +608,7 @@ impl ProviderTranslator for OpenCodeTranslator {
         body: &[u8],
         model_override: Option<&str>,
     ) -> Result<TranslatedRequest, TranslateError> {
-        let normalized = normalize_request(body);
+        let normalized = normalize_request_opts(body, self.skip_reasoning_injection);
         if let Some(model) = model_override {
             let mut req: serde_json::Value = serde_json::from_slice(&normalized)?;
             if let Some(obj) = req.as_object_mut() {
@@ -578,17 +705,31 @@ mod tests {
 
     #[test]
     fn test_tool_choice_any() {
-        let mut out = norm(json!({"model":"m","messages":[],"tool_choice":"any"}));
+        // "any" with tools declared maps to "required".
+        let mut out = norm(json!({"model":"m","messages":[],"tools":[
+            {"type":"function","function":{"name":"f","parameters":{}}}],"tool_choice":"any"}));
         assert_eq!(out["tool_choice"], "required");
         for ok in ["none", "auto", "required"] {
-            out = norm(json!({"model":"m","messages":[],"tool_choice":ok}));
+            out = norm(json!({"model":"m","messages":[],"tools":[
+                {"type":"function","function":{"name":"f","parameters":{}}}],"tool_choice":ok}));
             assert_eq!(out["tool_choice"], ok);
         }
         // Object is left untouched.
-        out = norm(
-            json!({"model":"m","messages":[],"tool_choice":{"type":"function","function":{"name":"f"}}}),
-        );
+        out = norm(json!({"model":"m","messages":[],"tools":[
+                {"type":"function","function":{"name":"f","parameters":{}}}],
+                "tool_choice":{"type":"function","function":{"name":"f"}}}));
         assert!(out["tool_choice"].is_object());
+    }
+
+    #[test]
+    fn test_tool_choice_dropped_without_tools() {
+        // A tool_choice sent with no tools is rejected by strict upstreams;
+        // dropping it is semantically equivalent.
+        let out = norm(json!({"model":"m","messages":[],"tool_choice":"any"}));
+        assert!(out.get("tool_choice").is_none());
+        let out = norm(json!({"model":"m","messages":[],
+            "tool_choice":{"type":"function","function":{"name":"f"}}}));
+        assert!(out.get("tool_choice").is_none());
     }
 
     #[test]
@@ -716,7 +857,9 @@ mod tests {
     fn test_translator_roundtrip() {
         let t = OpenCodeTranslator::new("opencode_go_1", "/zen/go/v1/chat/completions");
         let body = json!({"model":"deepseek-v4.1-flash","messages":[
-            {"role":"user","content":"hi"}],"tool_choice":"any","max_tokens":16});
+            {"role":"user","content":"hi"}],"tools":[
+            {"type":"function","function":{"name":"f","parameters":{}}}],
+            "tool_choice":"any","max_tokens":16});
         let bytes = serde_json::to_vec(&body).unwrap();
         let result = t.translate_request(&bytes, None).unwrap();
         assert!(!result.is_streaming);
@@ -752,6 +895,110 @@ mod tests {
         assert!(headers
             .iter()
             .any(|(k, v)| k == "Authorization" && v == "Bearer oc_sk_x"));
+    }
+
+    #[test]
+    fn test_tool_call_missing_arguments_and_type() {
+        let out = norm(json!({"model":"m","messages":[
+            {"role":"assistant","content":"","tool_calls":[
+                {"id":"c1","function":{"name":"f"}}]}]}));
+        let tc = &out["messages"][0]["tool_calls"][0];
+        assert_eq!(tc["type"], "function");
+        assert_eq!(tc["function"]["arguments"], "{}");
+    }
+
+    #[test]
+    fn test_tool_call_null_arguments_becomes_empty_object() {
+        let out = norm(json!({"model":"m","messages":[
+            {"role":"assistant","content":"","tool_calls":[
+                {"id":"c1","type":"function","function":{"name":"f","arguments":null}}]}]}));
+        assert_eq!(
+            out["messages"][0]["tool_calls"][0]["function"]["arguments"],
+            "{}"
+        );
+    }
+
+    #[test]
+    fn test_orphan_forward_reference_dropped() {
+        // A tool response referencing a call issued LATER is a forward
+        // reference — it must be dropped, not kept.
+        let out = norm(json!({"model":"m","messages":[
+            {"role":"tool","tool_call_id":"call_later","content":"a"},
+            {"role":"assistant","content":"","tool_calls":[
+                {"id":"call_later","type":"function","function":{"name":"f","arguments":"{}"}}]}]}));
+        let msgs = out["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2, "orphan dropped, synthetic inserted");
+        assert_eq!(msgs[0]["role"], "assistant");
+        assert_eq!(msgs[1]["role"], "tool");
+        assert_eq!(msgs[1]["tool_call_id"], "call_later");
+        assert_eq!(msgs[1]["content"], SYNTHETIC_TOOL_CONTENT);
+    }
+
+    #[test]
+    fn test_orphan_empty_id_dropped() {
+        // A standalone tool message with an empty tool_call_id cannot be
+        // paired with anything — drop it.
+        let out = norm(json!({"model":"m","messages":[
+            {"role":"user","content":"q"},
+            {"role":"tool","tool_call_id":"","content":"a"}]}));
+        assert_eq!(out["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(out["messages"][0]["role"], "user");
+    }
+
+    #[test]
+    fn test_reasoning_variant_mirrored_to_reasoning_content() {
+        let out = norm(json!({"model":"m","messages":[
+            {"role":"assistant","content":"","reasoning":"my reasoning",
+             "tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}}]}]}));
+        assert_eq!(out["messages"][0]["reasoning_content"], "my reasoning");
+    }
+
+    #[test]
+    fn test_reasoning_text_variant_mirrored() {
+        let out = norm(json!({"model":"m","messages":[
+            {"role":"assistant","content":"","reasoning_text":"r",
+             "tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}}]}]}));
+        assert_eq!(out["messages"][0]["reasoning_content"], "r");
+    }
+
+    #[test]
+    fn test_reasoning_injection_skipped() {
+        let body = json!({"model":"m","messages":[
+            {"role":"assistant","content":"","tool_calls":[
+                {"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}}]}]});
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let out = normalize_request_opts(&bytes, true);
+        let parsed: Value = serde_json::from_slice(&out).unwrap();
+        assert!(parsed["messages"][0].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn test_synthetic_response_inserted_for_duplicate_calls() {
+        // Two identical call ids need two tool responses; only one exists.
+        let out = norm(json!({"model":"m","messages":[
+            {"role":"assistant","content":"","tool_calls":[
+                {"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}},
+                {"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}}]},
+            {"role":"tool","tool_call_id":"c1","content":"a"}]}));
+        let msgs = out["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[2]["role"], "tool");
+        assert_eq!(msgs[2]["tool_call_id"], "c1");
+        assert_eq!(msgs[2]["content"], SYNTHETIC_TOOL_CONTENT);
+    }
+
+    #[test]
+    fn test_normalization_idempotent() {
+        let body = json!({"model":"m","messages":[
+            {"role":"developer","content":"sys"},
+            {"role":"assistant","content":"","tool_calls":[
+                {"id":"","type":"function","function":{"name":"","arguments":{"x":1}}}]},
+            {"role":"tool","tool_call_id":"","content":"a"}],
+            "tool_choice":"any"});
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let once = normalize_request(&bytes);
+        let twice = normalize_request(&once);
+        assert_eq!(once, twice, "normalization must be idempotent");
     }
 
     #[test]
