@@ -24,6 +24,7 @@
 //! The conversion is stateless: `previous_response_id` chaining is not
 //! resolved, because the gateway keeps no response store.
 
+use crate::opencode::REASONING_PLACEHOLDER;
 use crate::{StreamTranslator, TranslateError, TranslatedRequest};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -156,16 +157,145 @@ fn input_to_messages(input: &Value) -> Result<Vec<Value>, TranslateError> {
         Value::String(text) => Ok(vec![json!({ "role": "user", "content": text })]),
         Value::Array(items) => {
             let mut messages = Vec::new();
+            // Reasoning text carried by a `reasoning` input item. It belongs
+            // to the assistant turn that follows it, so it is held until that
+            // turn is emitted.
+            let mut pending_reasoning: Option<String> = None;
             for item in items {
-                if let Some(msg) = parse_input_item(item) {
-                    messages.push(msg);
+                if item.get("type").and_then(|t| t.as_str()) == Some("reasoning") {
+                    pending_reasoning = extract_reasoning_input_text(item);
+                    continue;
                 }
+                let Some(mut msg) = parse_input_item(item) else {
+                    continue;
+                };
+                // Attach the pending reasoning to the assistant turn it
+                // belongs to. A `reasoning` item that is not followed by an
+                // assistant turn keeps its text pending for the next one.
+                if msg.get("role").and_then(|r| r.as_str()) == Some("assistant") {
+                    if let Some(text) = pending_reasoning.take() {
+                        if let Some(obj) = msg.as_object_mut() {
+                            obj.insert("reasoning_content".into(), Value::String(text));
+                        }
+                    }
+                }
+                messages.push(msg);
             }
+            normalize_thinking_turns(&mut messages);
             Ok(messages)
         }
         _ => Err(TranslateError::Translation(
             "responses 'input' must be a string or an array".to_string(),
         )),
+    }
+}
+
+/// Extract the plaintext of a Responses `reasoning` input item.
+///
+/// The text lives in the `summary` blocks (`summary_text`) or, for clients
+/// that ask for raw reasoning, in the `content` blocks (`reasoning_text`).
+/// The opaque `encrypted_content` blob is not usable as reasoning text and
+/// is ignored.
+fn extract_reasoning_input_text(item: &Value) -> Option<String> {
+    for (field, block_types) in [
+        ("summary", &["summary_text"][..]),
+        ("content", &["reasoning_text"][..]),
+    ] {
+        if let Some(value) = item.get(field) {
+            if let Some(text) = flatten_reasoning_blocks(value, block_types) {
+                return Some(text);
+            }
+        }
+    }
+    None
+}
+
+/// Concatenate the text of every reasoning block of an accepted type.
+fn flatten_reasoning_blocks(value: &Value, block_types: &[&str]) -> Option<String> {
+    let mut text = String::new();
+    match value {
+        Value::String(s) => text.push_str(s),
+        Value::Array(parts) => {
+            for part in parts {
+                if let Some(chunk) = reasoning_block_text(part, block_types) {
+                    text.push_str(&chunk);
+                }
+            }
+        }
+        Value::Object(_) => {
+            if let Some(chunk) = reasoning_block_text(value, block_types) {
+                text.push_str(&chunk);
+            }
+        }
+        _ => {}
+    }
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// The text of a single reasoning block, when its type is accepted.
+fn reasoning_block_text(block: &Value, block_types: &[&str]) -> Option<String> {
+    let block_type = block.get("type").and_then(|t| t.as_str())?;
+    if !block_types.contains(&block_type) {
+        return None;
+    }
+    let text = block.get("text").and_then(|t| t.as_str())?;
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_string())
+    }
+}
+
+/// Keep thinking-mode turns continuous for upstreams that require the
+/// reasoning to be passed back.
+///
+/// A Responses client replays an assistant turn as *two* chat messages: the
+/// text part (`message` item) and the tool-call part (`function_call` item).
+/// The upstream model produced that turn as a single message carrying
+/// `reasoning_content`, so the replayed turn loses it — and a thinking-mode
+/// upstream then rejects the whole request with
+/// `The reasoning_content in the thinking mode must be passed back to the API`
+/// (verified live against DeepSeek: a turn without it answers 400, the same
+/// turn with it answers 200).
+///
+/// Every assistant message of a tool-using conversation therefore carries a
+/// `reasoning_content`: the real text when the client replayed a `reasoning`
+/// item, the placeholder otherwise. Conversations without tool calls are left
+/// untouched — a plain question/answer round needs no reasoning.
+fn normalize_thinking_turns(messages: &mut [Value]) {
+    let has_tool_calls = messages.iter().any(|msg| {
+        msg.get("role").and_then(|r| r.as_str()) == Some("assistant")
+            && msg
+                .get("tool_calls")
+                .and_then(|t| t.as_array())
+                .is_some_and(|calls| !calls.is_empty())
+    });
+    if !has_tool_calls {
+        return;
+    }
+    for msg in messages.iter_mut() {
+        if msg.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+            continue;
+        }
+        let Some(obj) = msg.as_object_mut() else {
+            continue;
+        };
+        let has_reasoning = match obj.get("reasoning_content") {
+            None | Some(Value::Null) => false,
+            Some(Value::String(s)) => !s.trim().is_empty(),
+            _ => true,
+        };
+        if !has_reasoning {
+            obj.insert(
+                "reasoning_content".into(),
+                Value::String(REASONING_PLACEHOLDER.to_string()),
+            );
+        }
     }
 }
 
@@ -1573,7 +1703,109 @@ mod tests {
     }
 
     #[test]
-    fn test_reasoning_items_are_dropped() {
+    fn test_reasoning_input_item_attaches_to_following_assistant_turn() {
+        // A `reasoning` input item is not a chat message of its own (a
+        // reasoning-only assistant message is rejected by DeepSeek with
+        // "content or tool_calls must be set"); its text becomes the
+        // `reasoning_content` of the assistant turn that follows it.
+        let body = br#"{
+            "model":"deepseek-flash",
+            "input":[
+                {"type":"message","role":"user","content":"hi"},
+                {"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"think step by step"}]},
+                {"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}]}
+            ]
+        }"#;
+        let out = responses_request_to_chat(body).unwrap();
+        let v: Value = serde_json::from_slice(&out.body).unwrap();
+        let msgs = v["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[1]["role"], "assistant");
+        assert_eq!(msgs[1]["reasoning_content"], "think step by step");
+        assert_eq!(msgs[1]["content"], "answer");
+    }
+
+    #[test]
+    fn test_reasoning_input_item_content_blocks() {
+        // Clients that request raw reasoning carry it in `content` blocks of
+        // type `reasoning_text` instead of the `summary`.
+        let body = br#"{
+            "model":"deepseek-flash",
+            "input":[
+                {"type":"reasoning","id":"rs_1","content":[{"type":"reasoning_text","text":"raw reasoning"}]},
+                {"type":"message","role":"assistant","content":"answer"}
+            ]
+        }"#;
+        let out = responses_request_to_chat(body).unwrap();
+        let v: Value = serde_json::from_slice(&out.body).unwrap();
+        let msgs = v["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["reasoning_content"], "raw reasoning");
+    }
+
+    #[test]
+    fn test_tool_call_turns_get_reasoning_content() {
+        // The live failure: a Responses client replays an assistant turn as a
+        // `message` item plus a `function_call` item, neither carrying the
+        // reasoning the model produced. DeepSeek rejects that replay with
+        // "The reasoning_content in the thinking mode must be passed back to
+        // the API"; every assistant message of a tool-using conversation must
+        // carry a reasoning_content. Verified live: the same request with the
+        // field present answers 200.
+        let body = br#"{
+            "model":"deepseek-flash",
+            "input":[
+                {"type":"message","role":"user","content":"create a file"},
+                {"type":"message","role":"assistant","content":[{"type":"output_text","text":"I will create it."}]},
+                {"type":"function_call","id":"fc_1","call_id":"call_1","name":"shell","arguments":"{\"cmd\":\"echo hi\"}"},
+                {"type":"function_call_output","call_id":"call_1","output":"ok"}
+            ]
+        }"#;
+        let out = responses_request_to_chat(body).unwrap();
+        let v: Value = serde_json::from_slice(&out.body).unwrap();
+        let msgs = v["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 4);
+        // The content part of the replayed turn.
+        assert_eq!(msgs[1]["role"], "assistant");
+        assert_eq!(
+            msgs[1]["reasoning_content"],
+            crate::opencode::REASONING_PLACEHOLDER
+        );
+        // The tool-call part of the replayed turn.
+        assert_eq!(msgs[2]["role"], "assistant");
+        assert_eq!(msgs[2]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(
+            msgs[2]["reasoning_content"],
+            crate::opencode::REASONING_PLACEHOLDER
+        );
+        assert_eq!(msgs[3]["role"], "tool");
+    }
+
+    #[test]
+    fn test_no_tool_calls_means_no_reasoning_injection() {
+        // A plain question/answer conversation is not a thinking turn; it is
+        // forwarded unchanged so upstreams that do not expect reasoning are
+        // not polluted with a synthetic reasoning field.
+        let body = br#"{
+            "model":"gpt-4o",
+            "input":[
+                {"type":"message","role":"user","content":"hi"},
+                {"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}
+            ]
+        }"#;
+        let out = responses_request_to_chat(body).unwrap();
+        let v: Value = serde_json::from_slice(&out.body).unwrap();
+        let msgs = v["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert!(msgs[0].get("reasoning_content").is_none());
+        assert!(msgs[1].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn test_reasoning_item_without_assistant_turn_is_dropped() {
+        // A leading `reasoning` item has no assistant turn to carry its text;
+        // it is dropped (a standalone reasoning-only assistant message is
+        // invalid for DeepSeek) rather than emitted on its own.
         let body = br#"{
             "model":"gpt-4o",
             "input":[
