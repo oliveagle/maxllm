@@ -27,10 +27,20 @@ impl TestGateway {
     /// The `{PORT}` placeholder is replaced with a random free port.
     /// The `{MOCK_URL}` placeholder is replaced with the given mock URL.
     async fn start(config_template: &str, mock_url: &str) -> Self {
+        Self::start_with_fallback(config_template, mock_url, mock_url).await
+    }
+
+    /// Like [`Self::start`], but also replaces the `{FALLBACK_URL}` placeholder.
+    async fn start_with_fallback(
+        config_template: &str,
+        mock_url: &str,
+        fallback_url: &str,
+    ) -> Self {
         let port = portpicker::pick_unused_port().expect("no free port");
         let config_str = config_template
             .replace("{PORT}", &port.to_string())
-            .replace("{MOCK_URL}", mock_url);
+            .replace("{MOCK_URL}", mock_url)
+            .replace("{FALLBACK_URL}", fallback_url);
 
         let mut config_file = tempfile::NamedTempFile::new().expect("temp file");
         config_file
@@ -1815,6 +1825,82 @@ async fn test_opencode_session_header_never_overwritten() {
 }
 
 #[tokio::test]
+async fn test_opencode_upstream_openai_error_is_passed_through() {
+    let mock = MockServer::start().await;
+
+    // opencode.ai reports its own failures in the OpenAI error envelope
+    // (e.g. "Model is unavailable."). The gateway must not re-wrap an
+    // already-standard error: the client sees the upstream status and body.
+    let upstream = json!({
+        "error": {
+            "type": "server_error",
+            "message": "Upstream request failed: Model is unavailable."
+        }
+    });
+    Mock::given(method("POST"))
+        .and(path("/zen/go/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(upstream.clone()))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let gw = TestGateway::start(OPENCODE_CHAT_CONFIG, &mock.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&chat_body("no-such-model-xyz", "hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body, upstream, "upstream error body must be passed through");
+}
+
+#[tokio::test]
+async fn test_opencode_nested_error_envelope_is_normalised() {
+    let mock = MockServer::start().await;
+
+    // The opencode.ai envelope for a missing session id is
+    // {"type":"error","error":{"type":"MissingSessionID","message":"…"}} —
+    // it must reach the client in the OpenAI error shape, with the real
+    // message rather than a generic "Unknown provider error".
+    Mock::given(method("POST"))
+        .and(path("/zen/go/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "type": "error",
+            "error": {"type": "MissingSessionID", "message": "session id is required"}
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let gw = TestGateway::start(OPENCODE_CHAT_CONFIG, &mock.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&chat_body("deepseek-v4.1-flash", "hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "MissingSessionID");
+    assert_eq!(body["error"]["message"], "session id is required");
+    assert_eq!(body["error"]["code"], 400);
+    assert!(
+        body.get("type").is_none(),
+        "the opencode envelope must be unwrapped: {body}"
+    );
+}
+
+#[tokio::test]
 async fn test_opencode_streaming_usage_is_recorded() {
     let mock = MockServer::start().await;
 
@@ -1880,4 +1966,233 @@ async fn test_opencode_streaming_usage_is_recorded() {
         line.trim_end().ends_with("7"),
         "expected 7 output tokens, got: {line}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Connect-failure fallback retry tests
+// ---------------------------------------------------------------------------
+
+/// Primary provider points at a port with nothing listening (connection
+/// refused) so the request never reaches an upstream; the fallback answers.
+const CONNECT_RETRY_CONFIG: &str = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.unreachable]
+kind = "openai"
+base_url = "http://127.0.0.1:1"
+api_key = "fake-key"
+
+[providers.backup]
+kind = "openai"
+base_url = "{FALLBACK_URL}"
+api_key = "fake-key"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "unreachable"
+fallback = ["backup"]
+strategy = "fallback"
+"#;
+
+#[tokio::test]
+async fn test_connect_failure_is_retried_on_fallback_provider() {
+    let fallback = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from fallback")))
+        .expect(1)
+        .mount(&fallback)
+        .await;
+
+    let gw = TestGateway::start_with_fallback(CONNECT_RETRY_CONFIG, "", &fallback.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&chat_body("gpt-4o", "hi"))
+        .send()
+        .await
+        .unwrap();
+
+    // The primary connection is refused, so the retry must have served the
+    // request from the fallback: 200 with the fallback's body.
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "from fallback");
+
+    let received = fallback.received_requests().await.unwrap_or_default();
+    assert_eq!(received.len(), 1, "fallback must receive exactly one retry");
+
+    // The retried request must carry the client's original body.
+    let sent: Value = serde_json::from_slice(&received[0].body).expect("json body");
+    assert_eq!(sent["model"], "gpt-4o");
+    assert_eq!(sent["messages"][0]["content"], "hi");
+}
+
+/// An upstream *error response* is not a connection failure — the request was
+/// executed upstream (and may have been billed), so it is never re-sent.
+#[tokio::test]
+async fn test_upstream_error_response_is_not_retried() {
+    let primary = MockServer::start().await;
+    let fallback = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500).set_body_json(json!({"error": "down"})))
+        .expect(1)
+        .mount(&primary)
+        .await;
+    // The fallback would happily answer — a retry leaking through would be
+    // visible in its request log below.
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("never")))
+        .mount(&fallback)
+        .await;
+
+    let config = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.primary]
+kind = "openai"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+
+[providers.backup]
+kind = "openai"
+base_url = "{FALLBACK_URL}"
+api_key = "fake-key"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "primary"
+fallback = ["backup"]
+strategy = "fallback"
+"#;
+    let gw = TestGateway::start_with_fallback(config, &primary.uri(), &fallback.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&chat_body("gpt-4o", "hi"))
+        .send()
+        .await
+        .unwrap();
+
+    // The upstream answered 500; the gateway must forward it untouched and
+    // must NOT retry on the fallback.
+    assert_eq!(resp.status(), 500);
+
+    let received = fallback.received_requests().await.unwrap_or_default();
+    assert!(
+        received.is_empty(),
+        "an upstream error response must never be retried on the fallback, got {} request(s)",
+        received.len()
+    );
+}
+
+/// A connect failure with no fallback configured must return 502 — the
+/// retry guard must not loop or panic.
+#[tokio::test]
+async fn test_connect_failure_without_fallback_returns_502() {
+    let config = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.unreachable]
+kind = "openai"
+base_url = "http://127.0.0.1:1"
+api_key = "fake-key"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "unreachable"
+strategy = "fallback"
+"#;
+    let gw = TestGateway::start(config, "").await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&chat_body("gpt-4o", "hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 502);
+}
+
+/// When the fallback is also unreachable, the request must fail with 502
+/// after the single retry — never loop or hang.
+#[tokio::test]
+async fn test_connect_failure_when_fallback_also_unreachable_returns_502() {
+    let config = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.unreachable]
+kind = "openai"
+base_url = "http://127.0.0.1:1"
+api_key = "fake-key"
+
+[providers.unreachable2]
+kind = "openai"
+base_url = "http://127.0.0.1:2"
+api_key = "fake-key"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "unreachable"
+fallback = ["unreachable2"]
+strategy = "fallback"
+"#;
+    let gw = TestGateway::start(config, "").await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&chat_body("gpt-4o", "hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 502);
 }

@@ -76,6 +76,9 @@ pub struct RequestCtx {
     /// Rolling tail of the streaming SSE body, kept so a token-usage line
     /// split across chunks is still parsed once the rest arrives.
     pub sse_tail: Vec<u8>,
+    /// Whether a one-shot fallback retry has already been attempted for a
+    /// connect-class upstream failure. Guards against retry loops.
+    pub retry_attempted: bool,
 }
 
 impl RequestCtx {
@@ -109,6 +112,7 @@ impl RequestCtx {
             keep_request_content_length: false,
             native_responses: false,
             sse_tail: Vec::new(),
+            retry_attempted: false,
         }
     }
 }

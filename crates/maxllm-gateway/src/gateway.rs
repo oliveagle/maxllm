@@ -2281,6 +2281,56 @@ impl ProxyHttp for AiGateway {
         Ok(None)
     }
 
+    /// A connection that could not be established never carried the request
+    /// to the upstream, so the call can be re-sent to a fallback provider
+    /// without any risk of a duplicate side effect. This is the difference
+    /// between "the upstream is unreachable" (retryable) and "the upstream
+    /// answered with an error" (never retried — the request was executed
+    /// upstream and may have been billed).
+    ///
+    /// Marking the error retryable makes pingora run the whole upstream
+    /// attempt again: the peer is rebuilt from `ctx.provider_name` (which now
+    /// points at the fallback), the request body is re-read from the client
+    /// and translated by the fallback's own translator, and the fallback's
+    /// response travels the regular response path.
+    fn fail_to_connect(
+        &self,
+        _session: &mut Session,
+        _peer: &HttpPeer,
+        ctx: &mut Self::CTX,
+        mut e: Box<pingora::Error>,
+    ) -> Box<pingora::Error> {
+        if ctx.retry_attempted || !AiGateway::is_connect_failure(&e) {
+            return e;
+        }
+        let Some((name, fallback)) = self.next_fallback_provider(ctx) else {
+            return e;
+        };
+        ctx.retry_attempted = true;
+        ctx.fallback_used = true;
+        if ctx.original_provider.is_none() {
+            ctx.original_provider = Some(ctx.provider_name.clone());
+        }
+        let failed_provider = ctx.provider_name.clone();
+        ctx.provider_name = name.clone();
+        // The fallback may speak a different contract than the provider that
+        // just failed — the request path depends on it.
+        ctx.native_responses = ctx.endpoint_type == EndpointType::Responses
+            && fallback.native_responses
+            && fallback.responses_path.is_some();
+        METRICS
+            .fallbacks_total
+            .with_label_values(&[&failed_provider, &name])
+            .inc();
+        info!(
+            provider = %name,
+            failed_provider = %failed_provider,
+            "upstream connection failed — retrying the request on the fallback provider"
+        );
+        e.set_retry(true);
+        e
+    }
+
     /// Pingora's default `fail_to_proxy` writes an empty-body error response,
     /// leaving clients to guess what failed (a connect timeout and a DNS
     /// failure look identical). Answer with a JSON error body in the same
@@ -2429,6 +2479,48 @@ impl ProxyHttp for AiGateway {
                 warn!(error = %err, "Failed to record request log");
             }
         }
+    }
+}
+
+impl AiGateway {
+    /// Whether the failure means the request never reached the upstream.
+    ///
+    /// Only connection-establishment failures qualify: the TCP handshake, the
+    /// TLS handshake, DNS resolution or a refused connection. Everything else
+    /// (a response that arrived, a mid-stream disconnect, a timeout while
+    /// reading) means the upstream may have processed the request, so it is
+    /// never re-sent.
+    fn is_connect_failure(e: &pingora::Error) -> bool {
+        e.esource() == &pingora::ErrorSource::Upstream
+            && matches!(
+                e.etype(),
+                pingora::ErrorType::ConnectTimedout
+                    | pingora::ErrorType::ConnectRefused
+                    | pingora::ErrorType::ConnectNoRoute
+                    | pingora::ErrorType::ConnectError
+                    | pingora::ErrorType::TLSHandshakeFailure
+                    | pingora::ErrorType::TLSHandshakeTimedout
+                    | pingora::ErrorType::HandshakeError
+                    | pingora::ErrorType::InvalidCert
+            )
+    }
+
+    /// The next provider to try after a connect failure: the first healthy
+    /// provider in the route's fallback list, skipping the provider whose
+    /// connection just failed. Returns its name and state.
+    fn next_fallback_provider(&self, ctx: &RequestCtx) -> Option<(String, Arc<ProviderState>)> {
+        let hot = self.hot.load();
+        let route = hot.routes.get(ctx.route_index?)?;
+        route
+            .fallback
+            .iter()
+            .filter(|name| *name != &ctx.provider_name)
+            .find_map(|name| {
+                hot.providers
+                    .get(name)
+                    .filter(|p| !p.circuit_breaker.is_open())
+                    .map(|p| (name.clone(), Arc::clone(p)))
+            })
     }
 }
 
