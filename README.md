@@ -348,6 +348,22 @@ total_connect_timeout_secs = 60
 
 For pass-through routes, the path suffix after the route prefix is forwarded to the upstream provider (e.g., `/passthrough/anthropic/v1/messages` proxies to `https://api.anthropic.com/v1/messages`).
 
+### Shutdown behaviour
+
+On `SIGTERM` the gateway stops accepting new connections and drains the
+in-flight ones for `grace_period_secs` (default 30) before tearing the
+runtimes down:
+
+```toml
+[server]
+listen = "0.0.0.0:8080"
+grace_period_secs = 30
+```
+
+Keep this below the service manager's stop timeout so the process exits on
+its own — Pingora's own default is 300s, which a manager would answer with a
+`SIGKILL` in the middle of the shutdown.
+
 ### Plugins
 
 ```toml

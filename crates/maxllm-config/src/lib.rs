@@ -77,10 +77,20 @@ pub struct ServerConfig {
     #[serde(default = "default_true")]
     pub tcp_reuseport: bool,
     pub tcp_fastopen: Option<usize>,
+    /// Seconds to drain in-flight requests after SIGTERM before the runtimes
+    /// are torn down. Pingora defaults to 300s, which is longer than the
+    /// service manager's stop timeout — the process was then SIGKILLed
+    /// mid-shutdown. Defaults to 30s.
+    #[serde(default = "default_grace_period_secs")]
+    pub grace_period_secs: u64,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_grace_period_secs() -> u64 {
+    30
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -505,6 +515,37 @@ api_key = "sk-test"
         assert_eq!(p.max_fails, 3);
         assert_eq!(p.fail_timeout_secs, 60);
         assert!(config.server.tcp_reuseport);
+    }
+
+    #[test]
+    fn test_grace_period_defaults_to_thirty_seconds() {
+        let toml = r#"
+[server]
+listen = "0.0.0.0:8080"
+
+[providers.openai]
+kind = "openai"
+base_url = "https://api.openai.com"
+api_key = "sk-test"
+"#;
+        let config = Config::parse(toml).unwrap();
+        assert_eq!(config.server.grace_period_secs, 30);
+    }
+
+    #[test]
+    fn test_grace_period_is_configurable() {
+        let toml = r#"
+[server]
+listen = "0.0.0.0:8080"
+grace_period_secs = 5
+
+[providers.openai]
+kind = "openai"
+base_url = "https://api.openai.com"
+api_key = "sk-test"
+"#;
+        let config = Config::parse(toml).unwrap();
+        assert_eq!(config.server.grace_period_secs, 5);
     }
 
     #[test]

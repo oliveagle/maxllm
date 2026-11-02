@@ -95,6 +95,10 @@ fn main() {
             conf.threads = threads;
         }
         conf.work_stealing = true;
+        // Pingora defaults to a 300s drain period on SIGTERM, which outlives
+        // the service manager's stop timeout and ends in a SIGKILL. Keep the
+        // drain short enough that the process exits on its own.
+        conf.grace_period_seconds = Some(config.server.grace_period_secs);
     }
 
     server.bootstrap();

@@ -9,6 +9,10 @@ listen = "0.0.0.0:8080"
 threads = 4
 # tcp_reuseport = true
 # tcp_fastopen = 256
+# Seconds to drain in-flight requests on SIGTERM before the runtimes are
+# torn down. Pingora's own default is 300s, which outlives the service
+# manager's stop timeout and ends in a SIGKILL mid-shutdown. Default: 30.
+# grace_period_secs = 30
 
 [metrics]
 enabled = true
