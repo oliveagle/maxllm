@@ -1297,10 +1297,26 @@ pub fn chat_response_to_responses_sse(body: &[u8]) -> Option<Vec<u8>> {
             let Some(message) = obj.get("message") else {
                 continue;
             };
+            // A non-streaming `message.tool_calls` entry has no `index`
+            // (that field exists only in stream deltas). The stream
+            // translator keys calls by index, so without one every parallel
+            // call collapses into slot 0 — the arguments get concatenated
+            // and only the last call's id/name survives. Assign each call
+            // its position in the array.
+            let mut tool_calls = message.get("tool_calls").cloned();
+            if let Some(Value::Array(calls)) = tool_calls.as_mut() {
+                for (i, call) in calls.iter_mut().enumerate() {
+                    if let Some(call_obj) = call.as_object_mut() {
+                        call_obj
+                            .entry(String::from("index"))
+                            .or_insert_with(|| Value::from(i as u64));
+                    }
+                }
+            }
             let delta = json!({
                 "role": message.get("role"),
                 "content": message.get("content"),
-                "tool_calls": message.get("tool_calls"),
+                "tool_calls": tool_calls,
             });
             obj.insert("delta".into(), delta);
             obj.remove("message");
@@ -1704,6 +1720,70 @@ mod tests {
         assert!(collected.contains(r#""delta":"hi""#));
         assert!(collected.contains("event: response.completed"));
         assert!(collected.contains("data: [DONE]"));
+    }
+
+    #[test]
+    fn test_sse_bridge_preserves_parallel_tool_calls() {
+        // A non-streaming chat reply may carry several tool_calls (parallel
+        // calls). The bridge feeds them into the stream translator as one
+        // delta, but chat `message.tool_calls` carry no `index` — without
+        // one the translator collapses every call into slot 0, concatenates
+        // their arguments and keeps only the last call's id/name. Each call
+        // must survive as its own function_call item.
+        let chat = json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "created": 1700000000,
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "tool_calls",
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [
+                        {"id": "call_a", "type": "function", "function": {"name": "fn_a", "arguments": "{\"a\":1}"}},
+                        {"id": "call_b", "type": "function", "function": {"name": "fn_b", "arguments": "{\"b\":2}"}}
+                    ]
+                }
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
+        });
+        let sse = chat_response_to_responses_sse(&serde_json::to_vec(&chat).unwrap())
+            .expect("bridge produces SSE");
+        let s = String::from_utf8(sse).unwrap();
+
+        // Collect every completed function_call item from output_item.done
+        // events as (call_id, parsed-arguments).
+        let calls: Vec<(String, Value)> = s
+            .split("event: response.output_item.done\n")
+            .skip(1)
+            .filter_map(|block| {
+                let data = block.split("\n\n").next()?.strip_prefix("data: ")?;
+                let obj: Value = serde_json::from_str(data).ok()?;
+                let item = obj.get("item")?;
+                if item.get("type").and_then(|t| t.as_str()) != Some("function_call") {
+                    return None;
+                }
+                let id = item
+                    .get("call_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let args: Value = serde_json::from_str(
+                    item.get("arguments").and_then(|v| v.as_str()).unwrap_or(""),
+                )
+                .ok()?;
+                Some((id, args))
+            })
+            .collect();
+        assert_eq!(
+            calls.len(),
+            2,
+            "must be two distinct function_call items: {s}"
+        );
+        assert!(calls.contains(&("call_a".to_string(), json!({"a": 1}))));
+        assert!(calls.contains(&("call_b".to_string(), json!({"b": 2}))));
     }
 
     #[test]
