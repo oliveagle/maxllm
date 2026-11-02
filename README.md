@@ -226,7 +226,7 @@ curl http://localhost:8080/passthrough/openai/v1/embeddings \
 | DeepSeek | `deepseek` | OpenAI-compatible | Bearer token |
 | Ollama | `ollama` | OpenAI-compatible | None (local) |
 | Cohere | `cohere` | Full translation | Bearer token |
-| OpenCode | `opencode` | OpenAI-compatible + strict schema | Bearer token |
+| OpenCode (opencode.ai "zen") | `opencode` | OpenAI-compatible + strict schema | Bearer token |
 | Custom | `openai_compat` | OpenAI-compatible | Configurable |
 
 ## Configuration
@@ -298,6 +298,42 @@ path = "/passthrough/anthropic"
 provider = "anthropic"
 endpoint_type = "passthrough"
 plugins = ["rate_limiter"]
+```
+
+
+## OpenCode (opencode.ai "zen") conversion
+
+`kind = "opencode"` proxies `https://opencode.ai` with OpenAI-compatible wire
+format but stricter validation than most providers. The gateway applies a
+complete, idempotent request-conversion pass before forwarding:
+
+* **Session header** — opencode.ai rejects requests without an
+  `x-opencode-session` header (`400 MissingSessionID`). The gateway forwards
+  the client's own header verbatim; when absent it injects the client's
+  `x-session-affinity` / `x-opencode-session-id`, or a fresh UUID.
+* **`tool_choice`** — the non-standard `"any"` (codex-cli) maps to
+  `"required"`; a `tool_choice` sent with no tools is dropped.
+* **Tool calls** — `arguments` are coerced to JSON strings (missing →
+  `"{}"`), `type` defaults to `"function"`, empty `function.name` /
+  `tool_call.id` are repaired, orphan/forward-reference tool messages are
+  dropped and missing tool responses are synthesised.
+* **Reasoning** — `reasoning`/`reasoning_text` dialects are mirrored into
+  `reasoning_content`; thinking-mode turns get a placeholder (echo collapse
+  prevents snowballing). Set `skip_reasoning_injection = true` to disable the
+  placeholder.
+* **Responses API** — `/zen/go/v1/responses` serves the Responses contract
+  natively, so `kind = "opencode"` defaults to `native_responses = true` and
+  `/v1/responses` requests are forwarded byte-for-byte.
+* **Streaming usage** — token usage is extracted from chat and Responses SSE
+  streams for the ledger/metrics.
+
+```toml
+[providers.opencode]
+kind = "opencode"
+base_url = "https://opencode.ai"
+upstream_path = "/zen/go/v1/chat/completions"
+api_key = "${OPENCODE_API_KEY}"
+default_model = "deepseek-v4.1-flash"
 ```
 
 For pass-through routes, the path suffix after the route prefix is forwarded to the upstream provider (e.g., `/passthrough/anthropic/v1/messages` proxies to `https://api.anthropic.com/v1/messages`).

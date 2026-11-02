@@ -192,6 +192,22 @@ kind = "openai"
 base_url = "http://127.0.0.1:9999"
 api_key = "mock"
 
+# opencode.ai ("zen") provider — OpenAI-compatible but with stricter
+# validation. The gateway normalises tool_choice / tool_call arguments /
+# function names / reasoning_content to its schema and injects the required
+# `x-opencode-session` header when the client did not send one. The Responses
+# API is served natively (default for kind = "opencode"), so /v1/responses
+# requests are forwarded to /zen/go/v1/responses byte-for-byte.
+# [providers.opencode]
+# kind = "opencode"
+# base_url = "https://opencode.ai"
+# upstream_path = "/zen/go/v1/chat/completions"
+# api_key = "${OPENCODE_API_KEY}"
+# default_model = "deepseek-v4.1-flash"
+# # Optional: set true when the upstream does not require reasoning_content
+# # to be passed back (echo collapse still runs).
+# skip_reasoning_injection = false
+
 # --- Routes ---
 
 [[routes]]

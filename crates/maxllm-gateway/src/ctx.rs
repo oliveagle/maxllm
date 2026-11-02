@@ -67,6 +67,12 @@ pub struct RequestCtx {
     /// Whether to preserve/update Content-Length on the upstream request
     /// (for providers like OpenAI that reject chunked encoding).
     pub keep_request_content_length: bool,
+    /// The selected provider speaks the Responses contract natively, so the
+    /// gateway forwards the request and response bodies unchanged.
+    pub native_responses: bool,
+    /// Rolling tail of the streaming SSE body, kept so a token-usage line
+    /// split across chunks is still parsed once the rest arrives.
+    pub sse_tail: Vec<u8>,
 }
 
 impl RequestCtx {
@@ -97,6 +103,8 @@ impl RequestCtx {
             passthrough_path: None,
             upstream_status: 0,
             keep_request_content_length: false,
+            native_responses: false,
+            sse_tail: Vec::new(),
         }
     }
 }

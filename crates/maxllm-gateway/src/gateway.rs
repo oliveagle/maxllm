@@ -22,10 +22,10 @@ use maxllm_plugin::guardrail::{
     self, GuardrailEngine, GuardrailInput, GuardrailOutput, GuardrailVerdict,
 };
 use maxllm_plugin::{Plugin, PluginChain};
-use maxllm_translate::ProviderTranslator;
+use maxllm_translate::{ProviderTranslator, TranslatedRequest};
 use pingora::http::ResponseHeader;
 use pingora::prelude::*;
-use pingora::proxy::{ProxyHttp, Session};
+use pingora::proxy::{FailToProxy, ProxyHttp, Session};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -114,6 +114,19 @@ fn provider_owned_by(kind: ProviderKind) -> &'static str {
     }
 }
 
+/// Derive the native Responses path from a chat completions path.
+/// `/zen/go/v1/chat/completions` → `/zen/go/v1/responses`.
+fn derive_responses_path(chat_path: &str) -> Option<String> {
+    let trimmed = chat_path.trim_end_matches('/');
+    if let Some(prefix) = trimmed.strip_suffix("/chat/completions") {
+        return Some(format!("{prefix}/responses"));
+    }
+    if let Some(prefix) = trimmed.strip_suffix("/completions") {
+        return Some(format!("{prefix}/responses"));
+    }
+    None
+}
+
 /// Runtime state for a configured provider.
 pub struct ProviderState {
     pub kind: ProviderKind,
@@ -128,6 +141,10 @@ pub struct ProviderState {
     #[allow(dead_code)]
     pub tags: Vec<String>,
     pub default_model: Option<String>,
+    /// Whether the provider speaks the Responses contract natively.
+    pub native_responses: bool,
+    /// Upstream path of the native Responses endpoint.
+    pub responses_path: Option<String>,
 }
 
 /// Hot-reloadable state — swapped atomically on config change.
@@ -217,10 +234,13 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
                     .upstream_path
                     .as_deref()
                     .unwrap_or("/zen/go/v1/chat/completions");
-                Box::new(maxllm_translate::opencode::OpenCodeTranslator::new(
-                    name.clone(),
-                    path.to_string(),
-                ))
+                Box::new(
+                    maxllm_translate::opencode::OpenCodeTranslator::with_options(
+                        name.clone(),
+                        path.to_string(),
+                        conf.skip_reasoning_injection.unwrap_or(false),
+                    ),
+                )
             }
         };
 
@@ -231,6 +251,27 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
         let tls = url.scheme() == "https";
         let host = url.host_str().unwrap_or("localhost").to_string();
         let port = url.port().unwrap_or(if tls { 443 } else { 80 });
+
+        // A provider may serve the Responses contract natively. The path is
+        // derived from the chat path (`…/chat/completions` → `…/responses`)
+        // unless the config names it explicitly.
+        let native_responses = conf
+            .native_responses
+            .unwrap_or(matches!(conf.kind, ProviderKind::OpenCode));
+        let responses_path = if native_responses {
+            Some(
+                conf.responses_path
+                    .clone()
+                    .or_else(|| {
+                        conf.upstream_path
+                            .as_deref()
+                            .and_then(derive_responses_path)
+                    })
+                    .unwrap_or_else(|| "/v1/responses".to_string()),
+            )
+        } else {
+            None
+        };
 
         providers.insert(
             name.clone(),
@@ -246,6 +287,8 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
                 weight: conf.weight,
                 tags: conf.tags.clone(),
                 default_model: conf.default_model.clone(),
+                native_responses,
+                responses_path,
             }),
         );
     }
@@ -510,6 +553,12 @@ impl AiGateway {
                         .inc();
                 }
                 ctx.provider_name = target.name.clone();
+                // A provider that speaks the Responses contract natively gets
+                // the request forwarded unchanged (no chat translation round
+                // trip), so the whole Responses feature set survives.
+                ctx.native_responses = ctx.endpoint_type == EndpointType::Responses
+                    && target.state.native_responses
+                    && target.state.responses_path.is_some();
                 Some(Arc::clone(&target.state))
             }
             None => None,
@@ -773,9 +822,16 @@ impl ProxyHttp for AiGateway {
         // Set upstream path based on endpoint type
         let path = match ctx.endpoint_type {
             EndpointType::Responses => {
-                // Responses is translated into chat completions for the
-                // upstream call, so it uses the provider's chat path.
-                if provider.kind == ProviderKind::Gemini {
+                if ctx.native_responses {
+                    // The provider speaks the Responses contract natively: the
+                    // request is forwarded unchanged to its own /responses path.
+                    provider
+                        .responses_path
+                        .clone()
+                        .unwrap_or_else(|| provider.translator.upstream_path().to_string())
+                } else if provider.kind == ProviderKind::Gemini {
+                    // Responses is translated into chat completions for the
+                    // upstream call, so it uses the provider's chat path.
                     let model = provider
                         .default_model
                         .as_deref()
@@ -896,7 +952,9 @@ impl ProxyHttp for AiGateway {
         if ctx.endpoint_type == EndpointType::Passthrough {
             // Keep original Content-Length
         } else {
-            let is_body_passthrough = provider.translator.name() == "openai"
+            let is_body_passthrough = (ctx.endpoint_type == EndpointType::Responses
+                && ctx.native_responses)
+                || provider.translator.name() == "openai"
                 || provider.translator.name() == "azure_openai";
             let compaction_enabled = ctx
                 .plugin_ctx
@@ -965,12 +1023,13 @@ impl ProxyHttp for AiGateway {
         // Exception: if auto-compaction is enabled, we take the body, compact it,
         // and replace it — switching to chunked framing since the body size changes.
         if ctx.keep_request_content_length {
-            let compaction_enabled = ctx
-                .plugin_ctx
-                .extensions
-                .get("auto_compact")
-                .map(|v| v.as_str())
-                == Some("1");
+            let compaction_enabled = !ctx.native_responses
+                && ctx
+                    .plugin_ctx
+                    .extensions
+                    .get("auto_compact")
+                    .map(|v| v.as_str())
+                    == Some("1");
 
             if compaction_enabled {
                 // Take the body into our buffer so we can mutate it.
@@ -1011,7 +1070,16 @@ impl ProxyHttp for AiGateway {
                                 if let Some(p) = provider {
                                     match ctx.stream_translator.lock() {
                                         Ok(mut guard) => {
-                                            *guard = Some(p.translator.streaming_translator());
+                                            if ctx.native_responses {
+                                                // The upstream stream already
+                                                // speaks the Responses
+                                                // contract — copy it verbatim.
+                                                *guard = Some(Box::new(
+                                                    maxllm_translate::NativePassthroughStream,
+                                                ));
+                                            } else {
+                                                *guard = Some(p.translator.streaming_translator());
+                                            }
                                         }
                                         Err(e) => {
                                             warn!("stream_translator mutex poisoned: {e}");
@@ -1061,7 +1129,7 @@ impl ProxyHttp for AiGateway {
             // ── RESPONSES: convert to chat completions before the normal ──
             // path runs, so model extraction, guardrails, and compaction
             // all see the canonical chat format they already understand.
-            if ctx.endpoint_type == EndpointType::Responses {
+            if ctx.endpoint_type == EndpointType::Responses && !ctx.native_responses {
                 match maxllm_translate::responses::responses_request_to_chat(&ctx.request_body_buf)
                 {
                     Ok(translated) => {
@@ -1288,13 +1356,17 @@ impl ProxyHttp for AiGateway {
                 }
 
                 // ── AUTO-COMPACTION ──
+                //
+                // A native Responses body is forwarded verbatim upstream, so
+                // compaction (which rewrites chat `messages`) must not run.
 
-                if ctx
-                    .plugin_ctx
-                    .extensions
-                    .get("auto_compact")
-                    .map(|v| v.as_str())
-                    == Some("1")
+                if !ctx.native_responses
+                    && ctx
+                        .plugin_ctx
+                        .extensions
+                        .get("auto_compact")
+                        .map(|v| v.as_str())
+                        == Some("1")
                 {
                     if let Ok(mut body_json) =
                         serde_json::from_slice::<serde_json::Value>(&ctx.request_body_buf)
@@ -1411,18 +1483,30 @@ impl ProxyHttp for AiGateway {
                     }
                 }
 
-                // Translate request body (OpenAI → provider format)
-                match provider
-                    .translator
-                    .translate_request(&ctx.request_body_buf, None)
-                {
+                // Translate request body (OpenAI → provider format).
+                //
+                // A native Responses body already speaks the upstream
+                // contract, so it is forwarded unchanged.
+                let translated = if ctx.native_responses {
+                    Ok(TranslatedRequest {
+                        body: std::mem::take(&mut ctx.request_body_buf),
+                        is_streaming: ctx.is_streaming,
+                    })
+                } else {
+                    provider
+                        .translator
+                        .translate_request(&ctx.request_body_buf, None)
+                };
+                match translated {
                     Ok(translated) => {
                         if translated.is_streaming {
                             ctx.is_streaming = true;
                             match ctx.stream_translator.lock() {
                                 Ok(mut guard) => {
                                     let inner = provider.translator.streaming_translator();
-                                    if ctx.endpoint_type == EndpointType::Responses {
+                                    if ctx.endpoint_type == EndpointType::Responses
+                                        && !ctx.native_responses
+                                    {
                                         *guard = Some(Box::new(
                                             maxllm_translate::responses::ResponsesStreamTranslator::new(inner),
                                         ));
@@ -1475,6 +1559,7 @@ impl ProxyHttp for AiGateway {
         let skip_response_translation = ctx.endpoint_type == EndpointType::Passthrough
             || ctx.endpoint_type == EndpointType::Native
             || ctx.endpoint_type == EndpointType::Embeddings
+            || ctx.native_responses
             || (provider.is_some_and(|p| p.translator.name() == "openai")
                 && ctx.endpoint_type != EndpointType::Responses);
         if !skip_response_translation {
@@ -1703,6 +1788,75 @@ impl ProxyHttp for AiGateway {
             let provider = hot.providers.get(&ctx.provider_name);
             let is_gemini = provider.is_some_and(|p| p.kind == ProviderKind::Gemini);
 
+            if ctx.native_responses {
+                // ── NATIVE RESPONSES: forward the upstream body verbatim ──
+                // The provider already speaks the Responses contract, so the
+                // body (streaming or not) is passed through unchanged. Only
+                // errors are normalised into the OpenAI error shape, and usage
+                // is still extracted for the metrics/ledger.
+                if ctx.is_streaming {
+                    if let Some(data) = body.as_ref() {
+                        let translated: Option<Bytes> = match ctx.stream_translator.lock() {
+                            Ok(mut guard) => guard.as_mut().map(|translator| {
+                                Bytes::from(translator.process_chunk(data, end_of_stream))
+                            }),
+                            Err(e) => {
+                                warn!(
+                                    "stream_translator mutex poisoned in native responses streaming: {e}"
+                                );
+                                None
+                            }
+                        };
+                        if let Some(ref t) = translated {
+                            extract_stream_usage(t, ctx, end_of_stream);
+                            *body = Some(t.clone());
+                        }
+                    }
+                } else {
+                    if let Some(data) = body.take() {
+                        ctx.response_body_buf.extend_from_slice(&data);
+                    }
+                    if end_of_stream && !ctx.response_body_buf.is_empty() {
+                        if let Ok(parsed) =
+                            serde_json::from_slice::<serde_json::Value>(&ctx.response_body_buf)
+                        {
+                            extract_usage(&parsed, ctx);
+                        }
+
+                        if ctx.upstream_status >= 400 {
+                            let error_body = provider
+                                .and_then(|p| {
+                                    normalize_error_response(
+                                        &ctx.response_body_buf,
+                                        ctx.upstream_status,
+                                        p.kind,
+                                    )
+                                })
+                                .unwrap_or_else(|| ctx.response_body_buf.clone());
+                            *body = Some(Bytes::from(error_body));
+                        } else {
+                            *body = Some(Bytes::from(std::mem::take(&mut ctx.response_body_buf)));
+                        }
+                    }
+                }
+
+                hot.global_chain.run_response_body(
+                    session,
+                    body,
+                    end_of_stream,
+                    &mut ctx.plugin_ctx,
+                )?;
+                if let Some(idx) = ctx.route_index {
+                    hot.route_chains[idx].run_response_body(
+                        session,
+                        body,
+                        end_of_stream,
+                        &mut ctx.plugin_ctx,
+                    )?;
+                }
+                return Ok(None);
+            }
+
             if ctx.is_streaming && is_gemini {
                 // Gemini answered generateContent with a single JSON body;
                 // convert it to Responses SSE events.
@@ -1740,17 +1894,18 @@ impl ProxyHttp for AiGateway {
                 // ResponsesStreamTranslator wrapping the provider's chat
                 // stream translator, so chunks flow through as Responses SSE.
                 if let Some(data) = body.as_ref() {
-                    match ctx.stream_translator.lock() {
-                        Ok(mut guard) => {
-                            if let Some(translator) = guard.as_mut() {
-                                let translated = translator.process_chunk(data, end_of_stream);
-                                drop(guard);
-                                *body = Some(Bytes::from(translated));
-                            }
-                        }
+                    let translated: Option<Bytes> = match ctx.stream_translator.lock() {
+                        Ok(mut guard) => guard.as_mut().map(|translator| {
+                            Bytes::from(translator.process_chunk(data, end_of_stream))
+                        }),
                         Err(e) => {
                             warn!("stream_translator mutex poisoned in responses streaming: {e}");
+                            None
                         }
+                    };
+                    if let Some(ref t) = translated {
+                        extract_stream_usage(t, ctx, end_of_stream);
+                        *body = Some(t.clone());
                     }
                 }
             } else {
@@ -1879,17 +2034,18 @@ impl ProxyHttp for AiGateway {
                     }
                 }
             } else if let Some(data) = body.as_ref() {
-                match ctx.stream_translator.lock() {
-                    Ok(mut guard) => {
-                        if let Some(translator) = guard.as_mut() {
-                            let translated = translator.process_chunk(data, end_of_stream);
-                            drop(guard);
-                            *body = Some(Bytes::from(translated));
-                        }
-                    }
+                let translated: Option<Bytes> = match ctx.stream_translator.lock() {
+                    Ok(mut guard) => guard.as_mut().map(|translator| {
+                        Bytes::from(translator.process_chunk(data, end_of_stream))
+                    }),
                     Err(e) => {
                         warn!("stream_translator mutex poisoned in streaming: {e}");
+                        None
                     }
+                };
+                if let Some(ref t) = translated {
+                    extract_stream_usage(t, ctx, end_of_stream);
+                    *body = Some(t.clone());
                 }
             }
         } else {
@@ -2032,6 +2188,57 @@ impl ProxyHttp for AiGateway {
         }
 
         Ok(None)
+    }
+
+    /// Pingora's default `fail_to_proxy` writes an empty-body error response,
+    /// leaving clients to guess what failed (a connect timeout and a DNS
+    /// failure look identical). Answer with a JSON error body in the same
+    /// OpenAI error shape the gateway already uses, carrying the pingora
+    /// error chain for diagnosis.
+    async fn fail_to_proxy(
+        &self,
+        session: &mut Session,
+        e: &pingora::Error,
+        _ctx: &mut Self::CTX,
+    ) -> FailToProxy {
+        let code = match e.etype() {
+            pingora::ErrorType::HTTPStatus(code) => *code,
+            _ => match e.esource() {
+                pingora::ErrorSource::Upstream => 502,
+                pingora::ErrorSource::Downstream => match e.etype() {
+                    pingora::ErrorType::WriteError
+                    | pingora::ErrorType::ReadError
+                    | pingora::ErrorType::ConnectionClosed => 0, // connection already dead
+                    _ => 400,
+                },
+                pingora::ErrorSource::Internal | pingora::ErrorSource::Unset => 500,
+            },
+        };
+
+        if code > 0 {
+            let message = e.to_string();
+            let body = serde_json::json!({
+                "error": {
+                    "message": message,
+                    "type": "gateway_error",
+                    "code": code
+                }
+            })
+            .to_string();
+            // `respond_error_with_body` keeps a response that was already
+            // written (e.g. our own send_error_response paths) untouched.
+            if let Err(err) = session
+                .respond_error_with_body(code, Bytes::from(body))
+                .await
+            {
+                warn!(error = %err, "failed to send error response to downstream");
+            }
+        }
+
+        FailToProxy {
+            error_code: code,
+            can_reuse_downstream: false,
+        }
     }
 
     async fn logging(
@@ -2341,6 +2548,91 @@ fn normalize_error_response(
     serde_json::to_vec(&normalized).ok()
 }
 
+/// Extract token usage from a streaming SSE chunk. OpenAI chat streams carry
+/// usage in the final chunk (`data: {…"usage":{…}…}`); Responses streams carry
+/// it in the terminal `response.completed` / `response.incomplete` event (at
+/// `.response.usage`). The scan is best-effort: only complete `data:` lines
+/// are parsed, a usage line split across chunks is reassembled via
+/// `ctx.sse_tail`, and a stream without any usage line changes nothing.
+fn extract_stream_usage(chunk: &[u8], ctx: &mut RequestCtx, end_of_stream: bool) {
+    // Fast path: a chunk that ends with a complete line and cannot carry a
+    // usage payload leaves nothing to scan and no partial line to keep.
+    if ctx.sse_tail.is_empty()
+        && !chunk.windows(5).any(|w| w == b"usage")
+        && chunk.last() == Some(&b'\n')
+    {
+        return;
+    }
+
+    // Reuse the tail buffer's allocation: prepend the trailing partial line of
+    // the previous chunk, then scan the complete lines that follow.
+    let mut buf = std::mem::take(&mut ctx.sse_tail);
+    buf.extend_from_slice(chunk);
+
+    let mut start = 0usize;
+    let mut last_complete_end = 0usize;
+    for (i, &b) in buf.iter().enumerate() {
+        if b != b'\n' {
+            continue;
+        }
+        let line = &buf[start..i];
+        last_complete_end = i + 1;
+        if line.starts_with(b"data:") && line.windows(5).any(|w| w == b"usage") {
+            parse_usage_line(line, ctx);
+        }
+        start = i + 1;
+    }
+
+    if end_of_stream {
+        // A stream may end without a trailing newline — parse the final
+        // partial line as the last event, then drop the tail.
+        if last_complete_end < buf.len() {
+            let line = &buf[last_complete_end..];
+            if line.starts_with(b"data:") && line.windows(5).any(|w| w == b"usage") {
+                parse_usage_line(line, ctx);
+            }
+        }
+        ctx.sse_tail.clear();
+    } else {
+        let rest_len = buf.len() - last_complete_end;
+        // Bounded: a stream that never emits complete lines (not SSE) must not
+        // grow the tail without limit.
+        if rest_len > 16 * 1024 {
+            ctx.sse_tail = Vec::new();
+        } else {
+            buf.copy_within(last_complete_end.., 0);
+            buf.truncate(rest_len);
+            ctx.sse_tail = buf;
+        }
+    }
+}
+
+/// Parse one SSE `data:` line (without the terminating newline) and copy any
+/// token usage it carries into `ctx`.
+fn parse_usage_line(line: &[u8], ctx: &mut RequestCtx) {
+    let payload = line[5..].strip_prefix(b" ").unwrap_or(&line[5..]);
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(payload) {
+        let usage = value
+            .get("usage")
+            .or_else(|| value.get("response").and_then(|r| r.get("usage")));
+        if let Some(u) = usage {
+            if let Some(pt) = u.get("prompt_tokens").and_then(|v| v.as_u64()) {
+                ctx.tokens_in = pt;
+            }
+            if let Some(ct) = u.get("completion_tokens").and_then(|v| v.as_u64()) {
+                ctx.tokens_out = ct;
+            }
+            // Responses accounting (input_tokens / output_tokens).
+            if let Some(it) = u.get("input_tokens").and_then(|v| v.as_u64()) {
+                ctx.tokens_in = it;
+            }
+            if let Some(ot) = u.get("output_tokens").and_then(|v| v.as_u64()) {
+                ctx.tokens_out = ot;
+            }
+        }
+    }
+}
+
 /// Extract token usage from a response body.
 fn extract_usage(body: &serde_json::Value, ctx: &mut RequestCtx) {
     if let Some(usage) = body.get("usage") {
@@ -2365,5 +2657,102 @@ fn extract_usage(body: &serde_json::Value, ctx: &mut RequestCtx) {
         if let Some(model) = body.get("model").and_then(|m| m.as_str()) {
             ctx.model = model.to_string();
         }
+    }
+}
+
+#[cfg(test)]
+mod stream_usage_tests {
+    use super::*;
+
+    fn ctx() -> RequestCtx {
+        RequestCtx::new()
+    }
+
+    #[test]
+    fn test_chat_stream_usage_is_extracted() {
+        let mut c = ctx();
+        let chunk = b"data: {\"id\":\"1\",\"object\":\"chat.completion.chunk\",\"choices\":[],\"usage\":{\"prompt_tokens\":31,\"completion_tokens\":7,\"total_tokens\":38}}\n\ndata: [DONE]\n\n";
+        extract_stream_usage(chunk, &mut c, true);
+        assert_eq!(c.tokens_in, 31);
+        assert_eq!(c.tokens_out, 7);
+    }
+
+    #[test]
+    fn test_responses_stream_usage_is_extracted() {
+        // The Responses contract nests usage under `response`.
+        let mut c = ctx();
+        let chunk = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"usage\":{\"input_tokens\":12,\"output_tokens\":4,\"total_tokens\":16}}}\n\n";
+        extract_stream_usage(chunk, &mut c, true);
+        assert_eq!(c.tokens_in, 12);
+        assert_eq!(c.tokens_out, 4);
+    }
+
+    #[test]
+    fn test_usage_split_across_chunks_is_reassembled() {
+        let mut c = ctx();
+        let first = b"data: {\"id\":\"1\",\"usage\":{\"prompt_tok";
+        extract_stream_usage(first, &mut c, false);
+        assert_eq!(c.tokens_in, 0);
+        let second = b"ens\":5,\"completion_tokens\":2}}\n\n";
+        extract_stream_usage(second, &mut c, true);
+        assert_eq!(c.tokens_in, 5);
+        assert_eq!(c.tokens_out, 2);
+    }
+
+    #[test]
+    fn test_usage_split_inside_the_usage_word_is_reassembled() {
+        // A chunk boundary can land anywhere, including inside the word
+        // "usage" itself — the first part then carries no "usage" substring.
+        let mut c = ctx();
+        let first = b"data: {\"id\":\"1\",\"us";
+        extract_stream_usage(first, &mut c, false);
+        assert_eq!(c.tokens_in, 0);
+        let second = b"age\":{\"prompt_tokens\":5,\"completion_tokens\":2}}\n\n";
+        extract_stream_usage(second, &mut c, true);
+        assert_eq!(c.tokens_in, 5);
+        assert_eq!(c.tokens_out, 2);
+    }
+
+    #[test]
+    fn test_final_partial_line_parsed_at_end_of_stream() {
+        // Some upstreams emit the final usage event without a trailing
+        // newline; the tail must still be parsed once the stream ends.
+        let mut c = ctx();
+        let chunk = b"data: {\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3}}";
+        extract_stream_usage(chunk, &mut c, true);
+        assert_eq!(c.tokens_in, 7);
+        assert_eq!(c.tokens_out, 3);
+    }
+
+    #[test]
+    fn test_stream_without_usage_leaves_tokens_zero() {
+        let mut c = ctx();
+        let chunk = b"data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+        extract_stream_usage(chunk, &mut c, true);
+        assert_eq!(c.tokens_in, 0);
+        assert_eq!(c.tokens_out, 0);
+    }
+
+    #[test]
+    fn test_malformed_usage_line_is_ignored() {
+        let mut c = ctx();
+        let chunk = b"data: {not json}\n\ndata: [DONE]\n\n";
+        extract_stream_usage(chunk, &mut c, true);
+        assert_eq!(c.tokens_in, 0);
+    }
+
+    #[test]
+    fn test_usage_survives_multiple_events() {
+        // Only the chunk carrying the usage block sets the counters; later
+        // events without usage must not reset them.
+        let mut c = ctx();
+        extract_stream_usage(
+            b"data: {\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":3}}\n\n",
+            &mut c,
+            false,
+        );
+        extract_stream_usage(b"data: {\"choices\":[]}\n\n", &mut c, true);
+        assert_eq!(c.tokens_in, 9);
+        assert_eq!(c.tokens_out, 3);
     }
 }

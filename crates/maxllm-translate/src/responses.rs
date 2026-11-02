@@ -556,6 +556,19 @@ pub struct ResponsesStreamTranslator {
     /// Usage reported by the provider, if any.
     usage: Value,
     finish_reason: Option<String>,
+    /// Id of the reasoning output item.
+    reasoning_item_id: String,
+    /// Accumulated reasoning text (from `delta.reasoning_content` and friends).
+    reasoning_text: String,
+    /// Whether the reasoning output item is currently open.
+    reasoning_open: bool,
+    /// Output index allocated to the reasoning item.
+    reasoning_output_index: Option<usize>,
+    /// Monotonic output-index allocator: every output item that opens gets a
+    /// unique index, so a client can key items by index without collisions.
+    next_output_index: usize,
+    /// Output index allocated to the assistant message item.
+    message_output_index: usize,
 }
 
 impl ResponsesStreamTranslator {
@@ -567,6 +580,12 @@ impl ResponsesStreamTranslator {
             finished: false,
             response_id: generate_id("resp_"),
             message_item_id: generate_id("msg_"),
+            reasoning_item_id: generate_id("rs_"),
+            reasoning_text: String::new(),
+            reasoning_open: false,
+            reasoning_output_index: None,
+            next_output_index: 0,
+            message_output_index: 0,
             model: String::new(),
             created_at: now_secs(),
             text: String::new(),
@@ -581,6 +600,21 @@ impl ResponsesStreamTranslator {
     /// and `response.completed`.
     fn response_object(&self, status: ResponseStatus) -> Value {
         let mut output: Vec<Value> = Vec::new();
+
+        // The reasoning item always precedes the message and the calls, the
+        // order the items were opened in the stream.
+        if !self.reasoning_text.is_empty() {
+            output.push(json!({
+                "type": "reasoning",
+                "id": self.reasoning_item_id,
+                "status": if status == ResponseStatus::InProgress {
+                    "in_progress"
+                } else {
+                    "completed"
+                },
+                "summary": [{ "type": "summary_text", "text": self.reasoning_text }]
+            }));
+        }
 
         if self.text_open || !self.text.is_empty() {
             output.push(json!({
@@ -679,6 +713,67 @@ impl ResponsesStreamTranslator {
 
         let delta = choice.and_then(|c| c.get("delta"));
 
+        // Reasoning deltas. Thinking models (deepseek, glm, ...) stream their
+        // reasoning before any content or tool call, as `reasoning_content`
+        // (DeepSeek style), `reasoning` or `reasoning_text`. The reasoning
+        // item is opened first and closed before the next item opens — a
+        // Responses client treats an interleaved reasoning start as a broken
+        // stream.
+        let reasoning_delta = delta
+            .and_then(|d| {
+                d.get("reasoning_content")
+                    .or_else(|| d.get("reasoning"))
+                    .or_else(|| d.get("reasoning_text"))
+            })
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+        if let Some(reasoning) = reasoning_delta {
+            if !self.reasoning_open {
+                self.close_reasoning(out);
+                self.reasoning_open = true;
+                self.reasoning_output_index = Some(self.next_output_index);
+                self.next_output_index += 1;
+                let output_index = self.reasoning_output_index.unwrap_or(0);
+                emit_event(
+                    out,
+                    "response.output_item.added",
+                    json!({
+                        "type": "response.output_item.added",
+                        "output_index": output_index,
+                        "item": {
+                            "type": "reasoning",
+                            "id": self.reasoning_item_id,
+                            "status": "in_progress",
+                            "summary": []
+                        }
+                    }),
+                );
+                emit_event(
+                    out,
+                    "response.reasoning_summary_part.added",
+                    json!({
+                        "type": "response.reasoning_summary_part.added",
+                        "item_id": self.reasoning_item_id,
+                        "output_index": output_index,
+                        "summary_index": 0,
+                        "part": { "type": "summary_text", "text": "" }
+                    }),
+                );
+            }
+            self.reasoning_text.push_str(reasoning);
+            emit_event(
+                out,
+                "response.reasoning_summary_text.delta",
+                json!({
+                    "type": "response.reasoning_summary_text.delta",
+                    "item_id": self.reasoning_item_id,
+                    "output_index": self.reasoning_output_index.unwrap_or(0),
+                    "summary_index": 0,
+                    "delta": reasoning
+                }),
+            );
+        }
+
         // Assistant text.
         if let Some(text) = delta
             .and_then(|d| d.get("content"))
@@ -686,13 +781,18 @@ impl ResponsesStreamTranslator {
         {
             if !text.is_empty() {
                 if !self.text_open {
+                    // The reasoning item must be closed before the message
+                    // item opens.
+                    self.close_reasoning(out);
                     self.text_open = true;
+                    self.message_output_index = self.next_output_index;
+                    self.next_output_index += 1;
                     emit_event(
                         out,
                         "response.output_item.added",
                         json!({
                             "type": "response.output_item.added",
-                            "output_index": 0,
+                            "output_index": self.message_output_index,
                             "item": {
                                 "type": "message",
                                 "id": self.message_item_id,
@@ -708,7 +808,7 @@ impl ResponsesStreamTranslator {
                         json!({
                             "type": "response.content_part.added",
                             "item_id": self.message_item_id,
-                            "output_index": 0,
+                            "output_index": self.message_output_index,
                             "content_index": 0,
                             "part": { "type": "output_text", "text": "", "annotations": [] }
                         }),
@@ -721,7 +821,7 @@ impl ResponsesStreamTranslator {
                     json!({
                         "type": "response.output_text.delta",
                         "item_id": self.message_item_id,
-                        "output_index": 0,
+                        "output_index": self.message_output_index,
                         "content_index": 0,
                         "delta": text
                     }),
@@ -739,9 +839,14 @@ impl ResponsesStreamTranslator {
                 let slot = match self.tool_calls.iter_mut().find(|(i, _)| *i == index) {
                     Some((_, state)) => state,
                     None => {
+                        // The reasoning item (if any) is closed before the
+                        // first call opens, so the call gets the next index.
+                        self.close_reasoning(out);
+                        let output_index = self.next_output_index;
+                        self.next_output_index += 1;
                         let state = ToolCallState {
                             item_id: generate_id("fc_"),
-                            output_index: self.tool_calls.len(),
+                            output_index,
                             ..Default::default()
                         };
                         self.tool_calls.push((index, state));
@@ -825,6 +930,9 @@ impl ResponsesStreamTranslator {
             );
         }
 
+        // A stream must not end with an open output item.
+        self.close_reasoning(out);
+
         if self.text_open {
             emit_event(
                 out,
@@ -832,7 +940,7 @@ impl ResponsesStreamTranslator {
                 json!({
                     "type": "response.output_text.done",
                     "item_id": self.message_item_id,
-                    "output_index": 0,
+                    "output_index": self.message_output_index,
                     "content_index": 0,
                     "text": self.text
                 }),
@@ -843,7 +951,7 @@ impl ResponsesStreamTranslator {
                 json!({
                     "type": "response.content_part.done",
                     "item_id": self.message_item_id,
-                    "output_index": 0,
+                    "output_index": self.message_output_index,
                     "content_index": 0,
                     "part": { "type": "output_text", "text": self.text, "annotations": [] }
                 }),
@@ -853,7 +961,7 @@ impl ResponsesStreamTranslator {
                 "response.output_item.done",
                 json!({
                     "type": "response.output_item.done",
-                    "output_index": 0,
+                    "output_index": self.message_output_index,
                     "item": {
                         "type": "message",
                         "id": self.message_item_id,
@@ -922,6 +1030,56 @@ impl ResponsesStreamTranslator {
         );
 
         out.extend_from_slice(b"data: [DONE]\n\n");
+    }
+}
+
+impl ResponsesStreamTranslator {
+    /// Close the open reasoning item, emitting its summary done events. The
+    /// Responses stream contract forbids opening a new output item while the
+    /// reasoning item is still open.
+    fn close_reasoning(&mut self, out: &mut Vec<u8>) {
+        if !self.reasoning_open {
+            return;
+        }
+        self.reasoning_open = false;
+        let text = self.reasoning_text.clone();
+        let output_index = self.reasoning_output_index.unwrap_or(0);
+        emit_event(
+            out,
+            "response.reasoning_summary_text.done",
+            json!({
+                "type": "response.reasoning_summary_text.done",
+                "item_id": self.reasoning_item_id,
+                "output_index": output_index,
+                "summary_index": 0,
+                "text": text
+            }),
+        );
+        emit_event(
+            out,
+            "response.reasoning_summary_part.done",
+            json!({
+                "type": "response.reasoning_summary_part.done",
+                "item_id": self.reasoning_item_id,
+                "output_index": output_index,
+                "summary_index": 0,
+                "part": { "type": "summary_text", "text": text }
+            }),
+        );
+        emit_event(
+            out,
+            "response.output_item.done",
+            json!({
+                "type": "response.output_item.done",
+                "output_index": output_index,
+                "item": {
+                    "type": "reasoning",
+                    "id": self.reasoning_item_id,
+                    "status": "completed",
+                    "summary": [{ "type": "summary_text", "text": text }]
+                }
+            }),
+        );
     }
 }
 
@@ -1388,6 +1546,157 @@ mod tests {
         assert!(s.contains("event: response.completed"));
         assert!(s.contains(r#""input_tokens":3"#));
         assert!(s.contains("data: [DONE]"));
+    }
+
+    /// Parse the `data:` payloads of a Responses SSE stream into JSON values.
+    fn sse_payloads(sse: &str) -> Vec<serde_json::Value> {
+        sse.lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter(|d| *d != "[DONE]")
+            .filter_map(|d| serde_json::from_str::<serde_json::Value>(d).ok())
+            .collect()
+    }
+
+    /// The item type and `output_index` of every `response.output_item.added`.
+    fn added_output_indexes(sse: &str) -> Vec<(String, u64)> {
+        sse_payloads(sse)
+            .into_iter()
+            .filter(|e| e["type"] == "response.output_item.added")
+            .map(|e| {
+                (
+                    e["item"]["type"].as_str().unwrap_or_default().to_string(),
+                    e["output_index"].as_u64().unwrap_or_default(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_reasoning_deltas_open_and_close_reasoning_item() {
+        // A thinking model streams reasoning first, then the answer.
+        let chunks = [
+            r#"{"id":"chatcmpl-r","object":"chat.completion.chunk","created":1700000000,"model":"deepseek-v4.1-flash","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"think"},"finish_reason":null}]}"#,
+            r#"{"id":"chatcmpl-r","object":"chat.completion.chunk","created":1700000000,"model":"deepseek-v4.1-flash","choices":[{"index":0,"delta":{"reasoning_content":"ing"},"finish_reason":null}]}"#,
+            r#"{"id":"chatcmpl-r","object":"chat.completion.chunk","created":1700000000,"model":"deepseek-v4.1-flash","choices":[{"index":0,"delta":{"content":"answer"},"finish_reason":null}]}"#,
+            r#"{"id":"chatcmpl-r","object":"chat.completion.chunk","created":1700000000,"model":"deepseek-v4.1-flash","choices":[{"index":0}],"finish_reason":"stop","usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}"#,
+        ];
+        let sse = chat_sse(&chunks);
+        let mut t = ResponsesStreamTranslator::new(Box::new(crate::NativePassthroughStream));
+        let out = t.process_chunk(sse.as_bytes(), true);
+        let s = String::from_utf8(out).unwrap();
+
+        let types: Vec<String> = sse_payloads(&s)
+            .iter()
+            .map(|e| e["type"].as_str().unwrap_or_default().to_string())
+            .collect();
+        let pos_reasoning_added = types
+            .iter()
+            .position(|t| t == "response.output_item.added")
+            .expect("an item is added");
+        let pos_reasoning_delta = types
+            .iter()
+            .position(|t| t == "response.reasoning_summary_text.delta")
+            .expect("a reasoning delta");
+        let pos_reasoning_done = types
+            .iter()
+            .position(|t| t == "response.reasoning_summary_text.done")
+            .expect("a reasoning done");
+        let pos_message_added = types
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| *t == "response.output_item.added")
+            .map(|(i, _)| i)
+            .nth(1)
+            .expect("the message item is added");
+        assert!(pos_reasoning_added < pos_reasoning_delta);
+        assert!(pos_reasoning_delta < pos_reasoning_done);
+        assert!(
+            pos_reasoning_done < pos_message_added,
+            "reasoning must close before the message item opens"
+        );
+
+        // The accumulated reasoning is carried in the summary events.
+        assert!(s.contains(r#""text":"thinking""#));
+        assert!(s.contains("event: response.reasoning_summary_part.done"));
+    }
+
+    #[test]
+    fn test_reasoning_only_stream_still_produces_output() {
+        // Reasoning without any content or tool call: the response must still
+        // carry the reasoning item instead of an empty output.
+        let chunks = [
+            r#"{"id":"chatcmpl-o","object":"chat.completion.chunk","created":1700000000,"model":"deepseek-v4.1-flash","choices":[{"index":0,"delta":{"reasoning_content":"only thinking"},"finish_reason":null}]}"#,
+            r#"{"id":"chatcmpl-o","object":"chat.completion.chunk","created":1700000000,"model":"deepseek-v4.1-flash","choices":[{"index":0}],"finish_reason":"stop","usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}"#,
+        ];
+        let sse = chat_sse(&chunks);
+        let mut t = ResponsesStreamTranslator::new(Box::new(crate::NativePassthroughStream));
+        let out = t.process_chunk(sse.as_bytes(), true);
+        let s = String::from_utf8(out).unwrap();
+
+        let payloads = sse_payloads(&s);
+        let completed = payloads
+            .iter()
+            .find(|e| e["type"] == "response.completed")
+            .expect("response.completed");
+        let output = completed["response"]["output"].as_array().unwrap();
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0]["type"], "reasoning");
+        assert_eq!(output[0]["summary"][0]["text"], "only thinking");
+    }
+
+    #[test]
+    fn test_output_indexes_are_unique() {
+        // Reasoning, message and a function call must not share an index.
+        let chunks = [
+            r#"{"id":"chatcmpl-x","object":"chat.completion.chunk","created":1700000000,"model":"deepseek-v4.1-flash","choices":[{"index":0,"delta":{"reasoning_content":"hmm"},"finish_reason":null}]}"#,
+            r#"{"id":"chatcmpl-x","object":"chat.completion.chunk","created":1700000000,"model":"deepseek-v4.1-flash","choices":[{"index":0,"delta":{"content":"text"},"finish_reason":null}]}"#,
+            r#"{"id":"chatcmpl-x","object":"chat.completion.chunk","created":1700000000,"model":"deepseek-v4.1-flash","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"f","arguments":"{}"}}]},"finish_reason":null}]}"#,
+            r#"{"id":"chatcmpl-x","object":"chat.completion.chunk","created":1700000000,"model":"deepseek-v4.1-flash","choices":[{"index":0}],"finish_reason":"tool_calls","usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}"#,
+        ];
+        let sse = chat_sse(&chunks);
+        let mut t = ResponsesStreamTranslator::new(Box::new(crate::NativePassthroughStream));
+        let out = t.process_chunk(sse.as_bytes(), true);
+        let s = String::from_utf8(out).unwrap();
+
+        let added = added_output_indexes(&s);
+        let kinds: Vec<&str> = added.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(kinds, vec!["reasoning", "message", "function_call"]);
+        let indexes: Vec<u64> = added.iter().map(|(_, i)| *i).collect();
+        assert_eq!(indexes, vec![0, 1, 2], "output indexes must be unique");
+    }
+
+    #[test]
+    fn test_message_output_index_without_reasoning() {
+        // Without reasoning the message keeps index 0 — the pre-reasoning
+        // contract other clients rely on.
+        let chunks = [
+            r#"{"id":"chatcmpl-y","object":"chat.completion.chunk","created":1700000000,"model":"gpt-4o","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}"#,
+        ];
+        let sse = chat_sse(&chunks);
+        let mut t = ResponsesStreamTranslator::new(Box::new(crate::NativePassthroughStream));
+        let out = t.process_chunk(sse.as_bytes(), true);
+        let s = String::from_utf8(out).unwrap();
+        let added = added_output_indexes(&s);
+        assert_eq!(added, vec![("message".to_string(), 0)]);
+    }
+
+    #[test]
+    fn test_reasoning_closes_at_stream_end() {
+        // A stream that ends while the reasoning item is still open must
+        // close it before the terminal event.
+        let chunks = [
+            r#"{"id":"chatcmpl-z","object":"chat.completion.chunk","created":1700000000,"model":"deepseek-v4.1-flash","choices":[{"index":0,"delta":{"reasoning_content":"cut off"},"finish_reason":null}]}"#,
+        ];
+        let sse = chat_sse(&chunks);
+        let mut t = ResponsesStreamTranslator::new(Box::new(crate::NativePassthroughStream));
+        let out = t.process_chunk(sse.as_bytes(), true);
+        let s = String::from_utf8(out).unwrap();
+        let pos_done = s
+            .find("event: response.reasoning_summary_text.done")
+            .unwrap();
+        let pos_completed = s.find("event: response.completed").unwrap();
+        assert!(pos_done < pos_completed);
+        assert!(s.contains("event: response.output_item.done"));
     }
 
     #[test]

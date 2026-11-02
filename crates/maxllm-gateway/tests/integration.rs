@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use std::io::Write;
 use std::process::{Child, Command};
 use std::time::Duration;
-use wiremock::matchers::{header, method};
+use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 // ---------------------------------------------------------------------------
@@ -144,6 +144,61 @@ api_key = "fake-key"
 path = "/v1/chat/completions"
 provider = "mock_openai"
 plugins = ["cors"]
+"#;
+
+const NATIVE_RESPONSES_CONFIG: &str = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[metrics]
+enabled = true
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.mock_opencode]
+kind = "opencode"
+base_url = "{MOCK_URL}"
+upstream_path = "/zen/go/v1/chat/completions"
+api_key = "fake-key"
+
+[[routes]]
+path = "/v1/responses"
+provider = "mock_opencode"
+endpoint_type = "responses"
+"#;
+
+const OPENCODE_CHAT_CONFIG: &str = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[metrics]
+enabled = true
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.mock_opencode]
+kind = "opencode"
+base_url = "{MOCK_URL}"
+upstream_path = "/zen/go/v1/chat/completions"
+api_key = "fake-key"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "mock_opencode"
 "#;
 
 const FALLBACK_CONFIG: &str = r#"
@@ -1442,5 +1497,318 @@ async fn test_compaction_skip_header_disables_compaction() {
     assert_eq!(
         upstream_count, original_count,
         "expected all {original_count} messages to be forwarded when skip header is set, got {upstream_count}"
+    );
+}
+
+#[tokio::test]
+async fn test_native_responses_passthrough_non_streaming() {
+    let mock = MockServer::start().await;
+
+    // The upstream speaks the Responses contract natively: the gateway must
+    // forward the request body unchanged (no chat translation round trip).
+    let upstream_body = json!({
+        "id": "resp_test",
+        "object": "response",
+        "status": "completed",
+        "model": "deepseek-v4.1-flash",
+        "output": [{
+            "id": "msg_test",
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "hi"}]
+        }],
+        "usage": {"input_tokens": 7, "output_tokens": 3, "total_tokens": 10}
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/zen/go/v1/responses"))
+        .and(header("x-opencode-session", "sess-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(upstream_body.clone()))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let gw = TestGateway::start(NATIVE_RESPONSES_CONFIG, &mock.uri()).await;
+    let c = client();
+
+    let request_body = json!({
+        "model": "deepseek-v4.1-flash",
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+        "stream": false,
+        "previous_response_id": "resp_prev"
+    });
+
+    let resp = c
+        .post(gw.url("/v1/responses"))
+        .header("Authorization", "Bearer test-key-123")
+        .header("x-opencode-session", "sess-1")
+        .json(&request_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: Value = resp.json().await.unwrap();
+    // The upstream body is returned verbatim — no chat→Responses conversion.
+    assert_eq!(body["object"], "response");
+    assert_eq!(body["id"], "resp_test");
+    assert_eq!(body["output"][0]["content"][0]["text"], "hi");
+    assert_eq!(body["usage"]["input_tokens"], 7);
+
+    // The request the upstream saw must still be a Responses request.
+    let requests = mock.received_requests().await.unwrap();
+    let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(sent["input"][0]["content"][0]["text"], "hi");
+    assert_eq!(sent["previous_response_id"], "resp_prev");
+    assert!(sent.get("messages").is_none());
+}
+
+#[tokio::test]
+async fn test_native_responses_passthrough_streaming() {
+    let mock = MockServer::start().await;
+
+    let sse = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_s\",\"object\":\"response\",\"status\":\"in_progress\"}}\n\n",
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_s\",\"output_index\":0,\"content_index\":0,\"delta\":\"hi\"}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_s\",\"object\":\"response\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/zen/go/v1/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(sse, "text/event-stream"),
+        )
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let gw = TestGateway::start(NATIVE_RESPONSES_CONFIG, &mock.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/responses"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&json!({
+            "model": "deepseek-v4.1-flash",
+            "input": "hi",
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let text = resp.text().await.unwrap();
+    // The upstream SSE is forwarded verbatim — no chat→Responses conversion.
+    assert!(text.contains("event: response.created"), "{text}");
+    assert!(text.contains("response.output_text.delta"), "{text}");
+    assert!(text.contains("event: response.completed"), "{text}");
+}
+
+#[tokio::test]
+async fn test_opencode_chat_normalizes_request_and_injects_session() {
+    let mock = MockServer::start().await;
+
+    // The upstream is the strict opencode.ai zen endpoint: it demands the
+    // x-opencode-session header and rejects the non-standard wire shapes the
+    // gateway normalises away.
+    Mock::given(method("POST"))
+        .and(path("/zen/go/v1/chat/completions"))
+        .and(header("x-opencode-session", "sess-1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"id":"c1","object":"chat.completion","choices":[]})),
+        )
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let gw = TestGateway::start(OPENCODE_CHAT_CONFIG, &mock.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .header("x-opencode-session", "sess-1")
+        .json(&json!({
+            "model": "deepseek-v4.1-flash",
+            "messages": [
+                {"role": "developer", "content": "be terse"},
+                {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "", "type": "function", "function": {"name": "", "arguments": {"city": "BJ"}}}
+                ]},
+                {"role": "tool", "tool_call_id": "", "content": "sunny"}
+            ],
+            "tools": [{"type": "function", "function": {"name": "get_weather", "parameters": {}}}],
+            "tool_choice": "any"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let requests = mock.received_requests().await.unwrap();
+    let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
+
+    // role normalised
+    assert_eq!(sent["messages"][0]["role"], "system");
+    // content part type normalised
+    assert_eq!(sent["messages"][1]["content"][0]["type"], "text");
+    // tool_choice normalised
+    assert_eq!(sent["tool_choice"], "required");
+    // empty tool_call id repaired and paired with its tool response
+    let call_id = sent["messages"][2]["tool_calls"][0]["id"].as_str().unwrap();
+    assert!(!call_id.is_empty());
+    assert_eq!(sent["messages"][3]["tool_call_id"], call_id);
+    // empty function name inherited from the single declared tool
+    assert_eq!(
+        sent["messages"][2]["tool_calls"][0]["function"]["name"],
+        "get_weather"
+    );
+    // arguments serialised to a JSON string
+    let args = sent["messages"][2]["tool_calls"][0]["function"]["arguments"]
+        .as_str()
+        .expect("arguments must be a string");
+    let parsed: Value = serde_json::from_str(args).unwrap();
+    assert_eq!(parsed["city"], "BJ");
+    // thinking-mode turn carries a reasoning_content
+    assert!(sent["messages"][2]["reasoning_content"].is_string());
+}
+
+#[tokio::test]
+async fn test_opencode_session_header_injected_from_affinity() {
+    let mock = MockServer::start().await;
+
+    // The client sent no session header of its own — the gateway injects the
+    // session-affinity id so the upstream can route/prompt-cache the request.
+    Mock::given(method("POST"))
+        .and(path("/zen/go/v1/chat/completions"))
+        .and(header("x-opencode-session", "affinity-42"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"id":"c1","object":"chat.completion","choices":[]})),
+        )
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let gw = TestGateway::start(OPENCODE_CHAT_CONFIG, &mock.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .header("x-session-affinity", "affinity-42")
+        .json(&chat_body("deepseek-v4.1-flash", "hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn test_opencode_session_header_never_overwritten() {
+    let mock = MockServer::start().await;
+
+    // A client-supplied session header (the opencode CLI sends one) is
+    // forwarded verbatim — the gateway must not replace it.
+    Mock::given(method("POST"))
+        .and(path("/zen/go/v1/chat/completions"))
+        .and(header("x-opencode-session", "client-session"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"id":"c1","object":"chat.completion","choices":[]})),
+        )
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let gw = TestGateway::start(OPENCODE_CHAT_CONFIG, &mock.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .header("x-opencode-session", "client-session")
+        .header("x-session-affinity", "affinity-42")
+        .json(&chat_body("deepseek-v4.1-flash", "hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn test_opencode_streaming_usage_is_recorded() {
+    let mock = MockServer::start().await;
+
+    // The opencode.ai chat stream reports usage in its final chunk.
+    let sse = concat!(
+        "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+        "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"finish_reason\":\"stop\",\"delta\":{}}],\"usage\":{\"prompt_tokens\":31,\"completion_tokens\":7,\"total_tokens\":38}}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/zen/go/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(sse, "text/event-stream"),
+        )
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let gw = TestGateway::start(OPENCODE_CHAT_CONFIG, &mock.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .header("x-opencode-session", "sess-1")
+        .json(&json!({
+            "model": "opencode-usage-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let text = resp.text().await.unwrap();
+    assert!(text.contains("data: [DONE]"), "{text}");
+
+    // The usage carried by the SSE stream must reach the ledger/metrics.
+    let metrics = c
+        .get(gw.url("/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let line = metrics
+        .lines()
+        .find(|l| l.starts_with("maxllm_tokens_in_total") && l.contains("opencode-usage-model"))
+        .unwrap_or_else(|| panic!("no tokens_in metric for the model:\n{metrics}"));
+    assert!(
+        line.trim_end().ends_with("31"),
+        "expected 31 input tokens, got: {line}"
+    );
+    let line = metrics
+        .lines()
+        .find(|l| l.starts_with("maxllm_tokens_out_total") && l.contains("opencode-usage-model"))
+        .unwrap_or_else(|| panic!("no tokens_out metric for the model:\n{metrics}"));
+    assert!(
+        line.trim_end().ends_with("7"),
+        "expected 7 output tokens, got: {line}"
     );
 }

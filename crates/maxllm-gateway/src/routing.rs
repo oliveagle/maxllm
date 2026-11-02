@@ -122,6 +122,8 @@ mod tests {
                 weight,
                 tags: vec![],
                 default_model: None,
+                native_responses: false,
+                responses_path: None,
             }),
             is_primary,
         }

@@ -102,6 +102,24 @@ pub struct ProviderConfig {
     pub region: Option<String>,
     /// Custom upstream path override.
     pub upstream_path: Option<String>,
+    /// Whether this provider speaks the Responses API natively. When true the
+    /// gateway forwards `/v1/responses` requests unchanged instead of
+    /// translating them into chat completions — fewer moving parts, and the
+    /// full Responses feature set (previous_response_id, encrypted reasoning)
+    /// survives the round trip. Defaults to true for `kind = "opencode"`,
+    /// false for every other kind.
+    #[serde(default)]
+    pub native_responses: Option<bool>,
+    /// Upstream path of the native Responses endpoint. Derived from
+    /// `upstream_path` (`…/chat/completions` → `…/responses`) when unset.
+    #[serde(default)]
+    pub responses_path: Option<String>,
+    /// Skip the `reasoning_content` placeholder injection for thinking-mode
+    /// tool-calling turns (echo collapse still runs). Set on opencode-kind
+    /// channels whose upstream does not require `reasoning_content` back, to
+    /// avoid feeding a fake reasoning marker into the model context.
+    #[serde(default)]
+    pub skip_reasoning_injection: Option<bool>,
     /// Weight for load balancing (higher = more traffic).
     #[serde(default = "default_weight")]
     pub weight: u32,
