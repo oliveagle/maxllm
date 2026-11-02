@@ -393,6 +393,31 @@ fn content_to_text(content: &Value) -> String {
     }
 }
 
+/// Extract the text of a stream `delta.content`, whether it is a plain
+/// string or an array of `{type, text}` parts.
+///
+/// Returns `None` when there is no text, so an empty delta does not open an
+/// output item.
+fn delta_content_text(content: &Value) -> Option<String> {
+    match content {
+        Value::String(text) if !text.is_empty() => Some(text.clone()),
+        Value::Array(parts) => {
+            let mut text = String::new();
+            for part in parts {
+                if let Some(chunk) = part.get("text").and_then(|t| t.as_str()) {
+                    text.push_str(chunk);
+                }
+            }
+            if text.is_empty() {
+                None
+            } else {
+                Some(text)
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Convert Responses message content into chat completions content.
 ///
 /// Text-only content stays a plain string — strict upstreams (e.g. Volcano
@@ -708,10 +733,13 @@ fn build_responses_object(chat: &Value, status: ResponseStatus) -> Value {
         }));
     }
 
+    // The content is a plain string on every upstream in this fleet, but
+    // some OpenAI-compatible upstreams answer with an array of parts; both
+    // shapes are flattened to text so the answer is never lost.
     let text = message
         .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_str())
-        .unwrap_or("");
+        .map(content_to_text)
+        .unwrap_or_default();
     let tool_calls = message
         .and_then(|m| m.get("tool_calls"))
         .and_then(|t| t.as_array())
@@ -1094,10 +1122,13 @@ impl ResponsesStreamTranslator {
             );
         }
 
-        // Assistant text.
+        // Assistant text. The delta content is a plain string on every
+        // upstream in this fleet, but some OpenAI-compatible upstreams stream
+        // it as an array of parts; both shapes are accepted so the answer is
+        // never lost.
         if let Some(text) = delta
             .and_then(|d| d.get("content"))
-            .and_then(|c| c.as_str())
+            .and_then(delta_content_text)
         {
             if !text.is_empty() {
                 if !self.text_open {
@@ -1134,7 +1165,7 @@ impl ResponsesStreamTranslator {
                         }),
                     );
                 }
-                self.text.push_str(text);
+                self.text.push_str(&text);
                 emit_event(
                     out,
                     "response.output_text.delta",
@@ -1413,7 +1444,7 @@ impl StreamTranslator for ResponsesStreamTranslator {
         // stream stays buffered and the client gets an empty completed
         // response. Normalize the whole buffer so a \r left at the edge of
         // a chunk still joins its \n from the next chunk.
-        let mut raw = std::mem::take(&mut self.buffer);
+        let raw = std::mem::take(&mut self.buffer);
         let mut normalized = Vec::with_capacity(raw.len());
         let mut i = 0;
         while i < raw.len() {
@@ -1779,6 +1810,41 @@ mod tests {
             crate::opencode::REASONING_PLACEHOLDER
         );
         assert_eq!(msgs[3]["role"], "tool");
+    }
+
+    #[test]
+    fn test_chat_response_with_array_content() {
+        // Some OpenAI-compatible upstreams answer with the content as an
+        // array of parts instead of a plain string; the answer must not be
+        // lost.
+        let chat = br#"{
+            "id":"chatcmpl-1","object":"chat.completion","created":1700000000,
+            "model":"gpt-4o","choices":[{"index":0,"finish_reason":"stop",
+                "message":{"role":"assistant","content":[{"type":"text","text":"pong"}]}}],
+            "usage":{"prompt_tokens":5,"completion_tokens":7,"total_tokens":12}
+        }"#;
+        let out = chat_response_to_responses(chat).unwrap();
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        let output = v["output"].as_array().unwrap();
+        assert_eq!(output[0]["type"], "message");
+        assert_eq!(output[0]["content"][0]["text"], "pong");
+    }
+
+    #[test]
+    fn test_stream_delta_with_array_content() {
+        // The same array shape on the stream side: the text must reach the
+        // client as an output_text delta.
+        let chunks = [
+            r#"{"id":"chatcmpl-a","object":"chat.completion.chunk","created":1700000000,"model":"deepseek-flash","choices":[{"index":0,"delta":{"role":"assistant","content":[{"type":"text","text":"po"}]},"finish_reason":null}]}"#,
+            r#"{"id":"chatcmpl-a","object":"chat.completion.chunk","created":1700000000,"model":"deepseek-flash","choices":[{"index":0,"finish_reason":"stop"}]}"#,
+        ];
+        let sse = chat_sse(&chunks);
+        let mut t = ResponsesStreamTranslator::new(Box::new(crate::NativePassthroughStream));
+        let out = t.process_chunk(sse.as_bytes(), true);
+        let text = String::from_utf8_lossy(&out).to_string();
+        assert!(text.contains("event: response.output_text.delta"), "{text}");
+        assert!(text.contains(r#""delta":"po""#), "{text}");
+        assert!(text.contains(r#""text":"po""#), "{text}");
     }
 
     #[test]
