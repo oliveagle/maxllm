@@ -136,8 +136,13 @@ const OPENCODE_UPSTREAM_UA: &str = "curl/8.5.0";
 /// Python's urllib) is blocked; curl, browsers and every other HTTP-client /
 /// SDK UA tested (OpenAI/Python, node-fetch, axios, python-requests, ...)
 /// are accepted, so they are never rewritten here.
+///
+/// The marker is `python-urllib/` — the real urllib UA always carries a
+/// version after the slash (`Python-urllib/3.11`). The urllib3 *package*
+/// sends `python-urllib3/2.0`, which is a different, allowed fingerprint and
+/// must not be clobbered.
 fn is_script_like_user_agent(ua_lower: &str) -> bool {
-    const BANNED_UA_MARKERS: [&str; 1] = ["python-urllib"];
+    const BANNED_UA_MARKERS: [&str; 1] = ["python-urllib/"];
     BANNED_UA_MARKERS.iter().any(|m| ua_lower.contains(m))
 }
 

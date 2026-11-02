@@ -2105,6 +2105,38 @@ async fn test_opencode_upstream_script_ua_replaced() {
 }
 
 #[tokio::test]
+async fn test_opencode_upstream_urllib3_ua_preserved() {
+    let mock = MockServer::start().await;
+
+    // `python-urllib3/2.0` is the urllib3 *package*, a different fingerprint
+    // from Python's `Python-urllib/3.11` — the upstream accepts it (verified
+    // live), so the gateway must forward it verbatim instead of masking it.
+    Mock::given(method("POST"))
+        .and(path("/zen/go/v1/chat/completions"))
+        .and(header("User-Agent", "python-urllib3/2.0"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"id":"c1","object":"chat.completion","choices":[]})),
+        )
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let gw = TestGateway::start(OPENCODE_CHAT_CONFIG, &mock.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .header("User-Agent", "python-urllib3/2.0")
+        .json(&chat_body("deepseek-v4.1-flash", "hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
 async fn test_opencode_upstream_client_ua_preserved() {
     let mock = MockServer::start().await;
 
