@@ -646,6 +646,25 @@ impl AiGateway {
     }
 }
 
+/// Buffer one `request_body_filter` chunk, keeping the upstream body open
+/// until the whole body has been read.
+///
+/// pingora treats a `None` body returned from `request_body_filter` as the
+/// END of the upstream body (`upstream_end_of_body = end_of_body || data.is_none()`),
+/// so a body that arrives in several 64 KiB chunks would otherwise be
+/// truncated to the first chunk — the upstream then receives an empty body
+/// and rejects the call (400 Bad Request). Returning an EMPTY but present
+/// buffer for a non-final chunk keeps the body open while sending nothing;
+/// the accumulated bytes are forwarded as one piece at `end_of_stream`.
+fn buffer_request_body_chunk(ctx: &mut RequestCtx, body: &mut Option<Bytes>, end_of_stream: bool) {
+    if let Some(data) = body.take() {
+        ctx.request_body_buf.extend_from_slice(&data);
+        if !end_of_stream {
+            *body = Some(Bytes::new());
+        }
+    }
+}
+
 #[async_trait]
 impl ProxyHttp for AiGateway {
     type CTX = RequestCtx;
@@ -1160,9 +1179,7 @@ impl ProxyHttp for AiGateway {
 
             if compaction_enabled {
                 // Take the body into our buffer so we can mutate it.
-                if let Some(data) = body.take() {
-                    ctx.request_body_buf.extend_from_slice(&data);
-                }
+                buffer_request_body_chunk(ctx, body, end_of_stream);
                 if end_of_stream && !ctx.body_translated {
                     // Fall through to the normal compaction + translation path.
                     // Clear keep_request_content_length so the normal path runs.
@@ -1179,9 +1196,7 @@ impl ProxyHttp for AiGateway {
                 // The original Content-Length is preserved by padding with
                 // spaces (JSON parsers ignore trailing whitespace), matching
                 // the auto-compaction framing.
-                if let Some(data) = body.take() {
-                    ctx.request_body_buf.extend_from_slice(&data);
-                }
+                buffer_request_body_chunk(ctx, body, end_of_stream);
                 if end_of_stream && !ctx.body_translated {
                     ctx.body_translated = true;
                     let hot = self.hot.load();
@@ -1290,9 +1305,7 @@ impl ProxyHttp for AiGateway {
 
         // ── EMBEDDINGS: forward as-is for OpenAI-compatible, extract model ──
         if ctx.endpoint_type == EndpointType::Embeddings {
-            if let Some(data) = body.take() {
-                ctx.request_body_buf.extend_from_slice(&data);
-            }
+            buffer_request_body_chunk(ctx, body, end_of_stream);
             if end_of_stream && !ctx.body_translated {
                 ctx.body_translated = true;
                 let hot = self.hot.load();
@@ -1311,9 +1324,7 @@ impl ProxyHttp for AiGateway {
         }
 
         // Buffer incoming body chunks (both normal and native modes)
-        if let Some(data) = body.take() {
-            ctx.request_body_buf.extend_from_slice(&data);
-        }
+        buffer_request_body_chunk(ctx, body, end_of_stream);
 
         if end_of_stream && !ctx.body_translated {
             ctx.body_translated = true;

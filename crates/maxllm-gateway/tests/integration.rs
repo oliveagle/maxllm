@@ -2794,3 +2794,53 @@ strategy = "fallback"
         .unwrap();
     assert_eq!(resp.status(), 502);
 }
+
+#[tokio::test]
+async fn test_opencode_large_request_body_reaches_upstream_intact() {
+    let mock = MockServer::start().await;
+
+    // pingora reads the downstream request body in 64 KiB chunks, so a body
+    // larger than that arrives at the gateway in several `request_body_filter`
+    // calls. Every byte must still reach the upstream: a real opencode-cli
+    // first turn carries a ~100 KiB system prompt + tool catalog, and when the
+    // gateway dropped the body the upstream answered a bare HTTP 400.
+    let padding = "context-padding-".repeat(12 * 1024); // ~100 KiB
+    let body = json!({
+        "model": "deepseek-v4.1-flash",
+        "messages": [
+            {"role": "system", "content": padding},
+            {"role": "user", "content": "Reply with exactly: pong"},
+        ],
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/zen/go/v1/chat/completions"))
+        .respond_with(move |req: &wiremock::Request| {
+            // The upstream must have received the complete JSON body.
+            let recv: Value =
+                serde_json::from_slice(&req.body).expect("upstream body is valid JSON");
+            let content = recv["messages"][0]["content"].as_str().unwrap_or_default();
+            assert!(
+                content == padding,
+                "upstream received a truncated body: {} bytes of {} expected",
+                content.len(),
+                padding.len()
+            );
+            ResponseTemplate::new(200).set_body_json(openai_response("pong"))
+        })
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let gw = TestGateway::start(OPENCODE_CHAT_CONFIG, &mock.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+}
