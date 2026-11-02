@@ -246,6 +246,41 @@ strategy = "fallback"
 endpoint_type = "responses"
 "#;
 
+const CHAT_TO_NATIVE_FALLBACK_CONFIG: &str = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[metrics]
+enabled = true
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.unreachable_chat]
+kind = "openai"
+base_url = "http://127.0.0.1:1"
+api_key = "fake-key"
+
+[providers.native_opencode]
+kind = "opencode"
+base_url = "{FALLBACK_URL}"
+upstream_path = "/zen/go/v1/chat/completions"
+api_key = "fake-key"
+
+[[routes]]
+path = "/v1/responses"
+provider = "unreachable_chat"
+fallback = ["native_opencode"]
+strategy = "fallback"
+endpoint_type = "responses"
+"#;
+
 const UNRESOLVABLE_HOST_CONFIG: &str = r#"
 global_plugins = ["api_auth"]
 
@@ -2615,6 +2650,78 @@ async fn test_native_responses_fallback_to_non_native_provider_translates_body()
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["object"], "response");
     assert_eq!(body["output"][0]["content"][0]["text"], "from fallback");
+}
+
+#[tokio::test]
+async fn test_chat_fallback_to_native_provider_forwards_the_responses_body() {
+    // Reverse of the native→chat fallback: the primary is a chat-only
+    // provider that is unreachable, so the request is retried on a native
+    // Responses provider (opencode). The retry must NOT carry the chat body
+    // the first attempt translated: the native fallback expects the original
+    // Responses body (with `input`), and it must come back verbatim.
+    let fallback = MockServer::start().await;
+    let upstream_body = json!({
+        "id": "resp_native_fallback",
+        "object": "response",
+        "status": "completed",
+        "model": "deepseek-v4.1-flash",
+        "output": [{
+            "id": "msg_1", "type": "message", "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "from native fallback"}]
+        }],
+        "usage": {"input_tokens": 7, "output_tokens": 3, "total_tokens": 10}
+    });
+    Mock::given(method("POST"))
+        .and(path("/zen/go/v1/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(upstream_body.clone()))
+        .expect(1)
+        .mount(&fallback)
+        .await;
+
+    let gw =
+        TestGateway::start_with_fallback(CHAT_TO_NATIVE_FALLBACK_CONFIG, "", &fallback.uri()).await;
+    let c = client();
+
+    let request_body = json!({
+        "model": "deepseek-v4.1-flash",
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+        "stream": false
+    });
+    let resp = c
+        .post(gw.url("/v1/responses"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&request_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["id"], "resp_native_fallback");
+    assert_eq!(
+        body["output"][0]["content"][0]["text"],
+        "from native fallback"
+    );
+
+    let received = fallback.received_requests().await.unwrap_or_default();
+    assert_eq!(
+        received.len(),
+        1,
+        "native fallback must receive exactly one retry"
+    );
+    let sent: Value = serde_json::from_slice(&received[0].body).unwrap();
+    assert!(
+        sent.get("input").is_some(),
+        "the native fallback must receive the original Responses body, got: {sent}"
+    );
+    assert!(
+        sent.get("messages").is_none(),
+        "the chat-translated body must not reach a native Responses upstream: {sent}"
+    );
+    // Byte-for-byte: the retry forwards the untouched Responses body.
+    let original_bytes = serde_json::to_vec(&request_body).unwrap();
+    assert_eq!(received[0].body, original_bytes);
 }
 
 #[tokio::test]
