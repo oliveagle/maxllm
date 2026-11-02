@@ -1232,6 +1232,11 @@ impl ResponsesStreamTranslator {
                         // The reasoning item (if any) is closed before the
                         // first call opens, so the call gets the next index.
                         self.close_reasoning(out);
+                        // A turn that produced text before the tool call
+                        // closes its message item first: the Responses
+                        // contract opens and closes output items one after
+                        // another, never interleaved.
+                        self.close_message(out);
                         let output_index = self.next_output_index;
                         self.next_output_index += 1;
                         let state = ToolCallState {
@@ -1361,50 +1366,7 @@ impl ResponsesStreamTranslator {
 
         // A stream must not end with an open output item.
         self.close_reasoning(out);
-
-        if self.text_open {
-            emit_event(
-                out,
-                "response.output_text.done",
-                json!({
-                    "type": "response.output_text.done",
-                    "item_id": self.message_item_id,
-                    "output_index": self.message_output_index,
-                    "content_index": 0,
-                    "text": self.text
-                }),
-            );
-            emit_event(
-                out,
-                "response.content_part.done",
-                json!({
-                    "type": "response.content_part.done",
-                    "item_id": self.message_item_id,
-                    "output_index": self.message_output_index,
-                    "content_index": 0,
-                    "part": { "type": "output_text", "text": self.text, "annotations": [] }
-                }),
-            );
-            emit_event(
-                out,
-                "response.output_item.done",
-                json!({
-                    "type": "response.output_item.done",
-                    "output_index": self.message_output_index,
-                    "item": {
-                        "type": "message",
-                        "id": self.message_item_id,
-                        "status": "completed",
-                        "role": "assistant",
-                        "content": [{
-                            "type": "output_text",
-                            "text": self.text,
-                            "annotations": []
-                        }]
-                    }
-                }),
-            );
-        }
+        self.close_message(out);
 
         let calls: Vec<ToolCallState> = self
             .tool_calls
@@ -1463,6 +1425,61 @@ impl ResponsesStreamTranslator {
 }
 
 impl ResponsesStreamTranslator {
+    /// Close the open assistant message item, emitting its done events.
+    ///
+    /// The Responses stream contract opens and closes output items one after
+    /// another: a client that keys items by `output_index` (and opencode's own
+    /// parser) expects the message item to be *done* before the next item
+    /// opens. A turn that produces text and then a tool call therefore closes
+    /// the message first.
+    fn close_message(&mut self, out: &mut Vec<u8>) {
+        if !self.text_open {
+            return;
+        }
+        self.text_open = false;
+        emit_event(
+            out,
+            "response.output_text.done",
+            json!({
+                "type": "response.output_text.done",
+                "item_id": self.message_item_id,
+                "output_index": self.message_output_index,
+                "content_index": 0,
+                "text": self.text
+            }),
+        );
+        emit_event(
+            out,
+            "response.content_part.done",
+            json!({
+                "type": "response.content_part.done",
+                "item_id": self.message_item_id,
+                "output_index": self.message_output_index,
+                "content_index": 0,
+                "part": { "type": "output_text", "text": self.text, "annotations": [] }
+            }),
+        );
+        emit_event(
+            out,
+            "response.output_item.done",
+            json!({
+                "type": "response.output_item.done",
+                "output_index": self.message_output_index,
+                "item": {
+                    "type": "message",
+                    "id": self.message_item_id,
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": self.text,
+                        "annotations": []
+                    }]
+                }
+            }),
+        );
+    }
+
     /// Close the open reasoning item, emitting its summary done events. The
     /// Responses stream contract forbids opening a new output item while the
     /// reasoning item is still open.
@@ -2642,6 +2659,54 @@ mod tests {
     fn test_invalid_json_passthrough() {
         let out = normalize_responses_request(b"not json");
         assert_eq!(out, b"not json");
+    }
+
+    #[test]
+    fn test_text_then_tool_call_closes_the_message_first() {
+        // A turn that produces text and then a tool call must close the
+        // message item before the function_call item opens — the Responses
+        // contract opens and closes output items one after another, never
+        // interleaved.
+        let chunks = [
+            r#"{"id":"c","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"content":"I'll check the weather"},"finish_reason":null}]}"#,
+            r#"{"id":"c","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Rome\"}"}}]},"finish_reason":null}]}"#,
+            r#"{"id":"c","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ];
+        let sse = chat_sse(&chunks);
+        let mut t = ResponsesStreamTranslator::new(Box::new(crate::NativePassthroughStream));
+        let out = t.process_chunk(sse.as_bytes(), true);
+        let s = String::from_utf8(out).unwrap();
+
+        // Every output_item.added of a message is followed by its done before
+        // the next item opens.
+        let mut events = Vec::new();
+        let mut last_added = None;
+        for line in s.lines() {
+            if let Some(ev) = line.strip_prefix("event: ") {
+                if ev.contains("output_item.added") {
+                    last_added = Some(ev.to_string());
+                } else if ev.contains("output_item.done") {
+                    if let Some(added) = last_added.take() {
+                        events.push((added, ev.to_string()));
+                    }
+                }
+            }
+        }
+        assert_eq!(events.len(), 2, "two items opened and closed: {events:?}");
+        assert!(events[0].0.contains("output_item.added"));
+        assert!(events[0].1.contains("output_item.done"));
+        assert!(events[1].0.contains("output_item.added"));
+        assert!(events[1].1.contains("output_item.done"));
+        // The message done precedes the function_call added.
+        let msg_done = s.find("event: response.output_item.done").unwrap();
+        let fc_added = s.rfind("event: response.output_item.added").unwrap();
+        assert!(
+            msg_done < fc_added,
+            "message done must precede call added: {s}"
+        );
+        assert!(s.contains("response.output_text.done"));
+        assert!(s.contains("I'll check the weather"));
+        assert!(s.contains("get_weather"));
     }
 
     #[test]
