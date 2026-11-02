@@ -296,6 +296,81 @@ fn responses_tools_to_chat(tools: &Value) -> Value {
 }
 
 // ---------------------------------------------------------------------------
+// Request normalisation for native Responses upstreams
+// ---------------------------------------------------------------------------
+
+/// Normalise a Responses request body for strict upstreams that serve the
+/// Responses contract natively (the opencode.ai "zen" `/zen/go/v1/responses`
+/// endpoint).
+///
+/// The endpoint accepts the official Responses tool shape
+/// (`{"type":"function","name":…,"parameters":…}`) but rejects the
+/// chat-completions nesting (`{"type":"function","function":{…}}`) with a 503
+/// — verified live. Third-party clients that convert a chat request into a
+/// Responses one (or echo Responses items built from a chat session) can send
+/// the nested shape, so it is flattened back to the official form before the
+/// byte-for-byte native passthrough forwards it.
+///
+/// Only `tools[]` entries and `tool_choice` carrying a nested `function`
+/// object are rewritten. Everything else — including the standard flat shape —
+/// is left untouched, and a body with nothing to rewrite is returned
+/// unchanged so the native passthrough stays byte-for-byte.
+pub fn normalize_responses_request(body: &[u8]) -> Vec<u8> {
+    let Ok(mut root) = serde_json::from_slice::<Value>(body) else {
+        return body.to_vec();
+    };
+    let Some(obj) = root.as_object_mut() else {
+        return body.to_vec();
+    };
+    let mut changed = false;
+
+    if let Some(tools) = obj.get_mut("tools").and_then(|t| t.as_array_mut()) {
+        for tool in tools.iter_mut() {
+            if let Some(flattened) = flatten_nested_function(tool) {
+                *tool = flattened;
+                changed = true;
+            }
+        }
+    }
+    if let Some(choice) = obj.get_mut("tool_choice") {
+        if let Some(flattened) = flatten_nested_function(choice) {
+            *choice = flattened;
+            changed = true;
+        }
+    }
+
+    if changed {
+        serde_json::to_vec(&root).unwrap_or_else(|_| body.to_vec())
+    } else {
+        body.to_vec()
+    }
+}
+
+/// Flatten a chat-style nested-function tool (`{"type":"function","function":
+/// {"name":…,…}}`) into the official Responses shape (`{"type":"function",
+/// "name":…,…}`). Returns `None` when the value is not a nested-function tool.
+fn flatten_nested_function(value: &Value) -> Option<Value> {
+    let tool = value.as_object()?;
+    if tool.get("type").and_then(|t| t.as_str()) != Some("function") {
+        return None;
+    }
+    let Some(inner) = tool.get("function").and_then(|f| f.as_object()) else {
+        return None;
+    };
+    // The inner function object already carries the official flat fields
+    // (name / description / parameters / strict); re-add the type marker.
+    let mut flat = inner.clone();
+    flat.insert("type".into(), Value::String("function".into()));
+    // Preserve any extra top-level fields (e.g. a top-level "strict").
+    for (k, v) in tool {
+        if k != "function" {
+            flat.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+    }
+    Some(Value::Object(flat))
+}
+
+// ---------------------------------------------------------------------------
 // Response: chat completions → Responses
 // ---------------------------------------------------------------------------
 
@@ -1697,6 +1772,76 @@ mod tests {
         let pos_completed = s.find("event: response.completed").unwrap();
         assert!(pos_done < pos_completed);
         assert!(s.contains("event: response.output_item.done"));
+    }
+
+    #[test]
+    fn test_nested_function_tools_are_flattened() {
+        let body = json!({
+            "model": "m",
+            "input": "hi",
+            "tools": [
+                {"type": "function", "function": {"name": "get_weather", "description": "d", "parameters": {"type": "object"}, "strict": true}}
+            ]
+        });
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let out = normalize_responses_request(&bytes);
+        let parsed: Value = serde_json::from_slice(&out).unwrap();
+        let tool = &parsed["tools"][0];
+        assert_eq!(tool["type"], "function");
+        assert_eq!(tool["name"], "get_weather");
+        assert_eq!(tool["description"], "d");
+        assert_eq!(tool["parameters"]["type"], "object");
+        assert_eq!(tool["strict"], true);
+        assert!(
+            tool.get("function").is_none(),
+            "nested wrapper must be removed"
+        );
+    }
+
+    #[test]
+    fn test_nested_tool_choice_is_flattened() {
+        let body = json!({
+            "model": "m",
+            "input": "hi",
+            "tool_choice": {"type": "function", "function": {"name": "get_weather"}}
+        });
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let out = normalize_responses_request(&bytes);
+        let parsed: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(parsed["tool_choice"]["type"], "function");
+        assert_eq!(parsed["tool_choice"]["name"], "get_weather");
+        assert!(parsed["tool_choice"].get("function").is_none());
+    }
+
+    #[test]
+    fn test_flat_tools_are_untouched_byte_for_byte() {
+        let body = json!({
+            "model": "m",
+            "input": "hi",
+            "tools": [{"type": "function", "name": "get_weather", "description": "d", "parameters": {"type": "object"}}]
+        });
+        let bytes = serde_json::to_vec(&body).unwrap();
+        assert_eq!(normalize_responses_request(&bytes), bytes);
+    }
+
+    #[test]
+    fn test_non_function_tool_types_are_untouched() {
+        let body = json!({
+            "model": "m",
+            "input": "hi",
+            "tools": [
+                {"type": "web_search", "max_results": 3},
+                {"type": "custom", "name": "c"}
+            ]
+        });
+        let bytes = serde_json::to_vec(&body).unwrap();
+        assert_eq!(normalize_responses_request(&bytes), bytes);
+    }
+
+    #[test]
+    fn test_invalid_json_passthrough() {
+        let out = normalize_responses_request(b"not json");
+        assert_eq!(out, b"not json");
     }
 
     #[test]

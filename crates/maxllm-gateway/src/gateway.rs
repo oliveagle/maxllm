@@ -965,7 +965,19 @@ impl ProxyHttp for AiGateway {
             if is_body_passthrough && !compaction_enabled {
                 // Mark as body-passthrough so request_body_filter lets chunks flow
                 ctx.keep_request_content_length = true;
-                // Keep original Content-Length header (don't remove, don't set chunked)
+                // Keep original Content-Length header (don't remove, don't set chunked).
+                // A native Responses body may be normalised (nested function
+                // tools -> flat) in request_body_filter; remember the original
+                // Content-Length so the rewritten body can be padded to match.
+                if ctx.native_responses {
+                    if let Some(cl) = upstream_request.headers.get("Content-Length") {
+                        if let Ok(cl_str) = cl.to_str() {
+                            ctx.plugin_ctx
+                                .extensions
+                                .insert("original_content_length".into(), cl_str.to_string());
+                        }
+                    }
+                }
             } else if is_body_passthrough && compaction_enabled {
                 // Compaction will modify the body but OpenAI/Cloudflare rejects
                 // Transfer-Encoding: chunked. Strategy: keep the ORIGINAL
@@ -1045,6 +1057,71 @@ impl ProxyHttp for AiGateway {
                 } else {
                     return Ok(());
                 }
+            } else if ctx.native_responses {
+                // NATIVE RESPONSES: buffer the body so a request carrying
+                // chat-style nested function tools can be normalised to the
+                // official Responses shape before the byte-for-byte forward.
+                // The original Content-Length is preserved by padding with
+                // spaces (JSON parsers ignore trailing whitespace), matching
+                // the auto-compaction framing.
+                if let Some(data) = body.take() {
+                    ctx.request_body_buf.extend_from_slice(&data);
+                }
+                if end_of_stream && !ctx.body_translated {
+                    ctx.body_translated = true;
+                    let hot = self.hot.load();
+                    if let Ok(parsed) =
+                        serde_json::from_slice::<serde_json::Value>(&ctx.request_body_buf)
+                    {
+                        if let Some(model) = parsed.get("model").and_then(|m| m.as_str()) {
+                            let resolved = Self::resolve_model_alias(&hot, model);
+                            ctx.model = resolved.clone();
+                            ctx.plugin_ctx.model = resolved;
+                        }
+                        if let Some(stream) = parsed.get("stream").and_then(|v| v.as_bool()) {
+                            ctx.is_streaming = stream;
+                            if stream {
+                                let provider = hot.providers.get(&ctx.provider_name);
+                                if let Some(p) = provider {
+                                    match ctx.stream_translator.lock() {
+                                        Ok(mut guard) => {
+                                            if ctx.native_responses {
+                                                // The upstream stream already
+                                                // speaks the Responses
+                                                // contract — copy it verbatim.
+                                                *guard = Some(Box::new(
+                                                    maxllm_translate::NativePassthroughStream,
+                                                ));
+                                            } else {
+                                                *guard = Some(p.translator.streaming_translator());
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!("stream_translator mutex poisoned: {e}");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let normalized = maxllm_translate::responses::normalize_responses_request(
+                        &ctx.request_body_buf,
+                    );
+                    let mut out = normalized;
+                    if let Some(original_cl) = ctx
+                        .plugin_ctx
+                        .extensions
+                        .get("original_content_length")
+                        .and_then(|s| s.parse::<usize>().ok())
+                    {
+                        if out.len() < original_cl {
+                            out.extend(std::iter::repeat_n(b' ', original_cl - out.len()));
+                        }
+                    }
+                    *body = Some(Bytes::from(out));
+                    ctx.request_body_buf = Vec::new();
+                }
+                return Ok(());
             } else {
                 // Buffer a copy for metadata extraction, but DON'T take the body —
                 // let it flow through to upstream unchanged.
@@ -2274,13 +2351,21 @@ impl ProxyHttp for AiGateway {
 
         let hot = self.hot.load();
 
-        // Calculate cost (skip when no tokens to avoid unnecessary lookups)
-        let cost = if ctx.tokens_in > 0 || ctx.tokens_out > 0 {
+        // Calculate cost (skip when no tokens to avoid unnecessary lookups).
+        // When the price table has no entry for the model, fall back to the
+        // cost the upstream itself reported (e.g. opencode.ai's
+        // `usage.opencode.allowance`) instead of recording 0.
+        let mut cost = if ctx.tokens_in > 0 || ctx.tokens_out > 0 {
             hot.cost_calculator
                 .calculate_cost(&ctx.model, ctx.tokens_in, ctx.tokens_out)
         } else {
             0.0
         };
+        if cost == 0.0 {
+            if let Some(upstream) = ctx.upstream_cost_usd {
+                cost = upstream;
+            }
+        }
         ctx.cost_usd = cost;
 
         // Run plugin logging chains
@@ -2629,8 +2714,30 @@ fn parse_usage_line(line: &[u8], ctx: &mut RequestCtx) {
             if let Some(ot) = u.get("output_tokens").and_then(|v| v.as_u64()) {
                 ctx.tokens_out = ot;
             }
+            if ctx.upstream_cost_usd.is_none() {
+                ctx.upstream_cost_usd = extract_usage_cost(u);
+            }
         }
     }
+}
+
+/// Extract the upstream-reported cost, if any, from a usage block.
+/// opencode.ai's zen endpoint reports the actual charge in
+/// `usage.opencode.allowance` (falling back to `list_cost`, then `cost`).
+fn extract_usage_cost(usage: &serde_json::Value) -> Option<f64> {
+    if let Some(opencode) = usage.get("opencode") {
+        for key in ["allowance", "list_cost"] {
+            if let Some(v) = opencode.get(key).and_then(|v| v.as_f64()) {
+                if v > 0.0 {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    usage
+        .get("cost")
+        .and_then(|v| v.as_f64())
+        .filter(|&c| c > 0.0)
 }
 
 /// Extract token usage from a response body.
@@ -2649,6 +2756,9 @@ fn extract_usage(body: &serde_json::Value, ctx: &mut RequestCtx) {
         }
         if let Some(ot) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
             ctx.tokens_out = ot;
+        }
+        if ctx.upstream_cost_usd.is_none() {
+            ctx.upstream_cost_usd = extract_usage_cost(usage);
         }
     }
 
@@ -2739,6 +2849,38 @@ mod stream_usage_tests {
         let chunk = b"data: {not json}\n\ndata: [DONE]\n\n";
         extract_stream_usage(chunk, &mut c, true);
         assert_eq!(c.tokens_in, 0);
+    }
+
+    #[test]
+    fn test_extract_usage_cost_prefers_allowance() {
+        let u = serde_json::json!({"prompt_tokens":1,"output_tokens":1,"cost":0,
+            "opencode":{"allowance":0.00000747,"list_cost":0.00001245}});
+        assert_eq!(extract_usage_cost(&u), Some(0.00000747));
+    }
+
+    #[test]
+    fn test_extract_usage_cost_falls_back_to_list_cost() {
+        let u = serde_json::json!({"prompt_tokens":1,"output_tokens":1,
+            "opencode":{"allowance":0,"list_cost":0.00001245}});
+        assert_eq!(extract_usage_cost(&u), Some(0.00001245));
+    }
+
+    #[test]
+    fn test_extract_usage_cost_ignores_zero() {
+        let u = serde_json::json!({"prompt_tokens":1,"output_tokens":1,"cost":0,
+            "opencode":{"allowance":0,"list_cost":0}});
+        assert_eq!(extract_usage_cost(&u), None);
+    }
+
+    #[test]
+    fn test_extract_usage_records_upstream_cost() {
+        let mut c = ctx();
+        let body = serde_json::json!({"model":"m","usage":{"prompt_tokens":1,"output_tokens":1,
+            "opencode":{"allowance":0.00000747,"list_cost":0.00001245}}});
+        extract_usage(&body, &mut c);
+        assert_eq!(c.tokens_in, 1);
+        assert_eq!(c.tokens_out, 1);
+        assert_eq!(c.upstream_cost_usd, Some(0.00000747));
     }
 
     #[test]

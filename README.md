@@ -323,9 +323,14 @@ complete, idempotent request-conversion pass before forwarding:
   placeholder.
 * **Responses API** — `/zen/go/v1/responses` serves the Responses contract
   natively, so `kind = "opencode"` defaults to `native_responses = true` and
-  `/v1/responses` requests are forwarded byte-for-byte.
+  `/v1/responses` requests are forwarded byte-for-byte. A request carrying
+  chat-style nested function tools (`{"type":"function","function":{…}}`) is
+  flattened to the official Responses shape, which the upstream rejects
+  otherwise.
 * **Streaming usage** — token usage is extracted from chat and Responses SSE
-  streams for the ledger/metrics.
+  streams for the ledger/metrics, and the cost the upstream reports
+  (`usage.opencode.allowance`) is recorded when the model has no price-table
+  entry.
 
 ```toml
 [providers.opencode]

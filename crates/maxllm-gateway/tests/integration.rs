@@ -1562,6 +1562,75 @@ async fn test_native_responses_passthrough_non_streaming() {
     assert_eq!(sent["input"][0]["content"][0]["text"], "hi");
     assert_eq!(sent["previous_response_id"], "resp_prev");
     assert!(sent.get("messages").is_none());
+
+    // Byte-for-byte passthrough: an already-canonical Responses request is
+    // forwarded without any re-serialisation.
+    let original_bytes = serde_json::to_vec(&request_body).unwrap();
+    assert_eq!(requests[0].body, original_bytes);
+}
+
+#[tokio::test]
+async fn test_native_responses_flattens_nested_function_tools() {
+    let mock = MockServer::start().await;
+
+    // The opencode.ai zen /responses endpoint accepts the official Responses
+    // tool shape but rejects the chat-completions nesting with a 503 (verified
+    // live). The gateway must flatten it before the byte-for-byte forward.
+    let upstream_body = json!({
+        "id": "resp_nested",
+        "object": "response",
+        "status": "completed",
+        "model": "deepseek-v4.1-flash",
+        "output": [],
+        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/zen/go/v1/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(upstream_body.clone()))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let gw = TestGateway::start(NATIVE_RESPONSES_CONFIG, &mock.uri()).await;
+    let c = client();
+
+    let request_body = json!({
+        "model": "deepseek-v4.1-flash",
+        "input": "hi",
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "weather",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        }],
+        "tool_choice": {"type": "function", "function": {"name": "get_weather"}}
+    });
+
+    let resp = c
+        .post(gw.url("/v1/responses"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&request_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // The upstream must have received the official flat tool shape.
+    let requests = mock.received_requests().await.unwrap();
+    let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let tool = &sent["tools"][0];
+    assert_eq!(tool["type"], "function");
+    assert_eq!(tool["name"], "get_weather");
+    assert_eq!(tool["parameters"]["type"], "object");
+    assert!(
+        tool.get("function").is_none(),
+        "nested wrapper must be removed"
+    );
+    assert_eq!(sent["tool_choice"]["name"], "get_weather");
+    assert!(sent["tool_choice"].get("function").is_none());
 }
 
 #[tokio::test]

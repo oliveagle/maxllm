@@ -43,6 +43,9 @@ pub struct RequestCtx {
     pub original_provider: Option<String>,
     /// Per-request cost in USD.
     pub cost_usd: f64,
+    /// Cost reported by the upstream itself (e.g. opencode.ai's
+    /// `usage.opencode.allowance`), used when the price table has no entry.
+    pub upstream_cost_usd: Option<f64>,
     /// When the request was sent to upstream (set at end of upstream_request_filter).
     pub upstream_send_time: Option<Instant>,
     /// Skip the logging hook (health/metrics endpoints).
@@ -92,6 +95,7 @@ impl RequestCtx {
             fallback_used: false,
             original_provider: None,
             cost_usd: 0.0,
+            upstream_cost_usd: None,
             upstream_send_time: None,
             skip_logging: false,
             plugin_ctx: PluginCtx::new(),
