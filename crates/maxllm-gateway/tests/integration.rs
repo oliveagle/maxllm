@@ -2013,6 +2013,36 @@ async fn test_opencode_empty_affinity_falls_through_to_session_id() {
 }
 
 #[tokio::test]
+async fn test_opencode_models_list_only_advertises_served_models() {
+    // The opencode well-known model list is verified against the live
+    // `/zen/go/v1` endpoint; `kimi-k2.5` was dropped upstream (400 "Model is
+    // unavailable") and must not be advertised. Regression guard so a stale
+    // id cannot sneak back into /v1/models.
+    let mock = MockServer::start().await;
+    let gw = TestGateway::start(OPENCODE_CHAT_CONFIG, &mock.uri()).await;
+    let c = client();
+
+    let resp = c.get(gw.url("/v1/models")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    let ids: Vec<&str> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["id"].as_str())
+        .collect();
+    assert!(
+        !ids.contains(&"kimi-k2.5"),
+        "stale unavailable model advertised"
+    );
+    assert!(
+        ids.contains(&"kimi-k2.7-code"),
+        "served replacement missing"
+    );
+    assert!(ids.contains(&"deepseek-v4.1-flash"));
+}
+
+#[tokio::test]
 async fn test_opencode_upstream_ua_injected_when_missing() {
     let mock = MockServer::start().await;
 

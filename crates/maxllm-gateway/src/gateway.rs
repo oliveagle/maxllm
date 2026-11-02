@@ -89,7 +89,17 @@ fn well_known_models(kind: ProviderKind) -> &'static [&'static str] {
         ProviderKind::Ollama => &["llama3.2", "mistral", "codellama"],
         ProviderKind::Cohere => &["command-r-plus", "command-r", "command-light"],
         ProviderKind::OpenaiCompat => &[],
-        ProviderKind::OpenCode => &["deepseek-v4.1-flash", "kimi-k2.5", "glm-5.2"],
+        // Every id here was verified served by the live `/zen/go/v1` endpoint
+        // (probed 2026-11-03). `kimi-k2.5` was dropped from the upstream's
+        // model list (400 "Model is unavailable"); region-restricted
+        // contributor models (beam-free, muse-spark-*, gpt-*-luna) are not
+        // advertised either.
+        ProviderKind::OpenCode => &[
+            "deepseek-v4.1-flash",
+            "deepseek-v4-pro",
+            "glm-5.2",
+            "kimi-k2.7-code",
+        ],
     }
 }
 
