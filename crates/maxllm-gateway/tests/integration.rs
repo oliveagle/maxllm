@@ -184,6 +184,68 @@ provider = "mock_opencode"
 endpoint_type = "responses"
 "#;
 
+const CHAT_ONLY_RESPONSES_CONFIG: &str = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[metrics]
+enabled = true
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.chat_only_openai]
+kind = "openai"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+
+[[routes]]
+path = "/v1/responses"
+provider = "chat_only_openai"
+endpoint_type = "responses"
+"#;
+
+const NATIVE_RESPONSES_FALLBACK_CONFIG: &str = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[metrics]
+enabled = true
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.unreachable_opencode]
+kind = "opencode"
+base_url = "http://127.0.0.1:1"
+upstream_path = "/zen/go/v1/chat/completions"
+api_key = "fake-key"
+
+[providers.backup_openai]
+kind = "openai"
+base_url = "{FALLBACK_URL}"
+api_key = "fake-key"
+
+[[routes]]
+path = "/v1/responses"
+provider = "unreachable_opencode"
+fallback = ["backup_openai"]
+strategy = "fallback"
+endpoint_type = "responses"
+"#;
+
 const UNRESOLVABLE_HOST_CONFIG: &str = r#"
 global_plugins = ["api_auth"]
 
@@ -2002,6 +2064,109 @@ async fn test_non_opencode_upstream_ua_untouched() {
         requests[1].headers.get("User-Agent").is_none(),
         "openai upstream must not gain a User-Agent when the client sent none"
     );
+}
+
+#[tokio::test]
+async fn test_chat_only_responses_route_translates_to_chat() {
+    // A `/v1/responses` route whose provider only speaks chat completions
+    // must translate the Responses body into a chat body for the upstream
+    // and translate the chat answer back into a Responses object.
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(openai_response("from chat upstream")),
+        )
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let gw = TestGateway::start(CHAT_ONLY_RESPONSES_CONFIG, &mock.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/responses"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&json!({
+            "model": "gpt-4o",
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "raw Responses body must not reach the chat upstream"
+    );
+
+    let received = mock.received_requests().await.unwrap_or_default();
+    assert_eq!(received.len(), 1);
+    let sent: Value = serde_json::from_slice(&received[0].body).unwrap();
+    assert!(
+        sent.get("messages").is_some(),
+        "chat upstream must receive a chat body, got: {sent}"
+    );
+    assert!(
+        sent.get("input").is_none(),
+        "raw Responses body leaked: {sent}"
+    );
+
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["object"], "response");
+    assert_eq!(
+        body["output"][0]["content"][0]["text"],
+        "from chat upstream"
+    );
+}
+
+#[tokio::test]
+async fn test_native_responses_fallback_to_non_native_provider_translates_body() {
+    // The native (opencode) primary is unreachable, so the request is retried
+    // on a chat-only (openai) fallback. The fallback speaks the chat
+    // completions contract, so the gateway must send it a CHAT body — not the
+    // raw Responses body — and translate its answer back to Responses.
+    let fallback = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from fallback")))
+        .expect(1)
+        .mount(&fallback)
+        .await;
+
+    let gw =
+        TestGateway::start_with_fallback(NATIVE_RESPONSES_FALLBACK_CONFIG, "", &fallback.uri())
+            .await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/responses"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&json!({
+            "model": "gpt-4o",
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let received = fallback.received_requests().await.unwrap_or_default();
+    assert_eq!(received.len(), 1, "fallback must receive exactly one retry");
+    let sent: Value = serde_json::from_slice(&received[0].body).expect("json body");
+    assert!(
+        sent.get("messages").is_some(),
+        "the chat fallback must receive a chat-format body, got: {sent}"
+    );
+    assert!(
+        sent.get("input").is_none(),
+        "the raw Responses body must not reach a chat upstream: {sent}"
+    );
+
+    // The chat answer must come back as a Responses object.
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["object"], "response");
+    assert_eq!(body["output"][0]["content"][0]["text"], "from fallback");
 }
 
 #[tokio::test]

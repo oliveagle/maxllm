@@ -1026,24 +1026,38 @@ impl ProxyHttp for AiGateway {
         if ctx.endpoint_type == EndpointType::Passthrough {
             // Keep original Content-Length
         } else {
-            let is_body_passthrough = (ctx.endpoint_type == EndpointType::Responses
-                && ctx.native_responses)
-                || provider.translator.name() == "openai"
+            // The request body is forwarded verbatim (its size must not change)
+            // when the upstream already speaks the request's contract: a
+            // native Responses upstream, or a chat-body passthrough to an
+            // openai-like upstream. A Responses request destined for a chat-only
+            // upstream must be rewritten into chat completions — it is never
+            // verbatim, even when that upstream is openai-like.
+            let is_native_responses =
+                ctx.endpoint_type == EndpointType::Responses && ctx.native_responses;
+            let is_responses_to_chat =
+                ctx.endpoint_type == EndpointType::Responses && !ctx.native_responses;
+            let openai_style = provider.translator.name() == "openai"
                 || provider.translator.name() == "azure_openai";
+            let verbatim = is_native_responses || (openai_style && !is_responses_to_chat);
+            // openai-like upstreams reject chunked encoding, so a body that has
+            // to be rewritten (compaction, or Responses→chat) keeps the original
+            // Content-Length and is padded back to that size instead.
+            let rewrite_with_content_length = openai_style && is_responses_to_chat;
+
             let compaction_enabled = ctx
                 .plugin_ctx
                 .extensions
                 .get("auto_compact")
                 .map(|v| v.as_str())
                 == Some("1");
-            if is_body_passthrough && !compaction_enabled {
+            if verbatim && !compaction_enabled {
                 // Mark as body-passthrough so request_body_filter lets chunks flow
                 ctx.keep_request_content_length = true;
                 // Keep original Content-Length header (don't remove, don't set chunked).
                 // A native Responses body may be normalised (nested function
                 // tools -> flat) in request_body_filter; remember the original
                 // Content-Length so the rewritten body can be padded to match.
-                if ctx.native_responses {
+                if is_native_responses {
                     if let Some(cl) = upstream_request.headers.get("Content-Length") {
                         if let Ok(cl_str) = cl.to_str() {
                             ctx.plugin_ctx
@@ -1052,10 +1066,11 @@ impl ProxyHttp for AiGateway {
                         }
                     }
                 }
-            } else if is_body_passthrough && compaction_enabled {
-                // Compaction will modify the body but OpenAI/Cloudflare rejects
+            } else if (verbatim && compaction_enabled) || rewrite_with_content_length {
+                // The body will be modified (compaction, or Responses→chat
+                // translation) but OpenAI/Cloudflare rejects
                 // Transfer-Encoding: chunked. Strategy: keep the ORIGINAL
-                // Content-Length, then in request_body_filter, pad the compacted
+                // Content-Length, then in request_body_filter, pad the rewritten
                 // body with spaces to match the original size. JSON parsers
                 // ignore trailing whitespace, so the upstream sees valid JSON.
                 ctx.keep_request_content_length = true;
@@ -1196,6 +1211,25 @@ impl ProxyHttp for AiGateway {
                     ctx.request_body_buf = Vec::new();
                 }
                 return Ok(());
+            } else if ctx.endpoint_type == EndpointType::Responses {
+                // RESPONSES → CHAT against a Content-Length-framed (openai-like)
+                // upstream: the body must be rewritten into chat completions, so
+                // it cannot flow through verbatim. Buffer it and fall through to
+                // the normal path below, which performs the Responses→chat
+                // translation, compaction, and provider translation — then pads
+                // the result back to the original Content-Length.
+                if let Some(data) = body.take() {
+                    ctx.request_body_buf.extend_from_slice(&data);
+                }
+                if end_of_stream && !ctx.body_translated {
+                    // Fall through to the normal translation path.
+                    // Clear keep_request_content_length so the normal path runs.
+                    ctx.keep_request_content_length = false;
+                    // Do NOT set body_translated here — let the normal path do it.
+                    // Continue below — do NOT return here.
+                } else {
+                    return Ok(());
+                }
             } else {
                 // Buffer a copy for metadata extraction, but DON'T take the body —
                 // let it flow through to upstream unchanged.
@@ -1670,7 +1704,25 @@ impl ProxyHttp for AiGateway {
                                 }
                             }
                         }
-                        *body = Some(Bytes::from(translated.body));
+                        // A Responses→chat rewrite against an openai-like
+                        // upstream keeps the original Content-Length; pad the
+                        // rewritten body with spaces to match (JSON parsers
+                        // ignore trailing whitespace).
+                        let mut final_body = translated.body;
+                        if let Some(original_cl) = ctx
+                            .plugin_ctx
+                            .extensions
+                            .get("original_content_length")
+                            .and_then(|s| s.parse::<usize>().ok())
+                        {
+                            if final_body.len() < original_cl {
+                                final_body.extend(std::iter::repeat_n(
+                                    b' ',
+                                    original_cl - final_body.len(),
+                                ));
+                            }
+                        }
+                        *body = Some(Bytes::from(final_body));
                     }
                     Err(e) => {
                         warn!(error = %e, "Failed to translate request body");
@@ -2378,6 +2430,26 @@ impl ProxyHttp for AiGateway {
         ctx.native_responses = ctx.endpoint_type == EndpointType::Responses
             && fallback.native_responses
             && fallback.responses_path.is_some();
+
+        // The retry re-runs the whole upstream attempt, including
+        // `request_body_filter` — that is what turns a Responses body into a
+        // chat body for a fallback that only speaks chat completions. State
+        // left over from the failed attempt would make the retry skip that
+        // work and forward the untranslated body (a chat upstream then
+        // receives `{"input":…}` and rejects it):
+        // - `body_translated` marks the failed attempt's body as processed;
+        // - `request_body_buf` still holds the chunks of that attempt;
+        // - `keep_request_content_length` was derived from the failed
+        //   provider's framing (re-derived by `upstream_request_filter`
+        //   for the retry, so it must start out false);
+        // - `stream_translator` was picked for the failed provider's
+        //   response contract.
+        ctx.body_translated = false;
+        ctx.request_body_buf.clear();
+        ctx.keep_request_content_length = false;
+        if let Ok(mut guard) = ctx.stream_translator.lock() {
+            *guard = None;
+        }
         METRICS
             .fallbacks_total
             .with_label_values(&[&failed_provider, &name])
