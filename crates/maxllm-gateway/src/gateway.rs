@@ -28,6 +28,7 @@ use pingora::prelude::*;
 use pingora::proxy::{FailToProxy, ProxyHttp, Session};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{info, warn};
 
 /// Shared HTTP client for LLM-based auto-compaction summarization calls.
@@ -114,6 +115,9 @@ fn provider_owned_by(kind: ProviderKind) -> &'static str {
     }
 }
 
+/// Default TCP connect timeout to an upstream, in seconds.
+const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
+
 /// Derive the native Responses path from a chat completions path.
 /// `/zen/go/v1/chat/completions` → `/zen/go/v1/responses`.
 fn derive_responses_path(chat_path: &str) -> Option<String> {
@@ -145,6 +149,10 @@ pub struct ProviderState {
     pub native_responses: bool,
     /// Upstream path of the native Responses endpoint.
     pub responses_path: Option<String>,
+    /// TCP connect timeout to the upstream.
+    pub connect_timeout: Duration,
+    /// Total budget for the upstream connection (TCP connect + TLS).
+    pub total_connect_timeout: Option<Duration>,
 }
 
 /// Hot-reloadable state — swapped atomically on config change.
@@ -289,6 +297,11 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
                 default_model: conf.default_model.clone(),
                 native_responses,
                 responses_path,
+                connect_timeout: Duration::from_secs(
+                    conf.connect_timeout_secs
+                        .unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECS),
+                ),
+                total_connect_timeout: conf.total_connect_timeout_secs.map(Duration::from_secs),
             }),
         );
     }
@@ -794,7 +807,8 @@ impl ProxyHttp for AiGateway {
             provider.tls,
             provider.sni.clone(),
         );
-        peer.options.connection_timeout = Some(std::time::Duration::from_secs(10));
+        peer.options.connection_timeout = Some(provider.connect_timeout);
+        peer.options.total_connection_timeout = provider.total_connect_timeout;
         peer.options.read_timeout = Some(std::time::Duration::from_secs(120));
         peer.options.write_timeout = Some(std::time::Duration::from_secs(30));
 
@@ -2767,6 +2781,45 @@ fn extract_usage(body: &serde_json::Value, ctx: &mut RequestCtx) {
         if let Some(model) = body.get("model").and_then(|m| m.as_str()) {
             ctx.model = model.to_string();
         }
+    }
+}
+
+#[cfg(test)]
+mod connect_timeout_tests {
+    use super::*;
+    use maxllm_config::Config;
+
+    fn hot_state(toml: &str) -> HotState {
+        let config = Config::parse(toml).unwrap();
+        build_hot_state(&config).unwrap()
+    }
+
+    const BASE: &str = r#"
+[server]
+listen = "0.0.0.0:8080"
+
+[providers.opencode]
+kind = "opencode"
+base_url = "https://opencode.ai"
+api_key = "sk-test"
+"#;
+
+    #[test]
+    fn test_default_connect_timeout_is_ten_seconds() {
+        let state = hot_state(BASE);
+        let p = &state.providers["opencode"];
+        assert_eq!(p.connect_timeout, Duration::from_secs(10));
+        assert_eq!(p.total_connect_timeout, None);
+    }
+
+    #[test]
+    fn test_connect_timeout_is_configurable() {
+        let state = hot_state(&format!(
+            "{BASE}connect_timeout_secs = 30\ntotal_connect_timeout_secs = 60\n"
+        ));
+        let p = &state.providers["opencode"];
+        assert_eq!(p.connect_timeout, Duration::from_secs(30));
+        assert_eq!(p.total_connect_timeout, Some(Duration::from_secs(60)));
     }
 }
 

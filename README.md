@@ -339,6 +339,11 @@ base_url = "https://opencode.ai"
 upstream_path = "/zen/go/v1/chat/completions"
 api_key = "${OPENCODE_API_KEY}"
 default_model = "deepseek-v4.1-flash"
+# opencode.ai's Cloudflare edge can be slow/lossy from some hosts (TCP
+# connect measured up to 15s); widen the default 10s connect budget so a
+# slow-but-healthy upstream does not turn into a 502.
+connect_timeout_secs = 30
+total_connect_timeout_secs = 60
 ```
 
 For pass-through routes, the path suffix after the route prefix is forwarded to the upstream provider (e.g., `/passthrough/anthropic/v1/messages` proxies to `https://api.anthropic.com/v1/messages`).

@@ -120,6 +120,17 @@ pub struct ProviderConfig {
     /// avoid feeding a fake reasoning marker into the model context.
     #[serde(default)]
     pub skip_reasoning_injection: Option<bool>,
+    /// TCP connect timeout to the upstream, in seconds. Defaults to 10.
+    /// Raise it for upstreams on a slow or lossy path (e.g. opencode.ai
+    /// behind Cloudflare from an international link, where the TCP handshake
+    /// was measured taking up to 15s) — a too-tight budget turns a slow but
+    /// healthy upstream into a 502.
+    #[serde(default)]
+    pub connect_timeout_secs: Option<u64>,
+    /// Total budget for establishing the upstream connection (TCP connect plus
+    /// TLS handshake), in seconds. Unset means no separate total budget.
+    #[serde(default)]
+    pub total_connect_timeout_secs: Option<u64>,
     /// Weight for load balancing (higher = more traffic).
     #[serde(default = "default_weight")]
     pub weight: u32,
@@ -494,5 +505,41 @@ api_key = "sk-test"
         assert_eq!(p.max_fails, 3);
         assert_eq!(p.fail_timeout_secs, 60);
         assert!(config.server.tcp_reuseport);
+    }
+
+    #[test]
+    fn test_connect_timeout_defaults_to_unset() {
+        let toml = r#"
+[server]
+listen = "0.0.0.0:8080"
+
+[providers.openai]
+kind = "openai"
+base_url = "https://api.openai.com"
+api_key = "sk-test"
+"#;
+        let config = Config::parse(toml).unwrap();
+        let p = &config.providers["openai"];
+        assert_eq!(p.connect_timeout_secs, None);
+        assert_eq!(p.total_connect_timeout_secs, None);
+    }
+
+    #[test]
+    fn test_connect_timeout_is_parsed() {
+        let toml = r#"
+[server]
+listen = "0.0.0.0:8080"
+
+[providers.opencode]
+kind = "opencode"
+base_url = "https://opencode.ai"
+api_key = "sk-test"
+connect_timeout_secs = 30
+total_connect_timeout_secs = 60
+"#;
+        let config = Config::parse(toml).unwrap();
+        let p = &config.providers["opencode"];
+        assert_eq!(p.connect_timeout_secs, Some(30));
+        assert_eq!(p.total_connect_timeout_secs, Some(60));
     }
 }

@@ -124,6 +124,8 @@ mod tests {
                 default_model: None,
                 native_responses: false,
                 responses_path: None,
+                connect_timeout: std::time::Duration::from_secs(10),
+                total_connect_timeout: None,
             }),
             is_primary,
         }

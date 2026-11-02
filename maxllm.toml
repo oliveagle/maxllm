@@ -207,6 +207,11 @@ api_key = "mock"
 # # Optional: set true when the upstream does not require reasoning_content
 # # to be passed back (echo collapse still runs).
 # skip_reasoning_injection = false
+# # The path to opencode.ai's Cloudflare edge can be slow/lossy from some
+# # hosts (TCP connect measured up to 15s); widen the default 10s connect
+# # budget so a slow-but-healthy upstream does not turn into a 502.
+# connect_timeout_secs = 30
+# total_connect_timeout_secs = 60
 
 # --- Routes ---
 
