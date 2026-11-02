@@ -2109,10 +2109,44 @@ impl ProxyHttp for AiGateway {
                     }
                 }
             } else if ctx.is_streaming {
-                // Non-Gemini: stream_translator is already a
-                // ResponsesStreamTranslator wrapping the provider's chat
-                // stream translator, so chunks flow through as Responses SSE.
-                if let Some(data) = body.as_ref() {
+                // An upstream error during a streaming Responses request must
+                // not be fed into the SSE translator: the error body is not
+                // SSE, so the translator would emit an empty "completed"
+                // response and the client would never see the real reason
+                // (it just gets a 4xx with no explanation). Deliver the
+                // normalized OpenAI error body instead.
+                if ctx.upstream_status >= 400 {
+                    if let Some(data) = body.take() {
+                        ctx.response_body_buf.extend_from_slice(&data);
+                    }
+                    if end_of_stream && !ctx.response_body_buf.is_empty() {
+                        let error_body = provider
+                            .and_then(|p| {
+                                normalize_error_response(
+                                    &ctx.response_body_buf,
+                                    ctx.upstream_status,
+                                    p.kind,
+                                )
+                            })
+                            .unwrap_or_else(|| ctx.response_body_buf.clone());
+                        *body = Some(Bytes::from(error_body));
+                        hot.global_chain.run_response_body(
+                            session,
+                            body,
+                            end_of_stream,
+                            &mut ctx.plugin_ctx,
+                        )?;
+                        if let Some(idx) = ctx.route_index {
+                            hot.route_chains[idx].run_response_body(
+                                session,
+                                body,
+                                end_of_stream,
+                                &mut ctx.plugin_ctx,
+                            )?;
+                        }
+                        return Ok(None);
+                    }
+                } else if let Some(data) = body.as_ref() {
                     let translated: Option<Bytes> = match ctx.stream_translator.lock() {
                         Ok(mut guard) => guard.as_mut().map(|translator| {
                             Bytes::from(translator.process_chunk(data, end_of_stream))

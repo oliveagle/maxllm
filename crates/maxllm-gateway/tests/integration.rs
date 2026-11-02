@@ -2428,6 +2428,49 @@ async fn test_chat_only_responses_route_nests_a_flat_tool_choice() {
 }
 
 #[tokio::test]
+async fn test_chat_only_responses_streaming_error_is_surfaced() {
+    // A streaming Responses request whose chat upstream answers 4xx must
+    // surface the error. Without this, the error body is fed into the SSE
+    // translator (it is not SSE), which emits an empty "completed" response
+    // and the client only learns it failed from the bare status code.
+    let mock = MockServer::start().await;
+    let upstream_error = json!({"error": {"type": "invalid_request_error",
+        "message": "bad tool_choice"}});
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(upstream_error.clone()))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let gw = TestGateway::start(CHAT_ONLY_RESPONSES_CONFIG, &mock.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/responses"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&json!({
+            "model": "gpt-4o",
+            "stream": true,
+            "input": "hi"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["error"]["message"], "bad tool_choice",
+        "the upstream error must reach the client: {body}"
+    );
+    assert_ne!(
+        body.get("object").and_then(|o| o.as_str()),
+        Some("response"),
+        "an error must not look like a completed response: {body}"
+    );
+}
+
+#[tokio::test]
 async fn test_native_responses_fallback_to_non_native_provider_translates_body() {
     // The native (opencode) primary is unreachable, so the request is retried
     // on a chat-only (openai) fallback. The fallback speaks the chat
