@@ -818,11 +818,33 @@ impl ProxyHttp for AiGateway {
             }
         };
 
-        let mut peer = HttpPeer::new(
-            (&*provider.host, provider.port),
-            provider.tls,
-            provider.sni.clone(),
-        );
+        // Resolve the upstream hostname here instead of letting
+        // `HttpPeer::new` do it: pingora's constructor calls
+        // `to_socket_addrs().unwrap()` internally and PANICS the worker
+        // thread when DNS fails (e.g. a corp-only host reached from a
+        // non-corp network), leaving the client with a dropped connection
+        // instead of a 502. Look the address up asynchronously and surface a
+        // clean error. Passing a resolved `SocketAddr` to `HttpPeer::new`
+        // skips the fallible lookup entirely.
+        let addr = match tokio::net::lookup_host((provider.host.as_str(), provider.port)).await {
+            Ok(mut addrs) => match addrs.next() {
+                Some(a) => a,
+                None => {
+                    return Err(pingora::Error::explain(
+                        pingora::ErrorType::HTTPStatus(502),
+                        format!("no address resolved for '{}'", provider.host),
+                    ));
+                }
+            },
+            Err(e) => {
+                return Err(pingora::Error::explain(
+                    pingora::ErrorType::HTTPStatus(502),
+                    format!("DNS resolution failed for '{}': {}", provider.host, e),
+                ));
+            }
+        };
+
+        let mut peer = HttpPeer::new(addr, provider.tls, provider.sni.clone());
         peer.options.connection_timeout = Some(provider.connect_timeout);
         peer.options.total_connection_timeout = provider.total_connect_timeout;
         peer.options.read_timeout = Some(std::time::Duration::from_secs(120));

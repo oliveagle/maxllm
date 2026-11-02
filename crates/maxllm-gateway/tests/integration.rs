@@ -184,6 +184,32 @@ provider = "mock_opencode"
 endpoint_type = "responses"
 "#;
 
+const UNRESOLVABLE_HOST_CONFIG: &str = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[metrics]
+enabled = true
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.dns_fail]
+kind = "openai"
+base_url = "http://nonexistent-host.invalid:1"
+api_key = "fake-key"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "dns_fail"
+"#;
+
 const OPENCODE_CHAT_CONFIG: &str = r#"
 global_plugins = ["api_auth"]
 
@@ -1975,6 +2001,37 @@ async fn test_non_opencode_upstream_ua_untouched() {
     assert!(
         requests[1].headers.get("User-Agent").is_none(),
         "openai upstream must not gain a User-Agent when the client sent none"
+    );
+}
+
+#[tokio::test]
+async fn test_dns_failure_returns_clean_502_instead_of_dropping_connection() {
+    // `.invalid` never resolves (RFC 2606). The gateway must answer with a
+    // clean 502 JSON error: pingora's `HttpPeer::new` resolves the hostname
+    // with `to_socket_addrs().unwrap()` and panics the worker thread when
+    // DNS fails, which left the client with a dropped connection.
+    let mock = MockServer::start().await;
+    let gw = TestGateway::start(UNRESOLVABLE_HOST_CONFIG, &mock.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&chat_body("gpt-4o", "hi"))
+        .send()
+        .await
+        .expect("the gateway must answer, not drop the connection");
+    assert_eq!(resp.status(), 502);
+
+    let body: Value = resp.json().await.expect("error body must be JSON");
+    assert_eq!(body["error"]["type"], "gateway_error");
+    assert_eq!(body["error"]["code"], 502);
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("nonexistent-host.invalid"),
+        "error message should name the host: {body}"
     );
 }
 
