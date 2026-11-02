@@ -647,6 +647,24 @@ fn flatten_nested_function(value: &Value) -> Option<Value> {
 /// Translate a chat completions response body into a Responses API body.
 pub fn chat_response_to_responses(body: &[u8]) -> Result<Vec<u8>, TranslateError> {
     let chat: Value = serde_json::from_slice(body)?;
+
+    // A chat upstream can answer 200 with an `{"error": {...}}` body (some
+    // providers report failures that way instead of a non-2xx status). Such
+    // a body must become a *failed* Responses object — never a completed one
+    // with empty output that hides the reason.
+    if let Some(error) = chat.get("error") {
+        if !error.is_null() {
+            let mut response = build_responses_object(&chat, ResponseStatus::Failed);
+            if let Some(obj) = response.as_object_mut() {
+                // An error body carries no answer; the message item the
+                // builder adds for an empty choice must not be there.
+                obj.insert("output".to_string(), json!([]));
+            }
+            attach_error(&mut response, error);
+            return Ok(serde_json::to_vec(&response)?);
+        }
+    }
+
     let finish_reason = chat
         .get("choices")
         .and_then(|c| c.as_array())
@@ -1309,29 +1327,8 @@ impl ResponsesStreamTranslator {
             );
         }
 
-        // The chat error is OpenAI-shaped: {"message", "type", "code",
-        // "param"}. Some upstreams send a bare string or nest the object one
-        // level deeper, so the fields are read defensively.
-        let message = match error {
-            Value::String(text) => text.clone(),
-            other => error_text(other, "message"),
-        };
-        let code = error_text(error, "code");
-        let kind = error_text(error, "type");
-        let param = error.get("param").cloned().unwrap_or(Value::Null);
-
         let mut response = self.response_object(ResponseStatus::Failed);
-        if let Some(obj) = response.as_object_mut() {
-            obj.insert(
-                "error".to_string(),
-                json!({
-                    "code": optional_text(&code),
-                    "message": optional_text(&message),
-                    "param": param,
-                    "type": optional_text(&kind),
-                }),
-            );
-        }
+        attach_error(&mut response, error);
         emit_event(
             out,
             "response.failed",
@@ -1595,6 +1592,33 @@ fn optional_text(text: &str) -> Value {
         Value::Null
     } else {
         Value::String(text.to_string())
+    }
+}
+
+/// Build the `error` payload of a failed Responses object from an upstream
+/// error value. The chat error is OpenAI-shaped: {"message", "type", "code",
+/// "param"}; some upstreams send a bare string or nest the object one level
+/// deeper, so the fields are read defensively.
+fn error_payload(error: &Value) -> Value {
+    let message = match error {
+        Value::String(text) => text.clone(),
+        other => error_text(other, "message"),
+    };
+    let code = error_text(error, "code");
+    let kind = error_text(error, "type");
+    let param = error.get("param").cloned().unwrap_or(Value::Null);
+    json!({
+        "code": optional_text(&code),
+        "message": optional_text(&message),
+        "param": param,
+        "type": optional_text(&kind),
+    })
+}
+
+/// Put the upstream error into a Responses object's `error` field.
+fn attach_error(response: &mut Value, error: &Value) {
+    if let Some(obj) = response.as_object_mut() {
+        obj.insert("error".to_string(), error_payload(error));
     }
 }
 
@@ -2098,6 +2122,45 @@ mod tests {
         assert_eq!(v["usage"]["input_tokens"], 5);
         assert_eq!(v["usage"]["output_tokens"], 7);
         assert_eq!(v["usage"]["total_tokens"], 12);
+    }
+
+    #[test]
+    fn test_chat_error_body_becomes_a_failed_response() {
+        // A chat upstream can answer 200 with an `{"error": {...}}` body.
+        // It must become a failed Responses object, not a completed one with
+        // empty output that hides the reason.
+        let chat = br#"{
+            "id":"chatcmpl-1","object":"chat.completion","created":1700000000,
+            "model":"gpt-4o","error":{"message":"upstream is down",
+                "type":"server_error","code":"server_error"}
+        }"#;
+        let out = chat_response_to_responses(chat).unwrap();
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["object"], "response");
+        assert_eq!(v["status"], "failed");
+        assert_eq!(v["error"]["message"], "upstream is down");
+        assert_eq!(v["error"]["code"], "server_error");
+        assert_eq!(v["error"]["type"], "server_error");
+        assert!(v["error"]["param"].is_null());
+        assert!(
+            v["output"].as_array().unwrap().is_empty(),
+            "a failed response carries no output"
+        );
+    }
+
+    #[test]
+    fn test_null_error_body_is_ignored() {
+        // Some providers carry "error": null on an ordinary answer.
+        let chat = br#"{
+            "id":"chatcmpl-1","object":"chat.completion","created":1700000000,
+            "model":"gpt-4o","error":null,
+            "choices":[{"index":0,"finish_reason":"stop",
+                "message":{"role":"assistant","content":"pong"}}]
+        }"#;
+        let out = chat_response_to_responses(chat).unwrap();
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["status"], "completed");
+        assert_eq!(v["output"][0]["content"][0]["text"], "pong");
     }
 
     #[test]

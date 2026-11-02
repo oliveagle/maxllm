@@ -2527,6 +2527,48 @@ async fn test_chat_only_responses_mid_stream_error_becomes_response_failed() {
 }
 
 #[tokio::test]
+async fn test_chat_only_responses_error_body_becomes_a_failed_response() {
+    // The chat upstream answers 200 with an `{"error": {...}}` body (some
+    // providers report failures that way). The client must see a failed
+    // Responses object carrying the reason — not a completed response with
+    // empty output that hides it.
+    let mock = MockServer::start().await;
+    let upstream_error = json!({"error": {"message": "upstream is down",
+        "type": "server_error", "code": "server_error"}});
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(upstream_error.clone()))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let gw = TestGateway::start(CHAT_ONLY_RESPONSES_CONFIG, &mock.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/responses"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&json!({
+            "model": "gpt-4o",
+            "input": "hi"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "the upstream answered 200");
+
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["object"], "response");
+    assert_eq!(body["status"], "failed");
+    assert_eq!(body["error"]["message"], "upstream is down");
+    assert_eq!(body["error"]["code"], "server_error");
+    assert!(
+        body["output"].as_array().unwrap().is_empty(),
+        "a failed response carries no output: {body}"
+    );
+}
+
+#[tokio::test]
 async fn test_native_responses_fallback_to_non_native_provider_translates_body() {
     // The native (opencode) primary is unreachable, so the request is retried
     // on a chat-only (openai) fallback. The fallback speaks the chat
