@@ -178,7 +178,7 @@ fn parse_input_item(item: &Value) -> Option<Value> {
         Some("message") => {
             let role = normalize_role(item.get("role").and_then(|r| r.as_str()));
             let content = item.get("content")?;
-            Some(json!({ "role": role, "content": content_to_text(content) }))
+            Some(json!({ "role": role, "content": content_to_chat_content(content) }))
         }
         // Model-issued function call.
         Some("function_call") => {
@@ -223,7 +223,7 @@ fn parse_input_item(item: &Value) -> Option<Value> {
         None => {
             let role = normalize_role(item.get("role").and_then(|r| r.as_str()));
             let content = item.get("content")?;
-            Some(json!({ "role": role, "content": content_to_text(content) }))
+            Some(json!({ "role": role, "content": content_to_chat_content(content) }))
         }
     }
 }
@@ -257,6 +257,51 @@ fn content_to_text(content: &Value) -> String {
             .collect::<Vec<_>>()
             .join("\n"),
         _ => String::new(),
+    }
+}
+
+/// Convert Responses message content into chat completions content.
+///
+/// Text-only content stays a plain string — strict upstreams (e.g. Volcano
+/// Ark) reject part arrays for plain text, and the plain-string form is what
+/// every current provider accepts. When the content carries a non-text part
+/// (an `input_image` from an image attachment), the parts are preserved as a
+/// chat content array so the image is not silently dropped: text parts become
+/// `{"type":"text"}` and `input_image` parts become
+/// `{"type":"image_url","image_url":{...}}`.
+fn content_to_chat_content(content: &Value) -> Value {
+    let Value::Array(parts) = content else {
+        return Value::String(content_to_text(content));
+    };
+    let mut out = Vec::new();
+    let mut saw_non_text = false;
+    for part in parts {
+        match part.get("type").and_then(|t| t.as_str()) {
+            Some("text") | Some("input_text") | Some("output_text") | None => {
+                if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                    out.push(json!({ "type": "text", "text": text }));
+                }
+            }
+            Some("input_image") => {
+                saw_non_text = true;
+                if let Some(img) = part.get("image_url") {
+                    let url = match img {
+                        Value::String(s) => json!({ "url": s }),
+                        other => other.clone(),
+                    };
+                    out.push(json!({ "type": "image_url", "image_url": url }));
+                }
+            }
+            _ => {
+                // Other part types (file, etc.) have no chat equivalent.
+            }
+        }
+    }
+    if saw_non_text {
+        Value::Array(out)
+    } else {
+        // Text-only: keep the proven plain-string form for strict upstreams.
+        Value::String(content_to_text(content))
     }
 }
 
@@ -1297,6 +1342,65 @@ impl ResponsesRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── content conversion ──────────────────────────────────────────────
+
+    #[test]
+    fn test_text_only_content_stays_a_plain_string() {
+        let content = json!([{"type":"input_text","text":"hi"}]);
+        assert_eq!(
+            content_to_chat_content(&content),
+            Value::String("hi".into())
+        );
+    }
+
+    #[test]
+    fn test_image_part_is_preserved_as_image_url() {
+        let content = json!([
+            {"type":"input_text","text":"what is this?"},
+            {"type":"input_image","image_url":"data:image/png;base64,AAAA"}
+        ]);
+        let out = content_to_chat_content(&content);
+        assert!(out.is_array());
+        assert_eq!(out[0], json!({"type":"text","text":"what is this?"}));
+        assert_eq!(
+            out[1],
+            json!({"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}})
+        );
+    }
+
+    #[test]
+    fn test_image_part_object_url_is_preserved() {
+        let content = json!([
+            {"type":"input_image","image_url":{"url":"https://x/y.png","detail":"high"}}
+        ]);
+        let out = content_to_chat_content(&content);
+        assert_eq!(
+            out[0],
+            json!({"type":"image_url","image_url":{"url":"https://x/y.png","detail":"high"}})
+        );
+    }
+
+    #[test]
+    fn test_message_item_with_image_keeps_the_image_in_chat() {
+        let body = br#"{"model":"gpt-4o","input":[{"type":"message","role":"user",
+            "content":[{"type":"input_text","text":"describe"},
+                       {"type":"input_image","image_url":"data:image/png;base64,AAA"}]}]}"#;
+        let out = responses_request_to_chat(body).unwrap();
+        let v: Value = serde_json::from_slice(&out.body).unwrap();
+        let content = &v["messages"][0]["content"];
+        assert!(content.is_array());
+        assert_eq!(content[1]["type"], "image_url");
+    }
+
+    #[test]
+    fn test_multiple_text_parts_join_without_images() {
+        let content = json!([{"type":"input_text","text":"a"},{"type":"output_text","text":"b"}]);
+        assert_eq!(
+            content_to_chat_content(&content),
+            Value::String("a\nb".into())
+        );
+    }
 
     // ── request translation ─────────────────────────────────────────────
 

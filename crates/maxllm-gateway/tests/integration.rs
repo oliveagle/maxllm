@@ -2343,6 +2343,49 @@ async fn test_chat_only_responses_route_translates_to_chat() {
 }
 
 #[tokio::test]
+async fn test_chat_only_responses_route_preserves_image_attachments() {
+    // An image attachment arrives as an `input_image` part in the Responses
+    // input. The chat translation must keep it (as a chat `image_url` part)
+    // instead of silently dropping it, or the model answers without seeing
+    // the image. Text-only content must still stay a plain string.
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("image ok")))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let gw = TestGateway::start(CHAT_ONLY_RESPONSES_CONFIG, &mock.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/responses"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&json!({
+            "model": "gpt-4o",
+            "input": [{"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "describe this"},
+                {"type": "input_image", "image_url": "data:image/png;base64,AAA"}
+            ]}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let received = mock.received_requests().await.unwrap_or_default();
+    let sent: Value = serde_json::from_slice(&received[0].body).unwrap();
+    let content = &sent["messages"][0]["content"];
+    assert!(content.is_array(), "image forces a parts array: {content}");
+    assert_eq!(content[0], json!({"type": "text", "text": "describe this"}));
+    assert_eq!(
+        content[1],
+        json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}})
+    );
+}
+
+#[tokio::test]
 async fn test_native_responses_fallback_to_non_native_provider_translates_body() {
     // The native (opencode) primary is unreachable, so the request is retried
     // on a chat-only (openai) fallback. The fallback speaks the chat
