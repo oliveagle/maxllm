@@ -2906,6 +2906,16 @@ fn extract_stream_usage(chunk: &[u8], ctx: &mut RequestCtx, end_of_stream: bool)
         start = i + 1;
     }
 
+    // Recover the usage object directly from whatever we buffered on EVERY
+    // call, not only when the stream ends. A terminal Responses event echoes
+    // the whole output array, so its `data:` line can exceed the 16 KiB tail
+    // cap (the prefix is dropped with the tail) or be split by raw newlines;
+    // the usage object sits at the end of that line, so scanning for it here
+    // catches it the moment it is fully present — including in the final data
+    // chunk, which pingora delivers with `end_of_stream == false` and then
+    // follows with a trailing `Body(None, true)` marker that carries no data.
+    extract_usage_object(&buf, ctx);
+
     if end_of_stream {
         // A stream may end without a trailing newline — parse the final
         // partial line as the last event, then drop the tail.
@@ -2915,14 +2925,6 @@ fn extract_stream_usage(chunk: &[u8], ctx: &mut RequestCtx, end_of_stream: bool)
                 parse_usage_line(line, ctx);
             }
         }
-        // A terminal event's `data:` line can be very large: the Responses API
-        // echoes the whole output array into `response.completed`, so the line
-        // can exceed the 16 KiB tail cap and its `data:` prefix gets dropped
-        // with the tail. The usage object sits at the very end of that line and
-        // stays intact, so recover it directly from whatever we buffered — the
-        // line-oriented scan above cannot see a line that no longer starts
-        // with `data:`.
-        extract_usage_object(&buf, ctx);
         ctx.sse_tail.clear();
     } else {
         let rest_len = buf.len() - last_complete_end;
@@ -3281,16 +3283,35 @@ mod stream_usage_tests {
         assert!(line.len() > 16 * 1024);
         let bytes = line.as_bytes();
 
-        // Feed it the way pingora delivers it: 16 KiB pieces.
+        // Feed it the way pingora delivers it: 16 KiB pieces. The last DATA
+        // chunk arrives with end_of_stream == false and is followed by a
+        // trailing end-of-stream marker that carries no data — the usage
+        // object must be recovered from the data chunk itself.
         let mut pos = 0;
         while pos < bytes.len() {
             let end = (pos + 16 * 1024).min(bytes.len());
-            let eos = end == bytes.len();
-            extract_stream_usage(&bytes[pos..end], &mut c, eos);
+            extract_stream_usage(&bytes[pos..end], &mut c, false);
             pos = end;
         }
+        extract_stream_usage(b"", &mut c, true);
         assert_eq!(c.tokens_in, 26356);
         assert_eq!(c.tokens_out, 3);
+    }
+
+    #[test]
+    fn test_usage_is_recovered_from_a_data_chunk_before_the_end_marker() {
+        // pingora delivers the final data chunk with end_of_stream == false
+        // and then a trailing Body(None, true) marker. The usage object lives
+        // in that data chunk, so it has to be picked up there.
+        let mut c = ctx();
+        let chunk = b"event: response.completed\ndata: {\"response\":{\"usage\":{\"input_tokens\":9,\"output_tokens\":4}}}\n\n";
+        extract_stream_usage(chunk, &mut c, false);
+        assert_eq!(c.tokens_in, 9);
+        assert_eq!(c.tokens_out, 4);
+        // The trailing end-of-stream marker carries no data and changes nothing.
+        extract_stream_usage(b"", &mut c, true);
+        assert_eq!(c.tokens_in, 9);
+        assert_eq!(c.tokens_out, 4);
     }
 
     #[test]
