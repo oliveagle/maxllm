@@ -1825,6 +1825,160 @@ async fn test_opencode_session_header_never_overwritten() {
 }
 
 #[tokio::test]
+async fn test_opencode_upstream_ua_injected_when_missing() {
+    let mock = MockServer::start().await;
+
+    // The client (reqwest sends no User-Agent by default) sent none — the
+    // gateway must inject a safe UA so opencode.ai's Cloudflare edge does not
+    // ban the request (403 error code 1010).
+    Mock::given(method("POST"))
+        .and(path("/zen/go/v1/chat/completions"))
+        .and(header("User-Agent", "curl/8.5.0"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"id":"c1","object":"chat.completion","choices":[]})),
+        )
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let gw = TestGateway::start(OPENCODE_CHAT_CONFIG, &mock.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&chat_body("deepseek-v4.1-flash", "hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn test_opencode_upstream_script_ua_replaced() {
+    let mock = MockServer::start().await;
+
+    // A script fingerprint (`Python-urllib/3.11`) is exactly what opencode.ai's
+    // Cloudflare edge bans; the gateway must swap it for the safe UA.
+    Mock::given(method("POST"))
+        .and(path("/zen/go/v1/chat/completions"))
+        .and(header("User-Agent", "curl/8.5.0"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"id":"c1","object":"chat.completion","choices":[]})),
+        )
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let gw = TestGateway::start(OPENCODE_CHAT_CONFIG, &mock.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .header("User-Agent", "Python-urllib/3.11")
+        .json(&chat_body("deepseek-v4.1-flash", "hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn test_opencode_upstream_client_ua_preserved() {
+    let mock = MockServer::start().await;
+
+    // A non-script UA the client sent itself (here another curl version, which
+    // differs from the gateway's injected `curl/8.5.0`) must be forwarded
+    // verbatim — the gateway must not clobber it. Browser UAs are also allowed.
+    const CLIENT_UA: &str = "curl/7.88.1";
+    Mock::given(method("POST"))
+        .and(path("/zen/go/v1/chat/completions"))
+        .and(header("User-Agent", CLIENT_UA))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"id":"c1","object":"chat.completion","choices":[]})),
+        )
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let gw = TestGateway::start(OPENCODE_CHAT_CONFIG, &mock.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .header("User-Agent", CLIENT_UA)
+        .json(&chat_body("deepseek-v4.1-flash", "hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn test_non_opencode_upstream_ua_untouched() {
+    let mock = MockServer::start().await;
+
+    // UA rewriting is scoped to opencode providers: an OpenAI upstream must
+    // receive the client's UA verbatim (here a script fingerprint) — or none
+    // at all when the client sent none.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("User-Agent", "Python-urllib/3.11"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"id":"c1","object":"chat.completion","choices":[]})),
+        )
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let gw = TestGateway::start(MOCK_CONFIG, &mock.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .header("User-Agent", "Python-urllib/3.11")
+        .json(&chat_body("gpt-4o", "hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // And when the client sends no UA, the upstream must not gain one either.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"id":"c2","object":"chat.completion","choices":[]})),
+        )
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&chat_body("gpt-4o", "hi again"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let requests = mock.received_requests().await.unwrap();
+    assert!(requests.len() == 2, "expected 2 upstream requests");
+    assert!(
+        requests[1].headers.get("User-Agent").is_none(),
+        "openai upstream must not gain a User-Agent when the client sent none"
+    );
+}
+
+#[tokio::test]
 async fn test_opencode_upstream_openai_error_is_passed_through() {
     let mock = MockServer::start().await;
 

@@ -115,6 +115,22 @@ fn provider_owned_by(kind: ProviderKind) -> &'static str {
     }
 }
 
+/// User-Agent injected on upstream requests to opencode.ai. The upstream's
+/// Cloudflare edge bans script / HTTP-client fingerprints (HTTP 403 "error
+/// code: 1010", browser signature banned); `curl/8.5.0` is verified allowed.
+const OPENCODE_UPSTREAM_UA: &str = "curl/8.5.0";
+
+/// True when a User-Agent string is one opencode.ai's Cloudflare edge
+/// verifiably bans (HTTP 403 "error code: 1010"). Probing the live upstream
+/// shows the ban list is narrow: only `Python-urllib/*` (the default UA of
+/// Python's urllib) is blocked; curl, browsers and every other HTTP-client /
+/// SDK UA tested (OpenAI/Python, node-fetch, axios, python-requests, ...)
+/// are accepted, so they are never rewritten here.
+fn is_script_like_user_agent(ua_lower: &str) -> bool {
+    const BANNED_UA_MARKERS: [&str; 1] = ["python-urllib"];
+    BANNED_UA_MARKERS.iter().any(|m| ua_lower.contains(m))
+}
+
 /// Default TCP connect timeout to an upstream, in seconds.
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 
@@ -954,6 +970,28 @@ impl ProxyHttp for AiGateway {
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
             upstream_request
                 .insert_header(maxllm_translate::opencode::SESSION_HEADER, &session_id)?;
+        }
+
+        // opencode.ai's Cloudflare edge bans requests whose User-Agent looks
+        // like a script / HTTP-client fingerprint (e.g. `Python-urllib/3.11`)
+        // with HTTP 403 "error code: 1010" (browser signature banned). Pingora
+        // forwards the client's User-Agent verbatim, so an SDK client would
+        // otherwise be banned outright. Inject a safe, generic UA unless the
+        // client already sent one that is not a known script fingerprint
+        // (curl / browser UAs are verified allowed by the upstream).
+        if provider.kind == ProviderKind::OpenCode {
+            let ua = upstream_request
+                .headers
+                .get("User-Agent")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_ascii_lowercase());
+            let needs_injection = match &ua {
+                None => true,
+                Some(s) => is_script_like_user_agent(s),
+            };
+            if needs_injection {
+                upstream_request.insert_header("User-Agent", OPENCODE_UPSTREAM_UA)?;
+            }
         }
 
         // Body framing strategy:
