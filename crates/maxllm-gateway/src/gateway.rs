@@ -2936,8 +2936,18 @@ fn extract_stream_usage(chunk: &[u8], ctx: &mut RequestCtx, end_of_stream: bool)
             // before that (the Responses terminal event's usage object sits at
             // the end of a huge data: line, so it may be fully present here
             // even though the line's `data:` prefix will be lost).
-            extract_usage_object(&buf[last_complete_end..], ctx);
-            ctx.sse_tail = Vec::new();
+            let partial = &buf[last_complete_end..];
+            extract_usage_object(partial, ctx);
+            // Keep a bounded fragment of the dropped partial line so that a
+            // usage object straddling this chunk boundary is still
+            // reassembled: the `"usage":{` marker (and part of the object)
+            // may sit in the dropped part while the closing brace only
+            // arrives with the next chunk. Without this, that one request is
+            // billed 0/0. The fragment is a rolling window over the huge
+            // line, discarded as soon as the line ends with a newline.
+            const CARRY: usize = 1024;
+            let keep = CARRY.min(partial.len());
+            ctx.sse_tail = partial[partial.len() - keep..].to_vec();
         } else {
             buf.copy_within(last_complete_end.., 0);
             buf.truncate(rest_len);
@@ -3335,6 +3345,49 @@ mod stream_usage_tests {
         }
         assert_eq!(c.tokens_in, 7);
         assert_eq!(c.tokens_out, 2);
+    }
+
+    #[test]
+    fn test_usage_object_split_across_a_chunk_boundary_is_reassembled() {
+        // The giant terminal event's `data:` line exceeds the 16 KiB tail
+        // cap, so the tail that would carry the `"usage":{` marker is
+        // dropped. When the chunk boundary lands INSIDE the usage object,
+        // the marker sits in the dropped part and the closing brace only
+        // arrives with the next chunk — the counters must still be
+        // recovered, otherwise this request is billed as 0/0.
+        let mut c = ctx();
+        let line = format!(
+            "data: {{\"response\":{{\"output\":[\"{}\"],\"usage\":{{\"input_tokens\":26356,\"output_tokens\":3}}}},\"type\":\"response.completed\"}}\n\n",
+            "x".repeat(120 * 1024)
+        );
+        let bytes = line.as_bytes();
+        // Split inside the usage object: the marker is before the split,
+        // the closing brace after it.
+        let split = bytes.len() - 60;
+        extract_stream_usage(&bytes[..split], &mut c, false);
+        assert_eq!(c.tokens_in, 0, "usage is not complete in the first chunk");
+        extract_stream_usage(&bytes[split..], &mut c, false);
+        assert_eq!(c.tokens_in, 26356);
+        assert_eq!(c.tokens_out, 3);
+    }
+
+    #[test]
+    fn test_usage_marker_split_across_a_chunk_boundary_is_reassembled() {
+        // Same scenario, but the boundary lands inside the word "usage"
+        // itself, so neither chunk carries the full `"usage":{` marker.
+        let mut c = ctx();
+        let line = format!(
+            "data: {{\"response\":{{\"output\":[\"{}\"],\"usage\":{{\"input_tokens\":11,\"output_tokens\":5}}}},\"type\":\"response.completed\"}}\n\n",
+            "x".repeat(120 * 1024)
+        );
+        let bytes = line.as_bytes();
+        let marker = find_bytes(bytes, b"\"usage\":{", 0).expect("marker present");
+        let split = marker + 4; // inside the word "usage"
+        extract_stream_usage(&bytes[..split], &mut c, false);
+        assert_eq!(c.tokens_in, 0);
+        extract_stream_usage(&bytes[split..], &mut c, false);
+        assert_eq!(c.tokens_in, 11);
+        assert_eq!(c.tokens_out, 5);
     }
 
     #[test]
