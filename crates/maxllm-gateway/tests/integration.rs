@@ -1979,6 +1979,40 @@ async fn test_opencode_blank_session_header_replaced() {
 }
 
 #[tokio::test]
+async fn test_opencode_empty_affinity_falls_through_to_session_id() {
+    let mock = MockServer::start().await;
+
+    // The client sent an empty `x-session-affinity` (same blank-value trap as
+    // an empty session header) with no session of its own. The gateway must
+    // skip the blank affinity and fall through to `x-opencode-session-id`,
+    // injecting its value as the session — never an empty one.
+    Mock::given(method("POST"))
+        .and(path("/zen/go/v1/chat/completions"))
+        .and(header("x-opencode-session", "affinity-42"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"id":"c1","object":"chat.completion","choices":[]})),
+        )
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let gw = TestGateway::start(OPENCODE_CHAT_CONFIG, &mock.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .header("x-session-affinity", "")
+        .header("x-opencode-session-id", "affinity-42")
+        .json(&chat_body("deepseek-v4.1-flash", "hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
 async fn test_opencode_upstream_ua_injected_when_missing() {
     let mock = MockServer::start().await;
 

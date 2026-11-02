@@ -989,13 +989,18 @@ impl ProxyHttp for AiGateway {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
         if provider.kind == ProviderKind::OpenCode && client_session.is_none() {
-            let session_id = session
-                .req_header()
-                .headers
-                .get("x-session-affinity")
-                .or_else(|| session.req_header().headers.get("x-opencode-session-id"))
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string())
+            // The affinity id is also subject to the blank-value rule: an
+            // empty `x-session-affinity` must not be injected as an empty
+            // session (the upstream rejects it). The sources are scanned in
+            // order and the first NON-BLANK one wins, so a present-but-empty
+            // affinity falls through to `x-opencode-session-id` instead of
+            // short-circuiting the lookup.
+            let session_id = ["x-session-affinity", "x-opencode-session-id"]
+                .iter()
+                .filter_map(|name| session.req_header().headers.get(*name))
+                .filter_map(|v| v.to_str().ok())
+                .map(|s| s.trim().to_string())
+                .find(|s| !s.is_empty())
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
             upstream_request
                 .insert_header(maxllm_translate::opencode::SESSION_HEADER, &session_id)?;
