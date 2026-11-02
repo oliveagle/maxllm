@@ -1207,6 +1207,25 @@ impl StreamTranslator for ResponsesStreamTranslator {
     fn process_chunk(&mut self, data: &[u8], end_of_stream: bool) -> Vec<u8> {
         let chat_sse = self.inner.process_chunk(data, end_of_stream);
         self.buffer.extend_from_slice(&chat_sse);
+        // Normalize CRLF to LF: a third-party upstream may emit \r\n line
+        // endings, and the event splitter below looks for \n\n — a
+        // \r\n\r\n boundary never contains it, so without this the whole
+        // stream stays buffered and the client gets an empty completed
+        // response. Normalize the whole buffer so a \r left at the edge of
+        // a chunk still joins its \n from the next chunk.
+        let mut raw = std::mem::take(&mut self.buffer);
+        let mut normalized = Vec::with_capacity(raw.len());
+        let mut i = 0;
+        while i < raw.len() {
+            if raw[i] == b'\r' && i + 1 < raw.len() && raw[i + 1] == b'\n' {
+                normalized.push(b'\n');
+                i += 2;
+            } else {
+                normalized.push(raw[i]);
+                i += 1;
+            }
+        }
+        self.buffer = normalized;
 
         let mut out = Vec::new();
         loop {
@@ -1784,6 +1803,35 @@ mod tests {
         );
         assert!(calls.contains(&("call_a".to_string(), json!({"a": 1}))));
         assert!(calls.contains(&("call_b".to_string(), json!({"b": 2}))));
+    }
+
+    #[test]
+    fn test_stream_accepts_crlf_delimited_sse() {
+        // A third-party upstream may emit \r\n line endings. The event
+        // splitter looks for \n\n, which \r\n\r\n boundaries never contain,
+        // so without normalization the entire stream would be buffered and
+        // the client would get an empty completed response.
+        let chunks = [
+            "{\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\r\n",
+            "{\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"m\",\"choices\":[{\"index\":0,\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2,\"total_tokens\":3}}\r\n",
+            "[DONE]\r\n",
+        ];
+        let mut sse = Vec::new();
+        for c in chunks {
+            sse.extend_from_slice(b"data: ");
+            sse.extend_from_slice(c.as_bytes());
+            sse.extend_from_slice(b"\r\n\r\n");
+        }
+        let mut t = ResponsesStreamTranslator::new(Box::new(crate::NativePassthroughStream));
+        let out = t.process_chunk(&sse, true);
+        let s = String::from_utf8(out).unwrap();
+        assert!(
+            s.contains("event: response.output_text.delta"),
+            "text lost: {s}"
+        );
+        assert!(s.contains(r#"hello"#), "content lost: {s}");
+        assert!(s.contains("event: response.completed"));
+        assert!(s.contains(r#"input_tokens"#), "usage lost: {s}");
     }
 
     #[test]
