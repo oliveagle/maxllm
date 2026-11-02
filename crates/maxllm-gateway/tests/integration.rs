@@ -2067,6 +2067,66 @@ async fn test_non_opencode_upstream_ua_untouched() {
 }
 
 #[tokio::test]
+async fn test_chat_only_responses_route_streaming_translates_sse() {
+    let mock = MockServer::start().await;
+
+    // The chat-only upstream answers with a chat-completions SSE stream; the
+    // gateway must turn it into Responses SSE events for the client.
+    let chat_sse = concat!(
+        "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3,\"total_tokens\":10}}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(chat_sse, "text/event-stream"),
+        )
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let gw = TestGateway::start(CHAT_ONLY_RESPONSES_CONFIG, &mock.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/responses"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&json!({
+            "model": "gpt-4o",
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let text = resp.text().await.unwrap();
+    // The chat stream must come back as Responses SSE events.
+    assert!(text.contains("response.created"), "{text}");
+    assert!(text.contains("response.output_text.delta"), "{text}");
+    assert!(text.contains("response.completed"), "{text}");
+
+    // The upstream must have received a chat streaming body.
+    let requests = mock.received_requests().await.unwrap();
+    let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert!(
+        sent.get("messages").is_some(),
+        "chat upstream must get a chat body: {sent}"
+    );
+    assert!(
+        sent.get("input").is_none(),
+        "raw Responses body leaked: {sent}"
+    );
+    assert_eq!(sent["stream"], true);
+}
+
+#[tokio::test]
 async fn test_chat_only_responses_route_translates_to_chat() {
     // A `/v1/responses` route whose provider only speaks chat completions
     // must translate the Responses body into a chat body for the upstream
