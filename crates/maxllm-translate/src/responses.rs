@@ -132,7 +132,10 @@ pub fn responses_request_to_chat(body: &[u8]) -> Result<TranslatedRequest, Trans
         chat.insert("tools".into(), responses_tools_to_chat(tools));
     }
     if let Some(tool_choice) = req.tool_choice.as_ref() {
-        chat.insert("tool_choice".into(), tool_choice.clone());
+        chat.insert(
+            "tool_choice".into(),
+            responses_tool_choice_to_chat(tool_choice),
+        );
     }
     for field in PASSTHROUGH_CHAT_FIELDS {
         if let Some(v) = req.extra.get(*field) {
@@ -303,6 +306,73 @@ fn content_to_chat_content(content: &Value) -> Value {
         // Text-only: keep the proven plain-string form for strict upstreams.
         Value::String(content_to_text(content))
     }
+}
+
+/// Rewrite a Responses tool_choice into the chat completions shape.
+///
+/// The two contracts spell a function choice differently: Responses names it
+/// flatly (`{"type":"function","name":"f"}`), chat completions nest it
+/// (`{"type":"function","function":{"name":"f"}}`). A chat upstream rejects
+/// the flat form (DeepSeek answers 422, verified live), so the flat shape is
+/// nested on the way to the upstream. String choices ("auto" / "none" /
+/// "required") are identical in both contracts and pass through unchanged.
+///
+/// The Responses-only "allowed_tools" choice (a set of permitted tools) has
+/// no chat equivalent: a single allowed tool becomes the nested function
+/// choice, several allowed tools degrade to "auto" — sending the object
+/// unchanged would be rejected by the chat upstream.
+fn responses_tool_choice_to_chat(tool_choice: &Value) -> Value {
+    let choice_type = tool_choice.get("type").and_then(|t| t.as_str());
+
+    // Flat function choice: {"type":"function","name":"f"}.
+    if choice_type == Some("function")
+        && tool_choice.get("function").is_none()
+        && tool_choice.get("name").is_some()
+    {
+        let mut func = Map::new();
+        if let Some(name) = tool_choice.get("name") {
+            func.insert("name".into(), name.clone());
+        }
+        let mut out = Map::new();
+        out.insert("type".into(), Value::String("function".into()));
+        out.insert("function".into(), Value::Object(func));
+        return Value::Object(out);
+    }
+
+    // Allowed-tools choice: {"type":"allowed_tools","mode":…,"tools":[…]}.
+    if choice_type == Some("allowed_tools") {
+        let allowed = tool_choice
+            .get("tools")
+            .and_then(|t| t.as_array())
+            .map(|tools| {
+                tools
+                    .iter()
+                    .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if allowed.len() == 1 {
+            let mut func = Map::new();
+            func.insert("name".into(), Value::String(allowed[0].to_string()));
+            let mut out = Map::new();
+            out.insert("type".into(), Value::String("function".into()));
+            out.insert("function".into(), Value::Object(func));
+            return Value::Object(out);
+        }
+        // Several allowed tools: the chat contract can only say "auto" (or
+        // "required" when the client demanded a call).
+        let mode = tool_choice
+            .get("mode")
+            .and_then(|m| m.as_str())
+            .unwrap_or("auto");
+        return Value::String(if mode == "required" {
+            "required".to_string()
+        } else {
+            "auto".to_string()
+        });
+    }
+
+    tool_choice.clone()
 }
 
 /// Rewrite Responses tool definitions into chat completions tool definitions.
@@ -1537,6 +1607,43 @@ mod tests {
         // Streaming asks the upstream for usage so `response.completed` can
         // carry token counts.
         assert_eq!(v["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn test_flat_tool_choice_is_nested_for_chat() {
+        // The Responses contract names the function flatly
+        // ({"type":"function","name":"f"}), chat completions nest it
+        // ({"type":"function","function":{"name":"f"}}). A chat upstream
+        // rejects the flat form (422 from DeepSeek, verified live).
+        let body = br#"{"model":"gpt-4o","input":"hi","tools":[{"type":"function","name":"f","parameters":{}}],
+            "tool_choice":{"type":"function","name":"f"}}"#;
+        let out = responses_request_to_chat(body).unwrap();
+        let v: Value = serde_json::from_slice(&out.body).unwrap();
+        assert_eq!(v["tool_choice"]["type"], "function");
+        assert_eq!(v["tool_choice"]["function"]["name"], "f");
+        assert!(v["tool_choice"].get("name").is_none());
+    }
+
+    #[test]
+    fn test_string_tool_choice_is_unchanged() {
+        let body = br#"{"model":"gpt-4o","input":"hi","tool_choice":"required"}"#;
+        let out = responses_request_to_chat(body).unwrap();
+        let v: Value = serde_json::from_slice(&out.body).unwrap();
+        assert_eq!(v["tool_choice"], "required");
+    }
+
+    #[test]
+    fn test_allowed_tools_choice_becomes_a_function_choice() {
+        // The Responses API can restrict the choice to a set of tools. Chat
+        // completions has no such shape, so a single allowed tool becomes the
+        // nested function choice; several allowed tools degrade to "auto"
+        // rather than sending an object the chat upstream cannot parse.
+        let body = br#"{"model":"gpt-4o","input":"hi","tools":[{"type":"function","name":"f","parameters":{}}],
+            "tool_choice":{"type":"allowed_tools","mode":"auto","tools":[{"type":"function","name":"f"}]}}"#;
+        let out = responses_request_to_chat(body).unwrap();
+        let v: Value = serde_json::from_slice(&out.body).unwrap();
+        assert_eq!(v["tool_choice"]["type"], "function");
+        assert_eq!(v["tool_choice"]["function"]["name"], "f");
     }
 
     #[test]

@@ -2386,6 +2386,48 @@ async fn test_chat_only_responses_route_preserves_image_attachments() {
 }
 
 #[tokio::test]
+async fn test_chat_only_responses_route_nests_a_flat_tool_choice() {
+    // The Responses contract names a function choice flatly
+    // ({"type":"function","name":"f"}), chat completions nest it
+    // ({"type":"function","function":{"name":"f"}}). A chat upstream rejects
+    // the flat form (DeepSeek answers 422), so the gateway must nest it on
+    // the way out.
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("ok")))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let gw = TestGateway::start(CHAT_ONLY_RESPONSES_CONFIG, &mock.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/responses"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&json!({
+            "model": "gpt-4o",
+            "input": "hi",
+            "tools": [{"type": "function", "name": "f", "parameters": {}}],
+            "tool_choice": {"type": "function", "name": "f"}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let received = mock.received_requests().await.unwrap_or_default();
+    let sent: Value = serde_json::from_slice(&received[0].body).unwrap();
+    assert_eq!(sent["tool_choice"]["type"], "function");
+    assert_eq!(sent["tool_choice"]["function"]["name"], "f");
+    assert!(
+        sent["tool_choice"].get("name").is_none(),
+        "flat tool_choice leaked to the chat upstream: {sent}"
+    );
+}
+
+#[tokio::test]
 async fn test_native_responses_fallback_to_non_native_provider_translates_body() {
     // The native (opencode) primary is unreachable, so the request is retried
     // on a chat-only (openai) fallback. The fallback speaks the chat
