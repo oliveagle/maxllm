@@ -217,12 +217,31 @@ early-answer race the request body is still being read, the client's intent
 is unknown, and the stream is kept — a streaming client must not be handed a
 single JSON object.
 
+The same fold applies to the **native** Responses path (providers that
+speak the Responses contract themselves, e.g. the `opencode_go` upstreams):
+a native upstream that answers with Responses SSE despite `stream: false` is
+folded into the single object the client asked for, and a stream that
+cannot be folded yields an explicit gateway error instead of leaking SSE
+bytes.
+
 Verified live against the new binary with an upstream that always returns
 chat SSE: `stream: false` → one `application/json` Responses object
 (`status: "completed"`, the answer text and 7 in / 4 out usage preserved);
 `stream: true` → the normal Responses SSE stream with a terminal
 `response.completed`. The previous binary leaked Responses SSE
-(`text/event-stream`) to the same non-streaming request.
+(`text/event-stream`) to the same non-streaming request. The native path was
+verified the same way against a mock that always answers with Responses SSE
+(`stream: false` → one JSON object with the text and 5 in / 2 out usage;
+`stream: true` → the SSE forwarded verbatim).
+
+The mirror case — a *streaming* request answered with a plain JSON object —
+is deliberately **not** rewritten into a stream: the AI SDK's stream
+consumer builds the answer from the `output_text.delta` / `output_item.done`
+events, not from the terminal event's `output` array (measured: a
+`response.created` + `response.completed` sequence yields an empty text
+stream), so re-emitting a JSON object as a minimal event sequence would
+silently drop the answer. A native upstream that answers a streaming request
+with a plain JSON body is left untouched rather than half-converted.
 
 ## Verified end to end
 
