@@ -34,6 +34,9 @@ pub struct GatewayMetrics {
     pub circuit_breaker_transitions_total: IntGaugeVec,
     /// Force-opens caused by HTTP 429 (quota exhaustion) per provider.
     pub circuit_breaker_quota_opens_total: IntCounterVec,
+    /// Failovers caused by an upstream HTTP error (the request is retried on
+    /// the next provider of the route's fallback chain).
+    pub http_failovers_total: IntCounterVec,
 }
 
 impl GatewayMetrics {
@@ -164,6 +167,18 @@ impl GatewayMetrics {
             .register(Box::new(circuit_breaker_quota_opens_total.clone()))
             .expect("register");
 
+        let http_failovers_total = IntCounterVec::new(
+            Opts::new(
+                "maxllm_http_failovers_total",
+                "Failovers triggered by an upstream HTTP error",
+            ),
+            &["from_provider", "to_provider", "status"],
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(http_failovers_total.clone()))
+            .expect("register");
+
         Self {
             registry,
             requests_total,
@@ -179,6 +194,7 @@ impl GatewayMetrics {
             circuit_breaker_state,
             circuit_breaker_transitions_total,
             circuit_breaker_quota_opens_total,
+            http_failovers_total,
         }
     }
 

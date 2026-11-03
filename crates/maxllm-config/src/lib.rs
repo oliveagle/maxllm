@@ -275,6 +275,12 @@ pub struct RouteConfig {
     /// the binding expires). Mirrors litellm_lb_go's session affinity.
     #[serde(default)]
     pub session_sticky: bool,
+    /// Maximum number of providers a single request may walk when the
+    /// current provider fails (an HTTP error such as 429/5xx/404, or a
+    /// connect failure). Mirrors litellm_lb_go's
+    /// `maxResponsesFailoverAttempts`. 0 disables request-level failover.
+    #[serde(default = "default_max_failover_attempts")]
+    pub max_failover_attempts: u32,
     /// Number of retries before falling back.
     #[serde(default)]
     pub num_retries: u32,
@@ -285,6 +291,10 @@ pub struct RouteConfig {
 
 fn default_retry_backoff_ms() -> u64 {
     500
+}
+
+fn default_max_failover_attempts() -> u32 {
+    6
 }
 
 fn default_false() -> bool {

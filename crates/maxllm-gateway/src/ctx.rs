@@ -76,9 +76,15 @@ pub struct RequestCtx {
     /// Rolling tail of the streaming SSE body, kept so a token-usage line
     /// split across chunks is still parsed once the rest arrives.
     pub sse_tail: Vec<u8>,
-    /// Whether a one-shot fallback retry has already been attempted for a
-    /// connect-class upstream failure. Guards against retry loops.
-    pub retry_attempted: bool,
+    /// How many providers this request already walked through. Every
+    /// failover (an HTTP error from the upstream or a connect failure)
+    /// switches to the next provider of the route's fallback chain and
+    /// counts here; the route's `max_failover_attempts` bounds the walk.
+    pub failover_count: u32,
+    /// Providers this request already tried (mirrors litellm_lb_go's
+    /// `attempted` list), so the fallback walk never goes backwards through
+    /// the chain — the walk is strictly `primary → fb1 → fb2 → …`.
+    pub attempted_providers: Vec<String>,
     /// Session identity for session-sticky routing (from headers and/or body).
     pub session_id: Option<String>,
     /// Per-request UUID, used to correlate recording events of one exchange.
@@ -131,7 +137,8 @@ impl RequestCtx {
             keep_request_content_length: false,
             native_responses: false,
             sse_tail: Vec::new(),
-            retry_attempted: false,
+            failover_count: 0,
+            attempted_providers: Vec::new(),
             session_id: None,
             request_uuid: uuid::Uuid::now_v7().to_string(),
             ttft_ms: None,

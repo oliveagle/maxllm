@@ -190,6 +190,12 @@ fn is_script_like_user_agent(ua_lower: &str) -> bool {
 /// Default TCP connect timeout to an upstream, in seconds.
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 
+/// Default request-level failover budget: how many providers one request may
+/// walk when providers fail. Matches litellm_lb_go's
+/// `maxResponsesFailoverAttempts` (six upstreams, one past the largest
+/// migrated one-api channel pool).
+const DEFAULT_MAX_FAILOVER_ATTEMPTS: u32 = 6;
+
 /// Derive the native Responses path from a chat completions path.
 /// `/zen/go/v1/chat/completions` → `/zen/go/v1/responses`.
 fn derive_responses_path(chat_path: &str) -> Option<String> {
@@ -869,6 +875,52 @@ fn route_timeout_secs(routes: &[RouteConfig], route_index: Option<usize>) -> Opt
         .and_then(|r| r.timeout_secs)
         .filter(|secs| *secs > 0)
         .map(Duration::from_secs)
+}
+
+/// The route's request-level failover budget: how many providers one request
+/// may walk when the current provider fails. Unset (or absent) routes keep
+/// the built-in default, which matches litellm_lb_go's bound.
+fn max_failover_attempts(routes: &[RouteConfig], route_index: Option<usize>) -> u32 {
+    route_index
+        .and_then(|i| routes.get(i))
+        .map(|r| r.max_failover_attempts)
+        .unwrap_or(DEFAULT_MAX_FAILOVER_ATTEMPTS)
+}
+
+/// Whether an upstream HTTP status means "this provider failed" rather than
+/// "this request is wrong" — i.e. whether another provider of the pool may
+/// still serve the request.
+///
+/// Mirrors litellm_lb_go's `responsesFailoverAllowed`: quota exhaustion, rate
+/// limits, auth rejections, a missing model and server errors all fail over,
+/// while 400/422 are request faults every upstream would reject the same way.
+///
+/// The pool needs one exception: the requested model is sent to the first
+/// provider of the chain, and a provider that does not carry it answers
+/// 400 (one-api's `invalid params, unknown model`). A provider whose own
+/// default model differs from the requested model is treated as not carrying
+/// it, so the request walks on to a provider that has the model.
+fn should_failover_status(status: u16, ctx: &RequestCtx, provider: &ProviderState) -> bool {
+    match status {
+        // The provider cannot serve this request now or at all: quota
+        // exhausted (429), auth rejected (401/403), model or endpoint
+        // missing (404/405/410), timed out (408), conflicting (409/425),
+        // unaffordable (402).
+        401 | 402 | 403 | 404 | 405 | 408 | 409 | 410 | 425 | 429 => true,
+        // The provider itself failed.
+        500..=599 => true,
+        // The request is wrong — unless this provider simply does not carry
+        // the requested model (its own default differs from the request).
+        400 | 422 => {
+            !ctx.model.is_empty()
+                && provider
+                    .default_model
+                    .as_deref()
+                    .is_some_and(|default_model| default_model != ctx.model)
+        }
+        // 2xx/3xx and anything else: the provider answered.
+        _ => false,
+    }
 }
 
 #[async_trait]
@@ -1985,6 +2037,126 @@ impl ProxyHttp for AiGateway {
         Ok(())
     }
 
+    /// The upstream answered with a status line — before anything is written
+    /// to the client.
+    ///
+    /// This is the request-level failover point: when the provider answered
+    /// with an error another provider of the pool may not have (its quota is
+    /// exhausted, it rate limits, it answers 5xx, it does not carry the
+    /// model), the request walks the rest of the fallback chain instead of
+    /// failing the client. The provider's answer is discarded here and the
+    /// whole upstream attempt is retried on the next provider, so the failed
+    /// attempt stays invisible to the client — the same behaviour litellm_lb_go
+    /// and one-api expose on their channel pools.
+    async fn upstream_response_filter(
+        &self,
+        _session: &mut Session,
+        upstream_response: &mut ResponseHeader,
+        ctx: &mut Self::CTX,
+    ) -> pingora::Result<()> {
+        let status = upstream_response.status.as_u16();
+
+        // Record circuit breaker state.
+        //
+        // A 429 (quota exhausted) force-opens the provider until its cooldown
+        // ends: retrying a quota-exhausted channel is wasted work, and the
+        // upstream usually says when it resets (Retry-After). Any other
+        // server error counts against `max_fails`. Successes reset the
+        // half-open probe and re-pin the session to this provider.
+        let retry_after = upstream_response
+            .headers
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_retry_after_secs);
+        let quota_open = status == 429;
+        let server_error = (500..=599).contains(&status);
+        let success = (200..=299).contains(&status);
+        if quota_open || server_error || success {
+            let hot = self.hot.load();
+            if let Some(p) = hot.providers.get(&ctx.provider_name) {
+                if quota_open {
+                    p.circuit_breaker.record_http_failure(429, retry_after);
+                    METRICS
+                        .circuit_breaker_quota_opens_total
+                        .with_label_values(&[&ctx.provider_name])
+                        .inc();
+                    // A quota-exhausted provider must not keep the session pinned.
+                    self.unpin_session(ctx);
+                } else if server_error {
+                    p.circuit_breaker.record_failure();
+                    self.unpin_session(ctx);
+                } else {
+                    p.circuit_breaker.record_success();
+                    // Pin the session to the provider that just served it.
+                    self.pin_session(ctx);
+                }
+                METRICS
+                    .circuit_breaker_state
+                    .with_label_values(&[&ctx.provider_name])
+                    .set(p.circuit_breaker.state() as i64);
+                METRICS
+                    .circuit_breaker_transitions_total
+                    .with_label_values(&[&ctx.provider_name])
+                    .set(p.circuit_breaker.state_transitions() as i64);
+                // Persist the breaker state so a restart keeps an open circuit
+                // and a 429 quota force-open.
+                self.persist_circuit_breaker(&ctx.provider_name, &p.circuit_breaker);
+            }
+        }
+
+        // A provider whose circuit is open must not keep the session pinned;
+        // done above. Now decide whether this error belongs to the provider
+        // (fail over) or to the request (return it to the client).
+        let hot = self.hot.load();
+        let Some(provider) = hot.providers.get(&ctx.provider_name) else {
+            return Ok(());
+        };
+        if !should_failover_status(status, ctx, provider) {
+            return Ok(());
+        }
+        if ctx.failover_count >= max_failover_attempts(&hot.routes, ctx.route_index) {
+            info!(
+                status = %status,
+                provider = %ctx.provider_name,
+                attempts = ctx.failover_count,
+                "upstream answered with an error and the failover budget is spent — returning the error to the client"
+            );
+            return Ok(());
+        }
+        // Audit trail: the failed provider answered (the final provider's
+        // answer is recorded by `response_filter` on the surviving attempt).
+        // Recorded before the switch so the provider label matches the status.
+        self.record_event(EVENT_PROVIDER_RESPONSE, ctx, Some(status), None, None, None);
+        let Some((failed_provider, next_provider)) = self.switch_to_fallback(ctx) else {
+            return Ok(());
+        };
+
+        METRICS
+            .http_failovers_total
+            .with_label_values(&[&failed_provider, &next_provider, &status.to_string()])
+            .inc();
+        info!(
+            status = %status,
+            provider = %next_provider,
+            failed_provider = %failed_provider,
+            "upstream answered with an error — retrying the request on the fallback provider"
+        );
+
+        // The request body is still buffered in pingora's retry buffer (the
+        // client has not received anything yet), so the whole upstream
+        // attempt — including the request body translation — is replayed on
+        // the new provider.
+        let mut e = pingora::Error::explain(
+            pingora::ErrorType::HTTPStatus(status),
+            format!(
+                "provider '{failed_provider}' answered {status}; retrying on '{next_provider}'"
+            ),
+        );
+        e.as_up();
+        e.set_retry(true);
+        Err(e)
+    }
+
     async fn response_filter(
         &self,
         session: &mut Session,
@@ -1996,46 +2168,9 @@ impl ProxyHttp for AiGateway {
         ctx.upstream_status = status;
         let provider = hot.providers.get(&ctx.provider_name);
 
-        // Record circuit breaker state.
-        //
-        // A 429 (quota exhausted) force-opens the provider until its cooldown
-        // ends: retrying a quota-exhausted channel is wasted work, and the
-        // upstream usually says when it resets (Retry-After). Any other
-        // server error counts against `max_fails`.
-        if let Some(p) = provider {
-            if status == 429 {
-                let retry_after = upstream_response
-                    .headers
-                    .get("retry-after")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(parse_retry_after_secs);
-                p.circuit_breaker.record_http_failure(429, retry_after);
-                METRICS
-                    .circuit_breaker_quota_opens_total
-                    .with_label_values(&[&ctx.provider_name])
-                    .inc();
-                // A quota-exhausted provider must not keep the session pinned.
-                self.unpin_session(ctx);
-            } else if (500..=599).contains(&status) {
-                p.circuit_breaker.record_failure();
-                self.unpin_session(ctx);
-            } else if (200..=299).contains(&status) {
-                p.circuit_breaker.record_success();
-                // Pin the session to the provider that just served it.
-                self.pin_session(ctx);
-            }
-            METRICS
-                .circuit_breaker_state
-                .with_label_values(&[&ctx.provider_name])
-                .set(p.circuit_breaker.state() as i64);
-            METRICS
-                .circuit_breaker_transitions_total
-                .with_label_values(&[&ctx.provider_name])
-                .set(p.circuit_breaker.state_transitions() as i64);
-            // Persist the breaker state so a restart keeps an open circuit and
-            // a 429 quota force-open.
-            self.persist_circuit_breaker(&ctx.provider_name, &p.circuit_breaker);
-        }
+        // Circuit breaker bookkeeping happens in `upstream_response_filter`,
+        // before the failover decision — the provider's failure must be
+        // recorded even when the request walks on to the next provider.
 
         // Audit trail: the upstream answered.
         self.record_event(EVENT_PROVIDER_RESPONSE, ctx, Some(status), None, None, None);
@@ -2895,67 +3030,31 @@ impl ProxyHttp for AiGateway {
         ctx: &mut Self::CTX,
         mut e: Box<pingora::Error>,
     ) -> Box<pingora::Error> {
-        if ctx.retry_attempted || !AiGateway::is_connect_failure(&e) {
+        // A connect failure means the upstream never received the request, so
+        // it is always safe to replay it on another provider. The walk is
+        // bounded by the route's failover budget.
+        if !AiGateway::is_connect_failure(&e) {
+            return e;
+        }
+        let max_attempts = {
+            let hot = self.hot.load();
+            max_failover_attempts(&hot.routes, ctx.route_index)
+        };
+        if ctx.failover_count >= max_attempts {
             return e;
         }
 
         // A connect failure is an upstream failure: count it against the
         // provider's circuit breaker so the fallback chain stops using it.
-        {
-            let hot = self.hot.load();
-            if let Some(p) = hot.providers.get(&ctx.provider_name) {
-                p.circuit_breaker.record_failure();
-                METRICS
-                    .circuit_breaker_state
-                    .with_label_values(&[&ctx.provider_name])
-                    .set(p.circuit_breaker.state() as i64);
-                self.persist_circuit_breaker(&ctx.provider_name, &p.circuit_breaker);
-            }
-        }
+        self.record_provider_connect_failure(ctx);
         self.unpin_session(ctx);
         self.record_event(EVENT_ERROR, ctx, Some(502), None, Some(e.to_string()), None);
 
-        let Some((name, fallback)) = self.next_fallback_provider(ctx) else {
+        let Some((failed_provider, next_provider)) = self.switch_to_fallback(ctx) else {
             return e;
         };
-        ctx.retry_attempted = true;
-        ctx.fallback_used = true;
-        if ctx.original_provider.is_none() {
-            ctx.original_provider = Some(ctx.provider_name.clone());
-        }
-        let failed_provider = ctx.provider_name.clone();
-        ctx.provider_name = name.clone();
-        // The fallback may speak a different contract than the provider that
-        // just failed — the request path depends on it.
-        ctx.native_responses = ctx.endpoint_type == EndpointType::Responses
-            && fallback.native_responses
-            && fallback.responses_path.is_some();
-
-        // The retry re-runs the whole upstream attempt, including
-        // `request_body_filter` — that is what turns a Responses body into a
-        // chat body for a fallback that only speaks chat completions. State
-        // left over from the failed attempt would make the retry skip that
-        // work and forward the untranslated body (a chat upstream then
-        // receives `{"input":…}` and rejects it):
-        // - `body_translated` marks the failed attempt's body as processed;
-        // - `request_body_buf` still holds the chunks of that attempt;
-        // - `keep_request_content_length` was derived from the failed
-        //   provider's framing (re-derived by `upstream_request_filter`
-        //   for the retry, so it must start out false);
-        // - `stream_translator` was picked for the failed provider's
-        //   response contract.
-        ctx.body_translated = false;
-        ctx.request_body_buf.clear();
-        ctx.keep_request_content_length = false;
-        if let Ok(mut guard) = ctx.stream_translator.lock() {
-            *guard = None;
-        }
-        METRICS
-            .fallbacks_total
-            .with_label_values(&[&failed_provider, &name])
-            .inc();
         info!(
-            provider = %name,
+            provider = %next_provider,
             failed_provider = %failed_provider,
             "upstream connection failed — retrying the request on the fallback provider"
         );
@@ -3147,9 +3246,10 @@ impl AiGateway {
             )
     }
 
-    /// The next provider to try after a connect failure: the first healthy
-    /// provider in the route's fallback list, skipping the provider whose
-    /// connection just failed. Returns its name and state.
+    /// The next provider to try: the first healthy provider of the route's
+    /// fallback chain that this request has not tried yet (skipping open
+    /// circuits), so the walk is strictly forward through the chain.
+    /// Returns its name and state.
     fn next_fallback_provider(&self, ctx: &RequestCtx) -> Option<(String, Arc<ProviderState>)> {
         let hot = self.hot.load();
         let route = hot.routes.get(ctx.route_index?)?;
@@ -3157,12 +3257,74 @@ impl AiGateway {
             .fallback
             .iter()
             .filter(|name| *name != &ctx.provider_name)
+            .filter(|name| !ctx.attempted_providers.contains(*name))
             .find_map(|name| {
                 hot.providers
                     .get(name)
                     .filter(|p| !p.circuit_breaker.is_open())
                     .map(|p| (name.clone(), Arc::clone(p)))
             })
+    }
+
+    /// Count a connect failure against the provider's circuit breaker,
+    /// update the breaker metrics and persist the new state, so the fallback
+    /// chain stops using a provider that cannot be reached.
+    fn record_provider_connect_failure(&self, ctx: &RequestCtx) {
+        let hot = self.hot.load();
+        let Some(p) = hot.providers.get(&ctx.provider_name) else {
+            return;
+        };
+        p.circuit_breaker.record_failure();
+        METRICS
+            .circuit_breaker_state
+            .with_label_values(&[&ctx.provider_name])
+            .set(p.circuit_breaker.state() as i64);
+        self.persist_circuit_breaker(&ctx.provider_name, &p.circuit_breaker);
+    }
+
+    /// Move the request to the next healthy provider of the route's fallback
+    /// chain. Returns the failed and the new provider name.
+    ///
+    /// The retry re-runs the whole upstream attempt, including
+    /// `request_body_filter` — that is what turns a Responses body into a
+    /// chat body for a fallback that only speaks chat completions (and what
+    /// normalises the body into opencode's stricter schema when the fallback
+    /// is an opencode provider). State left over from the failed attempt
+    /// would make the retry skip that work and forward the previous body (a
+    /// chat upstream then receives `{"input":…}` and rejects it):
+    /// - `body_translated` marks the failed attempt's body as processed;
+    /// - `request_body_buf` still holds the chunks of that attempt;
+    /// - `keep_request_content_length` was derived from the failed
+    ///   provider's framing (re-derived by `upstream_request_filter`
+    ///   for the retry, so it must start out false);
+    /// - `stream_translator` was picked for the failed provider's
+    ///   response contract.
+    fn switch_to_fallback(&self, ctx: &mut RequestCtx) -> Option<(String, String)> {
+        let (name, fallback) = self.next_fallback_provider(ctx)?;
+        let failed_provider = ctx.provider_name.clone();
+        ctx.failover_count += 1;
+        ctx.attempted_providers.push(failed_provider.clone());
+        ctx.fallback_used = true;
+        if ctx.original_provider.is_none() {
+            ctx.original_provider = Some(failed_provider.clone());
+        }
+        ctx.provider_name = name.clone();
+        // The fallback may speak a different contract than the provider that
+        // just failed — the request path depends on it.
+        ctx.native_responses = ctx.endpoint_type == EndpointType::Responses
+            && fallback.native_responses
+            && fallback.responses_path.is_some();
+        ctx.body_translated = false;
+        ctx.request_body_buf.clear();
+        ctx.keep_request_content_length = false;
+        if let Ok(mut guard) = ctx.stream_translator.lock() {
+            *guard = None;
+        }
+        METRICS
+            .fallbacks_total
+            .with_label_values(&[&failed_provider, &name])
+            .inc();
+        Some((failed_provider, name))
     }
 
     /// Persist a provider's circuit-breaker state.
@@ -3229,9 +3391,13 @@ impl AiGateway {
         };
         let evicted = self.sessions.set(session_id, &ctx.provider_name);
         if evicted > 0 {
-            METRICS.session_affinity_evictions_total.inc_by(evicted as u64);
+            METRICS
+                .session_affinity_evictions_total
+                .inc_by(evicted as u64);
         }
-        METRICS.session_affinity_size.set(self.sessions.len() as i64);
+        METRICS
+            .session_affinity_size
+            .set(self.sessions.len() as i64);
         // Persist the binding so session affinity survives a gateway restart.
         if let Some(ref admin_api) = self.admin_api {
             if let Err(err) = admin_api.save_session_binding(session_id, &ctx.provider_name) {
@@ -3256,7 +3422,9 @@ impl AiGateway {
         // Only unpin when the failing provider is the pinned one.
         if self.sessions.peek(session_id).as_deref() == Some(ctx.provider_name.as_str()) {
             self.sessions.remove(session_id);
-            METRICS.session_affinity_size.set(self.sessions.len() as i64);
+            METRICS
+                .session_affinity_size
+                .set(self.sessions.len() as i64);
             // Drop the persisted binding too.
             if let Some(ref admin_api) = self.admin_api {
                 if let Err(err) = admin_api.delete_session_binding(session_id) {
@@ -4165,5 +4333,99 @@ mod stream_usage_tests {
         extract_stream_usage(chunk, &mut c, true);
         assert_eq!(c.tokens_in, 4);
         assert_eq!(c.tokens_out, 1);
+    }
+}
+
+#[cfg(test)]
+mod failover_policy_tests {
+    use super::*;
+    use crate::circuit_breaker::CircuitBreaker;
+
+    fn provider(default_model: Option<&str>) -> ProviderState {
+        ProviderState {
+            kind: maxllm_config::ProviderKind::OpenaiCompat,
+            translator: Box::new(
+                maxllm_translate::openai_compat::OpenAICompatTranslator::new(
+                    "p".to_string(),
+                    "/v1/chat/completions".to_string(),
+                    maxllm_translate::openai_compat::AuthStyle::Bearer,
+                ),
+            ),
+            circuit_breaker: Arc::new(CircuitBreaker::new(3, 60)),
+            api_key: "k".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 9,
+            tls: false,
+            sni: "127.0.0.1".to_string(),
+            weight: 100,
+            tags: vec![],
+            default_model: default_model.map(|m| m.to_string()),
+            native_responses: false,
+            responses_path: None,
+            connect_timeout: Duration::from_secs(10),
+            total_connect_timeout: None,
+        }
+    }
+
+    fn ctx(model: &str) -> RequestCtx {
+        let mut c = RequestCtx::new();
+        c.model = model.to_string();
+        c
+    }
+
+    #[test]
+    fn failover_eligible_statuses() {
+        let p = provider(Some("MiniMax-M3"));
+        for status in [
+            401u16, 402, 403, 404, 405, 408, 409, 410, 425, 429, 500, 502, 503, 599,
+        ] {
+            assert!(
+                should_failover_status(status, &ctx("anything"), &p),
+                "status {status} must be failover-eligible"
+            );
+        }
+    }
+
+    #[test]
+    fn success_and_redirect_statuses_never_fail_over() {
+        let p = provider(Some("MiniMax-M3"));
+        for status in [200u16, 201, 204, 301, 302, 304, 307, 308] {
+            assert!(!should_failover_status(status, &ctx("anything"), &p));
+        }
+    }
+
+    #[test]
+    fn bad_request_with_model_mismatch_fails_over() {
+        // The pool sent a model this provider does not carry — one-api answers
+        // 400 "unknown model". The provider's own default differs from the
+        // request, so it is treated as a model-capability failure.
+        let p = provider(Some("MiniMax-M3"));
+        assert!(should_failover_status(400, &ctx("deepseek-v4-flash"), &p));
+        assert!(should_failover_status(422, &ctx("GLM-5.3"), &p));
+    }
+
+    #[test]
+    fn bad_request_with_matching_model_stays() {
+        // The provider carries the requested model (its default matches), so a
+        // 400 is a genuine request fault every provider would share.
+        let p = provider(Some("MiniMax-M3"));
+        assert!(!should_failover_status(400, &ctx("MiniMax-M3"), &p));
+        assert!(!should_failover_status(422, &ctx("MiniMax-M3"), &p));
+    }
+
+    #[test]
+    fn bad_request_with_unknown_model_stays_conservative() {
+        // A provider without a declared default gives no signal about which
+        // models it carries — a 400 is treated as a request fault.
+        let p = provider(None);
+        assert!(!should_failover_status(400, &ctx("anything"), &p));
+    }
+
+    #[test]
+    fn bad_request_before_model_is_known_stays() {
+        // The request body has not been read yet (early answer race) — no
+        // model signal, so a 400 stays.
+        let p = provider(Some("MiniMax-M3"));
+        assert!(!should_failover_status(400, &ctx(""), &p));
     }
 }
