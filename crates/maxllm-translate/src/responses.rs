@@ -1788,11 +1788,82 @@ impl StreamTranslator for ResponsesStreamTranslator {
         }
 
         if end_of_stream {
+            // The event splitter above only reads complete `\n\n`-delimited
+            // events. Two shapes can therefore reach the end of the stream
+            // unparsed, and both must not be dropped:
+            //
+            // * a final `data:` event whose `\n\n` terminator never arrived;
+            // * a plain JSON document — an upstream that answers a streaming
+            //   request with a non-streaming body, most often an
+            //   `{"error": {...}}` object it produced after accepting the
+            //   request.
+            //
+            // Dropping them would end the stream with an empty
+            // `response.completed`: an upstream error would be reported to
+            // the client as a successful empty answer, and a real answer
+            // would be lost. The non-streaming path already turns such a
+            // document into a failed Responses object; the streaming path
+            // must end with `response.failed` instead.
+            let rest = String::from_utf8_lossy(&self.buffer).trim().to_string();
+            if let Some(data) = rest.strip_prefix("data:") {
+                let data = data.trim_start();
+                if !data.is_empty() && data != "[DONE]" {
+                    if let Ok(chunk) = serde_json::from_str::<Value>(data) {
+                        self.handle_chunk(&chunk, &mut out);
+                    }
+                }
+            } else if rest.starts_with('{') {
+                if let Ok(chunk) = serde_json::from_str::<Value>(&rest) {
+                    let chunk = chat_json_to_stream_chunk(chunk);
+                    self.handle_chunk(&chunk, &mut out);
+                }
+            }
+            self.buffer.clear();
+
             self.finalize(&mut out);
         }
 
         out
     }
+}
+
+/// Normalize a non-streaming chat completion document into a stream-shaped
+/// chunk.
+///
+/// The streaming handler reads `choices[].delta`; a plain chat completion
+/// carries the answer in `choices[].message`. Moving the message into
+/// `delta` lets the ordinary handler pick it up. Tool calls only carry the
+/// `index` field on the wire in streaming mode, so the sequential index is
+/// added here — without it every call of a parallel run would share one
+/// slot and the later calls would overwrite the earlier ones.
+fn chat_json_to_stream_chunk(mut chunk: Value) -> Value {
+    let Some(choice) = chunk
+        .get_mut("choices")
+        .and_then(|c| c.as_array_mut())
+        .and_then(|a| a.first_mut())
+    else {
+        return chunk;
+    };
+    if choice.get("delta").is_some() {
+        return chunk;
+    }
+    let Some(message) = choice.get("message").cloned() else {
+        return chunk;
+    };
+    let mut message = message;
+    if let Some(calls) = message.get_mut("tool_calls").and_then(|t| t.as_array_mut()) {
+        for (index, call) in calls.iter_mut().enumerate() {
+            if call.get("index").is_none() {
+                if let Some(obj) = call.as_object_mut() {
+                    obj.insert("index".to_string(), json!(index));
+                }
+            }
+        }
+    }
+    if let Some(obj) = choice.as_object_mut() {
+        obj.insert("delta".to_string(), message);
+    }
+    chunk
 }
 
 // ---------------------------------------------------------------------------
@@ -3450,6 +3521,143 @@ mod tests {
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains("event: response.completed"));
         assert!(!s.contains("event: response.failed"));
+    }
+
+    #[test]
+    fn test_bare_json_error_body_ends_with_response_failed() {
+        // An upstream can answer a *streaming* request with a plain JSON
+        // error document (HTTP 200, no SSE framing) instead of an SSE error
+        // chunk. It must end the stream with `response.failed` carrying the
+        // reason — the bare body is not `data:`-framed, so without the
+        // end-of-stream JSON handling it would be dropped and the client
+        // would see an empty `response.completed` with the error hidden.
+        let body = r#"{"id":"chatcmpl-q","object":"chat.completion","created":1700000000,"model":"gpt-4o","choices":[],"error":{"message":"quota exhausted","type":"insufficient_quota_error","code":"insufficient_quota"}}"#;
+        let mut t = ResponsesStreamTranslator::new(Box::new(crate::NativePassthroughStream));
+        let out = t.process_chunk(body.as_bytes(), true);
+        let s = String::from_utf8(out).unwrap();
+
+        assert!(
+            !s.contains("event: response.completed"),
+            "a failed stream must not end with completed: {s}"
+        );
+        let events = sse_payloads(&s);
+        let failed = events
+            .iter()
+            .find(|e| e["type"] == "response.failed")
+            .expect("response.failed event expected");
+        assert_eq!(failed["response"]["status"], "failed");
+        assert_eq!(failed["response"]["error"]["message"], "quota exhausted");
+        assert_eq!(failed["response"]["error"]["code"], "insufficient_quota");
+        assert_eq!(
+            failed["response"]["error"]["type"],
+            "insufficient_quota_error"
+        );
+        assert!(s.contains("data: [DONE]"));
+    }
+
+    #[test]
+    fn test_bare_json_chat_completion_is_streamed() {
+        // A provider that ignored `stream: true` answers with a plain chat
+        // completion. The answer must reach the client as a normal stream —
+        // not be dropped into an empty `response.completed`.
+        let body = r#"{"id":"chatcmpl-r","object":"chat.completion","created":1700000000,"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"hello from non-streaming"},"finish_reason":"stop"}],"usage":{"prompt_tokens":4,"completion_tokens":3,"total_tokens":7}}"#;
+        let mut t = ResponsesStreamTranslator::new(Box::new(crate::NativePassthroughStream));
+        let out = t.process_chunk(body.as_bytes(), true);
+        let s = String::from_utf8(out).unwrap();
+
+        let events = sse_payloads(&s);
+        let deltas: Vec<&str> = events
+            .iter()
+            .filter(|e| e["type"] == "response.output_text.delta")
+            .map(|e| e["delta"].as_str().unwrap())
+            .collect();
+        assert_eq!(deltas, vec!["hello from non-streaming"]);
+        let completed = events
+            .iter()
+            .find(|e| e["type"] == "response.completed")
+            .expect("response.completed expected");
+        assert_eq!(completed["response"]["status"], "completed");
+        assert_eq!(
+            completed["response"]["output"][0]["content"][0]["text"],
+            "hello from non-streaming"
+        );
+        assert_eq!(completed["response"]["usage"]["input_tokens"], 4);
+        assert_eq!(completed["response"]["usage"]["output_tokens"], 3);
+        assert!(s.contains("data: [DONE]"));
+    }
+
+    #[test]
+    fn test_bare_json_chat_completion_parallel_tool_calls() {
+        // A non-streaming completion with several tool calls has no `index`
+        // on them (streaming-only field). The sequential index must be
+        // assigned so a parallel run stays in separate slots instead of all
+        // calls collapsing into one.
+        let body = r#"{"id":"chatcmpl-s","object":"chat.completion","created":1700000000,"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Rome\"}"}},{"id":"call_2","type":"function","function":{"name":"get_news","arguments":"{\"topic\":\"ai\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":6,"total_tokens":16}}"#;
+        let mut t = ResponsesStreamTranslator::new(Box::new(crate::NativePassthroughStream));
+        let out = t.process_chunk(body.as_bytes(), true);
+        let s = String::from_utf8(out).unwrap();
+
+        let events = sse_payloads(&s);
+        let done_calls: Vec<(&str, u64)> = events
+            .iter()
+            .filter(|e| {
+                e["type"] == "response.output_item.done" && e["item"]["type"] == "function_call"
+            })
+            .map(|e| {
+                (
+                    e["item"]["name"].as_str().unwrap(),
+                    e["output_index"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            done_calls,
+            vec![("get_weather", 0), ("get_news", 1)],
+            "parallel calls must stay in separate output slots: {done_calls:?}"
+        );
+        let completed = events
+            .iter()
+            .find(|e| e["type"] == "response.completed")
+            .expect("response.completed expected");
+        let outputs = completed["response"]["output"].as_array().unwrap();
+        let call_outputs: Vec<(&str, &str)> = outputs
+            .iter()
+            .filter(|i| i["type"] == "function_call")
+            .map(|i| {
+                (
+                    i["name"].as_str().unwrap(),
+                    i["arguments"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            call_outputs,
+            vec![
+                ("get_weather", "{\"city\":\"Rome\"}"),
+                ("get_news", "{\"topic\":\"ai\"}")
+            ],
+            "both calls must be in the completed output: {call_outputs:?}"
+        );
+    }
+
+    #[test]
+    fn test_final_event_without_terminator_is_parsed() {
+        // The last `data:` event may arrive without its `\n\n` terminator
+        // (a stream that ends without a trailing blank line). It must still
+        // be parsed, not dropped into an empty completed response.
+        let sse = "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"tail\"},\"finish_reason\":null}]}";
+        let mut t = ResponsesStreamTranslator::new(Box::new(crate::NativePassthroughStream));
+        let out = t.process_chunk(sse.as_bytes(), true);
+        let s = String::from_utf8(out).unwrap();
+
+        let events = sse_payloads(&s);
+        let deltas: Vec<&str> = events
+            .iter()
+            .filter(|e| e["type"] == "response.output_text.delta")
+            .map(|e| e["delta"].as_str().unwrap())
+            .collect();
+        assert_eq!(deltas, vec!["tail"]);
+        assert!(s.contains("event: response.completed"));
     }
 
     #[test]
