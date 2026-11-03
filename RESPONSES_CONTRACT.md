@@ -79,6 +79,20 @@ verified live: `output_item.added` → `reasoning_summary_part.added` →
   `response` object, and classifies `context_length_exceeded` / overflow
   messages as context-overflow.
 
+## Tool-call arguments may be a JSON object (verified live)
+
+`arguments` on a tool call is a JSON *string* on the wire, but some clients
+and upstreams send it as a JSON object. maxllm stringifies a non-string
+value in all three directions instead of dropping it: the request side
+(`function_call` input item), the non-streaming response side and the
+streaming response side (shared `arguments_to_string` helper). An empty
+string still means "no arguments yet" (a streamed tool call's opening
+fragment) and is not serialized into the literal `""`. Verified live: a
+stream whose arguments arrive as `{"city":"Rome"}` emits
+`function_call_arguments.delta` with the serialized string, completes the
+item, and lands in `response.completed` — every event parses as a strict
+AI SDK chunk.
+
 ## sequence_number on every event (verified against the AI SDK schema)
 
 Every Responses SSE frame carries a monotonic `sequence_number` (starting at
