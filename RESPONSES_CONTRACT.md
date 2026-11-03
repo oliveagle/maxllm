@@ -119,3 +119,52 @@ answered `391`.
 - A forced tool call (`tool_choice: {type: function, name}`) streams
   `function_call_arguments.delta` fragments and completes the item with the
   full arguments `{"city": "Paris"}`.
+
+## Why a conversion layer at all (one-api reference, audited 2026-11-03)
+
+The other reference implementation the original task named — one-api's
+Responses support — no longer converts anything. In its current source
+(`relay/controller/responses.go`, git `4c4ae9f`) the relay answers 503
+(`responses_unsupported_on_channel`) for any channel whose upstream does
+not natively serve the Responses API, and passes through byte-for-byte
+only for `support_responses` / `responses_only` channels and the
+`AIHubMix` / `OpenAIResponses` channel types; pools are split by wire
+protocol. The old Responses↔chat conversion was deleted in `160bc2b`
+(it had lived in `responses_convert.go` (801 lines) and
+`responses_convert_back.go` (484 lines), with 1687 lines of tests);
+ADR-0001 documents the earlier passthrough-over-conversion decision.
+
+The deleted conversion is the "not very stable, may have several bugs"
+code the task pointed at. Reading it, the concrete defects were:
+
+- **Forward: most request fields silently dropped.** The decoded
+  `ResponsesRequest` only knew `model`/`stream`/`input`/`instructions`/
+  `max_output_tokens`/`tools`/`tool_choice`, and `convertResponsesToChatCompletions`
+  emitted only those. `max_output_tokens`, `reasoning.effort`,
+  `temperature`, `top_p`, `parallel_tool_calls`, `stop` and `seed`
+  never reached the chat upstream: output limits and thinking strength
+  were silently lost.
+- **Forward: parallel tool calls split into consecutive assistant
+  messages.** Each `function_call` input item became its own assistant
+  `tool_calls` message, so a parallel tool run was two consecutive
+  assistant messages — the exact shape DeepSeek rejects (the same
+  defect maxllm fixed in `f512a78`).
+- **Forward: `encrypted_content` leaked to the chat upstream.** A
+  `reasoning` item with no plaintext fell back to its opaque encrypted
+  blob as `reasoning_content`, sending ciphertext to the provider.
+- **Back/stream: parallel tool calls indistinguishable.** The translator's
+  own comment admits the relay's `model.Message` has no `index`, so it
+  accumulated call fragments sequentially and mis-attributed interleaved
+  argument fragments; a tool-only turn also opened an empty `message`
+  item, and the terminal `response.completed` carried `"output": []`
+  instead of the items just emitted.
+
+maxllm's translation differs on each point: the full client field set is
+mapped (`max_output_tokens`→`max_tokens`, `reasoning.effort`→
+`reasoning_effort`, `parallel_tool_calls`, `temperature`/`top_p`, plus
+the chat-native `stop`/`seed`/penalty fields); a run of `function_call`
+items is merged into one assistant message; `encrypted_content` and
+`compaction` items are dropped (unit-tested); the stream translator keys
+tool calls by the chat delta `index` so interleaved parallel arguments
+stay in their own call; a tool-only turn emits no empty message item; and
+the terminal `response.completed` carries the full `output` array.
