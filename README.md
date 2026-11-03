@@ -54,6 +54,9 @@ A high-performance AI gateway built on [Pingora](https://github.com/cloudflare/p
 - **Three input modes** &mdash; OpenAI-format with translation, native provider format (Anthropic Messages API, Gemini, etc.), or raw pass-through
 - **Streaming support** &mdash; SSE streaming with real-time format translation (Anthropic SSE, Gemini SSE, Cohere SSE &rarr; OpenAI SSE)
 - **Smart routing** &mdash; Fallback chains, weighted load balancing, round-robin, least-connections, with per-provider circuit breakers
+- **Session stickiness** &mdash; Pin a conversation to the provider that first served it (session id from `X-Session-ID` / `X-Conversation-ID` / `session-id` / `thread-id` headers, or the request body), so a session never hops between API keys and loses upstream context
+- **Resilient circuit breakers** &mdash; Three-state (closed / open / half-open) with bounded half-open probing; an HTTP 429 force-opens a provider until its `Retry-After` or the fail window passes, so quota-exhausted channels are not retried pointlessly
+- **Request recorder** &mdash; JSONL audit trail of every client/provider exchange (hourly rotation, body truncation, retention pruning), same event shape as litellm_lb_go
 - **Plugin system** &mdash; 14 built-in plugins (auth, rate limiting, CORS, caching, PII filtering, prompt injection detection, context compaction, and more)
 - **Guardrails** &mdash; Content-level guardrails with 8 providers (built-in, webhook, Lakera AI, CEL expressions)
 - **Virtual keys** &mdash; Multi-tenant key management with per-key budgets, rate limits, model access control, and team grouping
@@ -399,6 +402,98 @@ key = "client_ip"
 | Least Connections | `least_connections` | Route to the least busy provider |
 
 All strategies include automatic **circuit breaking**: providers are temporarily removed from rotation after consecutive failures (default: 3 failures, 60s recovery). The circuit breaker is lock-free (AtomicU32/U64).
+
+
+## Resilience: Session Stickiness, Circuit Breaking & Recording
+
+A port of the resilience trio from [litellm_lb_go](https://github.com/oliveagle/litellm_lb_go) onto maxllm.
+
+### Session stickiness
+
+A conversation is bound to one upstream provider so every turn of the same
+session hits the same API key — different keys do not share provider-side
+context, so a session that hops between channels loses the thread and answer
+quality drops.
+
+The session id is resolved, most-explicit first (same precedence as
+litellm_lb_go):
+
+| Source | Spelling |
+|---|---|
+| Header | `X-Session-ID`, `X-Conversation-ID` (Anthropic style, Claude Code) |
+| Header | `session-id`, `thread-id` (codex-cli) |
+| Body | `metadata.user_id` (Claude Code) |
+| Body | `client_metadata.session_id` / `client_metadata.thread_id` (codex-cli) |
+| Body | `prompt_cache_key` (OpenAI Responses) |
+
+Two switches must both be on: the global `[session_sticky]` section and the
+route-level `session_sticky = true`. The binding is written only after the
+provider answers 2xx, and is dropped when the pinned provider fails, so a
+session re-pins to a healthy channel.
+
+```toml
+[session_sticky]
+enabled = true
+timeout_secs = 3600   # binding lifetime since last use
+max_entries = 10000   # LRU cap
+
+[[routes]]
+path = "/v1/responses"
+provider = "one_api_ollama_local"
+fallback = ["one_api_volc_1", "one_api_minimax", "..."]
+strategy = "fallback"
+endpoint_type = "responses"
+session_sticky = true   # opt-in
+```
+
+### Circuit breaker
+
+Three states (closed → open → half-open), lock-free, backed by atomics:
+
+- **Closed** — healthy; failures count against `max_fails`.
+- **Open** — `max_fails` reached within the fail window, or an HTTP 429
+  force-opened the provider until `Retry-After` (or the fail window) passes.
+  Requests are not routed to it.
+- **Half-open** — the fail window elapsed, so a bounded number of probe
+  requests (`half_open_max`) is admitted; `successes_to_close` successes close
+  the circuit, a probe failure re-opens it.
+
+Breakers live in a process-wide map (not in the reloadable `HotState`), so a
+config hot-reload — which rebuilds every provider — does not reset breaker
+state. Configured per provider:
+
+```toml
+[providers.one_api_kimi]
+kind = "openai_compat"
+base_url = "https://api.kimi.com"
+upstream_path = "/coding/v1/chat/completions"
+api_key = "..."
+max_fails = 3
+fail_timeout_secs = 60
+```
+
+Prometheus metrics: `maxllm_circuit_breaker_state{provider}` (0=closed,
+1=open, 2=half-open), `maxllm_circuit_breaker_transitions_total{provider}`,
+`maxllm_circuit_breaker_quota_opens_total{provider}` (429 force-opens).
+
+### Recorder
+
+JSONL audit trail of every exchange, written as one object per line with the
+same event/field shape as litellm_lb_go's recorder: `client_request`,
+`provider_request`, `provider_response`, `client_response`, `error` — each
+carrying `request_uuid` (correlates one exchange), `session_id`, provider,
+model, status, tokens, latency/TTFT. Shards rotate hourly (with a `-N` size
+suffix past `max_file_bytes`), bodies are truncated to `max_body_bytes`, and
+shards older than `retention_hours` are pruned.
+
+```toml
+[recording]
+enabled = true
+dir = "./recordings"
+max_body_bytes = 8192
+max_file_bytes = 67108864
+retention_hours = 168
+```
 
 ## Plugins
 
