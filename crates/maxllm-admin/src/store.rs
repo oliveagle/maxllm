@@ -67,6 +67,18 @@ pub trait AdminStore: Send + Sync {
         provider: Option<&str>,
         model: Option<&str>,
     ) -> Result<Vec<RequestLog>, StoreError>;
+
+    // -- Resilience state ----------------------------------------------------
+    /// Persist the circuit-breaker state of one provider (upsert).
+    fn save_circuit_breaker_state(&self, row: CircuitBreakerStateRow) -> Result<(), StoreError>;
+    /// Load every persisted circuit-breaker state (used on startup).
+    fn load_circuit_breaker_states(&self) -> Result<Vec<CircuitBreakerStateRow>, StoreError>;
+    /// Persist a session → provider affinity binding (upsert).
+    fn save_session_binding(&self, session_id: &str, provider: &str) -> Result<(), StoreError>;
+    /// Load every persisted session binding (used on startup).
+    fn load_session_bindings(&self) -> Result<Vec<(String, String)>, StoreError>;
+    /// Drop a session binding (the pinned provider became unhealthy).
+    fn delete_session_binding(&self, session_id: &str) -> Result<(), StoreError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -88,6 +100,10 @@ pub struct InMemoryStore {
     spend_logs: RwLock<Vec<SpendRecord>>,
     /// Request logs stored in insertion order.
     request_logs: RwLock<Vec<RequestLog>>,
+    /// Circuit-breaker state per provider.
+    circuit_breakers: RwLock<HashMap<String, CircuitBreakerStateRow>>,
+    /// Session → provider affinity bindings.
+    session_bindings: RwLock<HashMap<String, String>>,
 }
 
 impl InMemoryStore {
@@ -98,6 +114,8 @@ impl InMemoryStore {
             teams: RwLock::new(HashMap::new()),
             spend_logs: RwLock::new(Vec::new()),
             request_logs: RwLock::new(Vec::new()),
+            circuit_breakers: RwLock::new(HashMap::new()),
+            session_bindings: RwLock::new(HashMap::new()),
         }
     }
 }
@@ -339,6 +357,43 @@ impl AdminStore for InMemoryStore {
             .collect();
         Ok(filtered)
     }
+fn save_circuit_breaker_state(&self, row: CircuitBreakerStateRow) -> Result<(), StoreError> {
+        let mut map = self.circuit_breakers.write().map_err(|_| StoreError::LockPoisoned)?;
+        map.insert(row.provider.clone(), row);
+        Ok(())
+    }
+
+    fn load_circuit_breaker_states(&self) -> Result<Vec<CircuitBreakerStateRow>, StoreError> {
+        let map = self.circuit_breakers.read().map_err(|_| StoreError::LockPoisoned)?;
+        Ok(map.values().cloned().collect())
+    }
+
+    fn save_session_binding(&self, session_id: &str, provider: &str) -> Result<(), StoreError> {
+        let mut map = self
+            .session_bindings
+            .write()
+            .map_err(|_| StoreError::LockPoisoned)?;
+        map.insert(session_id.to_string(), provider.to_string());
+        Ok(())
+    }
+
+    fn load_session_bindings(&self) -> Result<Vec<(String, String)>, StoreError> {
+        let map = self
+            .session_bindings
+            .read()
+            .map_err(|_| StoreError::LockPoisoned)?;
+        Ok(map.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+    }
+
+    fn delete_session_binding(&self, session_id: &str) -> Result<(), StoreError> {
+        let mut map = self
+            .session_bindings
+            .write()
+            .map_err(|_| StoreError::LockPoisoned)?;
+        map.remove(session_id);
+        Ok(())
+    }
+
 }
 
 #[cfg(test)]

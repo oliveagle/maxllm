@@ -495,6 +495,37 @@ max_file_bytes = 67108864
 retention_hours = 168
 ```
 
+The `client_request` event carries the original client body (captured before
+any translation rewrites it) and `client_response` carries the upstream body —
+the full body for a non-streaming answer, the first chunk for a streaming one
+(a whole stream would balloon the log). Bodies are truncated to
+`max_body_bytes` and flagged with `body_truncated: true`.
+
+### Persistence
+
+The resilience state survives a gateway restart, so a bounced process does not
+immediately hammer a channel that just failed and every conversation does not
+get re-routed. It is stored in the admin store, so the admin section has to be
+enabled with a durable `db_path`:
+
+```toml
+[admin]
+enabled = true
+master_key = "${MAXLLM_MASTER_KEY}"
+db_path = "/var/lib/maxllm/maxllm.db"
+```
+
+| State | Table | Written | Restored |
+|---|---|---|---|
+| Circuit breaker (state, failures, force-open deadline, counters) | `circuit_breaker_state` | after every transition / 429 force-open | on startup |
+| Session → provider binding | `session_bindings` | when a session is pinned | on startup |
+
+A restored 429 force-open keeps its original deadline: the provider stays
+skipped until the quota cooldown passes, and the Prometheus gauges are
+re-published at startup so a fresh process shows the restored state before the
+first request. With an in-memory admin store (no `db_path`) the state is
+process-local, as before.
+
 ## Plugins
 
 14 built-in plugins with 5 lifecycle hooks (`on_request`, `on_upstream_request`, `on_response`, `on_response_body`, `on_logging`):

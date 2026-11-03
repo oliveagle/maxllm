@@ -67,6 +67,19 @@ fn breaker_for(name: &str, max_fails: u32, fail_timeout_secs: u64) -> Arc<Circui
         .clone()
 }
 
+/// Get the shared breaker of a provider without creating one.
+///
+/// The breakers are created by `build_hot_state` with the provider's real
+/// `max_fails` / `fail_timeout` config, so the startup restore path reuses
+/// them instead of creating a second breaker with default parameters.
+fn existing_breaker(name: &str) -> Option<Arc<CircuitBreaker>> {
+    let breakers = match BREAKERS.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    breakers.get(name).cloned()
+}
+
 /// Well-known models for each provider kind.
 fn well_known_models(kind: ProviderKind) -> &'static [&'static str] {
     match kind {
@@ -551,6 +564,58 @@ impl AiGateway {
             session_cfg.timeout_secs,
         ));
 
+        // Restore the persisted resilience state: a quota force-open (429) and
+        // the session → provider affinity must survive a restart, otherwise a
+        // bounced gateway immediately hammers the channel that just failed
+        // and every conversation gets re-routed.
+        if let Some(ref admin_api) = admin_api {
+            match admin_api.load_circuit_breaker_states() {
+                Ok(rows) => {
+                    let mut restored = 0usize;
+                    for row in rows {
+                        if let Some(breaker) = existing_breaker(&row.provider) {
+                            breaker.restore(&row);
+                            // Re-publish the gauges so a restarted process shows
+                            // the restored state before the next request.
+                            METRICS
+                                .circuit_breaker_state
+                                .with_label_values(&[&row.provider])
+                                .set(breaker.state() as i64);
+                            METRICS
+                                .circuit_breaker_transitions_total
+                                .with_label_values(&[&row.provider])
+                                .set(breaker.state_transitions() as i64);
+                            // Counter — a fresh process starts at 0, so inc_by
+                            // brings it up to the restored value exactly.
+                            METRICS
+                                .circuit_breaker_quota_opens_total
+                                .with_label_values(&[&row.provider])
+                                .inc_by(breaker.quota_opens());
+                            restored += 1;
+                        }
+                    }
+                    if restored > 0 {
+                        info!(count = restored, "Restored circuit breaker states");
+                    }
+                }
+                Err(e) => warn!(error = %e, "Failed to restore circuit breaker states"),
+            }
+            match admin_api.load_session_bindings() {
+                Ok(bindings) => {
+                    let mut restored = 0usize;
+                    for (session_id, provider) in bindings {
+                        sessions.set(&session_id, &provider);
+                        restored += 1;
+                    }
+                    METRICS.session_affinity_size.set(sessions.len() as i64);
+                    if restored > 0 {
+                        info!(count = restored, "Restored session bindings");
+                    }
+                }
+                Err(e) => warn!(error = %e, "Failed to restore session bindings"),
+            }
+        }
+
         // Optional JSONL recorder.
         let recorder = match config.recording.as_ref() {
             Some(rec_cfg) if rec_cfg.enabled => match Recorder::new(rec_cfg) {
@@ -761,11 +826,36 @@ impl AiGateway {
 /// and rejects the call (400 Bad Request). Returning an EMPTY but present
 /// buffer for a non-final chunk keeps the body open while sending nothing;
 /// the accumulated bytes are forwarded as one piece at `end_of_stream`.
-fn buffer_request_body_chunk(ctx: &mut RequestCtx, body: &mut Option<Bytes>, end_of_stream: bool) {
-    if let Some(data) = body.take() {
-        ctx.request_body_buf.extend_from_slice(&data);
-        if !end_of_stream {
-            *body = Some(Bytes::new());
+impl AiGateway {
+    /// Buffer one request body chunk, keeping the upstream body open until the
+    /// whole body has been read.
+    ///
+    /// Once the final chunk arrives, the `client_request` audit event is
+    /// recorded with the full original body — before any translation rewrites
+    /// `request_body_buf`.
+    fn buffer_request_body_chunk(
+        &self,
+        ctx: &mut RequestCtx,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+    ) {
+        if let Some(data) = body.take() {
+            ctx.request_body_buf.extend_from_slice(&data);
+            if end_of_stream && !ctx.client_request_recorded {
+                ctx.client_request_recorded = true;
+                ctx.client_body = Some(ctx.request_body_buf.clone());
+                self.record_event(
+                    EVENT_CLIENT_REQUEST,
+                    ctx,
+                    None,
+                    None,
+                    None,
+                    ctx.client_body.clone(),
+                );
+            }
+            if !end_of_stream {
+                *body = Some(Bytes::new());
+            }
         }
     }
 }
@@ -959,8 +1049,9 @@ impl ProxyHttp for AiGateway {
         // Sync plugin ctx with request ctx
         ctx.plugin_ctx.provider_name = ctx.provider_name.clone();
 
-        // Audit trail: a request entered the gateway.
-        self.record_event(EVENT_CLIENT_REQUEST, ctx, None, None, None);
+        // The `client_request` audit event is recorded by the body filter,
+        // where the full request body is known — recording it here would
+        // duplicate the event without the body.
 
         Ok(false)
     }
@@ -1282,7 +1373,7 @@ impl ProxyHttp for AiGateway {
         ctx.upstream_send_time = Some(std::time::Instant::now());
 
         // Audit trail: the request was handed to the upstream.
-        self.record_event(EVENT_PROVIDER_REQUEST, ctx, None, None, None);
+        self.record_event(EVENT_PROVIDER_REQUEST, ctx, None, None, None, None);
 
         Ok(())
     }
@@ -1326,7 +1417,7 @@ impl ProxyHttp for AiGateway {
 
             if compaction_enabled {
                 // Take the body into our buffer so we can mutate it.
-                buffer_request_body_chunk(ctx, body, end_of_stream);
+                self.buffer_request_body_chunk(ctx, body, end_of_stream);
                 if end_of_stream && !ctx.body_translated {
                     // Fall through to the normal compaction + translation path.
                     // Clear keep_request_content_length so the normal path runs.
@@ -1343,7 +1434,7 @@ impl ProxyHttp for AiGateway {
                 // The original Content-Length is preserved by padding with
                 // spaces (JSON parsers ignore trailing whitespace), matching
                 // the auto-compaction framing.
-                buffer_request_body_chunk(ctx, body, end_of_stream);
+                self.buffer_request_body_chunk(ctx, body, end_of_stream);
                 if end_of_stream && !ctx.body_translated {
                     ctx.body_translated = true;
                     let hot = self.hot.load();
@@ -1443,6 +1534,18 @@ impl ProxyHttp for AiGateway {
                             }
                         }
                     }
+                    if !ctx.client_request_recorded {
+                        ctx.client_request_recorded = true;
+                        ctx.client_body = Some(ctx.request_body_buf.clone());
+                        self.record_event(
+                            EVENT_CLIENT_REQUEST,
+                            ctx,
+                            None,
+                            None,
+                            None,
+                            ctx.client_body.clone(),
+                        );
+                    }
                     // Free the metadata buffer (not needed anymore)
                     ctx.request_body_buf = Vec::new();
                 }
@@ -1452,7 +1555,7 @@ impl ProxyHttp for AiGateway {
 
         // ── EMBEDDINGS: forward as-is for OpenAI-compatible, extract model ──
         if ctx.endpoint_type == EndpointType::Embeddings {
-            buffer_request_body_chunk(ctx, body, end_of_stream);
+            self.buffer_request_body_chunk(ctx, body, end_of_stream);
             if end_of_stream && !ctx.body_translated {
                 ctx.body_translated = true;
                 let hot = self.hot.load();
@@ -1471,7 +1574,7 @@ impl ProxyHttp for AiGateway {
         }
 
         // Buffer incoming body chunks (both normal and native modes)
-        buffer_request_body_chunk(ctx, body, end_of_stream);
+        self.buffer_request_body_chunk(ctx, body, end_of_stream);
 
         if end_of_stream && !ctx.body_translated {
             ctx.body_translated = true;
@@ -1929,10 +2032,13 @@ impl ProxyHttp for AiGateway {
                 .circuit_breaker_transitions_total
                 .with_label_values(&[&ctx.provider_name])
                 .set(p.circuit_breaker.state_transitions() as i64);
+            // Persist the breaker state so a restart keeps an open circuit and
+            // a 429 quota force-open.
+            self.persist_circuit_breaker(&ctx.provider_name, &p.circuit_breaker);
         }
 
         // Audit trail: the upstream answered.
-        self.record_event(EVENT_PROVIDER_RESPONSE, ctx, Some(status), None, None);
+        self.record_event(EVENT_PROVIDER_RESPONSE, ctx, Some(status), None, None, None);
 
         // Only remove Content-Length when the body will be translated (changes size).
         // Passthrough, native, and Embeddings keep the original Content-Length.
@@ -2043,6 +2149,27 @@ impl ProxyHttp for AiGateway {
         // upstream started answering.
         if ctx.ttft_ms.is_none() && !ctx.skip_logging {
             ctx.ttft_ms = Some(ctx.request_start.elapsed().as_millis() as u64);
+        }
+
+        // Capture the response body for the recorder. A non-streaming answer
+        // is buffered in `response_body_buf` (plus the chunk still in `body`),
+        // so the copy is the full upstream body; a streaming answer is not
+        // buffered, so only its first chunk is kept — a full stream would
+        // balloon the log.
+        if ctx.upstream_body.is_none() {
+            if ctx.is_streaming {
+                if let Some(data) = body.as_ref() {
+                    ctx.upstream_body = Some(data.to_vec());
+                }
+            } else if end_of_stream {
+                let mut buf = ctx.response_body_buf.clone();
+                if let Some(data) = body.as_ref() {
+                    buf.extend_from_slice(data);
+                }
+                if !buf.is_empty() {
+                    ctx.upstream_body = Some(buf);
+                }
+            }
         }
 
         // ── PASSTHROUGH and EMBEDDINGS: forward as-is, extract usage ──
@@ -2782,10 +2909,11 @@ impl ProxyHttp for AiGateway {
                     .circuit_breaker_state
                     .with_label_values(&[&ctx.provider_name])
                     .set(p.circuit_breaker.state() as i64);
+                self.persist_circuit_breaker(&ctx.provider_name, &p.circuit_breaker);
             }
         }
         self.unpin_session(ctx);
-        self.record_event(EVENT_ERROR, ctx, Some(502), None, Some(e.to_string()));
+        self.record_event(EVENT_ERROR, ctx, Some(502), None, Some(e.to_string()), None);
 
         let Some((name, fallback)) = self.next_fallback_provider(ctx) else {
             return e;
@@ -2991,6 +3119,7 @@ impl ProxyHttp for AiGateway {
             Some(ctx.upstream_status),
             Some(latency_ms),
             e.map(|err| err.to_string()),
+            ctx.upstream_body.clone(),
         );
     }
 }
@@ -3036,6 +3165,20 @@ impl AiGateway {
             })
     }
 
+    /// Persist a provider's circuit-breaker state.
+    ///
+    /// The admin store is the durable home of the breaker state: a gateway
+    /// restart (or hot reload) keeps an open circuit and a 429 quota
+    /// force-open instead of immediately hammering the failed channel.
+    fn persist_circuit_breaker(&self, provider_name: &str, breaker: &CircuitBreaker) {
+        let Some(admin_api) = self.admin_api.as_ref() else {
+            return;
+        };
+        if let Err(err) = admin_api.save_circuit_breaker_state(breaker.snapshot(provider_name)) {
+            warn!(error = %err, provider = %provider_name, "Failed to persist circuit breaker state");
+        }
+    }
+
     /// Append one event to the JSONL recorder, if recording is enabled.
     fn record_event(
         &self,
@@ -3044,6 +3187,7 @@ impl AiGateway {
         status: Option<u16>,
         duration_ms: Option<u64>,
         error: Option<String>,
+        body: Option<Vec<u8>>,
     ) {
         let Some(recorder) = self.recorder.as_ref() else {
             return;
@@ -3062,7 +3206,7 @@ impl AiGateway {
             method: Some(ctx.request_method.clone()),
             path: Some(ctx.request_path.clone()),
             status_code: status,
-            body: None,
+            body,
             duration_ms,
             ttft_ms: ctx.ttft_ms,
             tokens_in: Some(ctx.tokens_in),
@@ -3088,6 +3232,12 @@ impl AiGateway {
             METRICS.session_affinity_evictions_total.inc_by(evicted as u64);
         }
         METRICS.session_affinity_size.set(self.sessions.len() as i64);
+        // Persist the binding so session affinity survives a gateway restart.
+        if let Some(ref admin_api) = self.admin_api {
+            if let Err(err) = admin_api.save_session_binding(session_id, &ctx.provider_name) {
+                warn!(error = %err, session = %session_id, "Failed to persist session binding");
+            }
+        }
     }
 
     /// Drop the session binding when the pinned provider failed, so the next
@@ -3107,6 +3257,12 @@ impl AiGateway {
         if self.sessions.peek(session_id).as_deref() == Some(ctx.provider_name.as_str()) {
             self.sessions.remove(session_id);
             METRICS.session_affinity_size.set(self.sessions.len() as i64);
+            // Drop the persisted binding too.
+            if let Some(ref admin_api) = self.admin_api {
+                if let Err(err) = admin_api.delete_session_binding(session_id) {
+                    warn!(error = %err, session = %session_id, "Failed to delete session binding");
+                }
+            }
         }
     }
 }

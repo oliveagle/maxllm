@@ -191,6 +191,28 @@ pub struct RequestLog {
     pub error: Option<String>,
 }
 
+/// Persisted circuit-breaker state for one provider.
+///
+/// The gateway restores these rows on startup so a quota force-open (or an
+/// open circuit) survives a restart — otherwise a gateway bounced mid-incident
+/// would immediately hammer the channel that just failed.
+#[derive(Debug, Clone)]
+pub struct CircuitBreakerStateRow {
+    pub provider: String,
+    /// 0 = closed, 1 = open, 2 = half-open.
+    pub state: u8,
+    pub failures: u32,
+    /// Epoch millis of the last recorded failure.
+    pub last_failure_at: u64,
+    /// Epoch millis until which a quota (429) force-open holds.
+    pub force_open_until: u64,
+    pub successes_half_open: u32,
+    pub transitions: u64,
+    /// How often the provider was force-opened by a 429.
+    pub quota_opens: u64,
+    pub updated_at: DateTime<Utc>,
+}
+
 /// RBAC role for future use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

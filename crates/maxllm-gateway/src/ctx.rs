@@ -89,6 +89,15 @@ pub struct RequestCtx {
     /// Client request method and path, captured early for the recorder.
     pub request_method: String,
     pub request_path: String,
+    /// Original client request body, captured once the full body is read
+    /// (before translation). Used by the recorder's `client_request` event.
+    pub client_body: Option<Vec<u8>>,
+    /// Whether the `client_request` recorder event has been emitted for this
+    /// request (dedupe across body-chunk calls).
+    pub client_request_recorded: bool,
+    /// Upstream response body (non-streaming: full body; streaming: first
+    /// chunk). Used by the recorder's `client_response` event.
+    pub upstream_body: Option<Vec<u8>>,
 }
 
 impl RequestCtx {
@@ -128,6 +137,9 @@ impl RequestCtx {
             ttft_ms: None,
             request_method: String::new(),
             request_path: String::new(),
+            client_body: None,
+            client_request_recorded: false,
+            upstream_body: None,
         }
     }
 }

@@ -131,6 +131,24 @@ impl SqliteStore {
             CREATE INDEX IF NOT EXISTS idx_spend_ts ON spend_logs(timestamp);
             CREATE INDEX IF NOT EXISTS idx_reqlog_ts ON request_logs(timestamp);
             CREATE INDEX IF NOT EXISTS idx_reqlog_provider ON request_logs(provider);
+            CREATE TABLE IF NOT EXISTS circuit_breaker_state (
+                provider TEXT PRIMARY KEY,
+                state INTEGER NOT NULL DEFAULT 0,
+                failures INTEGER NOT NULL DEFAULT 0,
+                last_failure_at INTEGER NOT NULL DEFAULT 0,
+                force_open_until INTEGER NOT NULL DEFAULT 0,
+                successes_half_open INTEGER NOT NULL DEFAULT 0,
+                transitions INTEGER NOT NULL DEFAULT 0,
+                quota_opens INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS session_bindings (
+                session_id TEXT PRIMARY KEY,
+                provider TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
             ",
         )
         .map_err(|e| StoreError::Internal(format!("failed to create tables: {e}")))?;
@@ -634,6 +652,120 @@ impl AdminStore for SqliteStore {
         }
         Ok(records)
     }
+
+    fn save_circuit_breaker_state(&self, row: CircuitBreakerStateRow) -> Result<(), StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        conn.execute(
+            "INSERT INTO circuit_breaker_state (
+                provider, state, failures, last_failure_at, force_open_until,
+                successes_half_open, transitions, quota_opens, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            ON CONFLICT(provider) DO UPDATE SET
+                state = excluded.state,
+                failures = excluded.failures,
+                last_failure_at = excluded.last_failure_at,
+                force_open_until = excluded.force_open_until,
+                successes_half_open = excluded.successes_half_open,
+                transitions = excluded.transitions,
+                quota_opens = excluded.quota_opens,
+                updated_at = excluded.updated_at",
+            params![
+                row.provider,
+                row.state as i32,
+                row.failures as i32,
+                row.last_failure_at as i64,
+                row.force_open_until as i64,
+                row.successes_half_open as i32,
+                row.transitions as i64,
+                row.quota_opens as i64,
+                row.updated_at.to_rfc3339(),
+            ],
+        )
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    fn load_circuit_breaker_states(&self) -> Result<Vec<CircuitBreakerStateRow>, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT provider, state, failures, last_failure_at, force_open_until,
+                        successes_half_open, transitions, quota_opens, updated_at
+                 FROM circuit_breaker_state",
+            )
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| {
+                let provider: String = row.get("provider")?;
+                let state: i32 = row.get("state")?;
+                let failures: i32 = row.get("failures")?;
+                let last_failure_at: i64 = row.get("last_failure_at")?;
+                let force_open_until: i64 = row.get("force_open_until")?;
+                let successes_half_open: i32 = row.get("successes_half_open")?;
+                let transitions: i64 = row.get("transitions")?;
+                let quota_opens: i64 = row.get("quota_opens")?;
+                let updated_at: String = row.get("updated_at")?;
+                Ok(CircuitBreakerStateRow {
+                    provider,
+                    state: state.clamp(0, 2) as u8,
+                    failures: failures.max(0) as u32,
+                    last_failure_at: last_failure_at.max(0) as u64,
+                    force_open_until: force_open_until.max(0) as u64,
+                    successes_half_open: successes_half_open.max(0) as u32,
+                    transitions: transitions.max(0) as u64,
+                    quota_opens: quota_opens.max(0) as u64,
+                    updated_at: chrono::DateTime::parse_from_rfc3339(&updated_at)
+                        .map(|dt| dt.with_timezone(&chrono::Utc))
+                        .unwrap_or_else(|_| chrono::Utc::now()),
+                })
+            })
+            .map_err(|e| StoreError::Internal(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(rows)
+    }
+
+    fn save_session_binding(&self, session_id: &str, provider: &str) -> Result<(), StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        conn.execute(
+            "INSERT INTO session_bindings (session_id, provider, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(session_id) DO UPDATE SET
+                provider = excluded.provider,
+                updated_at = excluded.updated_at",
+            params![session_id, provider, chrono::Utc::now().to_rfc3339()],
+        )
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    fn load_session_bindings(&self) -> Result<Vec<(String, String)>, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let mut stmt = conn
+            .prepare("SELECT session_id, provider FROM session_bindings")
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| {
+                let session_id: String = row.get("session_id")?;
+                let provider: String = row.get("provider")?;
+                Ok((session_id, provider))
+            })
+            .map_err(|e| StoreError::Internal(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(rows)
+    }
+
+    fn delete_session_binding(&self, session_id: &str) -> Result<(), StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        conn.execute(
+            "DELETE FROM session_bindings WHERE session_id = ?1",
+            params![session_id],
+        )
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
 }
 
 fn request_log_from_row(row: &rusqlite::Row) -> rusqlite::Result<RequestLog> {
@@ -889,5 +1021,65 @@ mod tests {
         assert_eq!(logs[0].status, 200);
         assert!(!logs[0].fallback_used);
         assert_eq!(logs[0].request_id, Some("rid-1".into()));
+    }
+
+    #[test]
+    fn circuit_breaker_state_round_trip() {
+        let store = SqliteStore::in_memory().unwrap();
+
+        let row = CircuitBreakerStateRow {
+            provider: "OA-VOLC-1".into(),
+            state: 1, // open
+            failures: 3,
+            last_failure_at: 1_700_000_000_000,
+            force_open_until: 1_700_000_060_000,
+            successes_half_open: 0,
+            transitions: 2,
+            quota_opens: 1,
+            updated_at: Utc::now(),
+        };
+        store.save_circuit_breaker_state(row.clone()).unwrap();
+
+        // Upsert replaces the row.
+        let updated = CircuitBreakerStateRow {
+            force_open_until: 1_700_000_120_000,
+            ..row.clone()
+        };
+        store.save_circuit_breaker_state(updated).unwrap();
+
+        let rows = store.load_circuit_breaker_states().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].provider, "OA-VOLC-1");
+        assert_eq!(rows[0].state, 1);
+        assert_eq!(rows[0].failures, 3);
+        assert_eq!(rows[0].force_open_until, 1_700_000_120_000);
+        assert_eq!(rows[0].quota_opens, 1);
+    }
+
+    #[test]
+    fn session_binding_round_trip() {
+        let store = SqliteStore::in_memory().unwrap();
+
+        store
+            .save_session_binding("thread-abc-123", "OA-VOLC-1")
+            .unwrap();
+        store
+            .save_session_binding("thread-xyz", "OA-MINIMAX")
+            .unwrap();
+        // Upsert moves an existing binding to another provider.
+        store
+            .save_session_binding("thread-abc-123", "OA-ZHIPU-1")
+            .unwrap();
+
+        let mut bindings = store.load_session_bindings().unwrap();
+        bindings.sort();
+        assert_eq!(bindings.len(), 2);
+        assert!(bindings.contains(&("thread-abc-123".into(), "OA-ZHIPU-1".into())));
+        assert!(bindings.contains(&("thread-xyz".into(), "OA-MINIMAX".into())));
+
+        store.delete_session_binding("thread-abc-123").unwrap();
+        let bindings = store.load_session_bindings().unwrap();
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].0, "thread-xyz");
     }
 }

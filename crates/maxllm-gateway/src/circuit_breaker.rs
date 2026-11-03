@@ -9,6 +9,8 @@
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use maxllm_admin::CircuitBreakerStateRow;
+
 /// Circuit states (kept as small ints so the whole breaker fits in atomics).
 pub const STATE_CLOSED: u8 = 0;
 pub const STATE_OPEN: u8 = 1;
@@ -275,6 +277,51 @@ impl CircuitBreaker {
         let force_until = self.force_open_until_ms.load(Ordering::Relaxed);
         force_until != 0 && now_ms() < force_until
     }
+
+    /// Snapshot the breaker's runtime state for persistence.
+    ///
+    /// The gateway persists a row after every transition / quota force-open so
+    /// a restart (or hot reload) keeps an open circuit — otherwise a bounced
+    /// gateway would immediately hammer the channel that just failed.
+    pub fn snapshot(&self, provider: &str) -> CircuitBreakerStateRow {
+        let now = now_ms();
+        let force_until = self.force_open_until_ms.load(Ordering::Relaxed);
+        let state = if force_until != 0 && now < force_until {
+            STATE_OPEN
+        } else {
+            self.state.load(Ordering::Relaxed)
+        };
+        CircuitBreakerStateRow {
+            provider: provider.to_string(),
+            state,
+            failures: self.failures.load(Ordering::Relaxed),
+            last_failure_at: self.last_failure_at.load(Ordering::Relaxed),
+            force_open_until: force_until,
+            successes_half_open: self.successes_half_open.load(Ordering::Relaxed),
+            transitions: self.state_transitions.load(Ordering::Relaxed),
+            quota_opens: self.quota_opens.load(Ordering::Relaxed),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    /// Restore a persisted snapshot into this breaker's atomics.
+    ///
+    /// Startup only: the breaker is restored before the server accepts
+    /// traffic, so a plain `store()` is safe here (no concurrent callers).
+    /// `max_fails` / `fail_timeout_ms` are left untouched — they come from the
+    /// provider's live config, not the persisted row.
+    pub fn restore(&self, row: &CircuitBreakerStateRow) {
+        self.failures.store(row.failures, Ordering::Relaxed);
+        self.successes_half_open
+            .store(row.successes_half_open, Ordering::Relaxed);
+        self.pending_probes.store(0, Ordering::Relaxed);
+        self.last_failure_at.store(row.last_failure_at, Ordering::Relaxed);
+        self.state.store(row.state, Ordering::Relaxed);
+        self.force_open_until_ms
+            .store(row.force_open_until, Ordering::Relaxed);
+        self.state_transitions.store(row.transitions, Ordering::Relaxed);
+        self.quota_opens.store(row.quota_opens, Ordering::Relaxed);
+    }
 }
 
 fn now_ms() -> u64 {
@@ -380,6 +427,29 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1100));
         assert!(!cb.is_open());
         assert_eq!(cb.state(), STATE_CLOSED);
+    }
+
+    #[test]
+    fn test_snapshot_restore_round_trip() {
+        let cb = CircuitBreaker::new(3, 60);
+        cb.record_http_failure(429, Some(30));
+        let snap = cb.snapshot("provider-a");
+
+        assert_eq!(snap.provider, "provider-a");
+        assert_eq!(snap.state, STATE_OPEN);
+        assert_eq!(snap.quota_opens, 1);
+        assert!(snap.force_open_until > 0);
+        assert_eq!(snap.failures, 3);
+
+        // A fresh breaker is closed; after restoring the snapshot it is open
+        // again — this is what keeps a 429 force-open alive across a restart.
+        let restored = CircuitBreaker::new(3, 60);
+        assert!(!restored.is_open());
+        restored.restore(&snap);
+        assert!(restored.is_open());
+        assert_eq!(restored.state(), STATE_OPEN);
+        assert_eq!(restored.quota_opens(), 1);
+        assert_eq!(restored.failure_count(), 3);
     }
 
     #[test]

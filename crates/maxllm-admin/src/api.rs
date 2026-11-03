@@ -142,6 +142,42 @@ impl AdminApi {
         self.store.record_request_log(log)
     }
 
+    // -- Resilience state (called from the gateway so a restart keeps it) ----
+
+    /// Persist one provider's circuit-breaker state (upsert).
+    pub fn save_circuit_breaker_state(
+        &self,
+        row: CircuitBreakerStateRow,
+    ) -> Result<(), crate::store::StoreError> {
+        self.store.save_circuit_breaker_state(row)
+    }
+
+    /// Load every persisted circuit-breaker state (startup restore).
+    pub fn load_circuit_breaker_states(
+        &self,
+    ) -> Result<Vec<CircuitBreakerStateRow>, crate::store::StoreError> {
+        self.store.load_circuit_breaker_states()
+    }
+
+    /// Persist a session → provider affinity binding (upsert).
+    pub fn save_session_binding(
+        &self,
+        session_id: &str,
+        provider: &str,
+    ) -> Result<(), crate::store::StoreError> {
+        self.store.save_session_binding(session_id, provider)
+    }
+
+    /// Load every persisted session binding (startup restore).
+    pub fn load_session_bindings(&self) -> Result<Vec<(String, String)>, crate::store::StoreError> {
+        self.store.load_session_bindings()
+    }
+
+    /// Drop a session binding (the pinned provider became unhealthy).
+    pub fn delete_session_binding(&self, session_id: &str) -> Result<(), crate::store::StoreError> {
+        self.store.delete_session_binding(session_id)
+    }
+
     // -- Key handlers -------------------------------------------------------
 
     fn handle_create_key(&self, body: &[u8]) -> ApiResponse {
