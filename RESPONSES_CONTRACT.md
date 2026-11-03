@@ -131,6 +131,33 @@ would hang the client; finalizing on the usage chunk covers it and keeps the
 token counts in `response.completed` (verified: MiniMax 199 in / 29 out /
 228 total, previously 0/0/0).
 
+## A plain-JSON body on a streaming request (verified live)
+
+An upstream can answer a streaming Responses request with a non-streaming
+body: an `{"error": {...}}` object it produced after accepting the request
+(some gateways report failures that way instead of a non-2xx status), or a
+plain chat completion from a provider that ignored `stream: true`. The
+stream translator only parses complete `\n\n`-delimited `data:` events, so
+without explicit handling such a body was dropped at end-of-stream and the
+client saw an empty `response.completed` — an upstream error masqueraded as
+a successful empty answer, and a real answer was lost.
+
+maxllm now detects the unparsed remainder at end-of-stream (a final `data:`
+event without its `\n\n` terminator, or a bare JSON document) and routes it
+through the normal handler:
+
+- `{"error": {...}}` ends the stream with `response.failed` carrying the
+  reason (verified live: HTTP 200 + error body → `response.created` →
+  `response.failed`, no fake `completed`; the AI SDK parses it as a strict
+  `response.failed` with `errorFrame=true` and surfaces `APICallError`).
+- A plain chat completion is normalized into a stream-shaped chunk
+  (`choices[].message` → `delta`, tool calls get the sequential `index` they
+  only carry on the wire in streaming mode) and streams the answer with real
+  usage (verified live: 4 in / 3 out / 7 total).
+
+This mirrors the non-streaming path, which already turns a 200 + error body
+into a failed Responses object (`chat_response_to_responses`).
+
 ## Non-streaming response
 
 A `stream: false` request returns one JSON object (not SSE):
