@@ -27,6 +27,18 @@ Both expect the same wire contract, so maxllm serves a single translation.
 `input` items handled: `message`, `function_call`, `function_call_output`,
 `reasoning` (summary text kept, `encrypted_content` ignored), and unknown
 types such as `compaction` are dropped without error (unit-tested).
+`function_call_output.output` may be a string, a parts array (text-only
+flattens, image parts become `image_url`), or — outside the spec — a JSON
+object, which is stringified so the tool result is never dropped; a missing
+`output` becomes an empty tool message.
+
+`instructions` arrives as a **string** from the installed CLI (verified by
+capturing the real request body of an `@ai-sdk/openai` CLI run: the `include`,
+`input`, `instructions`, `model`, `prompt_cache_key`, `store`, `stream`,
+`tools` keys, with `stream: true` and `include: ["reasoning.encrypted_content"]`),
+so the `Option<String>` field on the request is the correct shape — the
+array-form `instructions` some generic clients send is a spec edge case, not
+a CLI compatibility issue.
 
 ## Streaming events required by the client
 
@@ -180,6 +192,38 @@ same fields the streaming `response.completed` carries. Verified live:
 `instructions` ("only reply with numbers") reached the upstream and the model
 answered `391`.
 
+## An SSE answer to a non-streaming request is folded into one object
+
+A Responses client that does not request a stream expects one JSON object,
+but an upstream can still answer with a chat SSE stream: it may ignore
+`stream: false`, or it may answer early while the gateway is still reading
+the request body (the request headers are forwarded upstream right away).
+The old gateway converted that stream into Responses SSE and handed it to
+the client either way, so a non-streaming client received SSE where it
+expected JSON and failed to parse it.
+
+The Responses stream contract ends with a terminal event
+(`response.completed` / `response.incomplete` / `response.failed`) whose
+`response` payload is the whole response object — the same shape the
+non-streaming endpoint returns. The gateway now folds the events by reading
+that terminal event (`responses_sse_to_response`), so a genuinely
+non-streaming client gets the single object it asked for, with text, tool
+calls, usage and error preserved; the response content type is forced to
+`application/json` for the same gated cases.
+
+The fold is gated on the request body having been read (`body_translated`):
+only then does `is_streaming` reflect the client's true intent. In the
+early-answer race the request body is still being read, the client's intent
+is unknown, and the stream is kept — a streaming client must not be handed a
+single JSON object.
+
+Verified live against the new binary with an upstream that always returns
+chat SSE: `stream: false` → one `application/json` Responses object
+(`status: "completed"`, the answer text and 7 in / 4 out usage preserved);
+`stream: true` → the normal Responses SSE stream with a terminal
+`response.completed`. The previous binary leaked Responses SSE
+(`text/event-stream`) to the same non-streaming request.
+
 ## Verified end to end
 
 - Real multi-turn opencode sessions (10 steps, tool calls, file writes,
@@ -200,6 +244,14 @@ answered `391`.
   (read/write/bash + pytest), a genuine debug fix, 12 passing tests, real
   usage on every turn (context 30k→32k tokens across the stateless turns),
   zero "Invalid stream event", zero hangs.
+- **Fresh CLI regression (2026-11-03, post fold fix)**: the same CLI
+  completed the 16-step PROMPT3 agentic session against production
+  (`/v1/responses/deepseek`, deepseek-flash): exit 0, 27 passing tests, real
+  usage on every turn, zero stream errors. The four production routes
+  (deepseek / minimax / xiaomi / ollama_local) smoke-tested in both
+  streaming (all events carry monotonic `sequence_number`, terminal
+  `response.completed`) and non-streaming (single `completed` object with
+  real usage).
 - **Every emitted event type schema-checked against `@ai-sdk/openai`**:
   streaming text/tool-call/reasoning/incomplete sequences and the
   non-streaming JSON (reasoning + message + parallel function_call items,
