@@ -338,15 +338,23 @@ fn parse_input_item(item: &Value) -> Option<Value> {
         // Tool result for a previous function call.
         Some("function_call_output") => {
             let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
-            let output = match item.get("output") {
-                Some(Value::String(s)) => s.clone(),
-                Some(other) => serde_json::to_string(other).unwrap_or_default(),
-                None => String::new(),
+            // The output is a plain string or an ordered array of content
+            // parts (a tool may return text plus images/files). A parts
+            // array is converted like message content: text-only arrays
+            // flatten to a plain string (strict upstreams reject part
+            // arrays for text), and image parts become `image_url` so the
+            // model still sees the tool's image. A raw JSON-stringify used
+            // to embed the whole array — base64 included — as literal text.
+            let content = match item.get("output") {
+                Some(Value::String(s)) => Value::String(s.clone()),
+                Some(Value::Array(parts)) => content_to_chat_content(&Value::Array(parts.clone())),
+                Some(other) => Value::String(serde_json::to_string(other).unwrap_or_default()),
+                None => Value::String(String::new()),
             };
             Some(json!({
                 "role": "tool",
                 "tool_call_id": call_id,
-                "content": output
+                "content": content
             }))
         }
         // Reasoning items are model-internal; the chat contract has no equivalent.
@@ -418,6 +426,52 @@ fn delta_content_text(content: &Value) -> Option<String> {
     }
 }
 
+/// Best-effort conversion of an `input_file` part into a chat part.
+///
+/// The Responses contract lets a tool result or an attachment carry a file
+/// (base64 `file_data` or `file_url`) alongside text. Chat completions have
+/// no generic file part, so only an image-mime file can be represented — as
+/// an `image_url` part — and anything else (PDFs, archives, …) is dropped
+/// rather than leaked as opaque base64 text. This mirrors the handling
+/// `input_image` already gets; opencode's `read` tool emits `input_file` for
+/// `application/pdf` and `input_image` for png/jpeg/gif/webp.
+fn file_part_to_chat(part: &Value) -> Option<Value> {
+    let file_data = part.get("file_data").and_then(|v| v.as_str());
+    let file_url = part.get("file_url").and_then(|v| v.as_str());
+    let (url, is_image) = match (file_data, file_url) {
+        (Some(data), _) => (data.to_string(), data_url_is_image(data)),
+        (None, Some(url)) => (url.to_string(), url_looks_like_image(url)),
+        _ => return None,
+    };
+    if is_image {
+        Some(json!({ "type": "image_url", "image_url": { "url": url } }))
+    } else {
+        None
+    }
+}
+
+/// Whether a `data:` URL (`data:image/png;base64,…`) carries an image mime.
+fn data_url_is_image(data: &str) -> bool {
+    let Some(rest) = data.strip_prefix("data:") else {
+        return false;
+    };
+    let Some(end) = rest.find(';') else {
+        return false;
+    };
+    rest[..end].split('/').next() == Some("image")
+}
+
+/// Whether a plain file URL points at an image, by its path extension.
+fn url_looks_like_image(url: &str) -> bool {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let lower = path.to_ascii_lowercase();
+    [
+        "png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "tif", "tiff", "heic", "avif", "ico",
+    ]
+    .iter()
+    .any(|ext| lower.ends_with(&format!(".{ext}")))
+}
+
 /// Convert Responses message content into chat completions content.
 ///
 /// Text-only content stays a plain string — strict upstreams (e.g. Volcano
@@ -450,8 +504,16 @@ fn content_to_chat_content(content: &Value) -> Value {
                     out.push(json!({ "type": "image_url", "image_url": url }));
                 }
             }
+            Some("input_file") => {
+                // A file has no chat part unless it is an image; then it is
+                // an `image_url` like any other image attachment.
+                if let Some(chat_part) = file_part_to_chat(part) {
+                    saw_non_text = true;
+                    out.push(chat_part);
+                }
+            }
             _ => {
-                // Other part types (file, etc.) have no chat equivalent.
+                // Remaining part types (input_video, …) have no chat equivalent.
             }
         }
     }
@@ -1749,6 +1811,85 @@ impl ResponsesRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_input_file_image_becomes_image_url() {
+        // opencode emits `input_file` with base64 `file_data` for files that
+        // are not lowered to `input_image`; an image-mime file is still an
+        // image and must reach a vision-capable chat upstream as `image_url`.
+        let content = json!([
+            {"type":"input_text","text":"what is this?"},
+            {"type":"input_file","filename":"pic.png","file_data":"data:image/png;base64,AAAA"}
+        ]);
+        let out = content_to_chat_content(&content);
+        // The array form is kept because a non-text part is present.
+        assert!(out.is_array());
+        assert_eq!(out[0]["type"], "text");
+        assert_eq!(out[1]["type"], "image_url");
+        assert_eq!(out[1]["image_url"]["url"], "data:image/png;base64,AAAA");
+    }
+
+    #[test]
+    fn test_input_file_pdf_is_dropped_text_still_flattens() {
+        // Chat completions have no PDF part; dropping the file must not turn
+        // the text-only remainder into an array (strict upstreams reject
+        // part arrays for plain text).
+        let content = json!([
+            {"type":"input_text","text":"see the attached pdf"},
+            {"type":"input_file","filename":"doc.pdf","file_data":"data:application/pdf;base64,AAAA"}
+        ]);
+        let out = content_to_chat_content(&content);
+        assert_eq!(out, Value::String("see the attached pdf".into()));
+    }
+
+    #[test]
+    fn test_input_file_file_url_image_extension_is_image() {
+        let content = json!([
+            {"type":"input_file","filename":"x","file_url":"https://example.com/a.PNG"}
+        ]);
+        let out = content_to_chat_content(&content);
+        assert_eq!(out[0]["type"], "image_url");
+        assert_eq!(out[0]["image_url"]["url"], "https://example.com/a.PNG");
+    }
+
+    #[test]
+    fn test_tool_output_array_flattens_to_string_when_text_only() {
+        let items = json!([
+            {"type":"function_call_output","call_id":"c1","output":[
+                {"type":"input_text","text":"line one"},
+                {"type":"input_text","text":"line two"}
+            ]}
+        ]);
+        let msg = parse_input_item(&items[0]).unwrap();
+        assert_eq!(msg["role"], "tool");
+        assert_eq!(msg["tool_call_id"], "c1");
+        // Text-only output is a plain string, not a JSON-stringified array.
+        assert_eq!(msg["content"], Value::String("line one\nline two".into()));
+    }
+
+    #[test]
+    fn test_tool_output_array_with_image_becomes_array_content() {
+        let items = json!([
+            {"type":"function_call_output","call_id":"c1","output":[
+                {"type":"input_text","text":"the screenshot:"},
+                {"type":"input_image","image_url":"data:image/png;base64,AAAA"}
+            ]}
+        ]);
+        let msg = parse_input_item(&items[0]).unwrap();
+        let content = &msg["content"];
+        assert!(content.is_array());
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["type"], "image_url");
+    }
+
+    #[test]
+    fn test_tool_output_string_passthrough_unchanged() {
+        let items = json!([
+            {"type":"function_call_output","call_id":"c1","output":"plain result"}
+        ]);
+        let msg = parse_input_item(&items[0]).unwrap();
+        assert_eq!(msg["content"], Value::String("plain result".into()));
+    }
 
     // ── content conversion ──────────────────────────────────────────────
 
