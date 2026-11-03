@@ -267,6 +267,10 @@ pub struct AiGateway {
     pub sessions: Arc<SessionStore>,
     /// Optional JSONL request/response recorder (audit trail).
     pub recorder: Option<Arc<Recorder>>,
+    /// Layered quota-reset-time resolver (headers → learned patterns → body
+    /// regex → laya decision). Replaces the blind cooldown a 429 used to
+    /// trigger with an exact "this provider is available again at T".
+    pub rate_limit_resolver: Arc<crate::rate_limit_resolver::RateLimitResolver>,
 }
 
 /// Build the hot-reloadable state from a config.
@@ -637,12 +641,37 @@ impl AiGateway {
             _ => None,
         };
 
+        // Rate-limit learning resolver. Disabled by default: without it a 429
+        // falls back to the plain `Retry-After` cooldown.
+        let rl_cfg = config.rate_limit_learning.clone().unwrap_or_default();
+        let resolver_cfg = crate::rate_limit_resolver::ResolverConfig {
+            enabled: rl_cfg.enabled,
+            rate_limit_threshold: rl_cfg.rate_limit_threshold,
+            default_cooldown_secs: rl_cfg.default_cooldown_secs,
+            laya_timeout: std::time::Duration::from_millis(rl_cfg.laya_timeout_ms),
+        };
+        let rate_limit_resolver = Arc::new(crate::rate_limit_resolver::RateLimitResolver::new(
+            resolver_cfg,
+            rl_cfg.laya_url.as_deref(),
+            rl_cfg.laya_model.as_deref(),
+            admin_api.clone(),
+        ));
+        if rl_cfg.enabled {
+            info!(
+                laya = rate_limit_resolver.laya_base_url().unwrap_or("(none)"),
+                threshold = rl_cfg.rate_limit_threshold,
+                default_cooldown_secs = rl_cfg.default_cooldown_secs,
+                "Rate-limit learning enabled"
+            );
+        }
+
         Ok(Self {
             hot: Arc::new(arc_swap::ArcSwap::from_pointee(hot_state)),
             budget_enforcer: None,
             admin_api,
             sessions,
             recorder,
+            rate_limit_resolver,
         })
     }
 
@@ -2071,7 +2100,74 @@ impl ProxyHttp for AiGateway {
         let quota_open = status == 429;
         let server_error = (500..=599).contains(&status);
         let success = (200..=299).contains(&status);
-        if quota_open || server_error || success {
+
+        // Layer 1 (headers) of the rate-limit resolver: the header may pin
+        // the exact reset instant without reading the body at all. When it
+        // does, the force-open deadline is set here and the failover proceeds
+        // immediately (the body never arrives on the retried attempt).
+        //
+        // When it does not, and the learning resolver is enabled, the 429's
+        // body is awaited in `upstream_response_body_filter` — that is where
+        // the layered decision (learned patterns → body regex → laya) runs.
+        // Without the resolver the pre-learning behaviour applies: a plain
+        // Retry-After (or the default) cooldown, decided here.
+        //
+        // `quota_resolved` guards the generic accounting block below: once
+        // the header layer pinned the reset instant it already force-opened
+        // the breaker and counted a quota open, so that block must not run
+        // again (it would double-count the failure and the quota-open).
+        let mut quota_resolved_by_header = false;
+        if quota_open && self.rate_limit_resolver.is_enabled() {
+            if let Some((reset_at_ms, source)) =
+                crate::rate_limit::resolve_from_headers(&upstream_response.headers)
+            {
+                quota_resolved_by_header = true;
+                let hot = self.hot.load();
+                if let Some(p) = hot.providers.get(&ctx.provider_name) {
+                    p.circuit_breaker.record_quota_until(reset_at_ms);
+                    METRICS
+                        .circuit_breaker_quota_opens_total
+                        .with_label_values(&[&ctx.provider_name])
+                        .inc();
+                    self.unpin_session(ctx);
+                    METRICS
+                        .circuit_breaker_state
+                        .with_label_values(&[&ctx.provider_name])
+                        .set(p.circuit_breaker.state() as i64);
+                    self.persist_circuit_breaker(&ctx.provider_name, &p.circuit_breaker);
+                    info!(
+                        provider = %ctx.provider_name,
+                        reset_at = %reset_at_ms,
+                        source = %source,
+                        "429 quota force-opened until the header-declared reset instant"
+                    );
+                }
+                // `quota_open` stays true — the failover decision below still
+                // walks the fallback chain.
+            } else {
+                // Headers are inconclusive: the body carries the phrasing
+                // ("It will reset at …"). Wait for it instead of failing over
+                // at header time — pingora has not written the header to the
+                // client yet, so the deferred decision is invisible.
+                ctx.pending_rate_limit = Some(status);
+                ctx.rate_limit_body_buf.clear();
+                // Keep the headers around: the resolver's header layer may
+                // still pin the reset instant from them.
+                ctx.rate_limit_headers = upstream_response
+                    .headers
+                    .iter()
+                    .map(|(k, v)| {
+                        (
+                            k.as_str().to_string(),
+                            v.to_str().unwrap_or_default().to_string(),
+                        )
+                    })
+                    .collect();
+                return Ok(()); // let the body flow to the body filter
+            }
+        }
+
+        if (quota_open || server_error || success) && !quota_resolved_by_header {
             let hot = self.hot.load();
             if let Some(p) = hot.providers.get(&ctx.provider_name) {
                 if quota_open {
@@ -2279,6 +2375,173 @@ impl ProxyHttp for AiGateway {
         ctx: &mut Self::CTX,
     ) -> pingora::Result<Option<std::time::Duration>> {
         let hot = self.hot.load();
+
+        // ── Pending rate-limit decision (429 whose headers did not pin the
+        // reset instant) ──────────────────────────────────────────────────
+        //
+        // The 429 body is collected here; when it is complete the layered
+        // resolver runs (learned patterns → body regex → laya). The decision
+        // then replaces the blind cooldown: a precise reset instant
+        // force-opens the provider until that moment, and a *non*-rate-limit
+        // classification takes the ordinary-failure path. Either way the
+        // request walks on to the next provider of the fallback chain.
+        //
+        // pingora buffers the whole response (header + body) before writing
+        // anything to the client, so deciding here and returning a retry
+        // error is invisible to the client — the failed attempt is replaced
+        // whole by the next provider's attempt.
+        if let Some(status) = ctx.pending_rate_limit {
+            let _ = status; // status is 429 for the deferred path; kept for logging below
+            if let Some(data) = body.as_ref() {
+                if ctx.rate_limit_body_buf.len() < 64 * 1024 {
+                    ctx.rate_limit_body_buf.extend_from_slice(data);
+                }
+            }
+            if !end_of_stream {
+                return Ok(None);
+            }
+
+            // Full error body collected → resolve the quota reset instant.
+            let status = ctx.pending_rate_limit.take().unwrap();
+            let body_bytes = std::mem::take(&mut ctx.rate_limit_body_buf);
+
+            let headers: http::HeaderMap = {
+                let mut m = http::HeaderMap::new();
+                for (k, v) in std::mem::take(&mut ctx.rate_limit_headers) {
+                    if let (Ok(name), Ok(val)) = (
+                        http::HeaderName::from_bytes(k.as_bytes()),
+                        http::HeaderValue::from_str(&v),
+                    ) {
+                        m.append(name, val);
+                    }
+                }
+                m
+            };
+
+            let resolver = self.rate_limit_resolver.clone();
+            let provider_name = ctx.provider_name.clone();
+            // The Pingora body filter is sync; the resolver is async (it may
+            // call laya over HTTP). Bridge the boundary with block_on on the
+            // current tokio runtime — the call is bounded by the laya
+            // timeout, and this is the same thread that will drive the
+            // retry, so the failover decision is still on-path.
+            let (decision, learned) = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::try_current().map(|rt| {
+                    rt.block_on(async { resolver.resolve(status, &headers, &body_bytes).await })
+                })
+            })
+            .unwrap_or_else(|_| {
+                // No runtime context (defensive): deterministic-only decision.
+                resolver.resolve_sync(status, &headers, &body_bytes)
+            });
+
+            // Persist what we learned (fire-and-forget; the DB write is
+            // small and off the request path).
+            if let Some(update) = learned {
+                if update.fingerprint.len() <= 512 {
+                    let resolver = resolver.clone();
+                    tokio::spawn(async move {
+                        resolver.persist_learned(update).await;
+                    });
+                }
+            }
+
+            // Apply the decision to the circuit breaker, then fail over.
+            let hot = self.hot.load();
+            if let Some(p) = hot.providers.get(&provider_name) {
+                match &decision {
+                    crate::rate_limit::RateLimitDecision::QuotaUntil {
+                        reset_at_ms,
+                        source,
+                    } => {
+                        p.circuit_breaker.record_quota_until(*reset_at_ms);
+                        METRICS
+                            .circuit_breaker_quota_opens_total
+                            .with_label_values(&[&provider_name])
+                            .inc();
+                        info!(
+                            provider = %provider_name,
+                            reset_at_ms = reset_at_ms,
+                            source = %source,
+                            "429 quota force-opened until the resolved reset instant"
+                        );
+                    }
+                    crate::rate_limit::RateLimitDecision::QuotaUnknown => {
+                        // Rate limit without a resolvable instant: default cooldown.
+                        let cooldown = self.rate_limit_resolver.default_cooldown_secs();
+                        p.circuit_breaker
+                            .record_quota_until(crate::rate_limit::now_ms() + cooldown * 1000);
+                        METRICS
+                            .circuit_breaker_quota_opens_total
+                            .with_label_values(&[&provider_name])
+                            .inc();
+                        info!(
+                            provider = %provider_name,
+                            cooldown_secs = cooldown,
+                            "429 quota force-opened with the default cooldown (reset instant unresolved)"
+                        );
+                    }
+                    crate::rate_limit::RateLimitDecision::OrdinaryFailure => {
+                        // Not a rate limit — ordinary failure accounting.
+                        p.circuit_breaker.record_failure();
+                        info!(
+                            provider = %provider_name,
+                            "429 classified as an ordinary failure (not a rate limit)"
+                        );
+                    }
+                }
+                METRICS
+                    .circuit_breaker_state
+                    .with_label_values(&[&provider_name])
+                    .set(p.circuit_breaker.state() as i64);
+                self.persist_circuit_breaker(&provider_name, &p.circuit_breaker);
+            }
+
+            // A quota-exhausted provider must not keep the session pinned.
+            self.unpin_session(ctx);
+
+            // Same failover budget as the header-time path: when it is spent,
+            // the 429 reaches the client as-is.
+            let hot = self.hot.load();
+            if ctx.failover_count >= max_failover_attempts(&hot.routes, ctx.route_index) {
+                info!(
+                    status = status,
+                    provider = %provider_name,
+                    attempts = ctx.failover_count,
+                    "429 rate-limit resolved but the failover budget is spent — returning the error to the client"
+                );
+                return Ok(None);
+            }
+
+            // Audit trail: the failed provider answered 429 (the final
+            // provider's answer is recorded by `response_filter`).
+            self.record_event(EVENT_PROVIDER_RESPONSE, ctx, Some(status), None, None, None);
+
+            // Walk the fallback chain like any other failover.
+            let Some((failed_provider, next_provider)) = self.switch_to_fallback(ctx) else {
+                // No fallback left — the error reaches the client as-is.
+                return Ok(None);
+            };
+            METRICS
+                .http_failovers_total
+                .with_label_values(&[&failed_provider, &next_provider, &status.to_string()])
+                .inc();
+            info!(
+                status = status,
+                provider = %next_provider,
+                failed_provider = %failed_provider,
+                "429 resolved via the layered rate-limit resolver — retrying on the fallback provider"
+            );
+            let mut e = pingora::Error::explain(
+                pingora::ErrorType::HTTPStatus(status),
+                format!(
+                    "provider '{failed_provider}' answered 429; rate-limit resolved; retrying on '{next_provider}'"
+                ),
+            );
+            e.as_up();
+            e.set_retry(true);
+            return Err(e);
+        }
 
         // Time-to-first-token: the first response chunk marks the moment the
         // upstream started answering.

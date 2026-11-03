@@ -9,7 +9,10 @@
 mod circuit_breaker;
 mod ctx;
 mod gateway;
+mod laya_client;
 mod metrics;
+mod rate_limit;
+mod rate_limit_resolver;
 mod recorder;
 mod routing;
 mod session_sticky;

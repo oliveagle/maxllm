@@ -178,6 +178,24 @@ impl CircuitBreaker {
         false
     }
 
+    /// Force-open the circuit until an absolute epoch-ms instant.
+    ///
+    /// Used when a layer resolved the provider's exact quota reset time —
+    /// the provider is known unavailable until that moment, so retrying it
+    /// before then is wasted work. Only ever extends the existing deadline
+    /// (a later observation wins), never shortens it.
+    pub fn record_quota_until(&self, reset_at_ms: u64) {
+        let now = now_ms();
+        if reset_at_ms <= now {
+            return; // already reset; nothing to force-open
+        }
+        self.force_open_until_ms.store(reset_at_ms, Ordering::Relaxed);
+        self.state.store(STATE_OPEN, Ordering::Relaxed);
+        self.failures.store(self.max_fails, Ordering::Relaxed);
+        self.quota_opens.fetch_add(1, Ordering::Relaxed);
+        self.state_transitions.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Record a failure. Increments failure count and updates timestamp.
     pub fn record_failure(&self) {
         self.record_http_failure(500, None);

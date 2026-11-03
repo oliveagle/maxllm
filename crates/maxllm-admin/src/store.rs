@@ -77,6 +77,13 @@ pub trait AdminStore: Send + Sync {
     fn save_session_binding(&self, session_id: &str, provider: &str) -> Result<(), StoreError>;
     /// Load every persisted session binding (used on startup).
     fn load_session_bindings(&self) -> Result<Vec<(String, String)>, StoreError>;
+    /// Persist a learned rate-limit pattern (upsert by fingerprint).
+    fn save_rate_limit_pattern(&self, row: RateLimitPatternRow) -> Result<(), StoreError>;
+    /// Look up one learned rate-limit pattern by fingerprint.
+    fn get_rate_limit_pattern(
+        &self,
+        fingerprint: &str,
+    ) -> Result<Option<RateLimitPatternRow>, StoreError>;
     /// Drop a session binding (the pinned provider became unhealthy).
     fn delete_session_binding(&self, session_id: &str) -> Result<(), StoreError>;
 }
@@ -104,6 +111,8 @@ pub struct InMemoryStore {
     circuit_breakers: RwLock<HashMap<String, CircuitBreakerStateRow>>,
     /// Session → provider affinity bindings.
     session_bindings: RwLock<HashMap<String, String>>,
+    /// Learned rate-limit message patterns keyed by shape fingerprint.
+    rate_limit_patterns: RwLock<HashMap<String, RateLimitPatternRow>>,
 }
 
 impl InMemoryStore {
@@ -116,6 +125,7 @@ impl InMemoryStore {
             request_logs: RwLock::new(Vec::new()),
             circuit_breakers: RwLock::new(HashMap::new()),
             session_bindings: RwLock::new(HashMap::new()),
+            rate_limit_patterns: RwLock::new(HashMap::new()),
         }
     }
 }
@@ -394,6 +404,34 @@ fn save_circuit_breaker_state(&self, row: CircuitBreakerStateRow) -> Result<(), 
         Ok(())
     }
 
+    fn save_rate_limit_pattern(&self, row: RateLimitPatternRow) -> Result<(), StoreError> {
+        let mut map = self
+            .rate_limit_patterns
+            .write()
+            .map_err(|_| StoreError::LockPoisoned)?;
+        // Upsert: keep the max hit count and freshest updated_at.
+        let merged = match map.get(&row.fingerprint) {
+            Some(existing) => RateLimitPatternRow {
+                hits: existing.hits.max(row.hits),
+                updated_at: row.updated_at.max(existing.updated_at),
+                ..row
+            },
+            None => row,
+        };
+        map.insert(merged.fingerprint.clone(), merged);
+        Ok(())
+    }
+
+    fn get_rate_limit_pattern(
+        &self,
+        fingerprint: &str,
+    ) -> Result<Option<RateLimitPatternRow>, StoreError> {
+        let map = self
+            .rate_limit_patterns
+            .read()
+            .map_err(|_| StoreError::LockPoisoned)?;
+        Ok(map.get(fingerprint).cloned())
+    }
 }
 
 #[cfg(test)]

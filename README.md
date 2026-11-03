@@ -29,6 +29,11 @@ A high-performance AI gateway built on [Pingora](https://github.com/cloudflare/p
   - [Plugins](#plugins)
   - [Model Aliases](#model-aliases)
 - [Routing Strategies](#routing-strategies)
+- [Resilience: Session Stickiness, Circuit Breaking & Recording](#resilience-session-stickiness-circuit-breaking--recording)
+  - [Circuit breaker](#circuit-breaker)
+  - [Request-level failover (HTTP errors)](#request-level-failover-http-errors)
+  - [Rate-limit resolution (exact reset time)](#rate-limit-resolution-exact-reset-time)
+  - [Recorder](#recorder)
 - [Plugins](#plugins-1)
 - [Guardrails](#guardrails)
   - [Providers](#providers-1)
@@ -55,7 +60,7 @@ A high-performance AI gateway built on [Pingora](https://github.com/cloudflare/p
 - **Streaming support** &mdash; SSE streaming with real-time format translation (Anthropic SSE, Gemini SSE, Cohere SSE &rarr; OpenAI SSE)
 - **Smart routing** &mdash; Fallback chains, weighted load balancing, round-robin, least-connections, with per-provider circuit breakers
 - **Session stickiness** &mdash; Pin a conversation to the provider that first served it (session id from `X-Session-ID` / `X-Conversation-ID` / `session-id` / `thread-id` headers, or the request body), so a session never hops between API keys and loses upstream context
-- **Resilient circuit breakers** &mdash; Three-state (closed / open / half-open) with bounded half-open probing; an HTTP 429 force-opens a provider until its `Retry-After` or the fail window passes, so quota-exhausted channels are not retried pointlessly
+- **Resilient circuit breakers** &mdash; Three-state (closed / open / half-open) with bounded half-open probing; an HTTP 429 force-opens a provider until the *exact* quota reset instant (resolved from headers, learned patterns, the error body, or a Laya decision model), so quota-exhausted channels are not retried pointlessly
 - **Request recorder** &mdash; JSONL audit trail of every client/provider exchange (hourly rotation, body truncation, retention pruning), same event shape as litellm_lb_go
 - **Plugin system** &mdash; 14 built-in plugins (auth, rate limiting, CORS, caching, PII filtering, prompt injection detection, context compaction, and more)
 - **Guardrails** &mdash; Content-level guardrails with 8 providers (built-in, webhook, Lakera AI, CEL expressions)
@@ -518,6 +523,67 @@ before it is sent, so a raw chat body is never forwarded as-is.
 Prometheus metrics: `maxllm_http_failovers_total{from_provider,to_provider,
 status}` counts each HTTP-error failover; `maxllm_fallbacks_total` counts
 every provider switch (connect + HTTP).
+
+### Rate-limit resolution (exact reset time)
+
+A 429 is not "try again in 60 s" — the provider usually states *when* the
+quota resets, and retrying before then is wasted work (and hammers a channel
+that is known to be exhausted). maxllm resolves the reset instant in four
+layers, cheapest first:
+
+| Layer | Source | Cost | Answers |
+|---|---|---|---|
+| 1. **Headers** | `Retry-After`, `x-ratelimit-reset-requests/tokens`, `x-ratelimit-reset`, `retry-after-ms`, `x-ms-retry-after-ms`, `anthropic-ratelimit-*-reset`, `ratelimit-reset` | none | the reset instant |
+| 2. **Learned patterns** | a SQLite table of message *shapes* seen before | none | the reset instant, without re-parsing |
+| 3. **Body regex** | a generic scan of the error text for time expressions | none | the reset instant |
+| 4. **Laya decision** | `POST /v1/systemone` — a `noul` classification + a `choice` over the candidate instants | one small call | is this a rate limit? which candidate is the reset? |
+
+The resolved instant force-opens the provider's circuit breaker **until that
+moment** (a later observation only extends the deadline, never shortens it),
+then the request walks on to the next provider of the fallback chain. When
+the layers agree the error is **not** a rate limit — a billing rejection, a
+bad request — the ordinary-failure path runs instead: normal failure
+accounting, no quota force-open.
+
+Layer 2 is what makes the system robust against upstream wording changes:
+each message is normalised into a *shape fingerprint* (digits → `#`, long
+identifiers → `<V>`), and the learned pattern records both "this shape is a
+rate limit" and "this shape expresses its reset time as an absolute timestamp
+/ a relative duration". The next message of the same shape is resolved
+instantly, with no laya call and no regex scan — so a reworded upstream costs
+one extra decision call, not a permanent blind cooldown.
+
+The time expressions the body scan recognises are the shapes providers
+actually use:
+
+- RFC 3339 / ISO 8601 — `2026-11-06T23:59:59Z`, `2026-11-06T23:59:59.123+08:00`
+- space-separated — `2026-11-06 23:59:59` (naive, read as UTC)
+- numeric offset with a trailing zone name — `2026-11-06 23:59:59 +0800 CST` (the Volcengine/ByteDance production shape)
+- relative durations — `12m50s`, `5m0s`, `45s`, `5分钟`
+- epoch seconds — `1793690399`
+
+The classification order is deliberate: **regex first, laya second, and only a
+confirmed non-rate-limit takes the non-rate-limit path.** Deterministic layers
+decide whenever they can; laya is consulted only when the text is
+inconclusive, and it can only *narrow* the answer — pick between candidate
+instants, or confirm the class — never invent a reset time that is not in the
+message. If laya is unreachable, too slow or answerless, the gateway falls
+back to the default cooldown instead of failing the request.
+
+```toml
+[rate_limit_learning]
+enabled = true                     # master switch (default false)
+laya_url = "http://10.126.126.20:18405"  # decision server (optional)
+laya_model = "winwinwinbb/soft-decider-421m"
+laya_timeout_ms = 1000             # a slow decision must not delay failover
+rate_limit_threshold = 0.5         # noul above which it IS a rate limit
+default_cooldown_secs = 300        # used when no layer resolved an instant
+max_learned_patterns = 1000        # learned-shape store cap
+```
+
+Prometheus metrics: `maxllm_circuit_breaker_quota_opens_total{provider}`
+counts each quota force-open (exact instant *or* default cooldown);
+`maxllm_circuit_breaker_state{provider}` reflects the force-open (1 = open).
 
 ### Recorder
 

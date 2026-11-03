@@ -178,6 +178,22 @@ impl AdminApi {
         self.store.delete_session_binding(session_id)
     }
 
+    /// Persist a learned rate-limit pattern (upsert by fingerprint).
+    pub fn save_rate_limit_pattern(
+        &self,
+        row: crate::models::RateLimitPatternRow,
+    ) -> Result<(), crate::store::StoreError> {
+        self.store.save_rate_limit_pattern(row)
+    }
+
+    /// Look up one learned rate-limit pattern by fingerprint.
+    pub fn get_rate_limit_pattern(
+        &self,
+        fingerprint: &str,
+    ) -> Result<Option<crate::models::RateLimitPatternRow>, crate::store::StoreError> {
+        self.store.get_rate_limit_pattern(fingerprint)
+    }
+
     // -- Key handlers -------------------------------------------------------
 
     fn handle_create_key(&self, body: &[u8]) -> ApiResponse {

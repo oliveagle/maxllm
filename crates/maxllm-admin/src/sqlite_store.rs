@@ -149,6 +149,15 @@ impl SqliteStore {
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS rate_limit_patterns (
+                fingerprint TEXT PRIMARY KEY,
+                is_rate_limit INTEGER NOT NULL,
+                reset_expression TEXT,
+                sample_message TEXT NOT NULL,
+                hits INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            );
+
             ",
         )
         .map_err(|e| StoreError::Internal(format!("failed to create tables: {e}")))?;
@@ -754,6 +763,71 @@ impl AdminStore for SqliteStore {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| StoreError::Internal(e.to_string()))?;
         Ok(rows)
+    }
+
+    fn save_rate_limit_pattern(&self, row: RateLimitPatternRow) -> Result<(), StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        conn.execute(
+            "INSERT INTO rate_limit_patterns (
+                fingerprint, is_rate_limit, reset_expression, sample_message,
+                hits, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            ON CONFLICT(fingerprint) DO UPDATE SET
+                is_rate_limit = excluded.is_rate_limit,
+                reset_expression = excluded.reset_expression,
+                sample_message = excluded.sample_message,
+                hits = excluded.hits,
+                updated_at = excluded.updated_at",
+            params![
+                row.fingerprint,
+                row.is_rate_limit as i32,
+                row.reset_expression,
+                row.sample_message,
+                row.hits as i64,
+                row.updated_at.to_rfc3339(),
+            ],
+        )
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    fn get_rate_limit_pattern(
+        &self,
+        fingerprint: &str,
+    ) -> Result<Option<RateLimitPatternRow>, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT fingerprint, is_rate_limit, reset_expression, sample_message,
+                        hits, updated_at
+                 FROM rate_limit_patterns WHERE fingerprint = ?1",
+            )
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        let mut rows = stmt
+            .query_map(params![fingerprint], |row| {
+                let fingerprint: String = row.get("fingerprint")?;
+                let is_rate_limit: i32 = row.get("is_rate_limit")?;
+                let reset_expression: Option<String> = row.get("reset_expression")?;
+                let sample_message: String = row.get("sample_message")?;
+                let hits: i64 = row.get("hits")?;
+                let updated_at: String = row.get("updated_at")?;
+                Ok(RateLimitPatternRow {
+                    fingerprint,
+                    is_rate_limit: is_rate_limit != 0,
+                    reset_expression,
+                    sample_message,
+                    hits: hits.max(0) as u64,
+                    updated_at: chrono::DateTime::parse_from_rfc3339(&updated_at)
+                        .map(|dt| dt.with_timezone(&chrono::Utc))
+                        .unwrap_or_else(|_| chrono::Utc::now()),
+                })
+            })
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        match rows.next() {
+            Some(Ok(row)) => Ok(Some(row)),
+            Some(Err(e)) => Err(StoreError::Internal(e.to_string())),
+            None => Ok(None),
+        }
     }
 
     fn delete_session_binding(&self, session_id: &str) -> Result<(), StoreError> {

@@ -104,6 +104,15 @@ pub struct RequestCtx {
     /// Upstream response body (non-streaming: full body; streaming: first
     /// chunk). Used by the recorder's `client_response` event.
     pub upstream_body: Option<Vec<u8>>,
+    /// Set when a 429 arrived whose headers did not pin the quota reset
+    /// instant, so the decision waits for the error body (the body carries
+    /// the phrasing, e.g. "It will reset at 2026-11-06 23:59:59").
+    pub pending_rate_limit: Option<u16>,
+    /// The 429 error body collected while `pending_rate_limit` is set.
+    pub rate_limit_body_buf: Vec<u8>,
+    /// The upstream response headers of the pending 429 (needed by the
+    /// resolver's header layer once the body arrives).
+    pub rate_limit_headers: Vec<(String, String)>,
 }
 
 impl RequestCtx {
@@ -147,6 +156,9 @@ impl RequestCtx {
             client_body: None,
             client_request_recorded: false,
             upstream_body: None,
+            pending_rate_limit: None,
+            rate_limit_body_buf: Vec::new(),
+            rate_limit_headers: Vec::new(),
         }
     }
 }

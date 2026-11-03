@@ -36,11 +36,23 @@ impl TestGateway {
         mock_url: &str,
         fallback_url: &str,
     ) -> Self {
+        Self::start_with_fallback_and_laya(config_template, mock_url, fallback_url, LAYA_TEST_URL).await
+    }
+
+    /// Like [`Self::start_with_fallback`], but with a caller-supplied laya
+    /// decision-server URL (used to point the resolver at a wiremock fake).
+    async fn start_with_fallback_and_laya(
+        config_template: &str,
+        mock_url: &str,
+        fallback_url: &str,
+        laya_url: &str,
+    ) -> Self {
         let port = portpicker::pick_unused_port().expect("no free port");
         let config_str = config_template
             .replace("{PORT}", &port.to_string())
             .replace("{MOCK_URL}", mock_url)
-            .replace("{FALLBACK_URL}", fallback_url);
+            .replace("{FALLBACK_URL}", fallback_url)
+            .replace("{LAYA_URL}", laya_url);
 
         let mut config_file = tempfile::NamedTempFile::new().expect("temp file");
         config_file
@@ -3691,4 +3703,349 @@ async fn test_failover_budget_is_respected() {
     assert_eq!(resp.status(), 500);
     let fallback_reqs = fallback.received_requests().await.unwrap();
     assert_eq!(fallback_reqs.len(), 1, "p2 is tried once");
+}
+
+// ---------------------------------------------------------------------------
+// Layered rate-limit resolution (headers → learned patterns → body regex →
+// laya decision)
+// ---------------------------------------------------------------------------
+
+/// The real local Laya decision server. The rate-limit tests exercise the
+/// full stack against it; the resolver is fail-open, so these tests still
+/// pass when the server is down (the deterministic layers decide alone).
+const LAYA_TEST_URL: &str = "http://10.126.126.20:18405";
+
+/// The learning resolver is enabled but laya is NOT configured: the
+/// deterministic layers must decide on their own, and a missing laya must
+/// never break the failover path.
+const RATE_LIMIT_LEARNING_CONFIG: &str = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[metrics]
+enabled = true
+
+[rate_limit_learning]
+enabled = true
+laya_url = "{LAYA_URL}"
+default_cooldown_secs = 300
+rate_limit_threshold = 0.5
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.primary]
+kind = "openai_compat"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+default_model = "deepseek-v4.1-flash"
+
+[providers.fallback]
+kind = "openai_compat"
+base_url = "{FALLBACK_URL}"
+api_key = "fake-key"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "primary"
+fallback = ["fallback"]
+strategy = "fallback"
+max_failover_attempts = 4
+"#;
+
+/// Read one Prometheus sample (`name{labels} value`) from the gateway's
+/// /metrics endpoint. Returns None when the series does not exist.
+async fn metric_sample(gw: &TestGateway, series: &str) -> Option<f64> {
+    let text = reqwest::Client::new()
+        .get(gw.url("/metrics"))
+        .send()
+        .await
+        .ok()?
+        .text()
+        .await
+        .ok()?;
+    for line in text.lines() {
+        if line.starts_with('#') {
+            continue;
+        }
+        let (name, value) = line.rsplit_once(' ')?;
+        if name == series {
+            return value.parse::<f64>().ok();
+        }
+    }
+    None
+}
+
+#[tokio::test]
+async fn test_429_body_rate_limit_fails_over_with_precise_reset() {
+    let primary = MockServer::start().await;
+    let fallback = MockServer::start().await;
+
+    // The production Volcengine shape: the quota message carries the reset
+    // instant with a numeric offset and a trailing zone name — a form a
+    // whitespace-tokenised scan misses completely.
+    let body = json!({
+        "error": {
+            "code": "AccountQuotaExceeded",
+            "message": "You have exceeded the monthly usage quota. \
+                        It will reset at 2099-11-06 23:59:59 +0800 CST. \
+                        Request id: 021793713952"
+        }
+    });
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(429).set_body_json(body))
+        .expect(1)
+        .mount(&primary)
+        .await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from fallback")))
+        .expect(1)
+        .mount(&fallback)
+        .await;
+
+    let gw = TestGateway::start_with_fallback(
+        RATE_LIMIT_LEARNING_CONFIG,
+        &primary.uri(),
+        &fallback.uri(),
+    )
+    .await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&chat_body("deepseek-v4.1-flash", "hi"))
+        .send()
+        .await
+        .unwrap();
+
+    // The client sees the fallback's answer, not the primary's 429.
+    assert_eq!(resp.status(), 200, "the 429 must fail over to the fallback");
+    assert_eq!(resp.headers().get("X-MaxLLM-Provider").unwrap(), "fallback");
+    assert_eq!(
+        resp.headers().get("X-MaxLLM-Fallback-From").unwrap(),
+        "primary"
+    );
+    let answer: Value = resp.json().await.unwrap();
+    assert_eq!(answer["choices"][0]["message"]["content"], "from fallback");
+
+    // The primary was tried exactly once.
+    let primary_reqs = primary.received_requests().await.unwrap();
+    assert_eq!(primary_reqs.len(), 1);
+
+    // The provider was force-opened because of the quota — not because of a
+    // blind cooldown — and the breaker is open.
+    let quota_opens =
+        metric_sample(&gw, "maxllm_circuit_breaker_quota_opens_total{provider=\"primary\"}")
+            .await;
+    assert_eq!(
+        quota_opens,
+        Some(1.0),
+        "the resolved quota must count exactly one quota open"
+    );
+    let state =
+        metric_sample(&gw, "maxllm_circuit_breaker_state{provider=\"primary\"}").await;
+    assert_eq!(state, Some(1.0), "the breaker must be open (1)");
+}
+
+#[tokio::test]
+async fn test_429_non_rate_limit_body_is_not_force_opened() {
+    let primary = MockServer::start().await;
+    let fallback = MockServer::start().await;
+
+    // A billing rejection that *looks* like a quota error ("usage limit
+    // reached") but does not reset on a timer: it must take the ordinary
+    // failure path, never a quota force-open.
+    let body = json!({
+        "error": {
+            "code": "InsufficientBalance",
+            "message": "You have reached your usage limit. Insufficient balance — \
+                        please recharge your account."
+        }
+    });
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(429).set_body_json(body))
+        .expect(1)
+        .mount(&primary)
+        .await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from fallback")))
+        .expect(1)
+        .mount(&fallback)
+        .await;
+
+    let gw = TestGateway::start_with_fallback(
+        RATE_LIMIT_LEARNING_CONFIG,
+        &primary.uri(),
+        &fallback.uri(),
+    )
+    .await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&chat_body("deepseek-v4.1-flash", "hi"))
+        .send()
+        .await
+        .unwrap();
+
+    // A 429 is still a provider failure, so the request walks on to the
+    // fallback…
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers().get("X-MaxLLM-Provider").unwrap(), "fallback");
+
+    // …but the provider must NOT be force-opened as a quota: the decision
+    // was "ordinary failure", so no quota open was counted.
+    let quota_opens =
+        metric_sample(&gw, "maxllm_circuit_breaker_quota_opens_total{provider=\"primary\"}")
+            .await;
+    assert_eq!(
+        quota_opens, None,
+        "a non-rate-limit error must not count a quota open"
+    );
+    // The ordinary failure left the breaker closed (max_fails defaults to 3).
+    let state =
+        metric_sample(&gw, "maxllm_circuit_breaker_state{provider=\"primary\"}").await;
+    assert_eq!(state, Some(0.0), "the breaker must stay closed (0)");
+}
+
+#[tokio::test]
+async fn test_429_retry_after_header_fails_over_immediately() {
+    let primary = MockServer::start().await;
+    let fallback = MockServer::start().await;
+
+    // The header layer answers the reset instant without reading the body.
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("Retry-After", "120")
+                .set_body_json(json!({"error": "quota exhausted"})),
+        )
+        .expect(1)
+        .mount(&primary)
+        .await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from fallback")))
+        .expect(1)
+        .mount(&fallback)
+        .await;
+
+    let gw = TestGateway::start_with_fallback(
+        RATE_LIMIT_LEARNING_CONFIG,
+        &primary.uri(),
+        &fallback.uri(),
+    )
+    .await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&chat_body("deepseek-v4.1-flash", "hi"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers().get("X-MaxLLM-Provider").unwrap(), "fallback");
+
+    let quota_opens =
+        metric_sample(&gw, "maxllm_circuit_breaker_quota_opens_total{provider=\"primary\"}")
+            .await;
+    assert_eq!(quota_opens, Some(1.0));
+    // The header path must count the quota open exactly once — the generic
+    // 429 accounting must not run a second time.
+    let state =
+        metric_sample(&gw, "maxllm_circuit_breaker_state{provider=\"primary\"}").await;
+    assert_eq!(state, Some(1.0));
+}
+
+#[tokio::test]
+async fn test_429_laya_classifies_inconclusive_text() {
+    let primary = MockServer::start().await;
+    let fallback = MockServer::start().await;
+    // A fake laya decider: it must be consulted only when the deterministic
+    // layers are inconclusive, and its answer must drive the force-open.
+    let laya = MockServer::start().await;
+
+    // 2099-01-01 00:00:00 UTC.
+    let reset_id = "4070908800000";
+
+    // No quota phrase, no billing phrase, but a concrete future instant the
+    // regex layer finds: the classification is delegated to laya, which says
+    // "yes, rate limit" and picks the candidate instant.
+    let body = json!({
+        "error": {
+            "code": "TemporarilyBlocked",
+            "message": "Access temporarily blocked. Please wait until 2099-01-01 00:00:00."
+        }
+    });
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(429).set_body_json(body))
+        .expect(1)
+        .mount(&primary)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({
+                "answers": {
+                    "is_rate_limit": { "type": "noul", "noul": 0.9 },
+                    "reset_time": { "type": "choice", "choice": reset_id }
+                }
+            })),
+        )
+        .expect(1)
+        .mount(&laya)
+        .await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from fallback")))
+        .expect(1)
+        .mount(&fallback)
+        .await;
+
+    let gw = TestGateway::start_with_fallback_and_laya(
+        RATE_LIMIT_LEARNING_CONFIG,
+        &primary.uri(),
+        &fallback.uri(),
+        &laya.uri(),
+    )
+    .await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&chat_body("deepseek-v4.1-flash", "hi"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200, "laya-classified 429 must fail over");
+    assert_eq!(resp.headers().get("X-MaxLLM-Provider").unwrap(), "fallback");
+
+    // laya was consulted exactly once for this shape.
+    let laya_reqs = laya.received_requests().await.unwrap();
+    assert_eq!(laya_reqs.len(), 1, "laya is consulted once");
+
+    // The provider is force-opened until the chosen instant (a quota open).
+    let quota_opens =
+        metric_sample(&gw, "maxllm_circuit_breaker_quota_opens_total{provider=\"primary\"}")
+            .await;
+    assert_eq!(quota_opens, Some(1.0));
+    let state =
+        metric_sample(&gw, "maxllm_circuit_breaker_state{provider=\"primary\"}").await;
+    assert_eq!(state, Some(1.0), "the breaker must be open (1)");
 }

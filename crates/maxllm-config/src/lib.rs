@@ -52,6 +52,11 @@ pub struct Config {
     /// provider exchange (mirrors litellm_lb_go's recorder).
     #[serde(default)]
     pub recording: Option<RecordingConfig>,
+    /// Rate-limit learning: layered quota-reset-time resolution (headers →
+    /// learned patterns → body regex → laya decision) that replaces the
+    /// "blind cooldown" a 429 used to trigger.
+    #[serde(default)]
+    pub rate_limit_learning: Option<RateLimitLearningConfig>,
     /// Model cost overrides (supplement built-in costs).
     #[serde(default)]
     pub model_costs: HashMap<String, ModelCostConfig>,
@@ -675,5 +680,73 @@ total_connect_timeout_secs = 60
         let p = &config.providers["opencode"];
         assert_eq!(p.connect_timeout_secs, Some(30));
         assert_eq!(p.total_connect_timeout_secs, Some(60));
+    }
+}
+
+/// Layered quota-reset-time resolution (see `rate_limit.rs` in the gateway).
+///
+/// When a provider answers 429, the gateway walks the layers in order of
+/// increasing cost to find the moment the quota resets, then force-opens the
+/// provider's circuit breaker until that exact instant — no blind cooldown
+/// retry against a quota-exhausted channel.
+#[derive(Debug, Deserialize, Clone)]
+pub struct RateLimitLearningConfig {
+    /// Master switch. When false the gateway falls back to its plain
+    /// `Retry-After`-header cooldown (the pre-learning behaviour).
+    #[serde(default = "default_false")]
+    pub enabled: bool,
+    /// Base URL of the Laya decision server (`POST /v1/systemone`).
+    /// Only consulted when the deterministic layers cannot pin the reset
+    /// time; an unreachable server falls back to the default cooldown.
+    #[serde(default)]
+    pub laya_url: Option<String>,
+    /// Laya model id (defaults to the soft-decider deployment).
+    #[serde(default)]
+    pub laya_model: Option<String>,
+    /// Laya call budget in milliseconds. A slow decision must never delay
+    /// the failover chain; the gateway falls back to the default cooldown
+    /// when this budget is exceeded.
+    #[serde(default = "default_laya_timeout_ms")]
+    pub laya_timeout_ms: u64,
+    /// Noul probability threshold: a laya answer above this classifies the
+    /// error as a rate limit; below it the error takes the ordinary-failure
+    /// path (no quota force-open).
+    #[serde(default = "default_rate_limit_threshold")]
+    pub rate_limit_threshold: f64,
+    /// Cooldown (seconds) applied when the error is a rate limit but no
+    /// layer resolved a precise reset instant. Mirrors litellm_lb_go's
+    /// 5-minute probing default.
+    #[serde(default = "default_quota_cooldown_secs")]
+    pub default_cooldown_secs: u64,
+    /// Cap the number of learned patterns kept in the store (LRU by hit
+    /// recency). 0 disables learning persistence.
+    #[serde(default = "default_max_learned_patterns")]
+    pub max_learned_patterns: usize,
+}
+
+fn default_laya_timeout_ms() -> u64 {
+    1000
+}
+fn default_rate_limit_threshold() -> f64 {
+    0.5
+}
+fn default_quota_cooldown_secs() -> u64 {
+    300
+}
+fn default_max_learned_patterns() -> usize {
+    1000
+}
+
+impl Default for RateLimitLearningConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            laya_url: None,
+            laya_model: None,
+            laya_timeout_ms: default_laya_timeout_ms(),
+            rate_limit_threshold: default_rate_limit_threshold(),
+            default_cooldown_secs: default_quota_cooldown_secs(),
+            max_learned_patterns: default_max_learned_patterns(),
+        }
     }
 }

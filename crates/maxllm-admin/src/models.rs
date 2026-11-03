@@ -221,3 +221,31 @@ pub enum Role {
     User,
     Viewer,
 }
+
+/// A learned rate-limit message pattern.
+///
+/// The gateway normalises an upstream quota error into a *shape fingerprint*
+/// (digits → `#`, long identifiers → `<V>`) and remembers what it learned
+/// about that shape: whether the error is a rate limit at all, and how its
+/// reset instant is expressed. The next time a provider answers with the same
+/// shape, the learned answer applies immediately — no laya call, no regex
+/// scan — so a phrasing change upstream costs one extra round trip, not a
+/// permanent blind cooldown.
+#[derive(Debug, Clone)]
+pub struct RateLimitPatternRow {
+    /// Normalised message shape (the lookup key).
+    pub fingerprint: String,
+    /// Whether this shape denotes a rate limit / quota exhaustion.
+    pub is_rate_limit: bool,
+    /// How the reset instant is expressed in this shape, e.g.
+    /// `timestamp` (an absolute instant in the text) or `duration`
+    /// (a relative duration). `None` = the shape is a rate limit but
+    /// carries no reset time.
+    pub reset_expression: Option<String>,
+    /// The concrete example that produced the pattern (for auditing).
+    pub sample_message: String,
+    /// How often the pattern was seen.
+    pub hits: u64,
+    /// When the pattern was last seen.
+    pub updated_at: DateTime<Utc>,
+}
