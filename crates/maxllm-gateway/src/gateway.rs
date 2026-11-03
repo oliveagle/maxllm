@@ -1808,6 +1808,21 @@ impl ProxyHttp for AiGateway {
             let _ = upstream_response.remove_header("Content-Length");
         }
 
+        // A non-streaming Responses client receives exactly one JSON object
+        // (the body filter folds an SSE answer back into it), so the content
+        // type must say JSON even when the upstream answered with a stream.
+        // The gate mirrors the fold: only once the request body has been read
+        // (`body_translated`) does `is_streaming` reflect the client's true
+        // intent — in the early-answer race the stream is kept, not folded.
+        if ctx.endpoint_type == EndpointType::Responses
+            && !ctx.native_responses
+            && !ctx.is_streaming
+            && ctx.body_translated
+            && status < 400
+        {
+            upstream_response.insert_header("Content-Type", "application/json")?;
+        }
+
         // Add gateway headers
         upstream_response.insert_header("X-MaxLLM-Provider", &ctx.provider_name)?;
         if ctx.fallback_used {
@@ -2224,17 +2239,29 @@ impl ProxyHttp for AiGateway {
                         return Ok(None);
                     }
 
-                    // The upstream may answer before the request body has
-                    // been fully read (the request headers are forwarded
-                    // upstream right away). At that point the request phase
-                    // has not run yet, so the gateway does not know the
-                    // client asked for a stream and has no stream translator
-                    // installed. An upstream that answers with a chat SSE
-                    // stream in that window would otherwise be forwarded to
-                    // the Responses client verbatim — the client then rejects
-                    // the payload ("Invalid ... stream event"), because a chat
-                    // chunk carries no Responses `type`. Translate it here
-                    // instead of leaking the provider format.
+                    // The upstream answered with a chat SSE stream although
+                    // the client did not ask for a stream. Two shapes lead
+                    // here:
+                    //
+                    // * the upstream ignored `stream: false` — the client
+                    //   expects one JSON object and must not be handed an
+                    //   SSE stream;
+                    // * the upstream answered before the request body had
+                    //   been fully read (the request headers are forwarded
+                    //   upstream right away), so the gateway does not know
+                    //   yet whether the client asked for a stream and has no
+                    //   stream translator installed. Without this branch the
+                    //   provider bytes would reach the Responses client
+                    //   verbatim — the client then rejects the payload
+                    //   ("Invalid ... stream event"), because a chat chunk
+                    //   carries no Responses `type`.
+                    //
+                    // The chat stream is translated into Responses events in
+                    // both cases. Once the request body has been read
+                    // (`body_translated`) the client's intent is known: a
+                    // non-streaming client gets the events folded back into
+                    // the single response object it asked for, while the
+                    // early-answer race keeps the stream.
                     if parsed.is_err() && looks_like_chat_sse(&ctx.response_body_buf) {
                         match provider {
                             Some(p) => {
@@ -2245,15 +2272,31 @@ impl ProxyHttp for AiGateway {
                                 let translated =
                                     translator.process_chunk(&ctx.response_body_buf, true);
                                 if translated.is_empty() {
-                                    warn!("Failed to convert early upstream chat SSE to Responses SSE");
+                                    warn!("Failed to convert upstream chat SSE to Responses SSE");
                                     *body = Some(Bytes::from(early_sse_failure_body()));
                                 } else {
                                     extract_stream_usage(&translated, ctx, true);
-                                    *body = Some(Bytes::from(translated));
+                                    if ctx.body_translated && !ctx.is_streaming {
+                                        // A non-streaming client wants one
+                                        // JSON object, not a stream.
+                                        match maxllm_translate::responses::responses_sse_to_response(
+                                            &translated,
+                                        ) {
+                                            Some(response) => {
+                                                *body = Some(Bytes::from(response));
+                                            }
+                                            None => {
+                                                warn!("Failed to fold upstream chat SSE into a single Responses object");
+                                                *body = Some(Bytes::from(early_sse_failure_body()));
+                                            }
+                                        }
+                                    } else {
+                                        *body = Some(Bytes::from(translated));
+                                    }
                                 }
                             }
                             None => {
-                                warn!("No provider to translate early upstream chat SSE");
+                                warn!("No provider to translate upstream chat SSE");
                                 *body = Some(Bytes::from(early_sse_failure_body()));
                             }
                         }

@@ -2029,6 +2029,42 @@ pub fn chat_response_to_responses_sse(body: &[u8]) -> Option<Vec<u8>> {
     Some(translator.process_chunk(&sse, true))
 }
 
+/// Fold a Responses SSE stream into the single Responses object a
+/// non-streaming client expects.
+///
+/// The Responses stream contract ends with a terminal event
+/// (`response.completed`, `response.incomplete`, or `response.failed`) whose
+/// `response` payload is the *whole* response object — the same shape the
+/// non-streaming endpoint returns. Folding is therefore a matter of reading
+/// that terminal event; the intermediate events (deltas, item done, usage)
+/// only carry pieces of the same object. Returns `None` when the stream has
+/// no terminal event (a truncated stream).
+pub fn responses_sse_to_response(sse: &[u8]) -> Option<Vec<u8>> {
+    let text = String::from_utf8_lossy(sse);
+    for line in text.lines() {
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim_start();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let Ok(payload) = serde_json::from_str::<Value>(data) else {
+            continue;
+        };
+        let terminal = matches!(
+            payload.get("type").and_then(|t| t.as_str()),
+            Some("response.completed") | Some("response.incomplete") | Some("response.failed")
+        );
+        if terminal {
+            if let Some(response) = payload.get("response") {
+                return serde_json::to_vec(response).ok();
+            }
+        }
+    }
+    None
+}
+
 /// Serialize a Responses request for logging or debugging.
 #[derive(Debug, Serialize)]
 pub struct ResponsesRequestSummary {
@@ -3764,5 +3800,84 @@ mod tests {
         assert!(s.contains("event: response.created"));
         assert!(s.contains("event: response.completed"));
         assert!(s.contains("data: [DONE]"));
+    }
+
+    // ── folding a stream into a single response object ───────────────
+
+    #[test]
+    fn test_sse_folds_into_a_single_response_object() {
+        // A non-streaming client must not be handed an SSE stream. The
+        // terminal event carries the whole response object, so folding it
+        // yields the same shape the non-streaming endpoint returns.
+        let sse = chat_sse(&[
+            r#"{"id":"chatcmpl-f","object":"chat.completion.chunk","created":1700000000,"model":"gpt-4o","choices":[{"index":0,"delta":{"role":"assistant","content":"hello"}}]}"#,
+            r#"{"id":"chatcmpl-f","object":"chat.completion.chunk","created":1700000000,"model":"gpt-4o","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}"#,
+        ]);
+        let mut t = ResponsesStreamTranslator::new(Box::new(crate::NativePassthroughStream));
+        let events = t.process_chunk(sse.as_bytes(), true);
+
+        let folded = responses_sse_to_response(&events).expect("foldable");
+        let v: Value = serde_json::from_slice(&folded).unwrap();
+        assert_eq!(v["object"], "response");
+        assert_eq!(v["status"], "completed");
+        assert_eq!(v["model"], "gpt-4o");
+        assert_eq!(v["output"][0]["type"], "message");
+        assert_eq!(v["output"][0]["content"][0]["text"], "hello");
+        assert_eq!(v["usage"]["input_tokens"], 3);
+        assert_eq!(v["usage"]["output_tokens"], 2);
+    }
+
+    #[test]
+    fn test_sse_fold_of_a_failed_stream_keeps_the_error() {
+        // An upstream that reports the failure inside the stream must not
+        // turn into a successful, empty answer when it is folded.
+        let sse = chat_sse(&[
+            r#"{"id":"chatcmpl-g","object":"chat.completion.chunk","created":1700000000,"model":"gpt-4o","choices":[],"error":{"message":"boom","type":"server_error"}}"#,
+        ]);
+        let mut t = ResponsesStreamTranslator::new(Box::new(crate::NativePassthroughStream));
+        let events = t.process_chunk(sse.as_bytes(), true);
+        assert!(String::from_utf8_lossy(&events).contains("event: response.failed"));
+
+        let folded = responses_sse_to_response(&events).expect("foldable");
+        let v: Value = serde_json::from_slice(&folded).unwrap();
+        assert_eq!(v["status"], "failed");
+        assert_eq!(v["error"]["message"], "boom");
+    }
+
+    #[test]
+    fn test_sse_fold_without_a_terminal_event_returns_none() {
+        // A truncated stream has no terminal event; there is nothing to
+        // fold, and the caller must not invent an empty answer.
+        let sse = "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n";
+        assert!(responses_sse_to_response(sse.as_bytes()).is_none());
+    }
+
+    // ── tool output shapes ───────────────────────────────────────────
+
+    #[test]
+    fn test_tool_output_object_is_stringified_not_dropped() {
+        // The Responses contract types `output` as a string, but a client
+        // may send a JSON object. The tool result must still reach the
+        // upstream — as its JSON text — instead of being dropped.
+        let items = json!([
+            {"type":"function_call_output","call_id":"c1","output":{"ok":true,"value":42}}
+        ]);
+        let msg = parse_input_item(&items[0]).unwrap();
+        assert_eq!(msg["role"], "tool");
+        assert_eq!(msg["tool_call_id"], "c1");
+        assert_eq!(
+            msg["content"],
+            Value::String(r#"{"ok":true,"value":42}"#.to_string())
+        );
+    }
+
+    #[test]
+    fn test_tool_output_missing_is_an_empty_string() {
+        // A tool result without an output field must not vanish: the tool
+        // message is still sent, with empty content.
+        let items = json!([{"type":"function_call_output","call_id":"c1"}]);
+        let msg = parse_input_item(&items[0]).unwrap();
+        assert_eq!(msg["role"], "tool");
+        assert_eq!(msg["content"], Value::String(String::new()));
     }
 }
