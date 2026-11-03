@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use std::io::Write;
 use std::process::{Child, Command};
 use std::time::Duration;
-use wiremock::matchers::{header, method, path};
+use wiremock::matchers::{header, header_exists, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 // ---------------------------------------------------------------------------
@@ -2971,10 +2971,12 @@ async fn test_connect_failure_is_retried_on_fallback_provider() {
     assert_eq!(sent["messages"][0]["content"], "hi");
 }
 
-/// An upstream *error response* is not a connection failure — the request was
-/// executed upstream (and may have been billed), so it is never re-sent.
+/// An upstream *error response* (5xx) fails over to the next provider of the
+/// route's fallback chain: the pool is a set of interchangeable supplies, and
+/// one supply failing must not fail the request. This mirrors litellm_lb_go's
+/// `responsesFailoverAllowed` and one-api's channel retry.
 #[tokio::test]
-async fn test_upstream_error_response_is_not_retried() {
+async fn test_upstream_error_response_fails_over_to_the_fallback() {
     let primary = MockServer::start().await;
     let fallback = MockServer::start().await;
 
@@ -3030,16 +3032,22 @@ strategy = "fallback"
         .await
         .unwrap();
 
-    // The upstream answered 500; the gateway must forward it untouched and
-    // must NOT retry on the fallback.
-    assert_eq!(resp.status(), 500);
+    // The upstream answered 500; the gateway must retry the request on the
+    // fallback instead of failing the client.
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "never");
 
     let received = fallback.received_requests().await.unwrap_or_default();
-    assert!(
-        received.is_empty(),
-        "an upstream error response must never be retried on the fallback, got {} request(s)",
-        received.len()
+    assert_eq!(
+        received.len(),
+        1,
+        "an upstream error response must fail over to the fallback"
     );
+    // The retry carries the client's original body.
+    let sent: Value = serde_json::from_slice(&received[0].body).expect("json body");
+    assert_eq!(sent["model"], "gpt-4o");
+    assert_eq!(sent["messages"][0]["content"], "hi");
 }
 
 /// A connect failure with no fallback configured must return 502 — the
@@ -3237,4 +3245,450 @@ async fn test_native_responses_large_body_records_usage() {
         line.trim_end().ends_with("11"),
         "expected 11 input tokens, got: {line}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Request-level HTTP failover tests
+// ---------------------------------------------------------------------------
+
+const HTTP_FAILOVER_CONFIG: &str = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[metrics]
+enabled = true
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.primary]
+kind = "openai_compat"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+default_model = "deepseek-v4.1-flash"
+
+[providers.fallback]
+kind = "openai_compat"
+base_url = "{FALLBACK_URL}"
+api_key = "fake-key"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "primary"
+fallback = ["fallback"]
+strategy = "fallback"
+max_failover_attempts = 4
+"#;
+
+const HTTP_FAILOVER_TO_OPENCODE_CONFIG: &str = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[metrics]
+enabled = true
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.primary]
+kind = "openai_compat"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+default_model = "deepseek-v4.1-flash"
+
+[providers.opencode_fb]
+kind = "opencode"
+base_url = "{FALLBACK_URL}"
+upstream_path = "/zen/go/v1/chat/completions"
+api_key = "fake-key"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "primary"
+fallback = ["opencode_fb"]
+strategy = "fallback"
+max_failover_attempts = 4
+"#;
+
+const HTTP_FAILOVER_400_MODEL_CONFIG: &str = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[metrics]
+enabled = true
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.primary]
+kind = "openai_compat"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+default_model = "MiniMax-M3"
+
+[providers.fallback]
+kind = "openai_compat"
+base_url = "{FALLBACK_URL}"
+api_key = "fake-key"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "primary"
+fallback = ["fallback"]
+strategy = "fallback"
+max_failover_attempts = 4
+"#;
+
+const HTTP_FAILOVER_BUDGET_CONFIG: &str = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[metrics]
+enabled = true
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.p1]
+kind = "openai_compat"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+
+[providers.p2]
+kind = "openai_compat"
+base_url = "{FALLBACK_URL}"
+api_key = "fake-key"
+
+[providers.p3]
+kind = "openai_compat"
+base_url = "http://127.0.0.1:1"
+api_key = "fake-key"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "p1"
+fallback = ["p2", "p3"]
+strategy = "fallback"
+max_failover_attempts = 1
+"#;
+
+#[tokio::test]
+async fn test_http_error_fails_over_to_fallback_provider() {
+    let primary = MockServer::start().await;
+    let fallback = MockServer::start().await;
+
+    // Primary answers 500 (a provider failure another provider may not have).
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500).set_body_json(json!({"error": "down"})))
+        .expect(1)
+        .mount(&primary)
+        .await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from fallback")))
+        .expect(1)
+        .mount(&fallback)
+        .await;
+
+    let gw =
+        TestGateway::start_with_fallback(HTTP_FAILOVER_CONFIG, &primary.uri(), &fallback.uri())
+            .await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&chat_body("deepseek-v4.1-flash", "hi"))
+        .send()
+        .await
+        .unwrap();
+
+    // The client sees the fallback's answer, not the primary's 500.
+    assert_eq!(resp.status(), 200, "request must fail over to the fallback");
+    // The gateway tells the client which provider served it.
+    assert_eq!(resp.headers().get("X-MaxLLM-Provider").unwrap(), "fallback");
+    assert_eq!(
+        resp.headers().get("X-MaxLLM-Fallback-From").unwrap(),
+        "primary"
+    );
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "from fallback");
+
+    // The primary was tried exactly once; the fallback exactly once.
+    let primary_reqs = primary.received_requests().await.unwrap();
+    assert_eq!(primary_reqs.len(), 1);
+    let fallback_reqs = fallback.received_requests().await.unwrap();
+    assert_eq!(fallback_reqs.len(), 1);
+}
+
+#[tokio::test]
+async fn test_http_error_fails_over_to_opencode_with_normalized_body() {
+    let primary = MockServer::start().await;
+    let fallback = MockServer::start().await;
+
+    // Primary rate-limits (429) — an upstream failure, not a request fault.
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(429).set_body_json(json!({"error": "rate limited"})))
+        .expect(1)
+        .mount(&primary)
+        .await;
+
+    // The fallback is a strict opencode.ai-style upstream: it requires the
+    // x-opencode-session header and rejects the non-standard wire shapes the
+    // gateway normalises away. Failing over to it must NOT forward the body
+    // as-is — it has to be converted to opencode's schema.
+    Mock::given(method("POST"))
+        .and(path("/zen/go/v1/chat/completions"))
+        .and(header_exists("x-opencode-session"))
+        .respond_with(move |req: &wiremock::Request| {
+            let sent: Value = serde_json::from_slice(&req.body).expect("json body");
+            // role normalised: developer -> system
+            assert_eq!(sent["messages"][0]["role"], "system");
+            // tool_choice "any" is rejected by opencode -> normalised to "required"
+            assert_eq!(sent["tool_choice"], "required");
+            // arguments must be a JSON string, not an object
+            let args = sent["messages"][2]["tool_calls"][0]["function"]["arguments"]
+                .as_str()
+                .expect("arguments must be a JSON string");
+            let parsed: Value = serde_json::from_str(args).unwrap();
+            assert_eq!(parsed["city"], "BJ");
+            ResponseTemplate::new(200).set_body_json(openai_response("from opencode"))
+        })
+        .expect(1)
+        .mount(&fallback)
+        .await;
+
+    let gw = TestGateway::start_with_fallback(
+        HTTP_FAILOVER_TO_OPENCODE_CONFIG,
+        &primary.uri(),
+        &fallback.uri(),
+    )
+    .await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&json!({
+            "model": "deepseek-v4.1-flash",
+            "messages": [
+                {"role": "developer", "content": "be terse"},
+                {"role": "user", "content": "what is the weather in Beijing?"},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "", "type": "function", "function": {"name": "get_weather", "arguments": {"city": "BJ"}}}
+                ]},
+                {"role": "tool", "tool_call_id": "", "content": "sunny"}
+            ],
+            "tools": [{"type": "function", "function": {"name": "get_weather", "parameters": {}}}],
+            "tool_choice": "any"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200, "must fail over to opencode and answer");
+    assert_eq!(
+        resp.headers().get("X-MaxLLM-Provider").unwrap(),
+        "opencode_fb"
+    );
+    assert_eq!(
+        resp.headers().get("X-MaxLLM-Fallback-From").unwrap(),
+        "primary"
+    );
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "from opencode");
+}
+
+#[tokio::test]
+async fn test_400_unknown_model_fails_over() {
+    let primary = MockServer::start().await;
+    let fallback = MockServer::start().await;
+
+    // The pool routes the requested model to the first provider; the primary
+    // does not carry it and answers 400 (one-api "invalid params, unknown
+    // model"). Its default model differs from the request, so the 400 is a
+    // capability failure and the request must walk on.
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(
+            json!({"error": {"message": "invalid params, unknown model 'deepseek-v4-flash'"}}),
+        ))
+        .expect(1)
+        .mount(&primary)
+        .await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("carried here")))
+        .expect(1)
+        .mount(&fallback)
+        .await;
+
+    let gw = TestGateway::start_with_fallback(
+        HTTP_FAILOVER_400_MODEL_CONFIG,
+        &primary.uri(),
+        &fallback.uri(),
+    )
+    .await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&chat_body("deepseek-v4-flash", "hi"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        200,
+        "a 400 for an uncarried model must fail over"
+    );
+    assert_eq!(
+        resp.headers().get("X-MaxLLM-Fallback-From").unwrap(),
+        "primary"
+    );
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "carried here");
+}
+
+#[tokio::test]
+async fn test_400_for_carried_model_does_not_fail_over() {
+    let primary = MockServer::start().await;
+    let fallback = MockServer::start().await;
+
+    // The primary carries the requested model (its default matches), so a 400
+    // is a genuine request fault every provider would share — it must not
+    // burn the fallback budget on it.
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(400).set_body_json(json!({"error": {"message": "bad request"}})),
+        )
+        .expect(1)
+        .mount(&primary)
+        .await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("never")))
+        .expect(0)
+        .mount(&fallback)
+        .await;
+
+    let gw = TestGateway::start_with_fallback(
+        HTTP_FAILOVER_400_MODEL_CONFIG,
+        &primary.uri(),
+        &fallback.uri(),
+    )
+    .await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&chat_body("MiniMax-M3", "hi"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 400, "a 400 for a carried model stays put");
+    // The fallback must never be touched.
+    let fallback_reqs = fallback.received_requests().await.unwrap_or_default();
+    assert_eq!(fallback_reqs.len(), 0);
+}
+
+#[tokio::test]
+async fn test_all_providers_fail_returns_last_error() {
+    let primary = MockServer::start().await;
+    let fallback = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500).set_body_json(json!({"error": "down"})))
+        .expect(1)
+        .mount(&primary)
+        .await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(429).set_body_json(json!({"error": "quota"})))
+        .expect(1)
+        .mount(&fallback)
+        .await;
+
+    let gw =
+        TestGateway::start_with_fallback(HTTP_FAILOVER_CONFIG, &primary.uri(), &fallback.uri())
+            .await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&chat_body("deepseek-v4.1-flash", "hi"))
+        .send()
+        .await
+        .unwrap();
+
+    // Both providers failed; the client receives the LAST provider's error.
+    assert_eq!(resp.status(), 429);
+}
+
+#[tokio::test]
+async fn test_failover_budget_is_respected() {
+    let primary = MockServer::start().await;
+    let fallback = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500).set_body_json(json!({"error": "down"})))
+        .expect(1)
+        .mount(&primary)
+        .await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500).set_body_json(json!({"error": "down too"})))
+        .expect(1)
+        .mount(&fallback)
+        .await;
+
+    let gw = TestGateway::start_with_fallback(
+        HTTP_FAILOVER_BUDGET_CONFIG,
+        &primary.uri(),
+        &fallback.uri(),
+    )
+    .await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&chat_body("deepseek-v4.1-flash", "hi"))
+        .send()
+        .await
+        .unwrap();
+
+    // max_failover_attempts = 1: p1 fails -> p2; p2 fails -> budget spent, the
+    // error of p2 is returned and p3 is never touched.
+    assert_eq!(resp.status(), 500);
+    let fallback_reqs = fallback.received_requests().await.unwrap();
+    assert_eq!(fallback_reqs.len(), 1, "p2 is tried once");
 }
