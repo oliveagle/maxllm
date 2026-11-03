@@ -1237,8 +1237,14 @@ impl ResponsesStreamTranslator {
             );
         }
 
-        if let Some(usage) = chunk.get("usage") {
-            if !usage.is_null() {
+        // A run's usage arrives either in the finish-reason chunk itself
+        // (DeepSeek) or in a separate chunk right after it (OpenAI-style:
+        // MiniMax, Xiaomi and the one-api relays). Remember whether this
+        // chunk carried it, so the stream can be ended on the first chunk
+        // that has the usage of a run whose finish reason is already known.
+        let usage_in_chunk = chunk.get("usage").is_some_and(|u| !u.is_null());
+        if usage_in_chunk {
+            if let Some(usage) = chunk.get("usage") {
                 self.usage = convert_usage(Some(usage));
             }
         }
@@ -1464,14 +1470,17 @@ impl ResponsesStreamTranslator {
             }
         }
 
-        // The upstream signals the end of generation with `finish_reason`.
-        // Some upstreams (e.g. MiniMax over HTTP/2) close the stream right
-        // after it without a `[DONE]` frame, and pingora does not forward an
-        // end-of-stream signal to the body filter for those connections, so
-        // waiting for `[DONE]`/end-of-stream would leave the Responses client
-        // hanging. Emitting the terminal events here covers them; upstreams
-        // that do send `[DONE]` hit the same finalize (it is idempotent).
-        if self.finish_reason.is_some() {
+        // End the stream once the finish reason is known and the run's usage
+        // is in hand. MiniMax ends its HTTP/2 stream right after the usage
+        // chunk without a `[DONE]` frame, and pingora does not forward an
+        // end-of-stream signal for such a connection, so waiting for
+        // `[DONE]`/end-of-stream alone would leave the Responses client
+        // hanging. Finalizing on the first chunk that carries the usage of a
+        // finished run covers MiniMax (usage chunk right after the finish
+        // reason) and DeepSeek (usage bundled with the finish reason); the
+        // `[DONE]` frame and the end-of-stream signal still finalize the
+        // streams that send them (the finalize is idempotent).
+        if self.finish_reason.is_some() && usage_in_chunk {
             self.finalize(out);
         }
     }
@@ -2792,17 +2801,21 @@ mod tests {
 
     #[test]
     fn test_stream_completes_without_a_done_frame() {
-        // Some upstreams (MiniMax over HTTP/2) end the stream right after the
-        // `finish_reason` chunk and never send `[DONE]`; pingora does not
-        // forward an end-of-stream signal for those connections. The
-        // terminal events must still be emitted, or the Responses client
-        // waits for `response.completed` forever.
+        // MiniMax ends its HTTP/2 stream right after the usage chunk and
+        // never sends `[DONE]`; pingora does not forward an end-of-stream
+        // signal for those connections. The terminal events must still be
+        // emitted, or the Responses client waits for `response.completed`
+        // forever. The usage arrives in a chunk of its own, right after the
+        // finish reason, and must not be cut off.
         let mut sse = String::new();
         sse.push_str("data: ");
         sse.push_str(r#"{"id":"chatcmpl-n","object":"chat.completion.chunk","created":1700000000,"model":"MiniMax-M3","choices":[{"index":0,"delta":{"role":"assistant","content":"hi"},"finish_reason":null}]}"#);
         sse.push_str("\n\n");
         sse.push_str("data: ");
-        sse.push_str(r#"{"id":"chatcmpl-n","object":"chat.completion.chunk","created":1700000000,"model":"MiniMax-M3","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#);
+        sse.push_str(r#"{"id":"chatcmpl-n","object":"chat.completion.chunk","created":1700000000,"model":"MiniMax-M3","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":null}"#);
+        sse.push_str("\n\n");
+        sse.push_str("data: ");
+        sse.push_str(r#"{"id":"chatcmpl-n","object":"chat.completion.chunk","created":1700000000,"model":"MiniMax-M3","choices":[],"usage":{"prompt_tokens":11,"completion_tokens":3,"total_tokens":14}}"#);
         sse.push_str("\n\n");
         let mut t = ResponsesStreamTranslator::new(Box::new(crate::NativePassthroughStream));
         // No `[DONE]` frame and no end-of-stream signal.
@@ -2811,6 +2824,35 @@ mod tests {
         assert!(s.contains("event: response.completed"));
         assert!(s.contains("data: [DONE]"));
         assert!(s.contains(r#""delta":"hi""#));
+        // The usage chunk that follows the finish reason must be in the
+        // completed response, not cut off by an early finalize.
+        assert!(s.contains(r#""total_tokens":14"#));
+        assert!(s.contains(r#""input_tokens":11"#));
+        assert!(s.contains(r#""output_tokens":3"#));
+    }
+
+    #[test]
+    fn test_stream_completes_on_end_of_stream_without_a_done_frame() {
+        // An upstream that reports no usage at all still has to end: the
+        // gateway forwards the end-of-stream signal of the connection, and
+        // that ends the Responses stream.
+        let mut sse = String::new();
+        sse.push_str("data: ");
+        sse.push_str(r#"{"id":"chatcmpl-n2","object":"chat.completion.chunk","created":1700000000,"model":"MiniMax-M3","choices":[{"index":0,"delta":{"role":"assistant","content":"hi"},"finish_reason":null}]}"#);
+        sse.push_str("\n\n");
+        sse.push_str("data: ");
+        sse.push_str(r#"{"id":"chatcmpl-n2","object":"chat.completion.chunk","created":1700000000,"model":"MiniMax-M3","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":null}"#);
+        sse.push_str("\n\n");
+        let mut t = ResponsesStreamTranslator::new(Box::new(crate::NativePassthroughStream));
+        let first = t.process_chunk(sse.as_bytes(), false);
+        let first = String::from_utf8(first).unwrap();
+        assert!(first.contains(r#""delta":"hi""#));
+        assert!(!first.contains("event: response.completed"));
+        // The connection ends without a `[DONE]` frame.
+        let out = t.process_chunk(b"", true);
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("event: response.completed"));
+        assert!(s.contains("data: [DONE]"));
     }
 
     #[test]
