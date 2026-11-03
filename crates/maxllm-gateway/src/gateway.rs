@@ -2336,19 +2336,29 @@ impl ProxyHttp for AiGateway {
                         }
                     }
                 }
-            } else if let Some(data) = body.as_ref() {
-                let translated: Option<Bytes> = match ctx.stream_translator.lock() {
-                    Ok(mut guard) => guard.as_mut().map(|translator| {
-                        Bytes::from(translator.process_chunk(data, end_of_stream))
-                    }),
-                    Err(e) => {
-                        warn!("stream_translator mutex poisoned in streaming: {e}");
-                        None
+            } else {
+                // Some upstreams end their stream with a `finish_reason` chunk
+                // and no `[DONE]` frame (MiniMax). pingora's last
+                // response_body_filter call then arrives with an empty body
+                // and end_of_stream=true, and the translator must still be
+                // given that signal — otherwise it never emits
+                // `response.completed`/`[DONE]` and the Responses client
+                // hangs waiting for the terminal event.
+                let chunk: &[u8] = body.as_deref().unwrap_or(&[]);
+                if !chunk.is_empty() || end_of_stream {
+                    let translated: Option<Bytes> = match ctx.stream_translator.lock() {
+                        Ok(mut guard) => guard.as_mut().map(|translator| {
+                            Bytes::from(translator.process_chunk(chunk, end_of_stream))
+                        }),
+                        Err(e) => {
+                            warn!("stream_translator mutex poisoned in streaming: {e}");
+                            None
+                        }
+                    };
+                    if let Some(ref t) = translated {
+                        extract_stream_usage(t, ctx, end_of_stream);
+                        *body = Some(t.clone());
                     }
-                };
-                if let Some(ref t) = translated {
-                    extract_stream_usage(t, ctx, end_of_stream);
-                    *body = Some(t.clone());
                 }
             }
         } else {

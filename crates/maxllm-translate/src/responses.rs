@@ -1463,6 +1463,17 @@ impl ResponsesStreamTranslator {
                 }
             }
         }
+
+        // The upstream signals the end of generation with `finish_reason`.
+        // Some upstreams (e.g. MiniMax over HTTP/2) close the stream right
+        // after it without a `[DONE]` frame, and pingora does not forward an
+        // end-of-stream signal to the body filter for those connections, so
+        // waiting for `[DONE]`/end-of-stream would leave the Responses client
+        // hanging. Emitting the terminal events here covers them; upstreams
+        // that do send `[DONE]` hit the same finalize (it is idempotent).
+        if self.finish_reason.is_some() {
+            self.finalize(out);
+        }
     }
 
     /// End the stream with the upstream's error, as a terminal
@@ -2777,6 +2788,45 @@ mod tests {
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains("event: response.incomplete"));
         assert!(s.contains(r#""reason":"max_output_tokens""#));
+    }
+
+    #[test]
+    fn test_stream_completes_without_a_done_frame() {
+        // Some upstreams (MiniMax over HTTP/2) end the stream right after the
+        // `finish_reason` chunk and never send `[DONE]`; pingora does not
+        // forward an end-of-stream signal for those connections. The
+        // terminal events must still be emitted, or the Responses client
+        // waits for `response.completed` forever.
+        let mut sse = String::new();
+        sse.push_str("data: ");
+        sse.push_str(r#"{"id":"chatcmpl-n","object":"chat.completion.chunk","created":1700000000,"model":"MiniMax-M3","choices":[{"index":0,"delta":{"role":"assistant","content":"hi"},"finish_reason":null}]}"#);
+        sse.push_str("\n\n");
+        sse.push_str("data: ");
+        sse.push_str(r#"{"id":"chatcmpl-n","object":"chat.completion.chunk","created":1700000000,"model":"MiniMax-M3","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#);
+        sse.push_str("\n\n");
+        let mut t = ResponsesStreamTranslator::new(Box::new(crate::NativePassthroughStream));
+        // No `[DONE]` frame and no end-of-stream signal.
+        let out = t.process_chunk(sse.as_bytes(), false);
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("event: response.completed"));
+        assert!(s.contains("data: [DONE]"));
+        assert!(s.contains(r#""delta":"hi""#));
+    }
+
+    #[test]
+    fn test_stream_finish_reason_chunk_keeps_the_usage() {
+        // DeepSeek reports the usage in the same chunk as the finish reason,
+        // so completing on that chunk must not lose the token counts.
+        let mut sse = String::new();
+        sse.push_str("data: ");
+        sse.push_str(r#"{"id":"chatcmpl-u","object":"chat.completion.chunk","created":1700000000,"model":"deepseek-chat","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":2,"total_tokens":9}}"#);
+        sse.push_str("\n\n");
+        let mut t = ResponsesStreamTranslator::new(Box::new(crate::NativePassthroughStream));
+        let out = t.process_chunk(sse.as_bytes(), false);
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("event: response.completed"));
+        assert!(s.contains(r#""total_tokens":9"#));
+        assert!(s.contains(r#""input_tokens":7"#));
     }
 
     #[test]
