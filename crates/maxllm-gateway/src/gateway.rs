@@ -1815,7 +1815,6 @@ impl ProxyHttp for AiGateway {
         // (`body_translated`) does `is_streaming` reflect the client's true
         // intent — in the early-answer race the stream is kept, not folded.
         if ctx.endpoint_type == EndpointType::Responses
-            && !ctx.native_responses
             && !ctx.is_streaming
             && ctx.body_translated
             && status < 400
@@ -2051,13 +2050,43 @@ impl ProxyHttp for AiGateway {
                         ctx.response_body_buf.extend_from_slice(&data);
                     }
                     if end_of_stream && !ctx.response_body_buf.is_empty() {
-                        if let Ok(parsed) =
-                            serde_json::from_slice::<serde_json::Value>(&ctx.response_body_buf)
-                        {
-                            extract_usage(&parsed, ctx);
+                        let parsed =
+                            serde_json::from_slice::<serde_json::Value>(&ctx.response_body_buf);
+                        if let Ok(ref parsed) = parsed {
+                            extract_usage(parsed, ctx);
                         }
 
-                        if ctx.upstream_status >= 400 {
+                        // A non-streaming client expects one Responses object.
+                        // A native upstream that answered with Responses SSE
+                        // anyway (ignoring `stream: false`) is folded into
+                        // that single object by reading the terminal event.
+                        // The gate mirrors the translated path: only once the
+                        // request body has been read (`body_translated`) does
+                        // `is_streaming` reflect the client's true intent —
+                        // in the early-answer race the stream is kept.
+                        if parsed.is_err()
+                            && ctx.body_translated
+                            && looks_like_responses_sse(&ctx.response_body_buf)
+                        {
+                            match maxllm_translate::responses::responses_sse_to_response(
+                                &ctx.response_body_buf,
+                            ) {
+                                Some(json) => {
+                                    if let Ok(parsed) =
+                                        serde_json::from_slice::<serde_json::Value>(&json)
+                                    {
+                                        extract_usage(&parsed, ctx);
+                                    }
+                                    *body = Some(Bytes::from(json));
+                                }
+                                None => {
+                                    warn!(
+                                        "Failed to fold native Responses SSE into a single object"
+                                    );
+                                    *body = Some(Bytes::from(early_sse_failure_body()));
+                                }
+                            }
+                        } else if ctx.upstream_status >= 400 {
                             let error_body = provider
                                 .and_then(|p| {
                                     normalize_error_response(
@@ -3038,6 +3067,19 @@ fn looks_like_chat_sse(data: &[u8]) -> bool {
     text.trim_start().starts_with("data:") && text.contains("chat.completion")
 }
 
+/// Whether the buffered body is a Responses SSE stream.
+///
+/// Responses frames start with an `event:` line followed by a `data:` line
+/// (chat frames start directly with `data:`), and the event payloads carry
+/// the Responses `response.*` type markers — the terminal event name is the
+/// distinguishing token. A plain JSON response has neither a `data:` line
+/// nor the terminal marker.
+fn looks_like_responses_sse(data: &[u8]) -> bool {
+    let head = &data[..data.len().min(4096)];
+    let text = String::from_utf8_lossy(head);
+    text.contains("data:") && text.contains("response.completed")
+}
+
 /// The body sent when an upstream chat SSE stream cannot be converted into
 /// Responses events. Raw provider bytes are never forwarded to a Responses
 /// client, so an explicit error is sent instead.
@@ -3409,6 +3451,21 @@ mod early_sse_tests {
         let responses =
             b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{}}\n\n";
         assert!(!looks_like_chat_sse(responses));
+    }
+
+    #[test]
+    fn test_responses_sse_is_detected() {
+        // A native upstream answers with Responses events; the terminal
+        // event name is what tells its stream apart from a chat stream.
+        let responses = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{}}\n\n";
+        assert!(looks_like_responses_sse(responses));
+        // A chat stream is not a Responses stream.
+        let chat = b"data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"choices\":[]}\n\n";
+        assert!(!looks_like_responses_sse(chat));
+        // A plain JSON body is not a stream either.
+        assert!(!looks_like_responses_sse(
+            br#"{"object":"response","output":[]}"#
+        ));
     }
 }
 
