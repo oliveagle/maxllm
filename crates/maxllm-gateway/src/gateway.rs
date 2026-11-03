@@ -1801,8 +1801,13 @@ impl ProxyHttp for AiGateway {
             let _ = upstream_response.remove_header("Content-Length");
         }
 
-        // Responses streaming always emits SSE.
-        if ctx.endpoint_type == EndpointType::Responses && ctx.is_streaming && !is_gemini_streaming
+        // Responses streaming always emits SSE — except error responses,
+        // whose body is the normalized OpenAI error JSON (not SSE) and must
+        // not be labelled as a stream.
+        if ctx.endpoint_type == EndpointType::Responses
+            && ctx.is_streaming
+            && !is_gemini_streaming
+            && status < 400
         {
             upstream_response.insert_header("Content-Type", "text/event-stream")?;
             let _ = upstream_response.remove_header("Content-Length");
