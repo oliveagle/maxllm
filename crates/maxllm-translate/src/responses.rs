@@ -714,35 +714,60 @@ fn responses_tool_choice_to_chat(tool_choice: &Value) -> Value {
 ///
 /// Responses uses a flat shape (`{"type":"function","name":…}`) while chat
 /// completions nests the function object (`{"type":"function","function":{…}}`).
+///
+/// A Responses `namespace` tool groups sub-tools under one name
+/// (`{"type":"namespace","name":…,"tools":[…]}`). Chat completions have no
+/// namespace concept and the strict tool parsers — the gateway's own
+/// provider translators and the upstream APIs behind them (DeepSeek answers
+/// `tools[0].type: unknown variant 'namespace', expected 'function'`) —
+/// reject the unknown type, so every sub-tool is expanded into its own
+/// top-level function tool. Sub-tool names inside a namespace are already
+/// unique (codex sends MCP namespaces such as `mcp__laya_mem` → `bdd_list`),
+/// so they are kept verbatim. A namespace without a `tools` array carries
+/// nothing and is dropped.
 fn responses_tools_to_chat(tools: &Value) -> Value {
     let Value::Array(items) = tools else {
         return tools.clone();
     };
 
-    Value::Array(
-        items
-            .iter()
-            .map(|tool| {
-                let is_flat_function = tool.get("type").and_then(|t| t.as_str())
-                    == Some("function")
-                    && tool.get("function").is_none();
-                if !is_flat_function {
-                    return tool.clone();
-                }
+    let mut out = Vec::with_capacity(items.len());
+    for tool in items {
+        expand_tool_to_chat(tool, &mut out);
+    }
+    Value::Array(out)
+}
 
-                let mut func = Map::new();
-                for field in ["name", "description", "parameters"] {
-                    if let Some(v) = tool.get(field) {
-                        func.insert(field.to_string(), v.clone());
-                    }
-                }
-                let mut out = Map::new();
-                out.insert("type".into(), Value::String("function".into()));
-                out.insert("function".into(), Value::Object(func));
-                Value::Object(out)
-            })
-            .collect(),
-    )
+/// Append one Responses tool to `out` in chat completions shape.
+///
+/// A `namespace` tool is expanded recursively; a flat function tool is
+/// nested under `function`; anything else is copied unchanged.
+fn expand_tool_to_chat(tool: &Value, out: &mut Vec<Value>) {
+    if tool.get("type").and_then(|t| t.as_str()) == Some("namespace") {
+        if let Some(subs) = tool.get("tools").and_then(|t| t.as_array()) {
+            for sub in subs {
+                expand_tool_to_chat(sub, out);
+            }
+        }
+        return;
+    }
+
+    let is_flat_function = tool.get("type").and_then(|t| t.as_str()) == Some("function")
+        && tool.get("function").is_none();
+    if !is_flat_function {
+        out.push(tool.clone());
+        return;
+    }
+
+    let mut func = Map::new();
+    for field in ["name", "description", "parameters"] {
+        if let Some(v) = tool.get(field) {
+            func.insert(field.to_string(), v.clone());
+        }
+    }
+    let mut chat_tool = Map::new();
+    chat_tool.insert("type".into(), Value::String("function".into()));
+    chat_tool.insert("function".into(), Value::Object(func));
+    out.push(Value::Object(chat_tool));
 }
 
 // ---------------------------------------------------------------------------
@@ -2787,6 +2812,28 @@ mod tests {
         assert_eq!(tool["function"]["name"], "fn");
         assert_eq!(tool["function"]["description"], "d");
         assert_eq!(v["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn test_namespace_tools_are_expanded_into_function_tools() {
+        let body = br#"{
+            "model":"gpt-4o","input":"hi",
+            "tools":[
+                {"type":"namespace","name":"mcp__laya_mem","description":"d",
+                 "tools":[{"type":"function","name":"bdd_list","description":"dd",
+                           "parameters":{"type":"object"}}]},
+                {"type":"function","name":"fn","description":"d","parameters":{"type":"object"}}
+            ]
+        }"#;
+        let out = responses_request_to_chat(body).unwrap();
+        let v: Value = serde_json::from_slice(&out.body).unwrap();
+        let tools = v["tools"].as_array().unwrap();
+        // The namespace contributes its sub-tool; the plain function stays.
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["function"]["name"], "bdd_list");
+        assert_eq!(tools[0]["function"]["description"], "dd");
+        assert_eq!(tools[1]["function"]["name"], "fn");
     }
 
     #[test]
