@@ -2111,6 +2111,35 @@ mod tests {
     }
 
     #[test]
+    fn test_compaction_input_item_is_dropped() {
+        // The opencode CLI compacts long conversations and replays the
+        // summary as a `compaction` input item whose text lives in an
+        // opaque `encrypted_content` blob. Chat upstreams have no place for
+        // it and cannot decrypt it, so the item must be dropped without
+        // breaking the rest of the input.
+        let body = br#"{
+            "model":"gpt-4o",
+            "input":[
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"before"}]},
+                {"type":"compaction","encrypted_content":{"kind":"encrypted","nonce":"abc","ciphertext":"xyz"}},
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"after"}]}
+            ]
+        }"#;
+        let out = responses_request_to_chat(body).unwrap();
+        let v: Value = serde_json::from_slice(&out.body).unwrap();
+        let msgs = v["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0]["content"], "before");
+        assert_eq!(msgs[1]["content"], "after");
+        assert!(
+            serde_json::to_string(&v)
+                .unwrap()
+                .contains("encrypted_content")
+                == false
+        );
+    }
+
+    #[test]
     fn test_function_call_round_trip_items() {
         let body = br#"{
             "model":"gpt-4o",
