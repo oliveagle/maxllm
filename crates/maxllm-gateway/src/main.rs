@@ -10,7 +10,9 @@ mod circuit_breaker;
 mod ctx;
 mod gateway;
 mod metrics;
+mod recorder;
 mod routing;
+mod session_sticky;
 
 use clap::Parser;
 use maxllm_config::Config;

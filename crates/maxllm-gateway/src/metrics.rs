@@ -8,7 +8,8 @@
 
 use once_cell::sync::Lazy;
 use prometheus::{
-    Encoder, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, Opts, Registry, TextEncoder,
+    Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
+    Registry, TextEncoder,
 };
 
 pub static METRICS: Lazy<GatewayMetrics> = Lazy::new(GatewayMetrics::new);
@@ -22,6 +23,17 @@ pub struct GatewayMetrics {
     pub request_duration_seconds: HistogramVec,
     pub active_requests: IntGauge,
     pub fallbacks_total: IntCounterVec,
+    /// Session-sticky affinity cache hit/miss counters.
+    pub session_affinity_hits_total: IntCounter,
+    pub session_affinity_misses_total: IntCounter,
+    pub session_affinity_evictions_total: IntCounter,
+    pub session_affinity_size: IntGauge,
+    /// Circuit breaker state per provider: 0=closed, 1=open, 2=half-open.
+    pub circuit_breaker_state: IntGaugeVec,
+    /// Total transitions per provider (absolute snapshot → gauge).
+    pub circuit_breaker_transitions_total: IntGaugeVec,
+    /// Force-opens caused by HTTP 429 (quota exhaustion) per provider.
+    pub circuit_breaker_quota_opens_total: IntCounterVec,
 }
 
 impl GatewayMetrics {
@@ -80,6 +92,78 @@ impl GatewayMetrics {
             .register(Box::new(fallbacks_total.clone()))
             .expect("register");
 
+        let session_affinity_hits_total = IntCounter::new(
+            "maxllm_session_affinity_hits_total",
+            "Session affinity cache hits",
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(session_affinity_hits_total.clone()))
+            .expect("register");
+
+        let session_affinity_misses_total = IntCounter::new(
+            "maxllm_session_affinity_misses_total",
+            "Session affinity cache misses",
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(session_affinity_misses_total.clone()))
+            .expect("register");
+
+        let session_affinity_evictions_total = IntCounter::new(
+            "maxllm_session_affinity_evictions_total",
+            "Session affinity cache evictions (LRU)",
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(session_affinity_evictions_total.clone()))
+            .expect("register");
+
+        let session_affinity_size = IntGauge::new(
+            "maxllm_session_affinity_size",
+            "Current number of session bindings",
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(session_affinity_size.clone()))
+            .expect("register");
+
+        let circuit_breaker_state = IntGaugeVec::new(
+            Opts::new(
+                "maxllm_circuit_breaker_state",
+                "Circuit breaker state per provider (0=closed 1=open 2=half-open)",
+            ),
+            &["provider"],
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(circuit_breaker_state.clone()))
+            .expect("register");
+
+        let circuit_breaker_transitions_total = IntGaugeVec::new(
+            Opts::new(
+                "maxllm_circuit_breaker_transitions_total",
+                "Circuit breaker state transitions per provider",
+            ),
+            &["provider"],
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(circuit_breaker_transitions_total.clone()))
+            .expect("register");
+
+        let circuit_breaker_quota_opens_total = IntCounterVec::new(
+            Opts::new(
+                "maxllm_circuit_breaker_quota_opens_total",
+                "Circuit breaker force-opens caused by HTTP 429 per provider",
+            ),
+            &["provider"],
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(circuit_breaker_quota_opens_total.clone()))
+            .expect("register");
+
         Self {
             registry,
             requests_total,
@@ -88,6 +172,13 @@ impl GatewayMetrics {
             request_duration_seconds,
             active_requests,
             fallbacks_total,
+            session_affinity_hits_total,
+            session_affinity_misses_total,
+            session_affinity_evictions_total,
+            session_affinity_size,
+            circuit_breaker_state,
+            circuit_breaker_transitions_total,
+            circuit_breaker_quota_opens_total,
         }
     }
 

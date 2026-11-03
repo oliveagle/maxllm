@@ -79,6 +79,16 @@ pub struct RequestCtx {
     /// Whether a one-shot fallback retry has already been attempted for a
     /// connect-class upstream failure. Guards against retry loops.
     pub retry_attempted: bool,
+    /// Session identity for session-sticky routing (from headers and/or body).
+    pub session_id: Option<String>,
+    /// Per-request UUID, used to correlate recording events of one exchange.
+    pub request_uuid: String,
+    /// Time-to-first-token (ms) for streaming responses, set when the first
+    /// response chunk arrives.
+    pub ttft_ms: Option<u64>,
+    /// Client request method and path, captured early for the recorder.
+    pub request_method: String,
+    pub request_path: String,
 }
 
 impl RequestCtx {
@@ -113,6 +123,11 @@ impl RequestCtx {
             native_responses: false,
             sse_tail: Vec::new(),
             retry_attempted: false,
+            session_id: None,
+            request_uuid: uuid::Uuid::now_v7().to_string(),
+            ttft_ms: None,
+            request_method: String::new(),
+            request_path: String::new(),
         }
     }
 }

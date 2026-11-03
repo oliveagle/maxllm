@@ -113,7 +113,7 @@ mod tests {
             state: Arc::new(ProviderState {
                 kind: maxllm_config::ProviderKind::OpenAI,
                 translator: Box::new(maxllm_translate::openai::OpenAITranslator),
-                circuit_breaker: CircuitBreaker::new(3, 60),
+                circuit_breaker: Arc::new(CircuitBreaker::new(3, 60)),
                 api_key: String::new(),
                 host: "localhost".to_string(),
                 port: 443,

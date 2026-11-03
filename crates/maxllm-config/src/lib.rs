@@ -44,6 +44,14 @@ pub struct Config {
     pub model_aliases: HashMap<String, String>,
     /// Admin API configuration.
     pub admin: Option<AdminConfig>,
+    /// Session-sticky routing settings (global switch + tuning). Routes opt in
+    /// individually with `session_sticky = true`.
+    #[serde(default)]
+    pub session_sticky: Option<SessionStickyConfig>,
+    /// Request/response recording — a JSONL audit trail of every client and
+    /// provider exchange (mirrors litellm_lb_go's recorder).
+    #[serde(default)]
+    pub recording: Option<RecordingConfig>,
     /// Model cost overrides (supplement built-in costs).
     #[serde(default)]
     pub model_costs: HashMap<String, ModelCostConfig>,
@@ -62,6 +70,47 @@ pub struct AdminConfig {
     /// Path to SQLite database file for persistent storage.
     /// If not set, uses in-memory storage.
     pub db_path: Option<String>,
+}
+
+impl Default for SessionStickyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            timeout_secs: default_session_timeout_secs(),
+            max_entries: default_session_max_entries(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct SessionStickyConfig {
+    /// Master switch. When false, no route pins sessions even if it opts in.
+    #[serde(default = "default_false")]
+    pub enabled: bool,
+    /// How long a session binding stays valid since last use, in seconds.
+    #[serde(default = "default_session_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Max number of session entries kept in memory (LRU eviction on overflow).
+    #[serde(default = "default_session_max_entries")]
+    pub max_entries: usize,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct RecordingConfig {
+    #[serde(default = "default_false")]
+    pub enabled: bool,
+    /// Directory for the JSONL recording files (created if missing).
+    #[serde(default = "default_recording_dir")]
+    pub dir: String,
+    /// Cap on how many bytes of a request/response body are stored per entry.
+    #[serde(default = "default_recording_max_body_bytes")]
+    pub max_body_bytes: usize,
+    /// Max bytes per recording file before it rotates to the next shard.
+    #[serde(default = "default_recording_max_file_bytes")]
+    pub max_file_bytes: u64,
+    /// Delete recording shards older than this many hours.
+    #[serde(default = "default_recording_retention_hours")]
+    pub retention_hours: u64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -220,6 +269,12 @@ pub struct RouteConfig {
     /// Load balancing strategy when multiple providers are available.
     #[serde(default)]
     pub strategy: RoutingStrategy,
+    /// Opt-in for session-sticky routing. When true and the global
+    /// `[session_sticky]` section is enabled, requests that carry a session id
+    /// are pinned to the provider they first succeeded on (until it trips or
+    /// the binding expires). Mirrors litellm_lb_go's session affinity.
+    #[serde(default)]
+    pub session_sticky: bool,
     /// Number of retries before falling back.
     #[serde(default)]
     pub num_retries: u32,
@@ -230,6 +285,34 @@ pub struct RouteConfig {
 
 fn default_retry_backoff_ms() -> u64 {
     500
+}
+
+fn default_false() -> bool {
+    false
+}
+
+fn default_session_timeout_secs() -> u64 {
+    3600
+}
+
+fn default_session_max_entries() -> usize {
+    10_000
+}
+
+fn default_recording_dir() -> String {
+    "./recordings".to_string()
+}
+
+fn default_recording_max_body_bytes() -> usize {
+    8192
+}
+
+fn default_recording_max_file_bytes() -> u64 {
+    64 * 1024 * 1024
+}
+
+fn default_recording_retention_hours() -> u64 {
+    168
 }
 
 /// Endpoint type determines which translator pipeline to use.

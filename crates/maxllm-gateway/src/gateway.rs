@@ -9,7 +9,12 @@
 use crate::circuit_breaker::CircuitBreaker;
 use crate::ctx::RequestCtx;
 use crate::metrics::METRICS;
+use crate::recorder::{
+    RecordEntry, Recorder, EVENT_CLIENT_REQUEST, EVENT_CLIENT_RESPONSE, EVENT_ERROR,
+    EVENT_PROVIDER_REQUEST, EVENT_PROVIDER_RESPONSE,
+};
 use crate::routing::{ProviderSelector, ProviderTarget};
+use crate::session_sticky::SessionStore;
 
 use ahash::AHashMap;
 use async_trait::async_trait;
@@ -28,6 +33,7 @@ use pingora::prelude::*;
 use pingora::proxy::{FailToProxy, ProxyHttp, Session};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 use tracing::{info, warn};
 
@@ -38,6 +44,28 @@ static LLM_HTTP_CLIENT: once_cell::sync::Lazy<reqwest::Client> = once_cell::sync
         .build()
         .expect("reqwest client init failed")
 });
+
+/// Process-wide circuit breakers, keyed by provider name.
+///
+/// They live outside `HotState` on purpose: a config hot-reload rebuilds
+/// every `ProviderState`, and a breaker that started from scratch on each
+/// reload would forget an open circuit — and a quota force-open — exactly
+/// when the gateway is being reconfigured.
+static BREAKERS: once_cell::sync::Lazy<Mutex<HashMap<String, Arc<CircuitBreaker>>>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Get (or create) the circuit breaker of a provider. The breaker instance is
+/// shared across hot reloads so its state survives them.
+fn breaker_for(name: &str, max_fails: u32, fail_timeout_secs: u64) -> Arc<CircuitBreaker> {
+    let mut breakers = match BREAKERS.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    breakers
+        .entry(name.to_string())
+        .or_insert_with(|| Arc::new(CircuitBreaker::new(max_fails, fail_timeout_secs)))
+        .clone()
+}
 
 /// Well-known models for each provider kind.
 fn well_known_models(kind: ProviderKind) -> &'static [&'static str] {
@@ -166,7 +194,10 @@ fn derive_responses_path(chat_path: &str) -> Option<String> {
 pub struct ProviderState {
     pub kind: ProviderKind,
     pub translator: Box<dyn ProviderTranslator>,
-    pub circuit_breaker: CircuitBreaker,
+    /// Process-wide circuit breaker. Shared (Arc) so a config hot-reload,
+    /// which rebuilds every `ProviderState`, keeps the breaker's state — an
+    /// open circuit or a quota force-open must survive a reload.
+    pub circuit_breaker: Arc<CircuitBreaker>,
     pub api_key: String,
     pub host: String,
     pub port: u16,
@@ -190,6 +221,9 @@ pub struct ProviderState {
 pub struct HotState {
     pub providers: AHashMap<String, Arc<ProviderState>>,
     pub routes: Vec<RouteConfig>,
+    /// Global session-sticky switch (the `[session_sticky]` section). A route
+    /// also has to opt in with `session_sticky = true`.
+    pub session_sticky_enabled: bool,
     pub metrics_enabled: bool,
     pub global_chain: PluginChain,
     pub route_chains: Vec<PluginChain>,
@@ -209,6 +243,11 @@ pub struct AiGateway {
     pub budget_enforcer: Option<Arc<maxllm_admin::BudgetEnforcer>>,
     /// Admin API handler (None if admin not configured).
     pub admin_api: Option<Arc<maxllm_admin::AdminApi>>,
+    /// Session → provider bindings for session-sticky routing. Kept outside
+    /// `HotState` so bindings survive a config hot-reload.
+    pub sessions: Arc<SessionStore>,
+    /// Optional JSONL request/response recorder (audit trail).
+    pub recorder: Option<Arc<Recorder>>,
 }
 
 /// Build the hot-reloadable state from a config.
@@ -317,7 +356,7 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
             Arc::new(ProviderState {
                 kind: conf.kind,
                 translator,
-                circuit_breaker: CircuitBreaker::new(conf.max_fails, conf.fail_timeout_secs),
+                circuit_breaker: breaker_for(name.as_str(), conf.max_fails, conf.fail_timeout_secs),
                 api_key: conf.api_key.clone(),
                 host: host.clone(),
                 port,
@@ -454,6 +493,11 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
 
     Ok(HotState {
         providers,
+        session_sticky_enabled: config
+            .session_sticky
+            .as_ref()
+            .map(|c| c.enabled)
+            .unwrap_or(false),
         routes: config.routes.clone(),
         metrics_enabled: config.metrics.enabled,
         global_chain,
@@ -499,10 +543,35 @@ impl AiGateway {
             None
         };
 
+        // Session-sticky store. The global switch is the route-level opt-in
+        // (`session_sticky = true`); this section only tunes the store.
+        let session_cfg = config.session_sticky.clone().unwrap_or_default();
+        let sessions = Arc::new(SessionStore::new(
+            session_cfg.max_entries,
+            session_cfg.timeout_secs,
+        ));
+
+        // Optional JSONL recorder.
+        let recorder = match config.recording.as_ref() {
+            Some(rec_cfg) if rec_cfg.enabled => match Recorder::new(rec_cfg) {
+                Ok(r) => {
+                    info!(dir = %rec_cfg.dir, "Request recorder enabled");
+                    Some(Arc::new(r))
+                }
+                Err(e) => {
+                    warn!(error = %e, "Failed to initialise recorder, continuing without it");
+                    None
+                }
+            },
+            _ => None,
+        };
+
         Ok(Self {
             hot: Arc::new(arc_swap::ArcSwap::from_pointee(hot_state)),
             budget_enforcer: None,
             admin_api,
+            sessions,
+            recorder,
         })
     }
 
@@ -560,6 +629,7 @@ impl AiGateway {
 
     /// Select provider using the route's configured strategy.
     fn select_provider(
+        &self,
         hot: &HotState,
         route: &RouteConfig,
         ctx: &mut RequestCtx,
@@ -582,6 +652,41 @@ impl AiGateway {
                     state: Arc::clone(provider),
                     is_primary: false,
                 });
+            }
+        }
+
+        // Session-sticky: a session that already succeeded on a provider is
+        // pinned to it, so a conversation keeps hitting the same API key
+        // (different keys do not share upstream context). A pinned provider
+        // whose circuit is open is skipped — the session is re-pinned after
+        // the next successful attempt.
+        if route.session_sticky && hot.session_sticky_enabled {
+            if let Some(session_id) = ctx.session_id.clone() {
+                match self.sessions.get(&session_id) {
+                    Some(pinned_name) => {
+                        METRICS.session_affinity_hits_total.inc();
+                        if let Some(pinned) = candidates.iter().find(|c| c.name == pinned_name) {
+                            if !pinned.state.circuit_breaker.is_open() {
+                                ctx.provider_name = pinned_name.clone();
+                                ctx.fallback_used = pinned_name != route.provider;
+                                if ctx.fallback_used {
+                                    ctx.original_provider = Some(route.provider.clone());
+                                }
+                                ctx.native_responses =
+                                    ctx.endpoint_type == EndpointType::Responses
+                                        && pinned.state.native_responses
+                                        && pinned.state.responses_path.is_some();
+                                return Some(Arc::clone(&pinned.state));
+                            }
+                        }
+                        // Pinned provider is unavailable (open circuit) — fall
+                        // through to the normal selector; the session gets
+                        // re-pinned on the next successful response.
+                    }
+                    None => {
+                        METRICS.session_affinity_misses_total.inc();
+                    }
+                }
             }
         }
 
@@ -826,8 +931,19 @@ impl ProxyHttp for AiGateway {
             return Ok(true);
         }
 
+        // Capture the request identity for the recorder and session-sticky.
+        ctx.request_method = session.req_header().method.to_string();
+        ctx.request_path = path.clone();
+
+        // Session-sticky: capture the session identity from the request
+        // headers. codex-cli sends `session-id`, Claude Code sends
+        // `X-Session-ID` / `X-Conversation-ID`; the body fallback is applied
+        // later in request_body_filter.
+        ctx.session_id =
+            crate::session_sticky::resolve_from_headers(&session.req_header().headers);
+
         // Select provider (with circuit breaker check and routing strategy)
-        let _provider = match Self::select_provider(&hot, route, ctx) {
+        let _provider = match self.select_provider(&hot, route, ctx) {
             Some(p) => p,
             None => {
                 METRICS.active_requests.dec();
@@ -842,6 +958,9 @@ impl ProxyHttp for AiGateway {
 
         // Sync plugin ctx with request ctx
         ctx.plugin_ctx.provider_name = ctx.provider_name.clone();
+
+        // Audit trail: a request entered the gateway.
+        self.record_event(EVENT_CLIENT_REQUEST, ctx, None, None, None);
 
         Ok(false)
     }
@@ -1162,6 +1281,9 @@ impl ProxyHttp for AiGateway {
         // Mark when we hand off to upstream — used to compute overhead
         ctx.upstream_send_time = Some(std::time::Instant::now());
 
+        // Audit trail: the request was handed to the upstream.
+        self.record_event(EVENT_PROVIDER_REQUEST, ctx, None, None, None);
+
         Ok(())
     }
 
@@ -1172,6 +1294,15 @@ impl ProxyHttp for AiGateway {
         end_of_stream: bool,
         ctx: &mut Self::CTX,
     ) -> pingora::Result<()> {
+        // Session-sticky: the session identity may also live in the request
+        // body (`metadata.user_id`, `client_metadata.session_id`,
+        // `prompt_cache_key`). Only buffered bodies are inspected — the
+        // header path already covers codex-cli and Claude Code. Runs before
+        // the passthrough shortcut so every buffered body is scanned.
+        if ctx.session_id.is_none() && end_of_stream && !ctx.request_body_buf.is_empty() {
+            ctx.session_id = crate::session_sticky::resolve_from_body(&ctx.request_body_buf);
+        }
+
         // ── PASSTHROUGH: zero processing, forward chunks as-is ──
         if ctx.endpoint_type == EndpointType::Passthrough {
             return Ok(());
@@ -1762,14 +1893,46 @@ impl ProxyHttp for AiGateway {
         ctx.upstream_status = status;
         let provider = hot.providers.get(&ctx.provider_name);
 
-        // Record circuit breaker state
+        // Record circuit breaker state.
+        //
+        // A 429 (quota exhausted) force-opens the provider until its cooldown
+        // ends: retrying a quota-exhausted channel is wasted work, and the
+        // upstream usually says when it resets (Retry-After). Any other
+        // server error counts against `max_fails`.
         if let Some(p) = provider {
-            if (500..=599).contains(&status) || status == 429 {
+            if status == 429 {
+                let retry_after = upstream_response
+                    .headers
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(parse_retry_after_secs);
+                p.circuit_breaker.record_http_failure(429, retry_after);
+                METRICS
+                    .circuit_breaker_quota_opens_total
+                    .with_label_values(&[&ctx.provider_name])
+                    .inc();
+                // A quota-exhausted provider must not keep the session pinned.
+                self.unpin_session(ctx);
+            } else if (500..=599).contains(&status) {
                 p.circuit_breaker.record_failure();
+                self.unpin_session(ctx);
             } else if (200..=299).contains(&status) {
                 p.circuit_breaker.record_success();
+                // Pin the session to the provider that just served it.
+                self.pin_session(ctx);
             }
+            METRICS
+                .circuit_breaker_state
+                .with_label_values(&[&ctx.provider_name])
+                .set(p.circuit_breaker.state() as i64);
+            METRICS
+                .circuit_breaker_transitions_total
+                .with_label_values(&[&ctx.provider_name])
+                .set(p.circuit_breaker.state_transitions() as i64);
         }
+
+        // Audit trail: the upstream answered.
+        self.record_event(EVENT_PROVIDER_RESPONSE, ctx, Some(status), None, None);
 
         // Only remove Content-Length when the body will be translated (changes size).
         // Passthrough, native, and Embeddings keep the original Content-Length.
@@ -1875,6 +2038,12 @@ impl ProxyHttp for AiGateway {
         ctx: &mut Self::CTX,
     ) -> pingora::Result<Option<std::time::Duration>> {
         let hot = self.hot.load();
+
+        // Time-to-first-token: the first response chunk marks the moment the
+        // upstream started answering.
+        if ctx.ttft_ms.is_none() && !ctx.skip_logging {
+            ctx.ttft_ms = Some(ctx.request_start.elapsed().as_millis() as u64);
+        }
 
         // ── PASSTHROUGH and EMBEDDINGS: forward as-is, extract usage ──
         if ctx.endpoint_type == EndpointType::Passthrough
@@ -2602,6 +2771,22 @@ impl ProxyHttp for AiGateway {
         if ctx.retry_attempted || !AiGateway::is_connect_failure(&e) {
             return e;
         }
+
+        // A connect failure is an upstream failure: count it against the
+        // provider's circuit breaker so the fallback chain stops using it.
+        {
+            let hot = self.hot.load();
+            if let Some(p) = hot.providers.get(&ctx.provider_name) {
+                p.circuit_breaker.record_failure();
+                METRICS
+                    .circuit_breaker_state
+                    .with_label_values(&[&ctx.provider_name])
+                    .set(p.circuit_breaker.state() as i64);
+            }
+        }
+        self.unpin_session(ctx);
+        self.record_event(EVENT_ERROR, ctx, Some(502), None, Some(e.to_string()));
+
         let Some((name, fallback)) = self.next_fallback_provider(ctx) else {
             return e;
         };
@@ -2798,6 +2983,15 @@ impl ProxyHttp for AiGateway {
                 warn!(error = %err, "Failed to record request log");
             }
         }
+
+        // Audit trail: the exchange finished.
+        self.record_event(
+            EVENT_CLIENT_RESPONSE,
+            ctx,
+            Some(ctx.upstream_status),
+            Some(latency_ms),
+            e.map(|err| err.to_string()),
+        );
     }
 }
 
@@ -2840,6 +3034,80 @@ impl AiGateway {
                     .filter(|p| !p.circuit_breaker.is_open())
                     .map(|p| (name.clone(), Arc::clone(p)))
             })
+    }
+
+    /// Append one event to the JSONL recorder, if recording is enabled.
+    fn record_event(
+        &self,
+        event_type: &'static str,
+        ctx: &RequestCtx,
+        status: Option<u16>,
+        duration_ms: Option<u64>,
+        error: Option<String>,
+    ) {
+        let Some(recorder) = self.recorder.as_ref() else {
+            return;
+        };
+        recorder.record(RecordEntry {
+            event_type,
+            request_uuid: ctx.request_uuid.clone(),
+            session_id: ctx.session_id.clone(),
+            client_ip: ctx.plugin_ctx.client_ip.clone(),
+            provider: Some(ctx.provider_name.clone()),
+            model: if ctx.model.is_empty() {
+                None
+            } else {
+                Some(ctx.model.clone())
+            },
+            method: Some(ctx.request_method.clone()),
+            path: Some(ctx.request_path.clone()),
+            status_code: status,
+            body: None,
+            duration_ms,
+            ttft_ms: ctx.ttft_ms,
+            tokens_in: Some(ctx.tokens_in),
+            tokens_out: Some(ctx.tokens_out),
+            error,
+        });
+    }
+
+    /// Pin the session to the provider that just served the request.
+    fn pin_session(&self, ctx: &RequestCtx) {
+        let hot = self.hot.load();
+        let Some(route) = ctx.route_index.and_then(|i| hot.routes.get(i)) else {
+            return;
+        };
+        if !route.session_sticky || !hot.session_sticky_enabled {
+            return;
+        }
+        let Some(session_id) = ctx.session_id.as_deref() else {
+            return;
+        };
+        let evicted = self.sessions.set(session_id, &ctx.provider_name);
+        if evicted > 0 {
+            METRICS.session_affinity_evictions_total.inc_by(evicted as u64);
+        }
+        METRICS.session_affinity_size.set(self.sessions.len() as i64);
+    }
+
+    /// Drop the session binding when the pinned provider failed, so the next
+    /// request is routed to a healthy provider.
+    fn unpin_session(&self, ctx: &RequestCtx) {
+        let hot = self.hot.load();
+        let Some(route) = ctx.route_index.and_then(|i| hot.routes.get(i)) else {
+            return;
+        };
+        if !route.session_sticky || !hot.session_sticky_enabled {
+            return;
+        }
+        let Some(session_id) = ctx.session_id.as_deref() else {
+            return;
+        };
+        // Only unpin when the failing provider is the pinned one.
+        if self.sessions.peek(session_id).as_deref() == Some(ctx.provider_name.as_str()) {
+            self.sessions.remove(session_id);
+            METRICS.session_affinity_size.set(self.sessions.len() as i64);
+        }
     }
 }
 
@@ -2954,6 +3222,24 @@ impl AiGateway {
             "guardrail blocked request",
         ))
     }
+}
+
+/// Parse a `Retry-After` header value into seconds. Supports the delay-seconds
+/// form ("120") and the HTTP-date form ("Wed, 21 Oct 2015 07:28:00 GMT"),
+/// resolved against the current time.
+fn parse_retry_after_secs(value: &str) -> Option<u64> {
+    let trimmed = value.trim();
+    if let Ok(secs) = trimmed.parse::<u64>() {
+        return Some(secs);
+    }
+    chrono::DateTime::parse_from_rfc2822(trimmed)
+        .ok()
+        .map(|dt| {
+            let delta = dt
+                .with_timezone(&chrono::Utc)
+                .signed_duration_since(chrono::Utc::now());
+            delta.num_seconds().max(0) as u64
+        })
 }
 
 /// Normalize a provider error response body to OpenAI error format.
