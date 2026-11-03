@@ -179,6 +179,22 @@ answered `391`.
 - A forced tool call (`tool_choice: {type: function, name}`) streams
   `function_call_arguments.delta` fragments and completes the item with the
   full arguments `{"city": "Paris"}`.
+- **Fresh CLI regression (2026-11-03, post sequence_number + plain-JSON
+  fixes)**: the installed opencode v2.0.16 CLI using the strict
+  `@ai-sdk/openai` provider completed a 10-step agentic session against
+  production (`/v1/responses/deepseek`, deepseek-flash): real tool calls
+  (read/write/bash + pytest), a genuine debug fix, 12 passing tests, real
+  usage on every turn (context 30k→32k tokens across the stateless turns),
+  zero "Invalid stream event", zero hangs.
+- **Every emitted event type schema-checked against `@ai-sdk/openai`**:
+  streaming text/tool-call/reasoning/incomplete sequences and the
+  non-streaming JSON (reasoning + message + parallel function_call items,
+  and the failed object) all parse as strict types (the only
+  `unknown_chunk` frames are `content_part.added` / `output_text.done` /
+  `content_part.done` / `reasoning_summary_text.done`, which the AI SDK has
+  no strict variant for and tolerantly skips). `response.incomplete`
+  carries `incomplete_details: {reason: "max_output_tokens"}` and a
+  `length` finish reason is mapped to it.
 
 ## Why a conversion layer at all (one-api reference, audited 2026-11-03)
 
