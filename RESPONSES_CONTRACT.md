@@ -79,6 +79,39 @@ verified live: `output_item.added` → `reasoning_summary_part.added` →
   `response` object, and classifies `context_length_exceeded` / overflow
   messages as context-overflow.
 
+## sequence_number on every event (verified against the AI SDK schema)
+
+Every Responses SSE frame carries a monotonic `sequence_number` (starting at
+1, incremented per event). Strict clients require it:
+
+- The AI SDK Responses parser (`@ai-sdk/openai`
+  `src/responses/openai-responses-api.ts`, v3.0.96) defines `response.failed`
+  as `{type: z.literal('response.failed'), sequence_number: z.number(),
+  response: {...}}`, with a trailing `z.object({type: z.string()}).loose()`
+  fallback that rewrites unmatched frames to `{type: 'unknown_chunk'}`. A
+  `response.failed` without `sequence_number` therefore parses as
+  `unknown_chunk`: both the pre-output error scan
+  (`isResponseFailedChunk`) and the stream consumer loop miss it, the
+  `{type: 'error', error: {type: 'response.failed', ...}}` chunk is never
+  enqueued, and the upstream error is **silently dropped** — the client sees
+  the stream end with no error at all.
+- The vendored opencode core copies the same strict schema
+  (`packages/core/src/github-copilot/responses/openai-responses-language-model.ts`).
+
+Verified against the real schema in a sandbox (`openaiResponsesChunkSchema()
+.validate(frame)`): the old stream's `response.failed` came back as
+`unknown_chunk` (errorFrame=false), the fixed stream's parsed as a strict
+`response.failed` with `sequence_number=5` (errorFrame=true), so the AI SDK
+throws `APICallError` with the mapped status code (upstream_error→500,
+context_length→400, insufficient_quota/rate_limit→429, ...) instead of
+swallowing it. Clients that do not know the field ignore it.
+
+Scope note: the **currently installed opencode CLI** parses Responses with the
+tolerant `@opencode/ai` protocol (`Event` schema `StructWithRest`), and a real
+failure stream still surfaced its error (observed in a live CLI run) — so this
+is spec alignment plus defense for strict SDK clients (e.g. code using
+`@ai-sdk/openai` directly), not a fix for a currently broken CLI path.
+
 ## Usage in streaming (verified live)
 
 The gateway always asks the upstream for usage
