@@ -476,6 +476,49 @@ Prometheus metrics: `maxllm_circuit_breaker_state{provider}` (0=closed,
 1=open, 2=half-open), `maxllm_circuit_breaker_transitions_total{provider}`,
 `maxllm_circuit_breaker_quota_opens_total{provider}` (429 force-opens).
 
+### Request-level failover (HTTP errors)
+
+Beyond connect failures, an upstream that *answers* with an error is now
+failed over to the next provider of the route's fallback chain, exactly like
+[litellm_lb_go](https://github.com/oliveagle/litellm_lb_go) and one-api walk
+their channel pools: you only add supply to the pool, and maxllm keeps the
+supply stable — a provider whose quota is exhausted (429), that rate limits,
+answers 5xx, rejects auth (401/403) or does not carry the requested model
+(404, or a 400 "unknown model") is swapped out transparently before the
+client sees anything.
+
+| Status | Fails over? |
+|---|---|
+| `429` rate limit / quota | yes (breaker force-opens on 429) |
+| `401`, `402`, `403`, `404`, `405`, `408`, `409`, `410`, `425` | yes |
+| `5xx` server errors | yes |
+| `400` / `422` | only when the provider does not carry the requested model (its `default_model` differs from the request) — a genuine request fault is not re-sent |
+| `2xx` / `3xx` | no |
+
+The walk is bounded per route by `max_failover_attempts` (default 6), so a
+request never loops. The failed attempt is invisible to the client: the
+provider's answer is discarded and the whole upstream attempt — including the
+request-body translation — is replayed on the next provider. When every
+provider of the pool fails, the client receives the **last** provider's error.
+
+```toml
+[[routes]]
+path = "/v1/responses"
+provider = "one_api_ollama_local"
+fallback = ["one_api_volc_1", "one_api_minimax", "opencode_go_1", "..."]
+strategy = "fallback"
+max_failover_attempts = 6   # how many providers one request may walk
+```
+
+Failing over to an opencode.ai provider converts the request to opencode's
+schema — the body is re-normalised (message roles, `tool_choice`, tool-call
+`arguments` as JSON strings, session header) by the opencode translator
+before it is sent, so a raw chat body is never forwarded as-is.
+
+Prometheus metrics: `maxllm_http_failovers_total{from_provider,to_provider,
+status}` counts each HTTP-error failover; `maxllm_fallbacks_total` counts
+every provider switch (connect + HTTP).
+
 ### Recorder
 
 JSONL audit trail of every exchange, written as one object per line with the
