@@ -1989,6 +1989,44 @@ mod tests {
     }
 
     #[test]
+    fn test_full_body_chat_sse_translates_in_one_call() {
+        // The gateway can receive a whole chat SSE stream in a single chunk
+        // (an upstream that answers before the request body is fully read).
+        // One process_chunk call with the entire body must yield a valid
+        // Responses SSE stream, never a raw chat chunk.
+        let chunks = [
+            r#"{"id":"c","object":"chat.completion.chunk","created":1,"model":"mock","choices":[{"index":0,"delta":{"role":"assistant","content":"Let me check the weather for you."},"finish_reason":null}]}"#,
+            r#"{"id":"c","object":"chat.completion.chunk","created":1,"model":"mock","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Rome\"}"}}]},"finish_reason":null}]}"#,
+            r#"{"id":"c","object":"chat.completion.chunk","created":1,"model":"mock","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":11,"completion_tokens":5,"total_tokens":16}}"#,
+        ];
+        let sse = chat_sse(&chunks);
+        let mut t = ResponsesStreamTranslator::new(Box::new(crate::NativePassthroughStream));
+        let out = t.process_chunk(sse.as_bytes(), true);
+        let text = String::from_utf8_lossy(&out).to_string();
+        // No raw chat object may leak to the Responses client.
+        assert!(
+            !text.contains("chat.completion"),
+            "raw chat SSE leaked: {text}"
+        );
+        // Every data line that carries JSON must carry a Responses `type`
+        // (`data: [DONE]` is the SSE terminator, not a JSON payload).
+        for line in text.lines() {
+            let line = line.trim();
+            if let Some(payload) = line.strip_prefix("data: ") {
+                if payload == "[DONE]" {
+                    continue;
+                }
+                let v: Value = serde_json::from_str(payload)
+                    .unwrap_or_else(|e| panic!("data line is not JSON ({e}): {line}"));
+                assert!(v.get("type").is_some(), "data line has no type: {line}");
+            }
+        }
+        assert!(text.contains("event: response.completed"), "{text}");
+        assert!(text.contains(r#""type":"message""#), "{text}");
+        assert!(text.contains(r#""name":"get_weather""#), "{text}");
+    }
+
+    #[test]
     fn test_no_tool_calls_means_no_reasoning_injection() {
         // A plain question/answer conversation is not a thinking turn; it is
         // forwarded unchanged so upstreams that do not expect reasoning are

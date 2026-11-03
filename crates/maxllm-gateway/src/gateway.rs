@@ -22,7 +22,7 @@ use maxllm_plugin::guardrail::{
     self, GuardrailEngine, GuardrailInput, GuardrailOutput, GuardrailVerdict,
 };
 use maxllm_plugin::{Plugin, PluginChain};
-use maxllm_translate::{ProviderTranslator, TranslatedRequest};
+use maxllm_translate::{ProviderTranslator, StreamTranslator, TranslatedRequest};
 use pingora::http::ResponseHeader;
 use pingora::prelude::*;
 use pingora::proxy::{FailToProxy, ProxyHttp, Session};
@@ -2148,9 +2148,26 @@ impl ProxyHttp for AiGateway {
                     }
                 } else if let Some(data) = body.as_ref() {
                     let translated: Option<Bytes> = match ctx.stream_translator.lock() {
-                        Ok(mut guard) => guard.as_mut().map(|translator| {
-                            Bytes::from(translator.process_chunk(data, end_of_stream))
-                        }),
+                        Ok(mut guard) => {
+                            // Defensive: the request phase installs the stream
+                            // translator, but it can be missing (the request
+                            // translation failed, or the upstream answered
+                            // before the request body was fully read). Raw
+                            // provider SSE must never reach a Responses
+                            // client, so install a translator on the fly.
+                            if guard.is_none() && looks_like_chat_sse(data) {
+                                if let Some(p) = provider {
+                                    *guard = Some(Box::new(
+                                        maxllm_translate::responses::ResponsesStreamTranslator::new(
+                                            p.translator.streaming_translator(),
+                                        ),
+                                    ));
+                                }
+                            }
+                            guard.as_mut().map(|translator| {
+                                Bytes::from(translator.process_chunk(data, end_of_stream))
+                            })
+                        }
                         Err(e) => {
                             warn!("stream_translator mutex poisoned in responses streaming: {e}");
                             None
@@ -2168,10 +2185,10 @@ impl ProxyHttp for AiGateway {
                 }
 
                 if end_of_stream && !ctx.response_body_buf.is_empty() {
-                    if let Ok(parsed) =
-                        serde_json::from_slice::<serde_json::Value>(&ctx.response_body_buf)
-                    {
-                        extract_usage(&parsed, ctx);
+                    let parsed =
+                        serde_json::from_slice::<serde_json::Value>(&ctx.response_body_buf);
+                    if let Ok(ref parsed) = parsed {
+                        extract_usage(parsed, ctx);
                     }
 
                     // Error responses are delivered as-is (normalized to the
@@ -2207,7 +2224,40 @@ impl ProxyHttp for AiGateway {
                         return Ok(None);
                     }
 
-                    if let Some(p) = provider {
+                    // The upstream may answer before the request body has
+                    // been fully read (the request headers are forwarded
+                    // upstream right away). At that point the request phase
+                    // has not run yet, so the gateway does not know the
+                    // client asked for a stream and has no stream translator
+                    // installed. An upstream that answers with a chat SSE
+                    // stream in that window would otherwise be forwarded to
+                    // the Responses client verbatim — the client then rejects
+                    // the payload ("Invalid ... stream event"), because a chat
+                    // chunk carries no Responses `type`. Translate it here
+                    // instead of leaking the provider format.
+                    if parsed.is_err() && looks_like_chat_sse(&ctx.response_body_buf) {
+                        match provider {
+                            Some(p) => {
+                                let mut translator =
+                                    maxllm_translate::responses::ResponsesStreamTranslator::new(
+                                        p.translator.streaming_translator(),
+                                    );
+                                let translated =
+                                    translator.process_chunk(&ctx.response_body_buf, true);
+                                if translated.is_empty() {
+                                    warn!("Failed to convert early upstream chat SSE to Responses SSE");
+                                    *body = Some(Bytes::from(early_sse_failure_body()));
+                                } else {
+                                    extract_stream_usage(&translated, ctx, true);
+                                    *body = Some(Bytes::from(translated));
+                                }
+                            }
+                            None => {
+                                warn!("No provider to translate early upstream chat SSE");
+                                *body = Some(Bytes::from(early_sse_failure_body()));
+                            }
+                        }
+                    } else if let Some(p) = provider {
                         match p.translator.translate_response(&ctx.response_body_buf) {
                             Ok(chat_bytes) => {
                                 match maxllm_translate::responses::chat_response_to_responses(
@@ -2921,6 +2971,34 @@ fn normalize_error_response(
     serde_json::to_vec(&normalized).ok()
 }
 
+/// Whether a response body is a chat-completions SSE stream.
+///
+/// The Responses contract and the chat contract share the `data:` framing, so
+/// the framing alone does not tell them apart. A chat chunk is recognised by
+/// its `chat.completion` object marker, which never appears in a Responses
+/// event.
+fn looks_like_chat_sse(data: &[u8]) -> bool {
+    let head = &data[..data.len().min(4096)];
+    let text = String::from_utf8_lossy(head);
+    // The SSE framing ("data:" at the start of the body) plus the chat object
+    // marker: a non-streaming chat response is JSON and carries no framing.
+    text.trim_start().starts_with("data:") && text.contains("chat.completion")
+}
+
+/// The body sent when an upstream chat SSE stream cannot be converted into
+/// Responses events. Raw provider bytes are never forwarded to a Responses
+/// client, so an explicit error is sent instead.
+fn early_sse_failure_body() -> String {
+    serde_json::json!({
+        "error": {
+            "message": "upstream returned a chat completion stream that could not be converted to the Responses format",
+            "type": "gateway_error",
+            "code": 502
+        }
+    })
+    .to_string()
+}
+
 /// Extract token usage from a streaming SSE chunk. OpenAI chat streams carry
 /// usage in the final chunk (`data: {…"usage":{…}…}`); Responses streams carry
 /// it in the terminal `response.completed` / `response.incomplete` event (at
@@ -3254,6 +3332,30 @@ api_key = "sk-test"
             format!("{BASE}[[routes]]\npath = \"/a\"\nprovider = \"opencode\"\ntimeout_secs = 0\n");
         let routes = routes_from(&toml);
         assert_eq!(route_timeout_secs(&routes, Some(0)), None);
+    }
+}
+
+#[cfg(test)]
+mod early_sse_tests {
+    use super::*;
+
+    #[test]
+    fn test_chat_sse_is_detected() {
+        // A chat completion chunk is identified by its object marker.
+        let chat = b"data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"choices\":[]}\n\n";
+        assert!(looks_like_chat_sse(chat));
+        // A chat (non-stream) JSON response is not an SSE stream.
+        assert!(!looks_like_chat_sse(
+            br#"{"object":"chat.completion","choices":[]}"#
+        ));
+    }
+
+    #[test]
+    fn test_responses_sse_is_not_detected_as_chat() {
+        // A Responses SSE event carries `type`, never `chat.completion`.
+        let responses =
+            b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{}}\n\n";
+        assert!(!looks_like_chat_sse(responses));
     }
 }
 
