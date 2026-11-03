@@ -207,10 +207,31 @@ fn input_to_messages(input: &Value) -> Result<Vec<Value>, TranslateError> {
             // to the assistant turn that follows it, so it is held until that
             // turn is emitted.
             let mut pending_reasoning: Option<String> = None;
+            // A run of consecutive `function_call` items is one assistant
+            // turn that issued several tool calls in parallel. Chat
+            // completions require them in a single assistant message —
+            // DeepSeek rejects two consecutive assistant `tool_calls`
+            // messages ("must be followed by tool messages responding to
+            // each tool_call_id"), verified live. They are accumulated here
+            // and flushed as one message when a non-function_call item (or
+            // the end of the input) is reached.
+            let mut pending_tool_calls: Vec<Value> = Vec::new();
             for item in items {
-                if item.get("type").and_then(|t| t.as_str()) == Some("reasoning") {
+                let item_type = item.get("type").and_then(|t| t.as_str());
+                if item_type == Some("reasoning") {
                     pending_reasoning = extract_reasoning_input_text(item);
                     continue;
+                }
+                if item_type == Some("function_call") {
+                    pending_tool_calls.push(function_call_tool_call(item));
+                    continue;
+                }
+                // A non-function_call item ends the current tool-call run.
+                if !pending_tool_calls.is_empty() {
+                    messages.push(assistant_tool_calls_message(
+                        std::mem::take(&mut pending_tool_calls),
+                        &mut pending_reasoning,
+                    ));
                 }
                 let Some(mut msg) = parse_input_item(item) else {
                     continue;
@@ -226,6 +247,13 @@ fn input_to_messages(input: &Value) -> Result<Vec<Value>, TranslateError> {
                     }
                 }
                 messages.push(msg);
+            }
+            // Flush a tool-call run that reaches the end of the input.
+            if !pending_tool_calls.is_empty() {
+                messages.push(assistant_tool_calls_message(
+                    pending_tool_calls,
+                    &mut pending_reasoning,
+                ));
             }
             normalize_thinking_turns(&mut messages);
             Ok(messages)
@@ -349,6 +377,45 @@ fn normalize_thinking_turns(messages: &mut [Value]) {
 ///
 /// Returns `None` for items that carry no chat equivalent (reasoning items,
 /// unknown types) — they are dropped rather than failing the request.
+/// Extract a single chat `tool_calls[]` entry from a Responses `function_call`
+/// input item.
+fn function_call_tool_call(item: &Value) -> Value {
+    let call_id = item
+        .get("call_id")
+        .and_then(|v| v.as_str())
+        .or_else(|| item.get("id").and_then(|v| v.as_str()))
+        .unwrap_or("");
+    let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let arguments = item
+        .get("arguments")
+        .and_then(|v| v.as_str())
+        .unwrap_or("{}");
+    json!({
+        "id": call_id,
+        "type": "function",
+        "function": { "name": name, "arguments": arguments }
+    })
+}
+
+/// Build the chat assistant message that carries one tool-call run, attaching
+/// any reasoning text held for that assistant turn.
+fn assistant_tool_calls_message(
+    tool_calls: Vec<Value>,
+    pending_reasoning: &mut Option<String>,
+) -> Value {
+    let mut msg = json!({
+        "role": "assistant",
+        "content": Value::Null,
+        "tool_calls": tool_calls,
+    });
+    if let Some(text) = pending_reasoning.take() {
+        if let Some(obj) = msg.as_object_mut() {
+            obj.insert("reasoning_content".into(), Value::String(text));
+        }
+    }
+    msg
+}
+
 fn parse_input_item(item: &Value) -> Option<Value> {
     let item_type = item.get("type").and_then(|t| t.as_str());
 
@@ -360,27 +427,11 @@ fn parse_input_item(item: &Value) -> Option<Value> {
             Some(json!({ "role": role, "content": content_to_chat_content(content) }))
         }
         // Model-issued function call.
-        Some("function_call") => {
-            let call_id = item
-                .get("call_id")
-                .and_then(|v| v.as_str())
-                .or_else(|| item.get("id").and_then(|v| v.as_str()))
-                .unwrap_or("");
-            let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            let arguments = item
-                .get("arguments")
-                .and_then(|v| v.as_str())
-                .unwrap_or("{}");
-            Some(json!({
-                "role": "assistant",
-                "content": Value::Null,
-                "tool_calls": [{
-                    "id": call_id,
-                    "type": "function",
-                    "function": { "name": name, "arguments": arguments }
-                }]
-            }))
-        }
+        Some("function_call") => Some(json!({
+            "role": "assistant",
+            "content": Value::Null,
+            "tool_calls": [function_call_tool_call(item)]
+        })),
         // Tool result for a previous function call.
         Some("function_call_output") => {
             let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -2365,6 +2416,109 @@ mod tests {
         let out = responses_request_to_chat(body).unwrap();
         let v: Value = serde_json::from_slice(&out.body).unwrap();
         assert_eq!(v["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn test_parallel_function_calls_merge_into_one_assistant_message() {
+        // opencode replays one assistant turn that issued two tool calls as
+        // two `function_call` items. Chat completions need them in a single
+        // assistant message: DeepSeek rejects two consecutive assistant
+        // `tool_calls` messages with "must be followed by tool messages
+        // responding to each tool_call_id" (verified live).
+        let body = br#"{
+            "model":"gpt-4o",
+            "input":[
+                {"type":"message","role":"user","content":"do it"},
+                {"type":"message","role":"assistant","content":"two calls"},
+                {"type":"function_call","call_id":"c1","name":"f1","arguments":"{}"},
+                {"type":"function_call","call_id":"c2","name":"f2","arguments":"{}"},
+                {"type":"function_call_output","call_id":"c1","output":"r1"},
+                {"type":"function_call_output","call_id":"c2","output":"r2"}
+            ]
+        }"#;
+        let out = responses_request_to_chat(body).unwrap();
+        let v: Value = serde_json::from_slice(&out.body).unwrap();
+        let msgs = v["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 5);
+        // user, assistant text, one assistant with both tool calls, two tools.
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[1]["role"], "assistant");
+        assert_eq!(msgs[1]["content"], "two calls");
+        assert_eq!(msgs[2]["role"], "assistant");
+        assert!(msgs[2]["tool_calls"].as_array().unwrap().len() == 2);
+        assert_eq!(msgs[2]["tool_calls"][0]["id"], "c1");
+        assert_eq!(msgs[2]["tool_calls"][1]["id"], "c2");
+        assert_eq!(msgs[3]["role"], "tool");
+        assert_eq!(msgs[3]["tool_call_id"], "c1");
+        assert_eq!(msgs[4]["role"], "tool");
+        assert_eq!(msgs[4]["tool_call_id"], "c2");
+    }
+
+    #[test]
+    fn test_interleaved_function_calls_keep_one_assistant_message_each() {
+        // A tool result between two calls breaks the run, so each call keeps
+        // its own assistant message followed by its own tool message — the
+        // shape DeepSeek accepts.
+        let body = br#"{
+            "model":"gpt-4o",
+            "input":[
+                {"type":"message","role":"user","content":"go"},
+                {"type":"function_call","call_id":"c1","name":"f1","arguments":"{}"},
+                {"type":"function_call_output","call_id":"c1","output":"r1"},
+                {"type":"function_call","call_id":"c2","name":"f2","arguments":"{}"},
+                {"type":"function_call_output","call_id":"c2","output":"r2"}
+            ]
+        }"#;
+        let out = responses_request_to_chat(body).unwrap();
+        let v: Value = serde_json::from_slice(&out.body).unwrap();
+        let msgs = v["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 5);
+        assert_eq!(msgs[1]["role"], "assistant");
+        assert_eq!(msgs[1]["tool_calls"].as_array().unwrap().len(), 1);
+        assert_eq!(msgs[2]["role"], "tool");
+        assert_eq!(msgs[3]["role"], "assistant");
+        assert_eq!(msgs[3]["tool_calls"].as_array().unwrap().len(), 1);
+        assert_eq!(msgs[4]["role"], "tool");
+    }
+
+    #[test]
+    fn test_trailing_function_call_run_is_flushed() {
+        // A run that reaches the end of the input still becomes one message.
+        let body = br#"{
+            "model":"gpt-4o",
+            "input":[
+                {"type":"message","role":"user","content":"go"},
+                {"type":"function_call","call_id":"c1","name":"f1","arguments":"{}"},
+                {"type":"function_call","call_id":"c2","name":"f2","arguments":"{}"}
+            ]
+        }"#;
+        let out = responses_request_to_chat(body).unwrap();
+        let v: Value = serde_json::from_slice(&out.body).unwrap();
+        let msgs = v["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[1]["tool_calls"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_merged_tool_calls_carry_the_pending_reasoning() {
+        // The reasoning of that turn belongs to the assistant message that
+        // carries the tool calls.
+        let body = br#"{
+            "model":"gpt-4o",
+            "input":[
+                {"type":"message","role":"user","content":"go"},
+                {"type":"reasoning","summary":[{"type":"summary_text","text":"thinking"}]},
+                {"type":"function_call","call_id":"c1","name":"f1","arguments":"{}"},
+                {"type":"function_call","call_id":"c2","name":"f2","arguments":"{}"},
+                {"type":"function_call_output","call_id":"c1","output":"r1"}
+            ]
+        }"#;
+        let out = responses_request_to_chat(body).unwrap();
+        let v: Value = serde_json::from_slice(&out.body).unwrap();
+        let msgs = v["messages"].as_array().unwrap();
+        assert_eq!(msgs[1]["role"], "assistant");
+        assert_eq!(msgs[1]["reasoning_content"], "thinking");
+        assert_eq!(msgs[1]["tool_calls"].as_array().unwrap().len(), 2);
     }
 
     #[test]
