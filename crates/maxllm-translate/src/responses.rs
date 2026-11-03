@@ -56,6 +56,14 @@ pub struct ResponsesRequest {
     pub tools: Option<Value>,
     #[serde(default)]
     pub tool_choice: Option<Value>,
+    /// Parallel tool execution; chat completions understand the same field,
+    /// so a client that explicitly disabled parallelism keeps that contract.
+    #[serde(default)]
+    pub parallel_tool_calls: Option<bool>,
+    /// Reasoning controls (`reasoning.effort`); the effort level maps onto
+    /// the chat completions `reasoning_effort` parameter.
+    #[serde(default)]
+    pub reasoning: Option<Value>,
     /// Fields the chat completions contract also understands. Anything else
     /// (`store`, `include`, `metadata`, `previous_response_id`, …) is
     /// Responses-specific and dropped.
@@ -138,6 +146,21 @@ pub fn responses_request_to_chat(body: &[u8]) -> Result<TranslatedRequest, Trans
             responses_tool_choice_to_chat(tool_choice),
         );
     }
+    if let Some(v) = req.parallel_tool_calls {
+        chat.insert("parallel_tool_calls".into(), json!(v));
+    }
+    // `reasoning.effort` is the Responses spelling of the chat completions
+    // `reasoning_effort` (DeepSeek/OpenAI/…); a `configuration_update` input
+    // item is the per-message spelling and the last one wins for this turn.
+    let effort = req
+        .reasoning
+        .as_ref()
+        .and_then(|r| r.get("effort"))
+        .and_then(|e| e.as_str())
+        .or_else(|| input_configuration_effort(req.input.as_ref()));
+    if let Some(effort) = effort {
+        chat.insert("reasoning_effort".into(), json!(effort));
+    }
     for field in PASSTHROUGH_CHAT_FIELDS {
         if let Some(v) = req.extra.get(*field) {
             chat.insert((*field).to_string(), v.clone());
@@ -148,6 +171,29 @@ pub fn responses_request_to_chat(body: &[u8]) -> Result<TranslatedRequest, Trans
         body: serde_json::to_vec(&Value::Object(chat))?,
         is_streaming: req.stream == Some(true),
     })
+}
+
+/// The `reasoning.effort` carried by the last `configuration_update` input
+/// item, if any. A configuration_update is a per-message effort marker the
+/// Responses contract uses to switch reasoning strength mid-conversation;
+/// chat completions only know one effort per request, so the last marker
+/// wins.
+fn input_configuration_effort(input: Option<&Value>) -> Option<&str> {
+    let Value::Array(items) = input? else {
+        return None;
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            if item.get("type").and_then(|t| t.as_str()) == Some("configuration_update") {
+                item.get("reasoning")
+                    .and_then(|r| r.get("effort"))
+                    .and_then(|e| e.as_str())
+            } else {
+                None
+            }
+        })
+        .last()
 }
 
 /// Expand the `input` field into chat completion messages.
@@ -2225,6 +2271,100 @@ mod tests {
         // Streaming asks the upstream for usage so `response.completed` can
         // carry token counts.
         assert_eq!(v["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn test_parallel_tool_calls_true_passthrough() {
+        let body = br#"{"model":"gpt-4o","input":"hi","parallel_tool_calls":true}"#;
+        let out = responses_request_to_chat(body).unwrap();
+        let v: Value = serde_json::from_slice(&out.body).unwrap();
+        assert_eq!(v["parallel_tool_calls"], true);
+    }
+
+    #[test]
+    fn test_parallel_tool_calls_false_passthrough() {
+        // An explicit opt-out must survive the translation; dropping it would
+        // let the upstream run tools in parallel against the client's intent.
+        let body = br#"{"model":"gpt-4o","input":"hi","parallel_tool_calls":false}"#;
+        let out = responses_request_to_chat(body).unwrap();
+        let v: Value = serde_json::from_slice(&out.body).unwrap();
+        assert_eq!(v["parallel_tool_calls"], false);
+    }
+
+    #[test]
+    fn test_parallel_tool_calls_absent_is_omitted() {
+        let body = br#"{"model":"gpt-4o","input":"hi"}"#;
+        let out = responses_request_to_chat(body).unwrap();
+        let v: Value = serde_json::from_slice(&out.body).unwrap();
+        assert!(v.get("parallel_tool_calls").is_none());
+    }
+
+    #[test]
+    fn test_reasoning_effort_maps_to_chat() {
+        let body =
+            br#"{"model":"gpt-4o","input":"hi","reasoning":{"effort":"high","summary":"auto"}}"#;
+        let out = responses_request_to_chat(body).unwrap();
+        let v: Value = serde_json::from_slice(&out.body).unwrap();
+        assert_eq!(v["reasoning_effort"], "high");
+        // The Responses-only `summary` control has no chat equivalent.
+        assert!(v.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn test_reasoning_without_effort_is_omitted() {
+        let body = br#"{"model":"gpt-4o","input":"hi","reasoning":{"summary":"concise"}}"#;
+        let out = responses_request_to_chat(body).unwrap();
+        let v: Value = serde_json::from_slice(&out.body).unwrap();
+        assert!(v.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn test_configuration_update_effort_applies() {
+        // opencode emits a per-message `configuration_update` item when it
+        // switches reasoning strength mid-conversation; chat has one effort
+        // per request, so the last marker becomes the request-level effort.
+        let body = br#"{
+            "model":"gpt-4o",
+            "input":[
+                {"type":"message","role":"user","content":"hi"},
+                {"type":"configuration_update","reasoning":{"effort":"high"}}
+            ]
+        }"#;
+        let out = responses_request_to_chat(body).unwrap();
+        let v: Value = serde_json::from_slice(&out.body).unwrap();
+        assert_eq!(v["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn test_configuration_update_last_wins() {
+        let body = br#"{
+            "model":"gpt-4o",
+            "input":[
+                {"type":"configuration_update","reasoning":{"effort":"low"}},
+                {"type":"message","role":"user","content":"hi"},
+                {"type":"configuration_update","reasoning":{"effort":"medium"}}
+            ]
+        }"#;
+        let out = responses_request_to_chat(body).unwrap();
+        let v: Value = serde_json::from_slice(&out.body).unwrap();
+        assert_eq!(v["reasoning_effort"], "medium");
+    }
+
+    #[test]
+    fn test_reasoning_effort_prefers_top_level() {
+        // An explicit top-level `reasoning.effort` beats a configuration_update
+        // marker for the current turn.
+        let body = br#"{
+            "model":"gpt-4o",
+            "input":[
+                {"type":"configuration_update","reasoning":{"effort":"low"}},
+                {"type":"message","role":"user","content":"hi"}
+            ],
+            "reasoning":{"effort":"high"}
+        }"#;
+        let out = responses_request_to_chat(body).unwrap();
+        let v: Value = serde_json::from_slice(&out.body).unwrap();
+        assert_eq!(v["reasoning_effort"], "high");
     }
 
     #[test]
