@@ -281,6 +281,45 @@ with a plain JSON body is left untouched rather than half-converted.
   carries `incomplete_details: {reason: "max_output_tokens"}` and a
   `length` finish reason is mapped to it.
 
+## Semantic verification: the AI SDK consumer assembles the payloads (2026-11-03)
+
+Schema validity is necessary but not sufficient — the strict
+`openaiResponsesChunkSchema` accepts an event without the SDK *using* it.
+The stream was therefore replayed through the real `@ai-sdk/openai` stream
+consumer (`doStream`, the code path opencode's AI SDK provider drives) with
+captured production streams, and the emitted chunks inspected:
+
+- **Text**: a deepseek stream (46 `output_text.delta` events) → `text-start`,
+  `text-delta` ×46, `text-end`, and the assembled answer
+  "17 × 23 = 391 …" verbatim.
+- **Reasoning**: the same stream's 44 `reasoning_summary_text.delta` events →
+  `reasoning-start` (from the `response.output_item.added` reasoning item),
+  `reasoning-delta` ×44, `reasoning-end`, with the reasoning text assembled.
+- **Tool calls**: a tool-call stream (7 fragmented `function_call_arguments.delta`
+  events) → `tool-input-start`, `tool-input-delta` ×7, `tool-input-end`,
+  `tool-call` with the fully assembled parsed input `{"city": "Rome"}` and
+  the right tool name.
+- **Non-streaming**: the same tool run as a single JSON object through
+  `doGenerate` → `content` carries the text part and the `tool-call` part
+  with `input: "{\"city\": \"Rome\"}"`, `finishReason: tool-calls`,
+  and usage (313 in / 47 out, cache read 128).
+
+This proves the *semantic* contract — the deltas are ordered, the items are
+opened and closed around each other, and the terminal event carries the
+whole object — not just that each frame parses.
+
+### Error content type on a streaming request
+
+A streaming request whose upstream answers with a 4xx/5xx receives the
+normalized OpenAI error JSON body, never SSE. The response is no longer
+labelled `text/event-stream` for those statuses (it was before — a strict
+SSE parser would fail to find the error); the upstream's own content type
+is kept instead. Verified live: `stream: true` + invalid model → HTTP 400
+`Content-Type: application/json` with the error message intact; the AI SDK
+surfaces it as `AI_APICallError` with `statusCode` and the message. The 2xx
+paths are unchanged (`stream: true` → `text/event-stream`, `stream: false`
+→ `application/json`).
+
 ## Why a conversion layer at all (one-api reference, audited 2026-11-03)
 
 The other reference implementation the original task named — one-api's
