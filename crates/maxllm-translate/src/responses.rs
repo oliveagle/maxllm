@@ -28,6 +28,7 @@ use crate::opencode::REASONING_PLACEHOLDER;
 use crate::{StreamTranslator, TranslateError, TranslatedRequest};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1097,6 +1098,11 @@ pub struct ResponsesStreamTranslator {
     next_output_index: usize,
     /// Output index allocated to the assistant message item.
     message_output_index: usize,
+    /// Monotonic event counter: every emitted event carries the
+    /// `sequence_number` the OpenAI Responses API puts on it. Strict clients
+    /// (the AI SDK) *require* the field on `response.failed` — without it the
+    /// event does not match their schema and the failure is silently dropped.
+    sequence: Cell<u64>,
 }
 
 impl ResponsesStreamTranslator {
@@ -1114,6 +1120,7 @@ impl ResponsesStreamTranslator {
             reasoning_output_index: None,
             next_output_index: 0,
             message_output_index: 0,
+            sequence: Cell::new(0),
             model: String::new(),
             created_at: now_secs(),
             text: String::new(),
@@ -1229,6 +1236,7 @@ impl ResponsesStreamTranslator {
             self.started = true;
             emit_event(
                 out,
+                &self.sequence,
                 "response.created",
                 json!({
                     "type": "response.created",
@@ -1288,6 +1296,7 @@ impl ResponsesStreamTranslator {
                 let output_index = self.reasoning_output_index.unwrap_or(0);
                 emit_event(
                     out,
+                    &self.sequence,
                     "response.output_item.added",
                     json!({
                         "type": "response.output_item.added",
@@ -1302,6 +1311,7 @@ impl ResponsesStreamTranslator {
                 );
                 emit_event(
                     out,
+                    &self.sequence,
                     "response.reasoning_summary_part.added",
                     json!({
                         "type": "response.reasoning_summary_part.added",
@@ -1315,6 +1325,7 @@ impl ResponsesStreamTranslator {
             self.reasoning_text.push_str(reasoning);
             emit_event(
                 out,
+                &self.sequence,
                 "response.reasoning_summary_text.delta",
                 json!({
                     "type": "response.reasoning_summary_text.delta",
@@ -1344,6 +1355,7 @@ impl ResponsesStreamTranslator {
                     self.next_output_index += 1;
                     emit_event(
                         out,
+                        &self.sequence,
                         "response.output_item.added",
                         json!({
                             "type": "response.output_item.added",
@@ -1359,6 +1371,7 @@ impl ResponsesStreamTranslator {
                     );
                     emit_event(
                         out,
+                        &self.sequence,
                         "response.content_part.added",
                         json!({
                             "type": "response.content_part.added",
@@ -1372,6 +1385,7 @@ impl ResponsesStreamTranslator {
                 self.text.push_str(&text);
                 emit_event(
                     out,
+                    &self.sequence,
                     "response.output_text.delta",
                     json!({
                         "type": "response.output_text.delta",
@@ -1437,6 +1451,7 @@ impl ResponsesStreamTranslator {
                             let name = slot.name.clone();
                             emit_event(
                                 out,
+                                &self.sequence,
                                 "response.output_item.added",
                                 json!({
                                     "type": "response.output_item.added",
@@ -1457,6 +1472,7 @@ impl ResponsesStreamTranslator {
                         let output_index = slot.output_index;
                         emit_event(
                             out,
+                            &self.sequence,
                             "response.function_call_arguments.delta",
                             json!({
                                 "type": "response.function_call_arguments.delta",
@@ -1503,6 +1519,7 @@ impl ResponsesStreamTranslator {
             self.started = true;
             emit_event(
                 out,
+                &self.sequence,
                 "response.created",
                 json!({
                     "type": "response.created",
@@ -1515,6 +1532,7 @@ impl ResponsesStreamTranslator {
         attach_error(&mut response, error);
         emit_event(
             out,
+            &self.sequence,
             "response.failed",
             json!({
                 "type": "response.failed",
@@ -1535,6 +1553,7 @@ impl ResponsesStreamTranslator {
             self.started = true;
             emit_event(
                 out,
+                &self.sequence,
                 "response.created",
                 json!({
                     "type": "response.created",
@@ -1556,6 +1575,7 @@ impl ResponsesStreamTranslator {
         for call in calls {
             emit_event(
                 out,
+                &self.sequence,
                 "response.output_item.done",
                 json!({
                     "type": "response.output_item.done",
@@ -1592,6 +1612,7 @@ impl ResponsesStreamTranslator {
         };
         emit_event(
             out,
+            &self.sequence,
             event_name,
             json!({
                 "type": event_name,
@@ -1618,6 +1639,7 @@ impl ResponsesStreamTranslator {
         self.text_open = false;
         emit_event(
             out,
+            &self.sequence,
             "response.output_text.done",
             json!({
                 "type": "response.output_text.done",
@@ -1629,6 +1651,7 @@ impl ResponsesStreamTranslator {
         );
         emit_event(
             out,
+            &self.sequence,
             "response.content_part.done",
             json!({
                 "type": "response.content_part.done",
@@ -1640,6 +1663,7 @@ impl ResponsesStreamTranslator {
         );
         emit_event(
             out,
+            &self.sequence,
             "response.output_item.done",
             json!({
                 "type": "response.output_item.done",
@@ -1671,6 +1695,7 @@ impl ResponsesStreamTranslator {
         let output_index = self.reasoning_output_index.unwrap_or(0);
         emit_event(
             out,
+            &self.sequence,
             "response.reasoning_summary_text.done",
             json!({
                 "type": "response.reasoning_summary_text.done",
@@ -1682,6 +1707,7 @@ impl ResponsesStreamTranslator {
         );
         emit_event(
             out,
+            &self.sequence,
             "response.reasoning_summary_part.done",
             json!({
                 "type": "response.reasoning_summary_part.done",
@@ -1693,6 +1719,7 @@ impl ResponsesStreamTranslator {
         );
         emit_event(
             out,
+            &self.sequence,
             "response.output_item.done",
             json!({
                 "type": "response.output_item.done",
@@ -1819,7 +1846,19 @@ fn attach_error(response: &mut Value, error: &Value) {
 }
 
 /// Serialize one Responses SSE event.
-fn emit_event(out: &mut Vec<u8>, event: &str, payload: Value) {
+///
+/// Every event carries the monotonic `sequence_number` the OpenAI Responses
+/// API stamps on its frames. The AI SDK's Responses schema *requires* the
+/// field on `response.failed`, so a failure event without it does not match
+/// the schema, falls through to the client's "unknown chunk" fallback, and
+/// the upstream error is silently dropped. Clients that do not know the
+/// field ignore it.
+fn emit_event(out: &mut Vec<u8>, sequence: &Cell<u64>, event: &str, mut payload: Value) {
+    let next = sequence.get() + 1;
+    sequence.set(next);
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("sequence_number".into(), json!(next));
+    }
     out.extend_from_slice(format!("event: {event}\n").as_bytes());
     out.extend_from_slice(format!("data: {payload}\n\n").as_bytes());
 }
@@ -3327,6 +3366,18 @@ mod tests {
             .find(|e| e["type"] == "response.failed")
             .expect("response.failed event expected");
         assert_eq!(failed["response"]["status"], "failed");
+        // Every event carries the monotonic `sequence_number` the OpenAI
+        // Responses API stamps on frames; the AI SDK schema *requires* it on
+        // `response.failed`, so a failure without it is parsed as an unknown
+        // chunk and the error is silently dropped.
+        let sequence = failed["sequence_number"].as_u64();
+        assert!(
+            sequence.is_some(),
+            "response.failed must carry a numeric sequence_number"
+        );
+        // The failed event is the fifth one emitted (created, item.added,
+        // content_part.added, text.delta, failed).
+        assert_eq!(sequence.unwrap(), 5);
         assert_eq!(
             failed["response"]["error"]["message"],
             "context length exceeded"
@@ -3360,6 +3411,9 @@ mod tests {
         let events = sse_payloads(&s);
         let types: Vec<&str> = events.iter().map(|e| e["type"].as_str().unwrap()).collect();
         assert_eq!(types, vec!["response.created", "response.failed"]);
+        // Every event carries the sequence stamp; the failed event is second.
+        assert!(events[0]["sequence_number"].is_u64());
+        assert_eq!(events[1]["sequence_number"], 2);
         let failed = events.last().unwrap();
         assert_eq!(failed["response"]["status"], "failed");
         assert_eq!(failed["response"]["error"]["message"], "upstream down");
