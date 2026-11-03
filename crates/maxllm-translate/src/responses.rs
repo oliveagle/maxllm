@@ -389,8 +389,8 @@ fn function_call_tool_call(item: &Value) -> Value {
     let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let arguments = item
         .get("arguments")
-        .and_then(|v| v.as_str())
-        .unwrap_or("{}");
+        .and_then(arguments_to_string)
+        .unwrap_or_else(|| "{}".to_string());
     json!({
         "id": call_id,
         "type": "function",
@@ -502,6 +502,26 @@ fn content_to_text(content: &Value) -> String {
 /// Extract the text of a stream `delta.content`, whether it is a plain
 /// string or an array of `{type, text}` parts.
 ///
+/// Tool-call arguments must be a JSON string on the wire; some clients and
+/// upstreams send them as a JSON object instead. Serialize such a value so
+/// the arguments are never silently dropped or replaced with an empty object.
+fn arguments_to_string(value: &Value) -> Option<String> {
+    match value {
+        // A string is used as-is. An empty string means "no arguments yet"
+        // (the opening fragment of a streamed tool call), not an empty JSON
+        // document — it must not be serialized into the literal `""`.
+        Value::String(s) => {
+            if s.is_empty() {
+                None
+            } else {
+                Some(s.clone())
+            }
+        }
+        Value::Null => None,
+        other => serde_json::to_string(other).ok().filter(|s| !s.is_empty()),
+    }
+}
+
 /// Returns `None` when there is no text, so an empty delta does not open an
 /// output item.
 fn delta_content_text(content: &Value) -> Option<String> {
@@ -951,8 +971,8 @@ fn build_responses_object(chat: &Value, status: ResponseStatus) -> Value {
             .unwrap_or("");
         let arguments = function
             .and_then(|f| f.get("arguments"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+            .and_then(arguments_to_string)
+            .unwrap_or_default();
         output.push(json!({
             "type": "function_call",
             "id": generate_id("fc_"),
@@ -1440,7 +1460,7 @@ impl ResponsesStreamTranslator {
                 }
                 if let Some(arguments) = function
                     .and_then(|f| f.get("arguments"))
-                    .and_then(|v| v.as_str())
+                    .and_then(arguments_to_string)
                 {
                     if !arguments.is_empty() {
                         if !slot.announced {
@@ -1467,7 +1487,7 @@ impl ResponsesStreamTranslator {
                                 }),
                             );
                         }
-                        slot.arguments.push_str(arguments);
+                        slot.arguments.push_str(&arguments);
                         let item_id = slot.item_id.clone();
                         let output_index = slot.output_index;
                         emit_event(
@@ -2771,6 +2791,77 @@ mod tests {
         assert_eq!(v["usage"]["input_tokens"], 5);
         assert_eq!(v["usage"]["output_tokens"], 7);
         assert_eq!(v["usage"]["total_tokens"], 12);
+    }
+
+    #[test]
+    fn test_request_function_call_with_object_arguments() {
+        // Tool-call arguments must be a JSON string on the wire; a client
+        // that sends them as an object must not have them dropped (the chat
+        // upstream would receive an empty `{}` and the tool call would be
+        // meaningless).
+        let body = br#"{
+            "model":"gpt-4o","stream":false,
+            "input":[
+                {"type":"message","role":"user","content":"weather?"},
+                {"type":"function_call","call_id":"call_1","name":"get_weather",
+                 "arguments":{"city":"Rome"}},
+                {"type":"function_call_output","call_id":"call_1","output":"sunny"}
+            ]
+        }"#;
+        let out = responses_request_to_chat(body).unwrap();
+        let v: Value = serde_json::from_slice(&out.body).unwrap();
+        let msgs = v["messages"].as_array().unwrap();
+        let call = msgs
+            .iter()
+            .find(|m| m["tool_calls"].is_array())
+            .expect("the replayed tool-call turn");
+        let args = call["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .expect("arguments must be a string");
+        assert_eq!(args, r#"{"city":"Rome"}"#);
+    }
+
+    #[test]
+    fn test_chat_response_with_object_tool_call_arguments() {
+        // The same shape on the response side: an upstream that answers with
+        // the arguments as an object must not lose them.
+        let chat = br#"{
+            "id":"chatcmpl-1","object":"chat.completion","created":1700000000,
+            "model":"gpt-4o","choices":[{"index":0,"finish_reason":"tool_calls",
+                "message":{"role":"assistant","tool_calls":[
+                    {"id":"call_1","type":"function",
+                     "function":{"name":"get_weather","arguments":{"city":"Rome"}}}]}}]
+        }"#;
+        let out = chat_response_to_responses(chat).unwrap();
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        let output = v["output"].as_array().unwrap();
+        let call = output
+            .iter()
+            .find(|i| i["type"] == "function_call")
+            .expect("function_call item expected");
+        assert_eq!(call["name"], "get_weather");
+        assert_eq!(call["arguments"], r#"{"city":"Rome"}"#);
+    }
+
+    #[test]
+    fn test_stream_delta_with_object_tool_call_arguments() {
+        // And the same on the stream side.
+        let chunks = [
+            r#"{"id":"chatcmpl-a","object":"chat.completion.chunk","created":1700000000,"model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":{"city":"Rome"}}}]},"finish_reason":null}]}"#,
+            r#"{"id":"chatcmpl-a","object":"chat.completion.chunk","created":1700000000,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ];
+        let sse = chat_sse(&chunks);
+        let mut t = ResponsesStreamTranslator::new(Box::new(crate::NativePassthroughStream));
+        let out = t.process_chunk(sse.as_bytes(), true);
+        let text = String::from_utf8_lossy(&out).to_string();
+        assert!(
+            text.contains(r#""delta":"{\"city\":\"Rome\"}""#),
+            "the arguments must reach the client as a string: {text}"
+        );
+        assert!(
+            text.contains(r#""arguments":"{\"city\":\"Rome\"}""#),
+            "the completed item must carry the arguments: {text}"
+        );
     }
 
     #[test]
