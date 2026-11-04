@@ -32,6 +32,7 @@ use pingora::http::ResponseHeader;
 use pingora::prelude::*;
 use pingora::proxy::{FailToProxy, ProxyHttp, Session};
 use std::collections::HashMap;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -250,6 +251,18 @@ pub struct HotState {
     pub cost_calculator: Arc<maxllm_admin::CostCalculator>,
     pub guardrail_engine: Option<Arc<GuardrailEngine>>,
     pub models_response: Bytes,
+    /// The `auto` rotation pool: (provider, model) pairs that the sentinel
+    /// model rotates over. Empty when auto is disabled or not configured.
+    /// Entries whose provider is missing from the config are dropped at
+    /// build time, so the pool can only contain usable providers.
+    pub auto_pool: Vec<AutoPoolEntry>,
+}
+
+/// One entry of the auto-rotation pool, resolved against the providers.
+#[derive(Debug, Clone)]
+pub struct AutoPoolEntry {
+    pub provider: String,
+    pub model: String,
 }
 
 /// The main AI gateway — implements Pingora's ProxyHttp trait.
@@ -514,6 +527,29 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
         "Hot state built"
     );
 
+    // The auto pool is self-contained: it lists the (provider, model) pairs
+    // explicitly, so the rotation set never depends on one-api's channel
+    // table (or on one-api running at all). Entries naming an unknown
+    // provider are dropped — a typo must not silently shrink the pool.
+    let mut auto_pool: Vec<AutoPoolEntry> = Vec::new();
+    if let Some(auto) = config.auto_model.as_ref() {
+        if auto.enabled {
+            for entry in &auto.pool {
+                if providers.contains_key(&entry.provider) {
+                    auto_pool.push(AutoPoolEntry {
+                        provider: entry.provider.clone(),
+                        model: entry.model.clone(),
+                    });
+                } else {
+                    warn!(
+                        provider = %entry.provider,
+                        "auto_model pool entry names an unknown provider — dropped"
+                    );
+                }
+            }
+        }
+    }
+
     Ok(HotState {
         providers,
         session_sticky_enabled: config
@@ -529,8 +565,12 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
         cost_calculator,
         guardrail_engine,
         models_response,
+        auto_pool,
     })
 }
+
+/// Round-robin counter for the auto pool (shared across auto routes).
+static AUTO_POOL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl AiGateway {
     pub fn new(config: &Config) -> Result<Self, Box<dyn std::error::Error>> {
@@ -734,6 +774,82 @@ impl AiGateway {
         route: &RouteConfig,
         ctx: &mut RequestCtx,
     ) -> Option<Arc<ProviderState>> {
+        // Auto route: rotate over the [auto_model] pool instead of the
+        // route's fallback chain. Selection is session-sticky first (a
+        // conversation stays on the provider that first served it, so the
+        // upstream keeps its context), then round-robin over the healthy
+        // entries (breaker not open). The chosen (provider, model) pair is
+        // remembered in ctx.auto_target so the body's model field can be
+        // rewritten to the entry's model later.
+        if route.auto_model && !hot.auto_pool.is_empty() {
+            // 1. Session-sticky: a session pinned to a pool provider keeps
+            //    using it (a different key loses upstream context), unless
+            //    that provider's circuit is open.
+            if route.session_sticky && hot.session_sticky_enabled {
+                if let Some(session_id) = ctx.session_id.clone() {
+                    match self.sessions.get(&session_id) {
+                        Some(pinned_name) => {
+                            if let Some(entry) =
+                                hot.auto_pool.iter().find(|e| e.provider == pinned_name)
+                            {
+                                if let Some(provider) = hot.providers.get(&entry.provider) {
+                                    if !provider.circuit_breaker.is_open() {
+                                        METRICS.session_affinity_hits_total.inc();
+                                        ctx.provider_name = entry.provider.clone();
+                                        ctx.auto_target =
+                                            Some((entry.provider.clone(), entry.model.clone()));
+                                        ctx.model = entry.model.clone();
+                                        ctx.plugin_ctx.model = entry.model.clone();
+                                        ctx.native_responses = ctx.endpoint_type
+                                            == EndpointType::Responses
+                                            && provider.native_responses
+                                            && provider.responses_path.is_some();
+                                        return Some(Arc::clone(provider));
+                                    }
+                                }
+                            }
+                            // Pinned provider unavailable (open circuit or no
+                            // longer in the pool) — fall through to
+                            // round-robin; the session re-pins on the next
+                            // successful response.
+                        }
+                        None => {
+                            METRICS.session_affinity_misses_total.inc();
+                        }
+                    }
+                }
+            }
+            // 2. Round-robin over the healthy pool entries.
+            let healthy: Vec<&AutoPoolEntry> = hot
+                .auto_pool
+                .iter()
+                .filter(|e| {
+                    hot.providers
+                        .get(&e.provider)
+                        .map(|p| !p.circuit_breaker.is_open())
+                        .unwrap_or(false)
+                })
+                .collect();
+            if healthy.is_empty() {
+                return None;
+            }
+            let idx = AUTO_POOL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as usize;
+            let entry = healthy[idx % healthy.len()];
+            let provider = match hot.providers.get(&entry.provider) {
+                Some(p) => Arc::clone(p),
+                None => return None,
+            };
+            ctx.provider_name = entry.provider.clone();
+            ctx.auto_target = Some((entry.provider.clone(), entry.model.clone()));
+            ctx.model = entry.model.clone();
+            ctx.plugin_ctx.model = entry.model.clone();
+            // A native-Responses entry gets the request forwarded unchanged.
+            ctx.native_responses = ctx.endpoint_type == EndpointType::Responses
+                && provider.native_responses
+                && provider.responses_path.is_some();
+            return Some(provider);
+        }
+
         // Build list of all candidate providers for this route
         let mut candidates: Vec<ProviderTarget> = Vec::new();
 
@@ -772,10 +888,9 @@ impl AiGateway {
                                 if ctx.fallback_used {
                                     ctx.original_provider = Some(route.provider.clone());
                                 }
-                                ctx.native_responses =
-                                    ctx.endpoint_type == EndpointType::Responses
-                                        && pinned.state.native_responses
-                                        && pinned.state.responses_path.is_some();
+                                ctx.native_responses = ctx.endpoint_type == EndpointType::Responses
+                                    && pinned.state.native_responses
+                                    && pinned.state.responses_path.is_some();
                                 return Some(Arc::clone(&pinned.state));
                             }
                         }
@@ -1110,8 +1225,7 @@ impl ProxyHttp for AiGateway {
         // headers. codex-cli sends `session-id`, Claude Code sends
         // `X-Session-ID` / `X-Conversation-ID`; the body fallback is applied
         // later in request_body_filter.
-        ctx.session_id =
-            crate::session_sticky::resolve_from_headers(&session.req_header().headers);
+        ctx.session_id = crate::session_sticky::resolve_from_headers(&session.req_header().headers);
 
         // Select provider (with circuit breaker check and routing strategy)
         let _provider = match self.select_provider(&hot, route, ctx) {
@@ -1142,18 +1256,6 @@ impl ProxyHttp for AiGateway {
         _session: &mut Session,
         ctx: &mut Self::CTX,
     ) -> pingora::Result<Box<HttpPeer>> {
-        let hot = self.hot.load();
-        let provider = match hot.providers.get(&ctx.provider_name) {
-            Some(p) => p,
-            None => {
-                warn!(provider = %ctx.provider_name, "provider not found in upstream_peer (config may have been reloaded)");
-                return Err(pingora::Error::explain(
-                    pingora::ErrorType::HTTPStatus(502),
-                    format!("provider '{}' no longer exists", ctx.provider_name),
-                ));
-            }
-        };
-
         // Resolve the upstream hostname here instead of letting
         // `HttpPeer::new` do it: pingora's constructor calls
         // `to_socket_addrs().unwrap()` internally and PANICS the worker
@@ -1162,24 +1264,54 @@ impl ProxyHttp for AiGateway {
         // instead of a 502. Look the address up asynchronously and surface a
         // clean error. Passing a resolved `SocketAddr` to `HttpPeer::new`
         // skips the fallible lookup entirely.
-        let addr = match tokio::net::lookup_host((provider.host.as_str(), provider.port)).await {
-            Ok(mut addrs) => match addrs.next() {
-                Some(a) => a,
+        //
+        // A DNS failure means this provider is unreachable *before* the
+        // connect phase, so it would bypass `fail_to_connect`'s failover.
+        // Treat it like a connect failure: count it against the breaker,
+        // switch to the next pool/fallback provider, and resolve again —
+        // bounded by the same failover budget.
+        let addr = loop {
+            let hot = self.hot.load();
+            let provider = match hot.providers.get(&ctx.provider_name) {
+                Some(p) => p,
                 None => {
+                    warn!(provider = %ctx.provider_name, "provider not found in upstream_peer (config may have been reloaded)");
                     return Err(pingora::Error::explain(
                         pingora::ErrorType::HTTPStatus(502),
-                        format!("no address resolved for '{}'", provider.host),
+                        format!("provider '{}' no longer exists", ctx.provider_name),
                     ));
                 }
-            },
-            Err(e) => {
+            };
+            // Clone what the lookup needs: the provider borrow must not
+            // cross the await point. `to_socket_addrs` accepts (String, u16).
+            let host = provider.host.clone();
+            let port = provider.port;
+            let resolved = match tokio::net::lookup_host((host.clone(), port)).await {
+                Ok(mut addrs) => addrs.next(),
+                Err(_) => None,
+            };
+            match resolved {
+                Some(a) => break a,
+                None => {
+                    if !self.try_dns_failover(ctx).await {
+                        return Err(pingora::Error::explain(
+                            pingora::ErrorType::HTTPStatus(502),
+                            format!("DNS resolution failed for '{}'", host),
+                        ));
+                    }
+                }
+            }
+        };
+        let hot = self.hot.load();
+        let provider = match hot.providers.get(&ctx.provider_name) {
+            Some(p) => p,
+            None => {
                 return Err(pingora::Error::explain(
                     pingora::ErrorType::HTTPStatus(502),
-                    format!("DNS resolution failed for '{}': {}", provider.host, e),
+                    format!("provider '{}' no longer exists", ctx.provider_name),
                 ));
             }
         };
-
         let mut peer = HttpPeer::new(addr, provider.tls, provider.sni.clone());
         peer.options.connection_timeout = Some(provider.connect_timeout);
         peer.options.total_connection_timeout = provider.total_connect_timeout;
@@ -1391,11 +1523,20 @@ impl ProxyHttp for AiGateway {
                 ctx.endpoint_type == EndpointType::Responses && !ctx.native_responses;
             let openai_style = provider.translator.name() == "openai"
                 || provider.translator.name() == "azure_openai";
+            // An auto route rewrites the request body's model field to the
+            // selected pool entry's model, so the body size changes and the
+            // request must travel chunked — never verbatim passthrough.
+            let is_auto_route = hot
+                .routes
+                .get(ctx.route_index.unwrap_or(usize::MAX))
+                .map(|r| r.auto_model)
+                .unwrap_or(false);
             // A Responses body rewritten into chat completions has an
             // unpredictable size (the chat form can be larger than the
             // Responses form), so it travels chunked instead of keeping the
             // original Content-Length — which would truncate a larger body.
-            let verbatim = is_native_responses || (openai_style && !is_responses_to_chat);
+            let verbatim =
+                !is_auto_route && (is_native_responses || (openai_style && !is_responses_to_chat));
 
             let compaction_enabled = ctx
                 .plugin_ctx
@@ -1656,6 +1797,33 @@ impl ProxyHttp for AiGateway {
 
         // Buffer incoming body chunks (both normal and native modes)
         self.buffer_request_body_chunk(ctx, body, end_of_stream);
+
+        // Auto route: rewrite the body's `model` field to the selected pool
+        // entry's model. The client sent the sentinel (e.g. "auto"); the
+        // upstream only understands its own model names. Done here, before
+        // any translation, so responses→chat, guardrails, and the provider
+        // translation all see the rewritten model.
+        if end_of_stream && !ctx.body_translated {
+            if let Some((_, auto_model)) = ctx.auto_target.clone() {
+                if !ctx.request_body_buf.is_empty() {
+                    if let Ok(mut v) =
+                        serde_json::from_slice::<serde_json::Value>(&ctx.request_body_buf)
+                    {
+                        if let Some(obj) = v.as_object_mut() {
+                            obj.insert(
+                                "model".into(),
+                                serde_json::Value::String(auto_model.clone()),
+                            );
+                        }
+                        if let Ok(bytes) = serde_json::to_vec(&v) {
+                            ctx.request_body_buf = bytes;
+                        }
+                        ctx.model = auto_model.clone();
+                        ctx.plugin_ctx.model = auto_model.clone();
+                    }
+                }
+            }
+        }
 
         if end_of_stream && !ctx.body_translated {
             ctx.body_translated = true;
@@ -3516,6 +3684,23 @@ impl AiGateway {
     fn next_fallback_provider(&self, ctx: &RequestCtx) -> Option<(String, Arc<ProviderState>)> {
         let hot = self.hot.load();
         let route = hot.routes.get(ctx.route_index?)?;
+
+        // Auto route: walk the [auto_model] pool (still skipping attempted
+        // and open-circuit entries) rather than the route's fallback chain.
+        if route.auto_model {
+            return hot
+                .auto_pool
+                .iter()
+                .filter(|e| e.provider != ctx.provider_name)
+                .filter(|e| !ctx.attempted_providers.contains(&e.provider))
+                .find_map(|e| {
+                    hot.providers
+                        .get(&e.provider)
+                        .filter(|p| !p.circuit_breaker.is_open())
+                        .map(|p| (e.provider.clone(), Arc::clone(p)))
+                });
+        }
+
         route
             .fallback
             .iter()
@@ -3577,6 +3762,16 @@ impl AiGateway {
         ctx.native_responses = ctx.endpoint_type == EndpointType::Responses
             && fallback.native_responses
             && fallback.responses_path.is_some();
+        // Auto route: refresh the (provider, model) target to the new pool
+        // entry so the replayed body carries the right model.
+        if ctx.auto_target.is_some() {
+            let hot = self.hot.load();
+            if let Some(e) = hot.auto_pool.iter().find(|e| e.provider == name) {
+                ctx.auto_target = Some((e.provider.clone(), e.model.clone()));
+                ctx.model = e.model.clone();
+                ctx.plugin_ctx.model = e.model.clone();
+            }
+        }
         ctx.body_translated = false;
         ctx.request_body_buf.clear();
         ctx.keep_request_content_length = false;
@@ -3602,6 +3797,32 @@ impl AiGateway {
         if let Err(err) = admin_api.save_circuit_breaker_state(breaker.snapshot(provider_name)) {
             warn!(error = %err, provider = %provider_name, "Failed to persist circuit breaker state");
         }
+    }
+
+    /// A provider whose hostname cannot be resolved is unreachable — the
+    /// same as a connect failure. Count it against the circuit breaker,
+    /// switch to the next provider of the route (fallback chain or auto
+    /// pool), and report whether the switch happened so the caller re-resolves.
+    /// Bounded by the route's failover budget.
+    async fn try_dns_failover(&self, ctx: &mut RequestCtx) -> bool {
+        let max_attempts = {
+            let hot = self.hot.load();
+            max_failover_attempts(&hot.routes, ctx.route_index)
+        };
+        if ctx.failover_count >= max_attempts {
+            return false;
+        }
+        self.record_provider_connect_failure(ctx);
+        self.unpin_session(ctx);
+        if let Some((failed_provider, next_provider)) = self.switch_to_fallback(ctx) {
+            info!(
+                provider = %next_provider,
+                failed_provider = %failed_provider,
+                "upstream DNS resolution failed — retrying the request on the fallback provider"
+            );
+            return true;
+        }
+        false
     }
 
     /// Append one event to the JSONL recorder, if recording is enabled.

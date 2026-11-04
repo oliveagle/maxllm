@@ -4049,3 +4049,261 @@ async fn test_429_laya_classifies_inconclusive_text() {
         metric_sample(&gw, "maxllm_circuit_breaker_state{provider=\"primary\"}").await;
     assert_eq!(state, Some(1.0), "the breaker must be open (1)");
 }
+
+// ---------------------------------------------------------------------------
+// auto model: rotation over an explicit (provider, model) pool
+// ---------------------------------------------------------------------------
+
+/// The auto route rotates over the `[auto_model]` pool and rewrites the
+/// request body's model field to the selected entry's model — the upstream
+/// never sees the sentinel. Two providers, two models, two requests: the
+/// pool must be walked round-robin.
+#[tokio::test]
+async fn test_auto_model_rotates_over_the_pool_and_rewrites_the_model() {
+    let a = MockServer::start().await;
+    let b = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from-a")))
+        .mount(&a)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from-b")))
+        .mount(&b)
+        .await;
+
+    let config = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.alpha]
+kind = "openai"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+
+[providers.beta]
+kind = "openai"
+base_url = "{FALLBACK_URL}"
+api_key = "fake-key"
+
+[auto_model]
+enabled = true
+name = "auto"
+
+[[auto_model.pool]]
+provider = "alpha"
+model = "model-a"
+
+[[auto_model.pool]]
+provider = "beta"
+model = "model-b"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "alpha"
+auto_model = true
+"#;
+    let gw = TestGateway::start_with_fallback(config, &a.uri(), &b.uri()).await;
+    let c = client();
+
+    // Two requests: the pool must be walked round-robin, so each upstream
+    // sees exactly one request.
+    for _ in 0..2 {
+        let resp = c
+            .post(gw.url("/v1/chat/completions"))
+            .header("Authorization", "Bearer test-key-123")
+            .json(&chat_body("auto", "hi"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    let a_reqs = a.received_requests().await.unwrap_or_default();
+    let b_reqs = b.received_requests().await.unwrap_or_default();
+    assert_eq!(
+        a_reqs.len(),
+        1,
+        "alpha must serve exactly one of the two requests"
+    );
+    assert_eq!(
+        b_reqs.len(),
+        1,
+        "beta must serve exactly one of the two requests"
+    );
+
+    // The sentinel must never reach the upstream — each provider gets its
+    // own model name.
+    let a_sent: Value = serde_json::from_slice(&a_reqs[0].body).expect("json body");
+    assert_eq!(a_sent["model"], "model-a");
+    let b_sent: Value = serde_json::from_slice(&b_reqs[0].body).expect("json body");
+    assert_eq!(b_sent["model"], "model-b");
+}
+
+/// A pool entry naming an unknown provider is dropped at startup, so a
+/// typo cannot silently shrink the pool into a single-provider route.
+#[tokio::test]
+async fn test_auto_model_drops_unknown_providers_from_the_pool() {
+    let a = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from-a")))
+        .mount(&a)
+        .await;
+
+    let config = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.alpha]
+kind = "openai"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+
+[auto_model]
+enabled = true
+name = "auto"
+
+[[auto_model.pool]]
+provider = "alpha"
+model = "model-a"
+
+[[auto_model.pool]]
+provider = "does_not_exist"
+model = "model-x"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "alpha"
+auto_model = true
+"#;
+    let gw = TestGateway::start(config, &a.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&chat_body("auto", "hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let received = a.received_requests().await.unwrap_or_default();
+    assert_eq!(received.len(), 1);
+    let sent: Value = serde_json::from_slice(&received[0].body).expect("json body");
+    assert_eq!(sent["model"], "model-a");
+}
+
+/// Session-sticky wins over the round-robin: a session pinned to a pool
+/// provider keeps hitting it, so the upstream keeps its context.
+#[tokio::test]
+async fn test_auto_model_prefers_the_session_binding_over_round_robin() {
+    let a = MockServer::start().await;
+    let b = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from-a")))
+        .mount(&a)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from-b")))
+        .mount(&b)
+        .await;
+
+    let config = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[session_sticky]
+enabled = true
+timeout_secs = 3600
+max_entries = 100
+
+[providers.alpha]
+kind = "openai"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+
+[providers.beta]
+kind = "openai"
+base_url = "{FALLBACK_URL}"
+api_key = "fake-key"
+
+[auto_model]
+enabled = true
+name = "auto"
+
+[[auto_model.pool]]
+provider = "alpha"
+model = "model-a"
+
+[[auto_model.pool]]
+provider = "beta"
+model = "model-b"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "alpha"
+auto_model = true
+session_sticky = true
+"#;
+    let gw = TestGateway::start_with_fallback(config, &a.uri(), &b.uri()).await;
+    let c = client();
+
+    // Two requests with the same session id: the first binds the session to
+    // whichever provider served it, the second must reuse that binding
+    // instead of rotating to the other provider.
+    for _ in 0..2 {
+        let resp = c
+            .post(gw.url("/v1/chat/completions"))
+            .header("Authorization", "Bearer test-key-123")
+            .header("session-id", "sess-1")
+            .json(&chat_body("auto", "hi"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    let a_reqs = a.received_requests().await.unwrap_or_default();
+    let b_reqs = b.received_requests().await.unwrap_or_default();
+    assert_eq!(
+        a_reqs.len() + b_reqs.len(),
+        2,
+        "both requests must be served"
+    );
+    assert_eq!(
+        a_reqs.len(),
+        2,
+        "the session binding must keep both requests on the same provider"
+    );
+    assert_eq!(b_reqs.len(), 0, "the bound provider must not rotate away");
+}

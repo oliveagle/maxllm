@@ -113,6 +113,10 @@ pub struct RequestCtx {
     /// The upstream response headers of the pending 429 (needed by the
     /// resolver's header layer once the body arrives).
     pub rate_limit_headers: Vec<(String, String)>,
+    /// The auto-rotation target selected for this request: (provider, model).
+    /// Set when the route carries the `auto` sentinel; the request body's
+    /// model field is rewritten to this model before it is sent upstream.
+    pub auto_target: Option<(String, String)>,
 }
 
 impl RequestCtx {
@@ -159,6 +163,7 @@ impl RequestCtx {
             pending_rate_limit: None,
             rate_limit_body_buf: Vec::new(),
             rate_limit_headers: Vec::new(),
+            auto_target: None,
         }
     }
 }

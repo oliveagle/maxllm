@@ -63,6 +63,44 @@ pub struct Config {
     /// Guardrail definitions (content-level guardrails).
     #[serde(default)]
     pub guardrails: Vec<GuardrailConfig>,
+    /// Auto model: a sentinel model name that rotates across an explicit,
+    /// self-contained pool of (provider, model) pairs. The pool is declared
+    /// in the gateway's own config — it never reads one-api's channel table,
+    /// so the rotation set stays stable even if one-api is not running.
+    #[serde(default)]
+    pub auto_model: Option<AutoModelConfig>,
+}
+
+/// Configuration for the `auto` sentinel model.
+#[derive(Debug, Deserialize, Clone)]
+pub struct AutoModelConfig {
+    /// Whether auto rotation is enabled.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// The sentinel model name clients send (typically "auto"). Requests
+    /// whose body model equals this string get their model rewritten to the
+    /// selected pool entry's model.
+    #[serde(default = "default_auto_model_name")]
+    pub name: String,
+    /// Explicit pool of (provider, model) pairs. Providers must be declared
+    /// in `[providers.*]`; the gateway filters out entries whose provider is
+    /// missing at startup.
+    #[serde(default)]
+    pub pool: Vec<AutoPoolEntry>,
+}
+
+/// One entry of the auto-rotation pool.
+#[derive(Debug, Deserialize, Clone)]
+pub struct AutoPoolEntry {
+    /// Provider name (must match a `[providers.<name>]` section).
+    pub provider: String,
+    /// Model name forwarded to that provider (rewritten into the request
+    /// body, so the upstream sees its own model rather than the sentinel).
+    pub model: String,
+}
+
+fn default_auto_model_name() -> String {
+    "auto".to_string()
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -292,6 +330,12 @@ pub struct RouteConfig {
     /// Retry backoff in milliseconds.
     #[serde(default = "default_retry_backoff_ms")]
     pub retry_backoff_ms: u64,
+    /// This route carries the `auto` sentinel model: provider selection
+    /// rotates over the `[auto_model]` pool instead of the route's
+    /// fallback chain, and the request body's model field is rewritten to
+    /// the selected entry's model.
+    #[serde(default)]
+    pub auto_model: bool,
 }
 
 fn default_retry_backoff_ms() -> u64 {
@@ -459,6 +503,23 @@ impl Config {
             ));
         }
         for route in &self.routes {
+            // An auto route rotates over the [auto_model] pool instead of
+            // naming a single provider, so its `provider` field is a sentinel
+            // (not a [providers.*] key). Validate the pool instead.
+            if route.auto_model {
+                let pool_ok = self
+                    .auto_model
+                    .as_ref()
+                    .map(|a| a.enabled && !a.pool.is_empty())
+                    .unwrap_or(false);
+                if !pool_ok {
+                    return Err(ConfigError::Validation(format!(
+                        "route '{}' is auto_model but [auto_model] is disabled or has an empty pool",
+                        route.path
+                    )));
+                }
+                continue;
+            }
             if !self.providers.contains_key(&route.provider) {
                 return Err(ConfigError::Validation(format!(
                     "route '{}' references unknown provider '{}'",
