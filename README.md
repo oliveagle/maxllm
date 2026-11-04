@@ -26,6 +26,7 @@ A high-performance AI gateway built on [Pingora](https://github.com/cloudflare/p
 - [Configuration](#configuration)
   - [Providers](#providers)
   - [Routes](#routes)
+  - [Auto model (rotation)](#auto-model-rotation)
   - [Plugins](#plugins)
   - [Model Aliases](#model-aliases)
 - [Routing Strategies](#routing-strategies)
@@ -308,6 +309,49 @@ endpoint_type = "passthrough"
 plugins = ["rate_limiter"]
 ```
 
+
+### Auto model (rotation)
+
+The `auto` sentinel model rotates across an explicit `[auto_model]` pool of
+`(provider, model)` pairs. The pool is declared in the gateway's own config,
+so the rotation set never reads one-api's channel table and stays stable even
+if one-api is not running. A route with `auto_model = true` selects from the
+pool instead of its own `provider`/`fallback` chain.
+
+Selection is **session-sticky first** — a session pinned to a pool provider
+keeps using it (unless that provider's circuit opens) so the upstream keeps
+its context — then **round-robin** over the healthy entries. The request
+body's `model` field is rewritten to the selected entry's model before it
+goes upstream, so the upstream never sees the sentinel. Failover re-selects
+within the pool (skipping attempted / open-circuit entries), and DNS
+resolution failures share the connect-failure path (breaker + switch).
+
+```toml
+[auto_model]
+enabled = true
+name = "auto"
+
+[[auto_model.pool]]
+provider = "openai"
+model = "gpt-4o"
+
+[[auto_model.pool]]
+provider = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+# The route's `provider` is a sentinel (not a [providers.*] key);
+# the request model "auto" gets rewritten to the selected entry's model.
+[[routes]]
+path = "/v1/responses/auto"
+provider = "auto"
+endpoint_type = "responses"
+auto_model = true
+session_sticky = true
+```
+
+Pool entries naming an unknown provider are dropped at startup (with a warn),
+so a typo cannot silently shrink the pool. The auto route must come before
+any broader prefix route (`match_route` takes the first prefix match).
 
 ## OpenCode (opencode.ai "zen") conversion
 
