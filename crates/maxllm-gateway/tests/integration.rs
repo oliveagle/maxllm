@@ -5003,3 +5003,358 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
     assert!(text.contains("data: "), "expected SSE data lines in: {text}");
     assert!(text.contains("chat.completion.chunk"), "expected OpenAI chunk format in: {text}");
 }
+
+// ---------------------------------------------------------------------------
+// Virtual-key auth & budget enforcement tests
+// ---------------------------------------------------------------------------
+
+const VK_CONFIG: &str = r#"
+global_plugins = ["request_id", "api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[metrics]
+enabled = true
+
+[admin]
+master_key = "test-master-key"
+enabled = true
+
+[plugins.request_id]
+category = "request_id"
+header_name = "X-Request-Id"
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["static-test-key"]
+
+[providers.mock_openai]
+kind = "openai"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "mock_openai"
+"#;
+
+const OPENAI_MOCK_RESPONSE: &str = r#"{"id":"cmpl-test","object":"chat.completion","created":1700000000,"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"Hello!"},"finish_reason":"stop"}],"usage":{"prompt_tokens":8,"completion_tokens":4,"total_tokens":12}}"#;
+
+async fn openai_mock(mock: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(OPENAI_MOCK_RESPONSE))
+        .mount(mock)
+        .await;
+}
+
+/// Create a virtual key via the admin API, returning (raw_key, key_id).
+async fn create_virtual_key(
+    gw: &TestGateway,
+    master_key: &str,
+    name: &str,
+    max_budget_usd: Option<f64>,
+) -> (String, String) {
+    let body = json!({
+        "name": name,
+        "max_budget_usd": max_budget_usd,
+    });
+    let resp = client()
+        .post(gw.url("/admin/keys"))
+        .header("Authorization", format!("Bearer {master_key}"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        201,
+        "create key failed: {}",
+        resp.text().await.unwrap_or_default()
+    );
+    let parsed: Value = resp.json().await.unwrap();
+    let key = parsed["key"].as_str().unwrap().to_string();
+    let id = parsed["key_id"].as_str().unwrap().to_string();
+    (key, id)
+}
+
+#[tokio::test]
+async fn test_virtual_key_authenticates_and_records_spend() {
+    let mock = MockServer::start().await;
+    openai_mock(&mock).await;
+    let gw = TestGateway::start(VK_CONFIG, &mock.uri()).await;
+
+    // Create a virtual key with a generous budget.
+    let (vk, vk_id) = create_virtual_key(&gw, "test-master-key", "test-key", Some(1000.0)).await;
+
+    // The virtual key authenticates even though it is not in the static
+    // `key_auth` key set — the gateway's virtual-key path handles it.
+    let resp = client()
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {vk}"))
+        .json(&chat_body("gpt-4o", "Hi"))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap();
+    assert_eq!(status, 200, "virtual key should authenticate: {text}");
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(parsed["object"], "chat.completion");
+
+    // Spend was recorded against the virtual key.
+    let resp = client()
+        .get(gw.url("/admin/spend/logs"))
+        .header("Authorization", "Bearer test-master-key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let logs: Value = resp.json().await.unwrap();
+    let arr = logs.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "expected exactly one spend log, got {arr:?}");
+    assert_eq!(arr[0]["key_id"], vk_id);
+    assert_eq!(arr[0]["tokens_in"], 8);
+    assert_eq!(arr[0]["tokens_out"], 4);
+    assert_eq!(arr[0]["model"], "gpt-4o");
+}
+
+#[tokio::test]
+async fn test_budget_exceeded_virtual_key_gets_402() {
+    let mock = MockServer::start().await;
+    openai_mock(&mock).await;
+    let gw = TestGateway::start(VK_CONFIG, &mock.uri()).await;
+
+    // A key with $0 budget is immediately over-budget.
+    let (vk, _id) = create_virtual_key(&gw, "test-master-key", "broke-key", Some(0.0)).await;
+
+    let resp = client()
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {vk}"))
+        .json(&chat_body("gpt-4o", "Hi"))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap();
+    assert_eq!(status, 402, "over-budget key should get 402: {text}");
+    assert!(
+        text.contains("budget"),
+        "error should mention budget: {text}"
+    );
+
+    // No spend was recorded (the request was blocked).
+    let resp = client()
+        .get(gw.url("/admin/spend/logs"))
+        .header("Authorization", "Bearer test-master-key")
+        .send()
+        .await
+        .unwrap();
+    let logs: Value = resp.json().await.unwrap();
+    assert_eq!(logs.as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn test_revoked_virtual_key_gets_401() {
+    let mock = MockServer::start().await;
+    openai_mock(&mock).await;
+    let gw = TestGateway::start(VK_CONFIG, &mock.uri()).await;
+
+    let (vk, vk_id) = create_virtual_key(&gw, "test-master-key", "short-lived", Some(1000.0)).await;
+
+    // Revoke the key.
+    let resp = client()
+        .delete(gw.url(&format!("/admin/keys/{vk_id}")))
+        .header("Authorization", "Bearer test-master-key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let resp = client()
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {vk}"))
+        .json(&chat_body("gpt-4o", "Hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "revoked key should get 401");
+}
+
+/// Create a virtual key restricted to `allowed_models` via the admin API.
+async fn create_virtual_key_with_models(
+    gw: &TestGateway,
+    master_key: &str,
+    name: &str,
+    allowed_models: &[&str],
+) -> String {
+    let body = json!({
+        "name": name,
+        "max_budget_usd": 1000.0,
+        "allowed_models": allowed_models,
+    });
+    let resp = client()
+        .post(gw.url("/admin/keys"))
+        .header("Authorization", format!("Bearer {master_key}"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        201,
+        "create key failed: {}",
+        resp.text().await.unwrap_or_default()
+    );
+    let parsed: Value = resp.json().await.unwrap();
+    parsed["key"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn test_model_allowlist_blocks_other_models() {
+    let mock = MockServer::start().await;
+    openai_mock(&mock).await;
+    let gw = TestGateway::start(VK_CONFIG, &mock.uri()).await;
+
+    let vk = create_virtual_key_with_models(&gw, "test-master-key", "limited", &["gpt-4o"]).await;
+
+    // The allowed model goes through.
+    let resp = client()
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {vk}"))
+        .json(&chat_body("gpt-4o", "Hi"))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    assert_eq!(
+        status,
+        200,
+        "allowed model should pass: {}",
+        resp.text().await.unwrap_or_default()
+    );
+
+    // A model outside the allow-list is rejected with 403 before the
+    // upstream is contacted.
+    let resp = client()
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {vk}"))
+        .json(&chat_body("gpt-4o-mini", "Hi"))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap();
+    assert_eq!(status, 403, "blocked model should get 403: {text}");
+    assert!(
+        text.contains("not allowed"),
+        "error should explain the denial: {text}"
+    );
+
+    // Only the allowed request ever reached the upstream.
+    let requests = mock.received_requests().await.unwrap();
+    assert_eq!(
+        requests.len(),
+        1,
+        "only the allowed request should reach the upstream, got {}",
+        requests.len()
+    );
+}
+
+#[tokio::test]
+async fn test_model_allowlist_glob_patterns() {
+    let mock = MockServer::start().await;
+    openai_mock(&mock).await;
+    let gw = TestGateway::start(VK_CONFIG, &mock.uri()).await;
+
+    let vk = create_virtual_key_with_models(&gw, "test-master-key", "globbed", &["gpt-4o*"]).await;
+
+    // A model matching the wildcard passes.
+    let resp = client()
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {vk}"))
+        .json(&chat_body("gpt-4o-mini", "Hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "wildcard-matching model should pass: {}",
+        resp.text().await.unwrap_or_default()
+    );
+
+    // A model outside the pattern is denied.
+    let resp = client()
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {vk}"))
+        .json(&chat_body("claude-sonnet-4-20250514", "Hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 403);
+}
+
+#[tokio::test]
+async fn test_static_key_bypasses_model_allowlist() {
+    let mock = MockServer::start().await;
+    openai_mock(&mock).await;
+    let gw = TestGateway::start(VK_CONFIG, &mock.uri()).await;
+
+    // The allow-list only applies to the virtual key; the static config key
+    // is unrestricted (model access control is a per-virtual-key feature).
+    let resp = client()
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer static-test-key")
+        .json(&chat_body("claude-sonnet-4-20250514", "Hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "static key should be unrestricted: {}",
+        resp.text().await.unwrap_or_default()
+    );
+}
+
+#[tokio::test]
+async fn test_static_key_still_works_alongside_virtual_keys() {
+    let mock = MockServer::start().await;
+    openai_mock(&mock).await;
+    let gw = TestGateway::start(VK_CONFIG, &mock.uri()).await;
+
+    // A static key from the key_auth config still authenticates.
+    let resp = client()
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer static-test-key")
+        .json(&chat_body("gpt-4o", "Hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // An unknown key is rejected by the plugin.
+    let resp = client()
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer unknown-key")
+        .json(&chat_body("gpt-4o", "Hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+
+    // Virtual-key spend was NOT recorded for the static-key request.
+    let resp = client()
+        .get(gw.url("/admin/spend/logs"))
+        .header("Authorization", "Bearer test-master-key")
+        .send()
+        .await
+        .unwrap();
+    let logs: Value = resp.json().await.unwrap();
+    assert_eq!(logs.as_array().unwrap().len(), 0);
+}

@@ -580,6 +580,7 @@ impl AiGateway {
         let hot_state = build_hot_state(config)?;
 
         // Initialize admin API if configured
+        let mut budget_enforcer: Option<Arc<maxllm_admin::BudgetEnforcer>> = None;
         let admin_api = if let Some(ref admin_config) = config.admin {
             if admin_config.enabled {
                 let store: Arc<dyn maxllm_admin::AdminStore> =
@@ -593,10 +594,17 @@ impl AiGateway {
                         Arc::new(maxllm_admin::InMemoryStore::new())
                     };
                 let api = maxllm_admin::AdminApi::new(
-                    store,
+                    Arc::clone(&store),
                     Arc::clone(&hot_state.cost_calculator),
                     &admin_config.master_key,
                 );
+                // Budget enforcement reads the same store: virtual keys
+                // created through the admin API are authenticated here and
+                // their spend is recorded by the logging hook.
+                budget_enforcer = Some(Arc::new(maxllm_admin::BudgetEnforcer::new(
+                    store,
+                    Arc::clone(&hot_state.cost_calculator),
+                )));
                 info!(
                     db = admin_config.db_path.as_deref().unwrap_or("in-memory"),
                     "Admin API initialized"
@@ -710,7 +718,7 @@ impl AiGateway {
 
         Ok(Self {
             hot: Arc::new(arc_swap::ArcSwap::from_pointee(hot_state)),
-            budget_enforcer: None,
+            budget_enforcer,
             admin_api,
             sessions,
             recorder,
@@ -958,6 +966,78 @@ impl AiGateway {
             .unwrap_or_else(|| model.to_string())
     }
 
+    /// The virtual key's model allow-list denies the request. `resolved` is
+    /// the model sent upstream (after alias resolution); `requested` is the
+    /// raw client-supplied name, so an allow-list entry may name either the
+    /// alias or the upstream model. Returns the denial message, or `None`
+    /// when the model is allowed (or no allow-list is in force).
+    fn model_denied(
+        allowed_models: &[String],
+        resolved: &str,
+        requested: Option<&str>,
+    ) -> Option<String> {
+        if allowed_models.is_empty() {
+            return None;
+        }
+        let matches = |pattern: &str, model: &str| {
+            !model.is_empty()
+                && (model == pattern || maxllm_admin::costs::glob_match(pattern, model))
+        };
+        let allowed = allowed_models.iter().any(|pattern| {
+            matches(pattern, resolved) || requested.is_some_and(|m| matches(pattern, m))
+        });
+        if allowed {
+            None
+        } else {
+            let shown = requested.filter(|m| !m.is_empty()).unwrap_or(resolved);
+            Some(format!("model '{shown}' is not allowed for this API key"))
+        }
+    }
+
+    /// Write a 403 response for a model the virtual key is not allowed to use.
+    async fn write_model_denied(session: &mut Session, message: &str) -> pingora::Result<()> {
+        let error_body = serde_json::json!({
+            "error": {
+                "message": message,
+                "type": "model_not_allowed",
+                "code": 403
+            }
+        });
+        let error_bytes = error_body.to_string().into_bytes();
+        let mut resp = ResponseHeader::build(403, Some(2))?;
+        resp.insert_header("Content-Type", "application/json")?;
+        resp.insert_header("Content-Length", error_bytes.len().to_string())?;
+        session.write_response_header(Box::new(resp), false).await?;
+        session
+            .write_response_body(Some(Bytes::from(error_bytes)), true)
+            .await?;
+        session.set_keepalive(None);
+        Ok(())
+    }
+
+    /// Enforce the virtual key's model allow-list at a model-resolution
+    /// point. When the key denies the model, a 403 response is written to
+    /// the client and `Err` is returned so the proxy pipeline stops — the
+    /// same contract as [`Self::send_guardrail_block`].
+    async fn enforce_model_allowlist(
+        session: &mut Session,
+        ctx: &mut RequestCtx,
+        resolved: &str,
+        requested: Option<&str>,
+    ) -> pingora::Result<()> {
+        let Some(message) =
+            Self::model_denied(&ctx.virtual_key_allowed_models, resolved, requested)
+        else {
+            return Ok(());
+        };
+        ctx.upstream_status = 403;
+        Self::write_model_denied(session, &message).await?;
+        Err(pingora::Error::explain(
+            pingora::ErrorType::HTTPStatus(403),
+            "model not allowed",
+        ))
+    }
+
     async fn send_error_response(
         session: &mut Session,
         status: u16,
@@ -1011,13 +1091,23 @@ impl AiGateway {
             client_body.extend_from_slice(&chunk);
         }
 
-        // 2. Extract the model (for metrics and alias resolution).
+        // 2. Extract the model (for metrics and alias resolution) and
+        //    enforce the virtual key's model allow-list before anything is
+        //    translated or signed — the request_filter context ends here,
+        //    so a denial writes the 403 and stops without an Err.
         let hot = self.hot.load();
         if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&client_body) {
             if let Some(m) = parsed.get("model").and_then(|v| v.as_str()) {
                 let resolved = Self::resolve_model_alias(&hot, m);
                 ctx.model = resolved.clone();
                 ctx.plugin_ctx.model = resolved;
+                if let Some(message) =
+                    Self::model_denied(&ctx.virtual_key_allowed_models, &ctx.model, Some(m))
+                {
+                    ctx.upstream_status = 403;
+                    Self::write_model_denied(session, &message).await?;
+                    return Ok(());
+                }
             }
         }
         drop(hot);
@@ -1223,6 +1313,21 @@ impl AiGateway {
     }
 }
 
+/// Extract the model from a Gemini-style request path
+/// (`/v1beta/models/gemini-2.5-flash:generateContent`). Returns `None` when
+/// the path does not carry a model.
+fn model_from_request_path(path: &str) -> Option<String> {
+    let marker = "/models/";
+    let idx = path.find(marker)?;
+    let rest = &path[idx + marker.len()..];
+    let end = rest.find([':', '/', '?']).unwrap_or(rest.len());
+    if end == 0 {
+        None
+    } else {
+        Some(rest[..end].to_string())
+    }
+}
+
 /// Resolve the upstream time budget for a request: a route may declare
 /// `timeout_secs`, which overrides the hard-coded read/write defaults.
 /// Returns `None` when the route does not configure one (or is unmatched).
@@ -1386,6 +1491,82 @@ impl ProxyHttp for AiGateway {
         if let Some(addr) = session.client_addr() {
             if let Some(sock) = addr.as_inet() {
                 ctx.plugin_ctx.client_ip = Some(sock.ip().to_string());
+            }
+        }
+
+        // ── Virtual-key authentication ──
+        // When the admin module is enabled, a bearer token that resolves to
+        // a virtual key created through the admin API is validated against
+        // the key store here (active, unexpired, within budget) and its key
+        // id is remembered so the logging hook can record spend against it.
+        // The `key_auth` plugin defers to this check via the
+        // `virtual_key_auth` extension marker, so static config keys keep
+        // working unchanged and keys that are neither static nor virtual
+        // still hit the plugin's 401.
+        if let Some(enforcer) = &self.budget_enforcer {
+            let auth = session
+                .req_header()
+                .headers
+                .get("Authorization")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            let token = auth.strip_prefix("Bearer ").unwrap_or(auth);
+            if token.starts_with("sk-maxllm-") {
+                match maxllm_admin::keys::validate_key(enforcer.store().as_ref(), token) {
+                    Ok(Some(mut key)) => {
+                        // Roll an expired budget window forward so stale
+                        // spend from a previous window does not block the key.
+                        if let Err(e) = enforcer.reset_key_budget_if_expired(&mut key) {
+                            warn!(error = %e, "Failed to reset expired budget window");
+                        }
+                        match enforcer.check_budget(&key) {
+                            Ok(()) => {
+                                ctx.plugin_ctx.client_id = Some(key.id.clone());
+                                ctx.plugin_ctx
+                                    .extensions
+                                    .insert("virtual_key_auth".into(), "1".into());
+                                ctx.virtual_key_id = Some(key.id.clone());
+                                ctx.virtual_key_allowed_models = key.allowed_models.clone();
+                            }
+                            Err(e) => {
+                                METRICS.active_requests.dec();
+                                ctx.skip_logging = true;
+                                return Self::send_error_response(
+                                    session,
+                                    e.http_status(),
+                                    &e.to_string(),
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        // Not a virtual key — fall through to the plugin
+                        // chain (a static config key or an unknown token).
+                    }
+                    Err(maxllm_admin::keys::KeyError::Revoked) => {
+                        METRICS.active_requests.dec();
+                        ctx.skip_logging = true;
+                        return Self::send_error_response(session, 401, "API key revoked").await;
+                    }
+                    Err(maxllm_admin::keys::KeyError::Expired) => {
+                        METRICS.active_requests.dec();
+                        ctx.skip_logging = true;
+                        return Self::send_error_response(session, 401, "API key expired").await;
+                    }
+                    Err(maxllm_admin::keys::KeyError::BudgetExceeded) => {
+                        METRICS.active_requests.dec();
+                        ctx.skip_logging = true;
+                        return Self::send_error_response(session, 402, "budget exceeded").await;
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Virtual-key validation failed");
+                        METRICS.active_requests.dec();
+                        ctx.skip_logging = true;
+                        return Self::send_error_response(session, 500, "key validation error")
+                            .await;
+                    }
+                }
             }
         }
 
@@ -1871,7 +2052,37 @@ impl ProxyHttp for AiGateway {
         }
 
         // ── PASSTHROUGH: zero processing, forward chunks as-is ──
+        // A virtual key with a model allow-list is the exception: the body is
+        // buffered so the model (from the body's `model` field, or a
+        // Gemini-style `/models/<model>:<method>` path) can be checked
+        // before anything reaches the upstream.
         if ctx.endpoint_type == EndpointType::Passthrough {
+            if ctx.virtual_key_allowed_models.is_empty() {
+                return Ok(());
+            }
+            self.buffer_request_body_chunk(ctx, body, end_of_stream);
+            if end_of_stream && !ctx.body_translated {
+                ctx.body_translated = true;
+                let hot = self.hot.load();
+                let body_model = serde_json::from_slice::<serde_json::Value>(&ctx.request_body_buf)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("model")
+                            .and_then(|m| m.as_str())
+                            .map(|m| Self::resolve_model_alias(&hot, m))
+                    });
+                let model = body_model.or_else(|| {
+                    ctx.passthrough_path
+                        .as_deref()
+                        .and_then(model_from_request_path)
+                });
+                if let Some(ref model) = model {
+                    ctx.model = model.clone();
+                    Self::enforce_model_allowlist(session, ctx, model, None).await?;
+                }
+                drop(hot);
+            }
+            *body = Some(Bytes::from(std::mem::take(&mut ctx.request_body_buf)));
             return Ok(());
         }
 
@@ -1920,6 +2131,8 @@ impl ProxyHttp for AiGateway {
                         if let Some(model) = parsed.get("model").and_then(|m| m.as_str()) {
                             let resolved = Self::resolve_model_alias(&hot, model);
                             ctx.model = resolved.clone();
+                            Self::enforce_model_allowlist(session, ctx, &resolved, Some(model))
+                                .await?;
                             ctx.plugin_ctx.model = resolved;
                         }
                         if let Some(stream) = parsed.get("stream").and_then(|v| v.as_bool()) {
@@ -1967,9 +2180,16 @@ impl ProxyHttp for AiGateway {
                 }
                 return Ok(());
             } else {
-                // Buffer a copy for metadata extraction, but DON'T take the body —
-                // let it flow through to upstream unchanged.
-                if let Some(ref data) = body {
+                // A virtual key with a model allow-list must be checked
+                // before the request reaches the upstream, so its body is
+                // buffered (instead of being streamed through unchanged) and
+                // forwarded whole once the check has run. Keys without an
+                // allow-list keep the zero-copy flow: the body is forwarded
+                // immediately and only a copy is buffered for metadata.
+                let enforce_allowlist = !ctx.virtual_key_allowed_models.is_empty();
+                if enforce_allowlist {
+                    self.buffer_request_body_chunk(ctx, body, end_of_stream);
+                } else if let Some(ref data) = body {
                     ctx.request_body_buf.extend_from_slice(data);
                 }
                 if end_of_stream && !ctx.body_translated {
@@ -1981,6 +2201,8 @@ impl ProxyHttp for AiGateway {
                         if let Some(model) = parsed.get("model").and_then(|m| m.as_str()) {
                             let resolved = Self::resolve_model_alias(&hot, model);
                             ctx.model = resolved.clone();
+                            Self::enforce_model_allowlist(session, ctx, &resolved, Some(model))
+                                .await?;
                             ctx.plugin_ctx.model = resolved;
                         }
                         if let Some(stream) = parsed.get("stream").and_then(|v| v.as_bool()) {
@@ -2022,8 +2244,12 @@ impl ProxyHttp for AiGateway {
                             ctx.client_body.clone(),
                         );
                     }
-                    // Free the metadata buffer (not needed anymore)
-                    ctx.request_body_buf = Vec::new();
+                    if enforce_allowlist {
+                        *body = Some(Bytes::from(std::mem::take(&mut ctx.request_body_buf)));
+                    } else {
+                        // Free the metadata buffer (not needed anymore)
+                        ctx.request_body_buf = Vec::new();
+                    }
                 }
                 return Ok(());
             }
@@ -2041,6 +2267,7 @@ impl ProxyHttp for AiGateway {
                     if let Some(model) = parsed.get("model").and_then(|m| m.as_str()) {
                         let resolved = Self::resolve_model_alias(&hot, model);
                         ctx.model = resolved.clone();
+                        Self::enforce_model_allowlist(session, ctx, &resolved, Some(model)).await?;
                         ctx.plugin_ctx.model = resolved;
                     }
                 }
@@ -2073,6 +2300,7 @@ impl ProxyHttp for AiGateway {
                             ctx.request_body_buf = bytes;
                         }
                         ctx.model = auto_model.clone();
+                        Self::enforce_model_allowlist(session, ctx, &auto_model, None).await?;
                         ctx.plugin_ctx.model = auto_model.clone();
                     }
                 }
@@ -2135,6 +2363,8 @@ impl ProxyHttp for AiGateway {
                     {
                         let resolved = Self::resolve_model_alias(&hot, &model);
                         ctx.model = resolved.clone();
+                        Self::enforce_model_allowlist(session, ctx, &resolved, Some(&model))
+                            .await?;
                         ctx.plugin_ctx.model = resolved;
                     }
 
@@ -2206,6 +2436,7 @@ impl ProxyHttp for AiGateway {
                     if let Some(model) = parsed.get("model").and_then(|m| m.as_str()) {
                         let resolved = Self::resolve_model_alias(&hot, model);
                         ctx.model = resolved.clone();
+                        Self::enforce_model_allowlist(session, ctx, &resolved, Some(model)).await?;
                         ctx.plugin_ctx.model = resolved;
                     }
 
@@ -3884,6 +4115,25 @@ impl ProxyHttp for AiGateway {
             }
         }
         ctx.cost_usd = cost;
+
+        // Record the spend against the virtual key that authenticated this
+        // request (per-key counters, budget window and spend log).
+        if let (Some(enforcer), Some(key_id)) =
+            (&self.budget_enforcer, ctx.virtual_key_id.as_deref())
+        {
+            if ctx.tokens_in > 0 || ctx.tokens_out > 0 {
+                if let Err(err) = enforcer.record_usage(
+                    key_id,
+                    &ctx.model,
+                    &ctx.provider_name,
+                    ctx.tokens_in,
+                    ctx.tokens_out,
+                    ctx.plugin_ctx.request_id.as_deref(),
+                ) {
+                    warn!(error = %err, "Failed to record usage for virtual key");
+                }
+            }
+        }
 
         // Run plugin logging chains
         hot.global_chain

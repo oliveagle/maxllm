@@ -52,6 +52,14 @@ pub struct RequestCtx {
     pub skip_logging: bool,
     /// Plugin context visible to all plugins.
     pub plugin_ctx: PluginCtx,
+    /// ID of the virtual key that authenticated this request (set by the
+    /// virtual-key path in `request_filter`; empty when the request used a
+    /// static key or no key was required).
+    pub virtual_key_id: Option<String>,
+    /// The virtual key's model allow-list (empty = every model permitted).
+    /// Cached at authentication time so the per-request enforcement in
+    /// `request_body_filter` does not hit the key store again.
+    pub virtual_key_allowed_models: Vec<String>,
     /// Client-requested guardrail names (from request body `guardrails` field).
     pub requested_guardrails: Option<Vec<String>>,
     /// Route-specific guardrail scope (from route config `guardrails` field).
@@ -139,6 +147,8 @@ impl RequestCtx {
             upstream_cost_usd: None,
             upstream_send_time: None,
             skip_logging: false,
+            virtual_key_id: None,
+            virtual_key_allowed_models: Vec::new(),
             plugin_ctx: PluginCtx::new(),
             requested_guardrails: None,
             route_guardrails: None,
