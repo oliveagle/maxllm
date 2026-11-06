@@ -238,6 +238,22 @@ curl http://localhost:8080/passthrough/openai/v1/embeddings \
 | OpenCode (opencode.ai "zen") | `opencode` | OpenAI-compatible + strict schema | Bearer token |
 | Custom | `openai_compat` | OpenAI-compatible | Configurable |
 
+> **AWS Bedrock** authenticates with AWS Signature V4. Credentials are read
+> from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (no STS assume-role
+> chain), and the region from the provider's `region` config key, then
+> `AWS_REGION`, defaulting to `us-east-1`. The model is routed into the
+> upstream URL (`/model/{id}/invoke`), so the body's `model` field is
+> stripped by the translator. Only one endpoint is proxied with a full
+> buffered request because the signature covers the payload hash:
+>
+> ```toml
+> [providers.my_bedrock]
+> kind = "bedrock"
+> base_url = "https://bedrock-runtime.us-east-1.amazonaws.com"
+> region = "us-east-1"
+> ```
+
+
 ## Configuration
 
 MaxLLM uses a single TOML config file with `${ENV_VAR}` expansion. See [maxllm.toml](maxllm.toml) for a full example.

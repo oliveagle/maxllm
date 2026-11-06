@@ -658,7 +658,10 @@ make clean           # cargo clean
 - **Phase 9: Admin UI** -- Web dashboard for key/spend management, config hot-reload
 - **Phase 10: Advanced Protocols** -- MCP gateway, A2A, batch API
 - **Postgres backend** -- PostgreSQL implementation of `AdminStore` (SQLite is implemented)
-- **Bedrock SigV4** -- AWS Signature V4 signing for Bedrock requests (the `bedrock`
-  provider kind translates but cannot authenticate until the gateway signs
-  the request; blocked on reworking the request pipeline to buffer the body
-  before the upstream headers are flushed)
+- **Bedrock SigV4 (implemented)** -- The `bedrock` provider kind signs requests
+  with AWS Signature V4. The signature covers the SHA-256 of the translated
+  body, so signing must wait until the full body is known. The gateway
+  handles this by reading the body in `request_filter`, translating it,
+  signing it, and forwarding it over a separate HTTP client. The signed
+  headers (`Authorization`, `X-Amz-Date`, `X-Amz-Content-Sha256`) are
+  verified against the payload hash before the request is sent upstream.
