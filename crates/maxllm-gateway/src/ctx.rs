@@ -6,6 +6,7 @@
 //
 // http://www.apache.org/licenses/LICENSE-2.0
 
+use crate::key_rate_limit::KeyInFlightGuard;
 use maxllm_config::EndpointType;
 use maxllm_plugin::guardrail::GuardrailVerdict;
 use maxllm_plugin::PluginCtx;
@@ -60,6 +61,10 @@ pub struct RequestCtx {
     /// Cached at authentication time so the per-request enforcement in
     /// `request_body_filter` does not hit the key store again.
     pub virtual_key_allowed_models: Vec<String>,
+    /// In-flight slot for the virtual key's `max_parallel_requests` limit.
+    /// Dropping the guard (the context is dropped when the request ends)
+    /// releases the slot on every exit path.
+    pub key_in_flight: Option<KeyInFlightGuard>,
     /// Client-requested guardrail names (from request body `guardrails` field).
     pub requested_guardrails: Option<Vec<String>>,
     /// Route-specific guardrail scope (from route config `guardrails` field).
@@ -149,6 +154,7 @@ impl RequestCtx {
             skip_logging: false,
             virtual_key_id: None,
             virtual_key_allowed_models: Vec::new(),
+            key_in_flight: None,
             plugin_ctx: PluginCtx::new(),
             requested_guardrails: None,
             route_guardrails: None,

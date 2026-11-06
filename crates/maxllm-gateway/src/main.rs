@@ -9,6 +9,7 @@
 mod circuit_breaker;
 mod ctx;
 mod gateway;
+mod key_rate_limit;
 mod laya_client;
 mod metrics;
 mod provider_stats;

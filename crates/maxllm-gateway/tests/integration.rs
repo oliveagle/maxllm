@@ -5299,6 +5299,167 @@ async fn test_model_allowlist_glob_patterns() {
     assert_eq!(resp.status().as_u16(), 403);
 }
 
+/// Create a virtual key with per-key rate limits via the admin API.
+async fn create_virtual_key_with_limits(
+    gw: &TestGateway,
+    master_key: &str,
+    name: &str,
+    rpm_limit: Option<u32>,
+    tpm_limit: Option<u64>,
+) -> String {
+    let body = json!({
+        "name": name,
+        "max_budget_usd": 1000.0,
+        "rpm_limit": rpm_limit,
+        "tpm_limit": tpm_limit,
+    });
+    let resp = client()
+        .post(gw.url("/admin/keys"))
+        .header("Authorization", format!("Bearer {master_key}"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        201,
+        "create key failed: {}",
+        resp.text().await.unwrap_or_default()
+    );
+    let parsed: Value = resp.json().await.unwrap();
+    parsed["key"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn test_virtual_key_rpm_limit_blocks_excess_requests() {
+    let mock = MockServer::start().await;
+    openai_mock(&mock).await;
+    let gw = TestGateway::start(VK_CONFIG, &mock.uri()).await;
+
+    let vk =
+        create_virtual_key_with_limits(&gw, "test-master-key", "rpm-limited", Some(2), None).await;
+
+    // The first two requests are inside the RPM window.
+    for i in 0..2 {
+        let resp = client()
+            .post(gw.url("/v1/chat/completions"))
+            .header("Authorization", format!("Bearer {vk}"))
+            .json(&chat_body("gpt-4o", "Hi"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "request {i} should be inside the RPM window: {}",
+            resp.text().await.unwrap_or_default()
+        );
+    }
+
+    // The third request exceeds the window.
+    let resp = client()
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {vk}"))
+        .json(&chat_body("gpt-4o", "Hi"))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap();
+    assert_eq!(status, 429, "over-RPM key should get 429: {text}");
+    assert!(
+        text.contains("rate limit"),
+        "error should mention the limit: {text}"
+    );
+
+    // The denied request never reached the upstream.
+    let requests = mock.received_requests().await.unwrap();
+    assert_eq!(
+        requests.len(),
+        2,
+        "only the admitted requests should reach the upstream"
+    );
+}
+
+#[tokio::test]
+async fn test_virtual_key_tpm_limit_blocks_excess_tokens() {
+    let mock = MockServer::start().await;
+    openai_mock(&mock).await;
+    let gw = TestGateway::start(VK_CONFIG, &mock.uri()).await;
+
+    // The mock answers with 8 input + 4 output tokens.
+    let vk =
+        create_virtual_key_with_limits(&gw, "test-master-key", "tpm-limited", None, Some(10)).await;
+
+    // The window is empty -> allowed; the response consumes 12 tokens.
+    let resp = client()
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {vk}"))
+        .json(&chat_body("gpt-4o", "Hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "first request should pass: {}",
+        resp.text().await.unwrap_or_default()
+    );
+
+    // The TPM window now holds 12 tokens, which is over the limit.
+    let resp = client()
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {vk}"))
+        .json(&chat_body("gpt-4o", "Hi"))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap();
+    assert_eq!(status, 429, "over-TPM key should get 429: {text}");
+    assert!(
+        text.contains("rate limit"),
+        "error should mention the limit: {text}"
+    );
+}
+
+#[tokio::test]
+async fn test_virtual_key_limits_do_not_affect_static_keys() {
+    let mock = MockServer::start().await;
+    openai_mock(&mock).await;
+    let gw = TestGateway::start(VK_CONFIG, &mock.uri()).await;
+
+    let vk =
+        create_virtual_key_with_limits(&gw, "test-master-key", "rpm-limited", Some(1), None).await;
+
+    // Burn the virtual key's single request.
+    let resp = client()
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {vk}"))
+        .json(&chat_body("gpt-4o", "Hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+
+    // The static key is unaffected by the virtual key's window.
+    for _ in 0..3 {
+        let resp = client()
+            .post(gw.url("/v1/chat/completions"))
+            .header("Authorization", "Bearer static-test-key")
+            .json(&chat_body("gpt-4o", "Hi"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "static key should be unrestricted: {}",
+            resp.text().await.unwrap_or_default()
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_static_key_bypasses_model_allowlist() {
     let mock = MockServer::start().await;

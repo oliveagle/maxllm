@@ -277,6 +277,8 @@ pub struct AiGateway {
     /// Budget enforcer for per-key budget tracking.
     #[allow(dead_code)]
     pub budget_enforcer: Option<Arc<maxllm_admin::BudgetEnforcer>>,
+    /// Per-key rate limiter (RPM / TPM / concurrency) for virtual keys.
+    pub key_rate_limiter: Arc<crate::key_rate_limit::KeyRateLimiter>,
     /// Admin API handler (None if admin not configured).
     pub admin_api: Option<Arc<maxllm_admin::AdminApi>>,
     /// Session → provider bindings for session-sticky routing. Kept outside
@@ -721,6 +723,7 @@ impl AiGateway {
         Ok(Self {
             hot: Arc::new(arc_swap::ArcSwap::from_pointee(hot_state)),
             budget_enforcer,
+            key_rate_limiter: Arc::new(crate::key_rate_limit::KeyRateLimiter::new()),
             admin_api,
             sessions,
             recorder,
@@ -1523,6 +1526,41 @@ impl ProxyHttp for AiGateway {
                         }
                         match enforcer.check_budget(&key) {
                             Ok(()) => {
+                                // Per-key rate limits: the RPM sliding
+                                // window is consumed here; the TPM window is
+                                // peeked (tokens are recorded when the
+                                // response completes) and an in-flight slot
+                                // is taken for the concurrency limit.
+                                // The checks are lazy: a key that is
+                                // already over its RPM limit is not charged
+                                // for a TPM peek or a concurrency slot.
+                                let denied = self
+                                    .key_rate_limiter
+                                    .check_request(&key.id, key.rpm_limit)
+                                    .err()
+                                    .map(|_| "rate limit exceeded (requests per minute)")
+                                    .or_else(|| {
+                                        self.key_rate_limiter
+                                            .check_tokens(&key.id, key.tpm_limit)
+                                            .err()
+                                            .map(|_| "rate limit exceeded (tokens per minute)")
+                                    })
+                                    .or_else(|| {
+                                        self.key_rate_limiter
+                                            .acquire(&key.id, key.max_parallel_requests)
+                                            .err()
+                                            .map(|_| "too many parallel requests")
+                                    });
+                                if let Some(reason) = denied {
+                                    METRICS.active_requests.dec();
+                                    ctx.skip_logging = true;
+                                    return Self::send_error_response(session, 429, reason).await;
+                                }
+                                ctx.key_in_flight =
+                                    Some(crate::key_rate_limit::KeyInFlightGuard::new(
+                                        Arc::clone(&self.key_rate_limiter),
+                                        key.id.clone(),
+                                    ));
                                 ctx.plugin_ctx.client_id = Some(key.id.clone());
                                 ctx.plugin_ctx
                                     .extensions
@@ -4134,6 +4172,9 @@ impl ProxyHttp for AiGateway {
                 ) {
                     warn!(error = %err, "Failed to record usage for virtual key");
                 }
+                // Feed the actual tokens into the key's TPM sliding window.
+                self.key_rate_limiter
+                    .record_tokens(key_id, ctx.tokens_in + ctx.tokens_out);
             }
         }
 
