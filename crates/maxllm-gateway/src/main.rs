@@ -110,9 +110,17 @@ fn main() {
 
     server.bootstrap();
 
-    // Create the HTTP proxy service
+    // Create the HTTP proxy service. The `[server]` socket knobs
+    // (tcp_reuseport / tcp_fastopen) are passed through to the listener —
+    // they were parsed but never applied, so a config declaring them was
+    // silently ignored.
     let mut service = http_proxy_service(&server.configuration, gateway);
-    service.add_tcp(&config.server.listen.to_string());
+    // `TcpSocketOptions` is `#[non_exhaustive]`, so its fields are set on a
+    // default value instead of a struct literal.
+    let mut sock_opt = pingora::listeners::TcpSocketOptions::default();
+    sock_opt.so_reuseport = Some(config.server.tcp_reuseport);
+    sock_opt.tcp_fastopen = config.server.tcp_fastopen;
+    service.add_tcp_with_settings(&config.server.listen.to_string(), sock_opt);
 
     server.add_service(service);
 
