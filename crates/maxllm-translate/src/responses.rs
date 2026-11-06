@@ -2320,11 +2320,9 @@ mod tests {
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0]["content"], "before");
         assert_eq!(msgs[1]["content"], "after");
-        assert!(
-            !serde_json::to_string(&v)
-                .unwrap()
-                .contains("encrypted_content")
-        );
+        assert!(!serde_json::to_string(&v)
+            .unwrap()
+            .contains("encrypted_content"));
     }
 
     #[test]

@@ -38,7 +38,8 @@ impl TestGateway {
         mock_url: &str,
         fallback_url: &str,
     ) -> Self {
-        Self::start_with_fallback_and_laya(config_template, mock_url, fallback_url, LAYA_TEST_URL).await
+        Self::start_with_fallback_and_laya(config_template, mock_url, fallback_url, LAYA_TEST_URL)
+            .await
     }
 
     /// Like [`Self::start_with_fallback`], but with a caller-supplied laya
@@ -67,7 +68,10 @@ impl TestGateway {
             .arg(config_file.path())
             .env("RUST_LOG", "warn")
             .env("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE")
-            .env("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY")
+            .env(
+                "AWS_SECRET_ACCESS_KEY",
+                "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+            )
             // Unset proxy env vars to avoid TLS issues
             .env_remove("HTTPS_PROXY")
             .env_remove("HTTP_PROXY")
@@ -3846,16 +3850,17 @@ async fn test_429_body_rate_limit_fails_over_with_precise_reset() {
 
     // The provider was force-opened because of the quota — not because of a
     // blind cooldown — and the breaker is open.
-    let quota_opens =
-        metric_sample(&gw, "maxllm_circuit_breaker_quota_opens_total{provider=\"primary\"}")
-            .await;
+    let quota_opens = metric_sample(
+        &gw,
+        "maxllm_circuit_breaker_quota_opens_total{provider=\"primary\"}",
+    )
+    .await;
     assert_eq!(
         quota_opens,
         Some(1.0),
         "the resolved quota must count exactly one quota open"
     );
-    let state =
-        metric_sample(&gw, "maxllm_circuit_breaker_state{provider=\"primary\"}").await;
+    let state = metric_sample(&gw, "maxllm_circuit_breaker_state{provider=\"primary\"}").await;
     assert_eq!(state, Some(1.0), "the breaker must be open (1)");
 }
 
@@ -3909,16 +3914,17 @@ async fn test_429_non_rate_limit_body_is_not_force_opened() {
 
     // …but the provider must NOT be force-opened as a quota: the decision
     // was "ordinary failure", so no quota open was counted.
-    let quota_opens =
-        metric_sample(&gw, "maxllm_circuit_breaker_quota_opens_total{provider=\"primary\"}")
-            .await;
+    let quota_opens = metric_sample(
+        &gw,
+        "maxllm_circuit_breaker_quota_opens_total{provider=\"primary\"}",
+    )
+    .await;
     assert_eq!(
         quota_opens, None,
         "a non-rate-limit error must not count a quota open"
     );
     // The ordinary failure left the breaker closed (max_fails defaults to 3).
-    let state =
-        metric_sample(&gw, "maxllm_circuit_breaker_state{provider=\"primary\"}").await;
+    let state = metric_sample(&gw, "maxllm_circuit_breaker_state{provider=\"primary\"}").await;
     assert_eq!(state, Some(0.0), "the breaker must stay closed (0)");
 }
 
@@ -3963,14 +3969,15 @@ async fn test_429_retry_after_header_fails_over_immediately() {
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.headers().get("X-MaxLLM-Provider").unwrap(), "fallback");
 
-    let quota_opens =
-        metric_sample(&gw, "maxllm_circuit_breaker_quota_opens_total{provider=\"primary\"}")
-            .await;
+    let quota_opens = metric_sample(
+        &gw,
+        "maxllm_circuit_breaker_quota_opens_total{provider=\"primary\"}",
+    )
+    .await;
     assert_eq!(quota_opens, Some(1.0));
     // The header path must count the quota open exactly once — the generic
     // 429 accounting must not run a second time.
-    let state =
-        metric_sample(&gw, "maxllm_circuit_breaker_state{provider=\"primary\"}").await;
+    let state = metric_sample(&gw, "maxllm_circuit_breaker_state{provider=\"primary\"}").await;
     assert_eq!(state, Some(1.0));
 }
 
@@ -4002,14 +4009,12 @@ async fn test_429_laya_classifies_inconclusive_text() {
 
     Mock::given(method("POST"))
         .and(path("/v1/systemone"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(json!({
-                "answers": {
-                    "is_rate_limit": { "type": "noul", "noul": 0.9 },
-                    "reset_time": { "type": "choice", "choice": reset_id }
-                }
-            })),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "answers": {
+                "is_rate_limit": { "type": "noul", "noul": 0.9 },
+                "reset_time": { "type": "choice", "choice": reset_id }
+            }
+        })))
         .expect(1)
         .mount(&laya)
         .await;
@@ -4045,12 +4050,13 @@ async fn test_429_laya_classifies_inconclusive_text() {
     assert_eq!(laya_reqs.len(), 1, "laya is consulted once");
 
     // The provider is force-opened until the chosen instant (a quota open).
-    let quota_opens =
-        metric_sample(&gw, "maxllm_circuit_breaker_quota_opens_total{provider=\"primary\"}")
-            .await;
+    let quota_opens = metric_sample(
+        &gw,
+        "maxllm_circuit_breaker_quota_opens_total{provider=\"primary\"}",
+    )
+    .await;
     assert_eq!(quota_opens, Some(1.0));
-    let state =
-        metric_sample(&gw, "maxllm_circuit_breaker_state{provider=\"primary\"}").await;
+    let state = metric_sample(&gw, "maxllm_circuit_breaker_state{provider=\"primary\"}").await;
     assert_eq!(state, Some(1.0), "the breaker must be open (1)");
 }
 
@@ -4839,7 +4845,6 @@ async fn test_least_connections_skips_the_busy_provider() {
     assert_eq!(slow.headers()["X-MaxLLM-Provider"], "a");
 }
 
-
 // ---------------------------------------------------------------------------
 // Bedrock SigV4 tests
 // ---------------------------------------------------------------------------
@@ -4915,9 +4920,18 @@ async fn test_bedrock_sigv4_signs_request_and_routes_model_into_path() {
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    assert!(auth.starts_with("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/"), "auth: {auth}");
-    assert!(auth.contains("/us-east-1/bedrock/aws4_request"), "auth: {auth}");
-    assert!(auth.contains("SignedHeaders=host;x-amz-content-sha256;x-amz-date"), "auth: {auth}");
+    assert!(
+        auth.starts_with("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/"),
+        "auth: {auth}"
+    );
+    assert!(
+        auth.contains("/us-east-1/bedrock/aws4_request"),
+        "auth: {auth}"
+    );
+    assert!(
+        auth.contains("SignedHeaders=host;x-amz-content-sha256;x-amz-date"),
+        "auth: {auth}"
+    );
     assert!(auth.contains("Signature="), "auth: {auth}");
 
     // Verify the Content-Sha256 header matches the body hash.
@@ -5002,8 +5016,14 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
     assert_eq!(status, 200, "streaming body: {text}");
 
     // The translated stream should contain OpenAI-format SSE chunks.
-    assert!(text.contains("data: "), "expected SSE data lines in: {text}");
-    assert!(text.contains("chat.completion.chunk"), "expected OpenAI chunk format in: {text}");
+    assert!(
+        text.contains("data: "),
+        "expected SSE data lines in: {text}"
+    );
+    assert!(
+        text.contains("chat.completion.chunk"),
+        "expected OpenAI chunk format in: {text}"
+    );
 }
 
 // ---------------------------------------------------------------------------

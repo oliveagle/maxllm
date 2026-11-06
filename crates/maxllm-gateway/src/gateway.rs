@@ -1253,8 +1253,12 @@ impl AiGateway {
             let mut resp_header = ResponseHeader::build(status, Some(2))?;
             resp_header.insert_header("Content-Type", "application/json")?;
             resp_header.insert_header("Content-Length", &content_len)?;
-            session.write_response_header(Box::new(resp_header), false).await?;
-            session.write_response_body(Some(Bytes::from(body_bytes)), true).await?;
+            session
+                .write_response_header(Box::new(resp_header), false)
+                .await?;
+            session
+                .write_response_body(Some(Bytes::from(body_bytes)), true)
+                .await?;
             return Ok(());
         }
 
@@ -1265,7 +1269,9 @@ impl AiGateway {
             resp_header.insert_header("Content-Type", "text/event-stream")?;
             resp_header.insert_header("Cache-Control", "no-cache")?;
             resp_header.insert_header("Connection", "keep-alive")?;
-            session.write_response_header(Box::new(resp_header), false).await?;
+            session
+                .write_response_header(Box::new(resp_header), false)
+                .await?;
 
             let mut resp = resp;
             let mut buffer = Vec::new();
@@ -1278,16 +1284,22 @@ impl AiGateway {
                 buffer.extend_from_slice(&chunk);
                 let out = stream_translator.process_chunk(&buffer, false);
                 if !out.is_empty() {
-                    session.write_response_body(Some(Bytes::from(out)), false).await?;
+                    session
+                        .write_response_body(Some(Bytes::from(out)), false)
+                        .await?;
                 }
                 buffer.clear();
             }
             // Flush any remaining buffered SSE data.
             let out = stream_translator.process_chunk(&buffer, true);
             if !out.is_empty() {
-                session.write_response_body(Some(Bytes::from(out)), false).await?;
+                session
+                    .write_response_body(Some(Bytes::from(out)), false)
+                    .await?;
             }
-            session.write_response_body(Some(Bytes::new()), true).await?;
+            session
+                .write_response_body(Some(Bytes::new()), true)
+                .await?;
         } else {
             // Non-streaming: read the full response and translate.
             let body = resp.bytes().await.map_err(|e| {
@@ -1312,8 +1324,12 @@ impl AiGateway {
             let mut resp_header = ResponseHeader::build(200, Some(2))?;
             resp_header.insert_header("Content-Type", "application/json")?;
             resp_header.insert_header("Content-Length", &content_len)?;
-            session.write_response_header(Box::new(resp_header), false).await?;
-            session.write_response_body(Some(Bytes::from(translated_resp)), true).await?;
+            session
+                .write_response_header(Box::new(resp_header), false)
+                .await?;
+            session
+                .write_response_body(Some(Bytes::from(translated_resp)), true)
+                .await?;
         }
 
         Ok(())

@@ -125,10 +125,8 @@ pub fn sign_request(params: &SigV4Params<'_>) -> SignedRequest {
     // Canonical headers: host and x-amz-date are always signed; the caller
     // headers (x-amz-content-sha256, …) are merged in and the whole set is
     // sorted by lowercase header name.
-    let mut signed: Vec<(&str, &str)> = vec![
-        ("host", params.host),
-        ("x-amz-date", params.amz_date),
-    ];
+    let mut signed: Vec<(&str, &str)> =
+        vec![("host", params.host), ("x-amz-date", params.amz_date)];
     for h in params.headers {
         signed.push((h.name, h.value));
     }
@@ -351,7 +349,12 @@ mod tests {
     /// Changing any signed input must change the signature.
     #[test]
     fn test_signature_sensitive_to_payload_and_host() {
-        let base = ("POST", "/model/m/invoke", "host.example.com", b"{}".as_slice());
+        let base = (
+            "POST",
+            "/model/m/invoke",
+            "host.example.com",
+            b"{}".as_slice(),
+        );
         let creds = AwsCredentials {
             access_key: AKID,
             secret_key: SECRET,

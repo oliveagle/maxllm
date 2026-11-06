@@ -839,7 +839,6 @@ impl AdminStore for SqliteStore {
         .map_err(|e| StoreError::Internal(e.to_string()))?;
         Ok(())
     }
-
 }
 
 fn request_log_from_row(row: &rusqlite::Row) -> rusqlite::Result<RequestLog> {

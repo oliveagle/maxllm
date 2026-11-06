@@ -367,14 +367,20 @@ impl AdminStore for InMemoryStore {
             .collect();
         Ok(filtered)
     }
-fn save_circuit_breaker_state(&self, row: CircuitBreakerStateRow) -> Result<(), StoreError> {
-        let mut map = self.circuit_breakers.write().map_err(|_| StoreError::LockPoisoned)?;
+    fn save_circuit_breaker_state(&self, row: CircuitBreakerStateRow) -> Result<(), StoreError> {
+        let mut map = self
+            .circuit_breakers
+            .write()
+            .map_err(|_| StoreError::LockPoisoned)?;
         map.insert(row.provider.clone(), row);
         Ok(())
     }
 
     fn load_circuit_breaker_states(&self) -> Result<Vec<CircuitBreakerStateRow>, StoreError> {
-        let map = self.circuit_breakers.read().map_err(|_| StoreError::LockPoisoned)?;
+        let map = self
+            .circuit_breakers
+            .read()
+            .map_err(|_| StoreError::LockPoisoned)?;
         Ok(map.values().cloned().collect())
     }
 

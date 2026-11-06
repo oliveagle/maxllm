@@ -346,10 +346,7 @@ mod tests {
 
     #[test]
     fn test_record_writes_jsonl() {
-        let dir = std::env::temp_dir().join(format!(
-            "maxllm-recorder-test-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("maxllm-recorder-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let cfg = RecordingConfig {
             enabled: true,
@@ -387,10 +384,8 @@ mod tests {
 
     #[test]
     fn test_body_truncation_keeps_json_parseable() {
-        let dir = std::env::temp_dir().join(format!(
-            "maxllm-recorder-trunc-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("maxllm-recorder-trunc-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let cfg = RecordingConfig {
             enabled: true,
