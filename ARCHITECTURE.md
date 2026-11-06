@@ -162,13 +162,27 @@ pub trait StreamTranslator: Send {
 
 **Supported Providers (14 translators):**
 
+**Bedrock SigV4 signing.** The Bedrock Runtime API authenticates with AWS
+Signature Version 4, whose signature covers the SHA-256 of the translated
+request payload. The exact bytes must therefore be known before the upstream
+request headers are written — but Pingora's proxy pipeline streams body
+chunks after the headers are already on the wire. The gateway handles this
+in `request_filter`: it reads the full client body, translates it, signs it
+(`maxllm_translate::aws_sigv4`), and forwards it over a separate HTTP
+client, then translates the response back before writing it to the client.
+Credentials come from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`; the
+region from the provider's `region` key, then `AWS_REGION`, then
+`us-east-1`. The model travels in the URL path (`/model/{id}/invoke` or
+`/model/{id}/invoke-with-response-stream`), so the translator strips the
+body's `model` field.
+
 | Provider | Module | Key Features |
 |----------|--------|--------------|
 | OpenAI | `openai.rs` | Pass-through (canonical format) |
 | Anthropic | `anthropic.rs`, `anthropic_stream.rs` | Maps to Messages API (`/v1/messages`) |
 | Gemini | `gemini.rs`, `gemini_stream.rs` | Maps to Generative Language API, query-param auth |
 | Azure OpenAI | `azure_openai.rs` | Custom deployment & API version |
-| Bedrock | `bedrock.rs` | AWS service format & model mapping |
+| Bedrock | `bedrock.rs`, `aws_sigv4.rs` | AWS service format, model-in-URL, SigV4-signed (gateway) |
 | Groq | `openai_compat.rs` | OpenAI-compatible (Bearer auth) |
 | Together | `openai_compat.rs` | OpenAI-compatible (Bearer auth) |
 | Fireworks | `openai_compat.rs` | OpenAI-compatible (Bearer auth) |
@@ -658,10 +672,3 @@ make clean           # cargo clean
 - **Phase 9: Admin UI** -- Web dashboard for key/spend management, config hot-reload
 - **Phase 10: Advanced Protocols** -- MCP gateway, A2A, batch API
 - **Postgres backend** -- PostgreSQL implementation of `AdminStore` (SQLite is implemented)
-- **Bedrock SigV4 (implemented)** -- The `bedrock` provider kind signs requests
-  with AWS Signature V4. The signature covers the SHA-256 of the translated
-  body, so signing must wait until the full body is known. The gateway
-  handles this by reading the body in `request_filter`, translating it,
-  signing it, and forwarding it over a separate HTTP client. The signed
-  headers (`Authorization`, `X-Amz-Date`, `X-Amz-Content-Sha256`) are
-  verified against the payload hash before the request is sent upstream.
