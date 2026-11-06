@@ -432,9 +432,55 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
         plugin_instances.insert(name.clone(), plugin);
     }
 
+    // The top-level [auth] and [rate_limit] sections predate the plugin
+    // system. Wire them to the plugins that implement them so a config that
+    // declares them is honoured instead of silently ignored. A plugin the
+    // user configured explicitly always wins.
+    let mut global_plugin_names: Vec<String> = config.global_plugins.clone();
+    let configured_categories: std::collections::HashSet<&str> = config
+        .plugins
+        .values()
+        .map(|p| p.category.as_str())
+        .collect();
+    if let Some(auth) = &config.auth {
+        if !auth.api_keys.is_empty() && !configured_categories.contains("key_auth") {
+            let mut t = toml::Table::new();
+            t.insert("category".into(), toml::Value::String("key_auth".into()));
+            t.insert("header".into(), toml::Value::String("Authorization".into()));
+            t.insert("strip_prefix".into(), toml::Value::String("Bearer ".into()));
+            t.insert(
+                "keys".into(),
+                toml::Value::Array(
+                    auth.api_keys
+                        .iter()
+                        .map(|k| toml::Value::String(k.clone()))
+                        .collect(),
+                ),
+            );
+            let plugin = maxllm_plugin::create_plugin("[auth] api_keys", &t)
+                .map_err(|e| format!("failed to build the [auth] plugin: {e}"))?;
+            plugin_instances.insert("[auth] api_keys".into(), plugin);
+            // Auth runs before every other plugin.
+            global_plugin_names.insert(0, "[auth] api_keys".into());
+        }
+    }
+    if let Some(rl) = &config.rate_limit {
+        if !configured_categories.contains("rate_limit") {
+            let mut t = toml::Table::new();
+            t.insert("category".into(), toml::Value::String("rate_limit".into()));
+            t.insert(
+                "requests_per_minute".into(),
+                toml::Value::Integer(rl.requests_per_minute as i64),
+            );
+            let plugin = maxllm_plugin::create_plugin("[rate_limit]", &t)
+                .map_err(|e| format!("failed to build the [rate_limit] plugin: {e}"))?;
+            plugin_instances.insert("[rate_limit]".into(), plugin);
+            global_plugin_names.push("[rate_limit]".into());
+        }
+    }
+
     // Build global plugin chain
-    let global_plugins: Vec<Arc<dyn Plugin>> = config
-        .global_plugins
+    let global_plugins: Vec<Arc<dyn Plugin>> = global_plugin_names
         .iter()
         .filter_map(|name| plugin_instances.get(name).cloned())
         .collect();

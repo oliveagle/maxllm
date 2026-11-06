@@ -5330,6 +5330,92 @@ async fn create_virtual_key_with_limits(
     parsed["key"].as_str().unwrap().to_string()
 }
 
+const LEGACY_AUTH_CONFIG: &str = r#"
+global_plugins = []
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[metrics]
+enabled = true
+
+[auth]
+api_keys = ["legacy-key"]
+
+[rate_limit]
+requests_per_minute = 2
+
+[providers.mock_openai]
+kind = "openai"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "mock_openai"
+"#;
+
+#[tokio::test]
+async fn test_legacy_auth_and_rate_limit_sections_are_honoured() {
+    let mock = MockServer::start().await;
+    openai_mock(&mock).await;
+    let gw = TestGateway::start(LEGACY_AUTH_CONFIG, &mock.uri()).await;
+
+    // The top-level [auth] section authenticates without any explicit
+    // key_auth plugin.
+    let resp = client()
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer legacy-key")
+        .json(&chat_body("gpt-4o", "Hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "the [auth] api_keys section must authenticate: {}",
+        resp.text().await.unwrap_or_default()
+    );
+
+    // An unknown key is rejected.
+    let resp = client()
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer unknown-key")
+        .json(&chat_body("gpt-4o", "Hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        401,
+        "the [auth] api_keys section must reject unknown keys"
+    );
+
+    // The top-level [rate_limit] section caps requests per minute. The two
+    // requests already sent consumed the window; the next one is denied.
+    for _ in 0..3 {
+        let resp = client()
+            .post(gw.url("/v1/chat/completions"))
+            .header("Authorization", "Bearer legacy-key")
+            .json(&chat_body("gpt-4o", "Hi"))
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status().as_u16();
+        if status == 429 {
+            let text = resp.text().await.unwrap();
+            assert!(
+                text.contains("Rate limit"),
+                "the [rate_limit] section must enforce its window: {text}"
+            );
+            return;
+        }
+        assert_eq!(status, 200);
+    }
+    panic!("the [rate_limit] section never produced a 429");
+}
+
 #[tokio::test]
 async fn test_virtual_key_rpm_limit_blocks_excess_requests() {
     let mock = MockServer::start().await;

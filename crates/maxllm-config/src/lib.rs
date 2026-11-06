@@ -435,7 +435,6 @@ pub struct AuthConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct RateLimitConfig {
     pub requests_per_minute: u64,
-    pub tokens_per_minute: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
