@@ -194,7 +194,7 @@ fn input_configuration_effort(input: Option<&Value>) -> Option<&str> {
                 None
             }
         })
-        .last()
+        .next_back()
 }
 
 /// Expand the `input` field into chat completion messages.
@@ -829,9 +829,7 @@ fn flatten_nested_function(value: &Value) -> Option<Value> {
     if tool.get("type").and_then(|t| t.as_str()) != Some("function") {
         return None;
     }
-    let Some(inner) = tool.get("function").and_then(|f| f.as_object()) else {
-        return None;
-    };
+    let inner = tool.get("function").and_then(|f| f.as_object())?;
     // The inner function object already carries the official flat fields
     // (name / description / parameters / strict); re-add the type marker.
     let mut flat = inner.clone();
@@ -2323,10 +2321,9 @@ mod tests {
         assert_eq!(msgs[0]["content"], "before");
         assert_eq!(msgs[1]["content"], "after");
         assert!(
-            serde_json::to_string(&v)
+            !serde_json::to_string(&v)
                 .unwrap()
                 .contains("encrypted_content")
-                == false
         );
     }
 

@@ -198,12 +198,12 @@ impl Recorder {
             "event_type": entry.event_type,
             "request_uuid": entry.request_uuid,
         });
-        add_opt(&mut obj, "session_id", entry.session_id.as_ref().map(|s| s.as_str()));
-        add_opt(&mut obj, "client_ip", entry.client_ip.as_ref().map(|s| s.as_str()));
-        add_opt(&mut obj, "provider", entry.provider.as_ref().map(|s| s.as_str()));
-        add_opt(&mut obj, "model", entry.model.as_ref().map(|s| s.as_str()));
-        add_opt(&mut obj, "method", entry.method.as_ref().map(|s| s.as_str()));
-        add_opt(&mut obj, "path", entry.path.as_ref().map(|s| s.as_str()));
+        add_opt(&mut obj, "session_id", entry.session_id.as_deref());
+        add_opt(&mut obj, "client_ip", entry.client_ip.as_deref());
+        add_opt(&mut obj, "provider", entry.provider.as_deref());
+        add_opt(&mut obj, "model", entry.model.as_deref());
+        add_opt(&mut obj, "method", entry.method.as_deref());
+        add_opt(&mut obj, "path", entry.path.as_deref());
         if let Some(code) = entry.status_code {
             obj["status_code"] = json!(code);
         }
@@ -225,7 +225,7 @@ impl Recorder {
         if let Some(v) = entry.tokens_out {
             obj["tokens_out"] = json!(v);
         }
-        if let Some(v) = entry.error.as_ref().map(|s| s.as_str()) {
+        if let Some(v) = entry.error.as_deref() {
             obj["error"] = json!(v);
         }
         obj.to_string()
@@ -266,7 +266,7 @@ fn add_opt(obj: &mut Value, key: &str, value: Option<&str>) {
 
 /// Hourly shard stem for a timestamp, e.g. `2026-11-03T19`.
 fn shard_stem(ts_ms: i64) -> String {
-    let secs = (ts_ms / 1000) as i64;
+    let secs = ts_ms / 1000;
     let days = secs.div_euclid(86400);
     let rem = secs.rem_euclid(86400);
     let hour = rem / 3600;
@@ -299,7 +299,7 @@ fn parse_shard_ts(stem: &str) -> i64 {
         return 0;
     }
     let days = days_from_civil(y, m, d);
-    (days * 86400 + h as i64 * 3600) * 1000
+    (days * 86400 + h * 3600) * 1000
 }
 
 fn parse_num(b: &[u8]) -> i64 {
@@ -409,7 +409,7 @@ mod tests {
         });
         let files: Vec<_> = fs::read_dir(&dir).unwrap().flatten().collect();
         assert_eq!(files.len(), 1);
-        let content = fs::read_to_string(&files[0].path()).unwrap();
+        let content = fs::read_to_string(files[0].path()).unwrap();
         assert!(content.contains("\"body_truncated\":true"));
         let _ = fs::remove_dir_all(&dir);
     }

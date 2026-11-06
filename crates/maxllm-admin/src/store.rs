@@ -175,7 +175,7 @@ impl AdminStore for InMemoryStore {
         let keys = self.keys.read().map_err(|_| StoreError::LockPoisoned)?;
         let mut all: Vec<VirtualKey> = keys.values().cloned().collect();
         // Stable ordering by creation time (newest first).
-        all.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        all.sort_by_key(|k| std::cmp::Reverse(k.created_at));
         Ok(all.into_iter().skip(offset).take(limit).collect())
     }
 
@@ -220,7 +220,7 @@ impl AdminStore for InMemoryStore {
     fn list_teams(&self) -> Result<Vec<Team>, StoreError> {
         let teams = self.teams.read().map_err(|_| StoreError::LockPoisoned)?;
         let mut all: Vec<Team> = teams.values().cloned().collect();
-        all.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        all.sort_by_key(|k| std::cmp::Reverse(k.created_at));
         Ok(all)
     }
 

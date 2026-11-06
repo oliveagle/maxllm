@@ -916,10 +916,7 @@ impl AiGateway {
             }
             let idx = AUTO_POOL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as usize;
             let entry = healthy[idx % healthy.len()];
-            let provider = match hot.providers.get(&entry.provider) {
-                Some(p) => Arc::clone(p),
-                None => return None,
-            };
+            let provider = Arc::clone(hot.providers.get(&entry.provider)?);
             ctx.provider_name = entry.provider.clone();
             ctx.auto_target = Some((entry.provider.clone(), entry.model.clone()));
             ctx.model = entry.model.clone();

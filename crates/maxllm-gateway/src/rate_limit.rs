@@ -74,7 +74,7 @@ pub fn resolve_from_headers(headers: &http::HeaderMap) -> Option<(u64, &'static 
         "anthropic-ratelimit-unified-reset",
     ] {
         if let Some(v) = header_str(headers, name) {
-            if let Some(ms) = parse_iso8601_ms(&v) {
+            if let Some(ms) = parse_iso8601_ms(v) {
                 return Some((ms, "anthropic_reset_header"));
             }
         }
@@ -82,7 +82,7 @@ pub fn resolve_from_headers(headers: &http::HeaderMap) -> Option<(u64, &'static 
 
     // Epoch seconds (OpenAI x-ratelimit-reset, GitHub-style).
     if let Some(v) = header_str(headers, "x-ratelimit-reset") {
-        if let Some(ms) = parse_epoch_seconds_ms(&v) {
+        if let Some(ms) = parse_epoch_seconds_ms(v) {
             return Some((ms, "x_ratelimit_reset"));
         }
     }
@@ -90,7 +90,7 @@ pub fn resolve_from_headers(headers: &http::HeaderMap) -> Option<(u64, &'static 
     // OpenAI / Azure durations: "1s", "6m0s", "1h2m3s", "120ms".
     for name in &["x-ratelimit-reset-requests", "x-ratelimit-reset-tokens"] {
         if let Some(v) = header_str(headers, name) {
-            if let Some(ms) = parse_duration_ms(&v) {
+            if let Some(ms) = parse_duration_ms(v) {
                 return Some((now_ms + ms, name_static(name)));
             }
         }
@@ -110,7 +110,7 @@ pub fn resolve_from_headers(headers: &http::HeaderMap) -> Option<(u64, &'static 
         if let Ok(secs) = v.trim().parse::<u64>() {
             return Some((now_ms + secs * 1000, "retry_after_seconds"));
         }
-        if let Some(ms) = parse_http_date_ms(&v) {
+        if let Some(ms) = parse_http_date_ms(v) {
             return Some((ms, "retry_after_http_date"));
         }
     }
@@ -400,7 +400,8 @@ fn parse_date_shape(s: &str) -> Option<(u64, usize, String)> {
     let mut time = String::new();
     let mut has_time = false;
     if idx < b.len() && (b[idx] == b'T' || b[idx] == b't' || b[idx] == b' ') {
-        let sep_len = if b[idx] == b' ' { 1 } else { 1 };
+        // The separator is one byte wide, whichever of 'T' / 't' / ' ' it is.
+        let sep_len = 1;
         let t = &s[idx + sep_len..];
         if let Some((parsed, used)) = parse_time_shape(t) {
             time = parsed;
@@ -503,28 +504,31 @@ fn parse_time_shape(s: &str) -> Option<(String, usize)> {
 
     // Optional seconds. `<=` (not `<`): a timestamp may end exactly at the
     // end of the message ("…resets at 2099-06-15 12:00:00").
-    if idx + 1 < b.len() && b[idx] == b':' && b[idx + 1].is_ascii_digit() {
-        if idx + 3 <= b.len() && b[idx + 2].is_ascii_digit() {
-            let ss: u32 = s[idx + 1..idx + 3].parse().ok()?;
-            if ss > 59 {
-                return None;
-            }
-            time.push_str(&format!(":{:02}", ss));
-            idx += 3;
+    if idx + 1 < b.len()
+        && b[idx] == b':'
+        && b[idx + 1].is_ascii_digit()
+        && idx + 3 <= b.len()
+        && b[idx + 2].is_ascii_digit()
+    {
+        let ss: u32 = s[idx + 1..idx + 3].parse().ok()?;
+        if ss > 59 {
+            return None;
+        }
+        time.push_str(&format!(":{:02}", ss));
+        idx += 3;
 
-            // Optional fractional seconds.
-            if idx < b.len() && b[idx] == b'.' {
-                let frac_start = idx + 1;
-                let mut frac_end = frac_start;
-                while frac_end < b.len() && b[frac_end].is_ascii_digit() {
-                    frac_end += 1;
-                }
-                if frac_end > frac_start {
-                    let frac = &s[frac_start..frac_end.min(frac_start + 3)];
-                    time.push('.');
-                    time.push_str(frac);
-                    idx = frac_end;
-                }
+        // Optional fractional seconds.
+        if idx < b.len() && b[idx] == b'.' {
+            let frac_start = idx + 1;
+            let mut frac_end = frac_start;
+            while frac_end < b.len() && b[frac_end].is_ascii_digit() {
+                frac_end += 1;
+            }
+            if frac_end > frac_start {
+                let frac = &s[frac_start..frac_end.min(frac_start + 3)];
+                time.push('.');
+                time.push_str(frac);
+                idx = frac_end;
             }
         }
     }
