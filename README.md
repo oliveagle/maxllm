@@ -805,6 +805,7 @@ Available at `GET /metrics` when enabled:
 | `circuit_breaker_state` | provider | Gauge |
 | `circuit_breaker_transitions_total` | provider | Gauge |
 | `circuit_breaker_quota_opens_total` | provider | Counter |
+| `provider_inflight_requests` | provider | Gauge |
 
 `requests_total` counts each request that reached a provider, once, with the
 provider that served it (after any failover), the model and the upstream

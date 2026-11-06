@@ -37,6 +37,9 @@ pub struct GatewayMetrics {
     /// Failovers caused by an upstream HTTP error (the request is retried on
     /// the next provider of the route's fallback chain).
     pub http_failovers_total: IntCounterVec,
+    /// Requests currently in flight per provider — the live view of the
+    /// least-connections routing decision.
+    pub provider_inflight_requests: IntGaugeVec,
 }
 
 impl GatewayMetrics {
@@ -179,6 +182,18 @@ impl GatewayMetrics {
             .register(Box::new(http_failovers_total.clone()))
             .expect("register");
 
+        let provider_inflight_requests = IntGaugeVec::new(
+            Opts::new(
+                "maxllm_provider_inflight_requests",
+                "Requests currently in flight per provider",
+            ),
+            &["provider"],
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(provider_inflight_requests.clone()))
+            .expect("register");
+
         Self {
             registry,
             requests_total,
@@ -195,6 +210,7 @@ impl GatewayMetrics {
             circuit_breaker_transitions_total,
             circuit_breaker_quota_opens_total,
             http_failovers_total,
+            provider_inflight_requests,
         }
     }
 

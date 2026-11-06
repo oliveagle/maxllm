@@ -4678,3 +4678,149 @@ async fn test_cost_based_routes_to_the_cheapest_provider() {
     );
     assert_eq!(cheap_reqs.len(), 1);
 }
+
+const INFLIGHT_CONFIG: &str = r#"
+global_plugins = ["request_id", "api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[metrics]
+enabled = true
+
+[plugins.request_id]
+category = "request_id"
+header_name = "X-Request-Id"
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.a]
+kind = "openai"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+default_model = "gpt-4o"
+
+[providers.b]
+kind = "openai"
+base_url = "{FALLBACK_URL}"
+api_key = "fake-key"
+default_model = "gpt-4o-mini"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "a"
+fallback = ["b"]
+strategy = "least_connections"
+"#;
+
+/// The per-provider in-flight gauge is derived from the counter the
+/// least-connections router reads, so it must return to zero once a request
+/// finishes — proving the acquire/release wiring in the real request path.
+#[tokio::test]
+async fn test_provider_inflight_gauge_returns_to_zero() {
+    let a = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("ok")))
+        .mount(&a)
+        .await;
+
+    let gw = TestGateway::start(INFLIGHT_CONFIG, &a.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&chat_body("gpt-4o", "hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let text = c.get(gw.url("/metrics")).send().await.unwrap().text().await.unwrap();
+    let series = text
+        .lines()
+        .find(|l| {
+            l.starts_with("maxllm_provider_inflight_requests")
+                && l.contains("provider=\"a\"")
+        })
+        .unwrap_or_else(|| panic!("inflight series missing:\\n{text}"));
+    let value: f64 = series.rsplit_once(' ').unwrap().1.parse().unwrap();
+    assert_eq!(value, 0.0, "the in-flight count must settle back to 0: {series}");
+}
+
+/// The least-connections strategy is no longer a proxy for the failure
+/// count: a provider that already has a request in flight is skipped in
+/// favour of the idle one.
+#[tokio::test]
+async fn test_least_connections_skips_the_busy_provider() {
+    let a = MockServer::start().await;
+    let b = MockServer::start().await;
+
+    // Provider "a" holds the matching request for 400 ms; everything else
+    // answers instantly. wiremock tries mocks in registration order (the
+    // first mounted mock wins), so the specific matcher is mounted first.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("hold"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(openai_response("held"))
+                .set_delay(Duration::from_millis(400)),
+        )
+        .mount(&a)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("quick")))
+        .mount(&a)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("quick")))
+        .mount(&b)
+        .await;
+
+    let gw = TestGateway::start_with_fallback(INFLIGHT_CONFIG, &a.uri(), &b.uri()).await;
+    let c = client();
+
+    // Start a request that stays in flight on "a". `send()` returns a lazy
+    // future — spawn it so it actually runs while the next request selects.
+    let slow = {
+        let url = gw.url("/v1/chat/completions");
+        tokio::spawn(async move {
+            Client::new()
+                .post(url)
+                .header("Authorization", "Bearer test-key-123")
+                .json(&chat_body("gpt-4o", "hold"))
+                .send()
+                .await
+                .unwrap()
+        })
+    };
+    // Give the gateway time to select the provider and count the request.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    // While "a" is busy, the second request must route to the idle "b".
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&chat_body("gpt-4o", "now"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()["X-MaxLLM-Provider"], "b",
+        "the least-connections route must skip the busy provider"
+    );
+
+    let slow = slow.await.unwrap();
+    assert_eq!(slow.status(), 200);
+    assert_eq!(slow.headers()["X-MaxLLM-Provider"], "a");
+}

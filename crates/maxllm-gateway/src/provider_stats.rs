@@ -75,6 +75,19 @@ pub fn release(provider: &str) {
     }
 }
 
+/// All providers with requests currently in flight, as (provider, count).
+/// Feeds the Prometheus gauge, so the least-connections decision is
+/// observable — the gauge is derived here rather than incremented
+/// separately, so it can never drift from the counter the router reads.
+pub fn inflight_counts() -> Vec<(String, u64)> {
+    INFLIGHT
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|(k, v)| (k.clone(), *v))
+        .collect()
+}
+
 /// Requests currently routed to `provider`.
 pub fn inflight(provider: &str) -> u64 {
     INFLIGHT

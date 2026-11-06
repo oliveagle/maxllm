@@ -1135,6 +1135,14 @@ impl ProxyHttp for AiGateway {
         // gauge, and the exposition must not include the scrape itself —
         // otherwise the gauge could never read 0 while it is being scraped.
         if path == "/metrics" && hot.metrics_enabled {
+            // The in-flight gauge is derived from the counter the
+            // least-connections router reads, so it can never drift.
+            for (provider, count) in crate::provider_stats::inflight_counts() {
+                METRICS
+                    .provider_inflight_requests
+                    .with_label_values(&[&provider])
+                    .set(count as i64);
+            }
             let body = METRICS.encode();
             let content_len = body.len().to_string();
             let mut resp = ResponseHeader::build(200, Some(2))?;
