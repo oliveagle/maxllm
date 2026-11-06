@@ -64,6 +64,8 @@ impl TestGateway {
             .arg("--config")
             .arg(config_file.path())
             .env("RUST_LOG", "warn")
+            .env("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE")
+            .env("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY")
             // Unset proxy env vars to avoid TLS issues
             .env_remove("HTTPS_PROXY")
             .env_remove("HTTP_PROXY")
@@ -4833,4 +4835,171 @@ async fn test_least_connections_skips_the_busy_provider() {
     let slow = slow.await.unwrap();
     assert_eq!(slow.status(), 200);
     assert_eq!(slow.headers()["X-MaxLLM-Provider"], "a");
+}
+
+
+// ---------------------------------------------------------------------------
+// Bedrock SigV4 tests
+// ---------------------------------------------------------------------------
+
+const BEDROCK_CONFIG: &str = r#"
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[metrics]
+enabled = true
+
+[providers.bedrock_mock]
+kind = "bedrock"
+base_url = "{MOCK_URL}"
+region = "us-east-1"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "bedrock_mock"
+"#;
+
+#[tokio::test]
+async fn test_bedrock_sigv4_signs_request_and_routes_model_into_path() {
+    let mock = MockServer::start().await;
+    let model_id = "test-claude-haiku";
+
+    // The gateway should POST to /model/{model_id}/invoke with SigV4 headers.
+    Mock::given(method("POST"))
+        .and(path(format!("/model/{model_id}/invoke")))
+        .and(header_exists("Authorization"))
+        .and(header_exists("X-Amz-Date"))
+        .and(header_exists("X-Amz-Content-Sha256"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "msg_bedrock_test",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "Hello from Bedrock!"}],
+            "model": model_id,
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 8, "output_tokens": 4}
+        })))
+        .mount(&mock)
+        .await;
+
+    let gw = TestGateway::start(BEDROCK_CONFIG, &mock.uri()).await;
+
+    let body = chat_body(model_id, "Hello!");
+    let resp = client()
+        .post(gw.url("/v1/chat/completions"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap();
+
+    assert_eq!(status, 200, "body: {text}");
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(parsed["object"], "chat.completion");
+    assert_eq!(
+        parsed["choices"][0]["message"]["content"],
+        "Hello from Bedrock!"
+    );
+    assert_eq!(parsed["usage"]["prompt_tokens"], 8);
+    assert_eq!(parsed["usage"]["completion_tokens"], 4);
+
+    // Verify the Authorization header structure on the upstream call.
+    let received = mock.received_requests().await.unwrap();
+    assert_eq!(received.len(), 1);
+    let auth = received[0]
+        .headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(auth.starts_with("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/"), "auth: {auth}");
+    assert!(auth.contains("/us-east-1/bedrock/aws4_request"), "auth: {auth}");
+    assert!(auth.contains("SignedHeaders=host;x-amz-content-sha256;x-amz-date"), "auth: {auth}");
+    assert!(auth.contains("Signature="), "auth: {auth}");
+
+    // Verify the Content-Sha256 header matches the body hash.
+    let body_hash = {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(&received[0].body);
+        hasher.finalize()
+    };
+    let expected_hash: String = body_hash.iter().map(|b| format!("{b:02x}")).collect();
+    let sent_hash = received[0]
+        .headers
+        .get("x-amz-content-sha256")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert_eq!(sent_hash, expected_hash, "payload hash mismatch");
+}
+
+#[tokio::test]
+async fn test_bedrock_sigv4_error_response_forwarded() {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/model/nonexistent-model/invoke"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "__type": "ResourceNotFoundException",
+            "message": "Could not find model"
+        })))
+        .mount(&mock)
+        .await;
+
+    let gw = TestGateway::start(BEDROCK_CONFIG, &mock.uri()).await;
+
+    let body = chat_body("nonexistent-model", "Hi");
+    let resp = client()
+        .post(gw.url("/v1/chat/completions"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 404);
+    let parsed: Value = resp.json().await.unwrap();
+    assert_eq!(parsed["__type"], "ResourceNotFoundException");
+}
+
+#[tokio::test]
+async fn test_bedrock_sigv4_streaming_response_translated() {
+    let mock = MockServer::start().await;
+
+    // Bedrock streaming returns Anthropic SSE events.
+    let sse_body = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stream\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"test-model\",\"stop_reason\":null,\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n\
+event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n\
+event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n\
+event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+    Mock::given(method("POST"))
+        .and(path("/model/stream-test-model/invoke-with-response-stream"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(sse_body)
+                .append_header("Content-Type", "text/event-stream"),
+        )
+        .mount(&mock)
+        .await;
+
+    let gw = TestGateway::start(BEDROCK_CONFIG, &mock.uri()).await;
+
+    let body = json!({
+        "model": "stream-test-model",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": true
+    });
+    let resp = client()
+        .post(gw.url("/v1/chat/completions"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap();
+    assert_eq!(status, 200, "streaming body: {text}");
+
+    // The translated stream should contain OpenAI-format SSE chunks.
+    assert!(text.contains("data: "), "expected SSE data lines in: {text}");
+    assert!(text.contains("chat.completion.chunk"), "expected OpenAI chunk format in: {text}");
 }

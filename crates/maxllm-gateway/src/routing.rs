@@ -151,6 +151,7 @@ mod tests {
                 port: 443,
                 tls: true,
                 sni: "localhost".to_string(),
+                region: None,
                 weight,
                 tags: vec![],
                 default_model: None,

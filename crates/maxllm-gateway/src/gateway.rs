@@ -223,6 +223,8 @@ pub struct ProviderState {
     pub port: u16,
     pub tls: bool,
     pub sni: String,
+    /// AWS region for Bedrock SigV4 signing (from the provider config).
+    pub region: Option<String>,
     pub weight: u32,
     #[allow(dead_code)]
     pub tags: Vec<String>,
@@ -398,6 +400,7 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
                 port,
                 tls,
                 sni: host,
+                region: conf.region.clone(),
                 weight: conf.weight,
                 tags: conf.tags.clone(),
                 default_model: conf.default_model.clone(),
@@ -982,6 +985,198 @@ impl AiGateway {
 
         Ok(true)
     }
+
+    /// Handle a Bedrock request end-to-end using an out-of-band HTTP client.
+    ///
+    /// Bedrock authenticates with AWS Signature Version 4, whose signature
+    /// covers the SHA-256 of the translated request payload. The exact bytes
+    /// must be known before the request headers are written. Pingora's proxy
+    /// pipeline streams body chunks after the headers have already been
+    /// sent, so the payload hash cannot be embedded in the `Authorization`
+    /// header there. Bedrock requests are therefore read, translated, signed
+    /// and sent via `reqwest` (which buffers the full body), and the
+    /// response is translated back and written to the client before
+    /// returning. Metrics (`requests_total`, tokens, latency) are still
+    /// recorded by the `logging` hook that runs after `request_filter`
+    /// returns `Ok(true)`.
+    async fn handle_bedrock_request(
+        &self,
+        session: &mut Session,
+        ctx: &mut RequestCtx,
+        provider: &Arc<ProviderState>,
+    ) -> pingora::Result<()> {
+        // 1. Read the full client body.
+        let mut client_body = Vec::new();
+        while let Some(chunk) = session.read_request_body().await? {
+            client_body.extend_from_slice(&chunk);
+        }
+
+        // 2. Extract the model (for metrics and alias resolution).
+        let hot = self.hot.load();
+        if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&client_body) {
+            if let Some(m) = parsed.get("model").and_then(|v| v.as_str()) {
+                let resolved = Self::resolve_model_alias(&hot, m);
+                ctx.model = resolved.clone();
+                ctx.plugin_ctx.model = resolved;
+            }
+        }
+        drop(hot);
+
+        // 3. Translate OpenAI → Bedrock/Anthropic format.
+        let translated = provider
+            .translator
+            .translate_request(&client_body, None)
+            .map_err(|e| {
+                pingora::Error::explain(
+                    pingora::ErrorType::HTTPStatus(400),
+                    format!("Bedrock body translation failed: {e}"),
+                )
+            })?;
+        let is_streaming = translated.is_streaming;
+        ctx.is_streaming = is_streaming;
+
+        // 4. Build the model-specific Bedrock path.
+        let model_id = provider
+            .translator
+            .as_any()
+            .downcast_ref::<maxllm_translate::bedrock::BedrockTranslator>()
+            .map(|b| b.last_model_id())
+            .or_else(|| provider.default_model.clone())
+            .unwrap_or_else(|| "anthropic.claude-sonnet-4-20250514-v1:0".into());
+        let path = maxllm_translate::bedrock::BedrockTranslator::path_for(&model_id, is_streaming);
+
+        // 5. Sign the request with SigV4.
+        let access_key = std::env::var("AWS_ACCESS_KEY_ID").unwrap_or_default();
+        let secret_key = std::env::var("AWS_SECRET_ACCESS_KEY").unwrap_or_default();
+        let region = provider
+            .region
+            .clone()
+            .or_else(|| std::env::var("AWS_REGION").ok())
+            .unwrap_or_else(|| "us-east-1".into());
+        let amz_date = maxllm_translate::aws_sigv4::amz_date_now();
+        let credentials = maxllm_translate::aws_sigv4::AwsCredentials {
+            access_key: &access_key,
+            secret_key: &secret_key,
+            region: &region,
+        };
+        let signed = maxllm_translate::aws_sigv4::sign_bedrock(
+            "POST",
+            &path,
+            &provider.host,
+            &translated.body,
+            &credentials,
+            &amz_date,
+        );
+
+        // 6. Build the URL.
+        let scheme = if provider.tls { "https" } else { "http" };
+        let default_port = if provider.tls { 443 } else { 80 };
+        let url = if provider.port != default_port {
+            format!("{scheme}://{}:{}{}", provider.host, provider.port, path)
+        } else {
+            format!("{scheme}://{}{}", provider.host, path)
+        };
+
+        // 7. Send via reqwest.
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(&url)
+            .header("Host", &provider.host)
+            .header("X-Amz-Date", &signed.amz_date)
+            .header("X-Amz-Content-Sha256", &signed.content_sha256)
+            .header("Authorization", &signed.authorization)
+            .header("Content-Type", "application/json")
+            .header("anthropic-version", "bedrock-2023-05-31")
+            .body(translated.body.clone())
+            .send()
+            .await
+            .map_err(|e| {
+                pingora::Error::explain(
+                    pingora::ErrorType::ConnectError,
+                    format!("Bedrock upstream request failed: {e}"),
+                )
+            })?;
+        let status = resp.status().as_u16();
+        ctx.upstream_status = status;
+
+        if status >= 400 {
+            // Forward Bedrock error responses as-is.
+            let body = resp.bytes().await.map_err(|e| {
+                pingora::Error::explain(
+                    pingora::ErrorType::ReadError,
+                    format!("Bedrock error response read failed: {e}"),
+                )
+            })?;
+            let body_bytes = body.to_vec();
+            let content_len = body_bytes.len().to_string();
+            let mut resp_header = ResponseHeader::build(status, Some(2))?;
+            resp_header.insert_header("Content-Type", "application/json")?;
+            resp_header.insert_header("Content-Length", &content_len)?;
+            session.write_response_header(Box::new(resp_header), false).await?;
+            session.write_response_body(Some(Bytes::from(body_bytes)), true).await?;
+            return Ok(());
+        }
+
+        if is_streaming {
+            // Streaming: forward SSE chunks through the stream translator.
+            let mut stream_translator = provider.translator.streaming_translator();
+            let mut resp_header = ResponseHeader::build(200, Some(3))?;
+            resp_header.insert_header("Content-Type", "text/event-stream")?;
+            resp_header.insert_header("Cache-Control", "no-cache")?;
+            resp_header.insert_header("Connection", "keep-alive")?;
+            session.write_response_header(Box::new(resp_header), false).await?;
+
+            let mut resp = resp;
+            let mut buffer = Vec::new();
+            while let Some(chunk) = resp.chunk().await.map_err(|e| {
+                pingora::Error::explain(
+                    pingora::ErrorType::ReadError,
+                    format!("Bedrock stream read failed: {e}"),
+                )
+            })? {
+                buffer.extend_from_slice(&chunk);
+                let out = stream_translator.process_chunk(&buffer, false);
+                if !out.is_empty() {
+                    session.write_response_body(Some(Bytes::from(out)), false).await?;
+                }
+                buffer.clear();
+            }
+            // Flush any remaining buffered SSE data.
+            let out = stream_translator.process_chunk(&buffer, true);
+            if !out.is_empty() {
+                session.write_response_body(Some(Bytes::from(out)), false).await?;
+            }
+            session.write_response_body(Some(Bytes::new()), true).await?;
+        } else {
+            // Non-streaming: read the full response and translate.
+            let body = resp.bytes().await.map_err(|e| {
+                pingora::Error::explain(
+                    pingora::ErrorType::ReadError,
+                    format!("Bedrock response read failed: {e}"),
+                )
+            })?;
+            let translated_resp = provider.translator.translate_response(&body).map_err(|e| {
+                pingora::Error::explain(
+                    pingora::ErrorType::HTTPStatus(502),
+                    format!("Bedrock response translation failed: {e}"),
+                )
+            })?;
+            // Extract tokens for metrics.
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&translated_resp) {
+                if let Some(usage) = v.get("usage") {
+                    copy_usage_tokens(usage, ctx);
+                }
+            }
+            let content_len = translated_resp.len().to_string();
+            let mut resp_header = ResponseHeader::build(200, Some(2))?;
+            resp_header.insert_header("Content-Type", "application/json")?;
+            resp_header.insert_header("Content-Length", &content_len)?;
+            session.write_response_header(Box::new(resp_header), false).await?;
+            session.write_response_body(Some(Bytes::from(translated_resp)), true).await?;
+        }
+
+        Ok(())
+    }
 }
 
 /// Buffer one `request_body_filter` chunk, keeping the upstream body open
@@ -1283,6 +1478,22 @@ impl ProxyHttp for AiGateway {
                 .await;
             }
         };
+
+        // ── Bedrock SigV4 path ──
+        // Bedrock authenticates with AWS SigV4, whose signature covers the
+        // SHA-256 of the translated request payload. The exact bytes must be
+        // known before the request headers are written. Pingora's proxy
+        // pipeline streams body chunks after the headers have been sent, so
+        // the payload hash cannot be embedded in the Authorization header
+        // there. Bedrock requests are therefore read, translated, signed and
+        // sent via reqwest in `handle_bedrock_request` (which buffers the
+        // full body), and the response is translated back before returning.
+        if let Some(provider) = hot.providers.get(&ctx.provider_name) {
+            if provider.kind == maxllm_config::ProviderKind::Bedrock {
+                self.handle_bedrock_request(session, ctx, provider).await?;
+                return Ok(true);
+            }
+        }
 
         // Sync plugin ctx with request ctx
         ctx.plugin_ctx.provider_name = ctx.provider_name.clone();
@@ -4925,6 +5136,7 @@ mod failover_policy_tests {
             port: 9,
             tls: false,
             sni: "127.0.0.1".to_string(),
+            region: None,
             weight: 100,
             tags: vec![],
             default_model: default_model.map(|m| m.to_string()),
