@@ -7,7 +7,9 @@ global_plugins = ["request_id", "api_auth"]
 [server]
 listen = "0.0.0.0:8080"
 threads = 4
+# SO_REUSEPORT on the listening socket (kernel-level load balancing).
 # tcp_reuseport = true
+# TCP fast open backlog on the listening socket.
 # tcp_fastopen = 256
 # Seconds to drain in-flight requests on SIGTERM before the runtimes are
 # torn down. Pingora's own default is 300s, which outlives the service
@@ -226,6 +228,10 @@ fallback = ["anthropic"]
 timeout_secs = 120
 strategy = "fallback"
 plugins = ["rate_limiter", "cors"]
+# Replay a transient 5xx on the same provider before walking the fallback
+# chain (0 = disabled):
+# num_retries = 2
+# retry_backoff_ms = 500
 # guardrails = ["injection-guard", "pii-check", "secret-scan"]  # Only these guardrails run for this route
 
 [[routes]]

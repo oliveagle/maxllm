@@ -8,6 +8,8 @@ use reqwest::Client;
 use serde_json::{json, Value};
 use std::io::Write;
 use std::process::{Child, Command};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use wiremock::matchers::{body_string_contains, header, header_exists, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -5328,6 +5330,164 @@ async fn create_virtual_key_with_limits(
     );
     let parsed: Value = resp.json().await.unwrap();
     parsed["key"].as_str().unwrap().to_string()
+}
+
+const SAME_PROVIDER_RETRY_CONFIG: &str = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[metrics]
+enabled = true
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.primary]
+kind = "openai"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+
+[providers.backup]
+kind = "openai"
+base_url = "{FALLBACK_URL}"
+api_key = "fake-key"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "primary"
+fallback = ["backup"]
+strategy = "fallback"
+num_retries = 1
+retry_backoff_ms = 10
+"#;
+
+/// `num_retries` is wired: the first transient 5xx from the primary is
+/// retried on the SAME provider (after `retry_backoff_ms`), and when that
+/// retry succeeds the fallback chain is never touched.
+#[tokio::test]
+async fn test_num_retries_replays_a_transient_error_on_the_same_provider() {
+    let primary = MockServer::start().await;
+    let fallback = MockServer::start().await;
+
+    // The primary answers 500 once, then 200: the same-provider retry must
+    // hit the success. A closure is needed because wiremock mocks always
+    // match (the request log, not `expect`, decides what the second call
+    // sees).
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+    Mock::given(method("POST"))
+        .respond_with(move |_req: &wiremock::Request| {
+            if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(500).set_body_json(json!({"error": "transient"}))
+            } else {
+                ResponseTemplate::new(200).set_body_json(openai_response("from primary retry"))
+            }
+        })
+        .mount(&primary)
+        .await;
+    // The fallback must never be reached when the same-provider retry wins.
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("never")))
+        .mount(&fallback)
+        .await;
+
+    let gw = TestGateway::start_with_fallback(
+        SAME_PROVIDER_RETRY_CONFIG,
+        &primary.uri(),
+        &fallback.uri(),
+    )
+    .await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&chat_body("gpt-4o", "hi"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200, "the retried attempt must succeed");
+    assert_eq!(
+        resp.headers().get("X-MaxLLM-Provider").unwrap(),
+        "primary",
+        "the same-provider retry must serve the request on the primary"
+    );
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["choices"][0]["message"]["content"],
+        "from primary retry"
+    );
+
+    let primary_reqs = primary.received_requests().await.unwrap();
+    assert_eq!(
+        primary_reqs.len(),
+        2,
+        "the primary must be tried twice (500 then the retry)"
+    );
+    let fallback_reqs = fallback.received_requests().await.unwrap_or_default();
+    assert!(
+        fallback_reqs.is_empty(),
+        "the fallback must stay untouched when the same-provider retry succeeds"
+    );
+}
+
+/// When the same-provider retry budget is exhausted (every attempt still
+/// answers 5xx), the request walks on to the fallback chain as before: the
+/// primary is tried `num_retries + 1` times, the fallback once.
+#[tokio::test]
+async fn test_num_retries_exhausted_falls_over_to_the_fallback() {
+    let primary = MockServer::start().await;
+    let fallback = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500).set_body_json(json!({"error": "still down"})))
+        .mount(&primary)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from fallback")))
+        .mount(&fallback)
+        .await;
+
+    let gw = TestGateway::start_with_fallback(
+        SAME_PROVIDER_RETRY_CONFIG,
+        &primary.uri(),
+        &fallback.uri(),
+    )
+    .await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&chat_body("gpt-4o", "hi"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200, "the fallback must serve the request");
+    assert_eq!(resp.headers().get("X-MaxLLM-Provider").unwrap(), "backup");
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "from fallback");
+
+    let primary_reqs = primary.received_requests().await.unwrap();
+    assert_eq!(
+        primary_reqs.len(),
+        2,
+        "num_retries = 1 must try the primary twice before failing over"
+    );
+    let fallback_reqs = fallback.received_requests().await.unwrap_or_default();
+    assert_eq!(
+        fallback_reqs.len(),
+        1,
+        "the fallback must serve exactly the exhausted retry"
+    );
 }
 
 const LEGACY_AUTH_CONFIG: &str = r#"

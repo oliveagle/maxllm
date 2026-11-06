@@ -197,6 +197,9 @@ const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 /// migrated one-api channel pool).
 const DEFAULT_MAX_FAILOVER_ATTEMPTS: u32 = 6;
 
+/// Default backoff between two same-provider retries, in milliseconds.
+const DEFAULT_RETRY_BACKOFF_MS: u64 = 500;
+
 /// Derive the native Responses path from a chat completions path.
 /// `/zen/go/v1/chat/completions` → `/zen/go/v1/responses`.
 fn derive_responses_path(chat_path: &str) -> Option<String> {
@@ -1400,6 +1403,20 @@ fn max_failover_attempts(routes: &[RouteConfig], route_index: Option<usize>) -> 
         .unwrap_or(DEFAULT_MAX_FAILOVER_ATTEMPTS)
 }
 
+/// The route's same-provider retry budget: how many times a transient
+/// upstream failure (HTTP 5xx) may be retried on the SAME provider before
+/// the request moves to the next provider of the fallback chain, plus the
+/// backoff to wait between those retries.
+///
+/// Unset (or absent) routes keep the built-in default: no same-provider
+/// retry at all — a failed attempt walks straight to the fallback chain.
+fn same_provider_retries(routes: &[RouteConfig], route_index: Option<usize>) -> (u32, u64) {
+    route_index
+        .and_then(|i| routes.get(i))
+        .map(|r| (r.num_retries, r.retry_backoff_ms))
+        .unwrap_or((0, DEFAULT_RETRY_BACKOFF_MS))
+}
+
 /// Whether an upstream HTTP status means "this provider failed" rather than
 /// "this request is wrong" — i.e. whether another provider of the pool may
 /// still serve the request.
@@ -1853,6 +1870,15 @@ impl ProxyHttp for AiGateway {
         upstream_request: &mut RequestHeader,
         ctx: &mut Self::CTX,
     ) -> pingora::Result<()> {
+        // A same-provider retry carries a backoff to wait before the next
+        // attempt, so a transient upstream error is not hammered again
+        // immediately. Consumed here — before the request is (re)sent — and
+        // cleared, so only the retried attempt waits.
+        if let Some(backoff_ms) = ctx.pending_retry_backoff_ms.take() {
+            if backoff_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+            }
+        }
         let hot = self.hot.load();
         let provider = match hot.providers.get(&ctx.provider_name) {
             Some(p) => p,
@@ -2959,6 +2985,42 @@ impl ProxyHttp for AiGateway {
         };
         if !should_failover_status(status, ctx, provider) {
             return Ok(());
+        }
+        // A 5xx is a transient provider failure: when the route allows it
+        // (`num_retries`), retry the SAME provider — spaced by
+        // `retry_backoff_ms` — before burning a provider of the fallback
+        // chain. Deterministic rejections (429 quota, 401/403 auth, 404
+        // missing model) are never retried on the same provider: the
+        // upstream would answer the same way again. A connect failure fails
+        // over too (`fail_to_connect`) — the provider is unreachable, not
+        // flaky.
+        if (500..=599).contains(&status) && !provider.circuit_breaker.is_open() {
+            let (num_retries, backoff_ms) = same_provider_retries(&hot.routes, ctx.route_index);
+            if ctx.provider_retry_count < num_retries {
+                ctx.provider_retry_count += 1;
+                ctx.pending_retry_backoff_ms = Some(backoff_ms);
+                METRICS
+                    .provider_retries_total
+                    .with_label_values(&[&ctx.provider_name, &status.to_string()])
+                    .inc();
+                info!(
+                    status = %status,
+                    provider = %ctx.provider_name,
+                    retry = ctx.provider_retry_count,
+                    backoff_ms = %backoff_ms,
+                    "upstream answered with a transient error — retrying the same provider"
+                );
+                let mut e = pingora::Error::explain(
+                    pingora::ErrorType::HTTPStatus(status),
+                    format!(
+                        "provider '{}' answered {status}; retrying the same provider (retry {})",
+                        ctx.provider_name, ctx.provider_retry_count
+                    ),
+                );
+                e.as_up();
+                e.set_retry(true);
+                return Err(e);
+            }
         }
         if ctx.failover_count >= max_failover_attempts(&hot.routes, ctx.route_index) {
             info!(
@@ -4381,6 +4443,9 @@ impl AiGateway {
         let (name, fallback) = self.next_fallback_provider(ctx)?;
         let failed_provider = ctx.provider_name.clone();
         ctx.failover_count += 1;
+        // The new provider starts with a fresh same-provider retry budget.
+        ctx.provider_retry_count = 0;
+        ctx.pending_retry_backoff_ms = None;
         ctx.attempted_providers.push(failed_provider.clone());
         ctx.fallback_used = true;
         if ctx.original_provider.is_none() {

@@ -576,6 +576,24 @@ provider's answer is discarded and the whole upstream attempt — including the
 request-body translation — is replayed on the next provider. When every
 provider of the pool fails, the client receives the **last** provider's error.
 
+A transient server error can also be replayed on the **same** provider before
+the pool is walked at all — `num_retries` (default 0) is the number of such
+retries and `retry_backoff_ms` (default 500) the pause between them:
+
+```toml
+[[routes]]
+path = "/v1/chat/completions"
+provider = "openai"
+fallback = ["anthropic"]
+num_retries = 2          # replay a 5xx on the same provider twice
+retry_backoff_ms = 250   # pause between those retries
+```
+
+Only HTTP 5xx is retried this way: a 429 (quota exhausted), a 401/403 (auth
+rejected) or a 404 (model missing) would be answered the same way again, so
+those move on to the next provider immediately, as does a connect failure. A
+retry is also skipped once the provider's circuit breaker is open.
+
 ```toml
 [[routes]]
 path = "/v1/responses"
@@ -592,7 +610,9 @@ before it is sent, so a raw chat body is never forwarded as-is.
 
 Prometheus metrics: `maxllm_http_failovers_total{from_provider,to_provider,
 status}` counts each HTTP-error failover; `maxllm_fallbacks_total` counts
-every provider switch (connect + HTTP).
+every provider switch (connect + HTTP);
+`maxllm_provider_retries_total{provider,status}` counts the same-provider
+retries.
 
 ### Rate-limit resolution (exact reset time)
 

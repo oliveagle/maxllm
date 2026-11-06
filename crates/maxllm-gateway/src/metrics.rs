@@ -37,6 +37,9 @@ pub struct GatewayMetrics {
     /// Failovers caused by an upstream HTTP error (the request is retried on
     /// the next provider of the route's fallback chain).
     pub http_failovers_total: IntCounterVec,
+    /// Same-provider retries after a transient upstream HTTP error (5xx),
+    /// per provider and status. The route's `num_retries` bounds them.
+    pub provider_retries_total: IntCounterVec,
     /// Requests currently in flight per provider — the live view of the
     /// least-connections routing decision.
     pub provider_inflight_requests: IntGaugeVec,
@@ -182,6 +185,18 @@ impl GatewayMetrics {
             .register(Box::new(http_failovers_total.clone()))
             .expect("register");
 
+        let provider_retries_total = IntCounterVec::new(
+            Opts::new(
+                "maxllm_provider_retries_total",
+                "Same-provider retries after a transient upstream HTTP error",
+            ),
+            &["provider", "status"],
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(provider_retries_total.clone()))
+            .expect("register");
+
         let provider_inflight_requests = IntGaugeVec::new(
             Opts::new(
                 "maxllm_provider_inflight_requests",
@@ -210,6 +225,7 @@ impl GatewayMetrics {
             circuit_breaker_transitions_total,
             circuit_breaker_quota_opens_total,
             http_failovers_total,
+            provider_retries_total,
             provider_inflight_requests,
         }
     }

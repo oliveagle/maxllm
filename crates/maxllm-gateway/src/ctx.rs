@@ -94,6 +94,15 @@ pub struct RequestCtx {
     /// switches to the next provider of the route's fallback chain and
     /// counts here; the route's `max_failover_attempts` bounds the walk.
     pub failover_count: u32,
+    /// How many times this request already retried the SAME provider after a
+    /// transient upstream error (HTTP 5xx). The route's `num_retries` bounds
+    /// it; the counter is reset when the request moves to the next provider
+    /// of the fallback chain (`switch_to_fallback`).
+    pub provider_retry_count: u32,
+    /// Backoff (ms) to wait before the next upstream attempt. Set when a
+    /// same-provider retry is scheduled; consumed (and cleared) by
+    /// `upstream_request_filter` on the retried attempt.
+    pub pending_retry_backoff_ms: Option<u64>,
     /// Providers this request already tried (mirrors litellm_lb_go's
     /// `attempted` list), so the fallback walk never goes backwards through
     /// the chain — the walk is strictly `primary → fb1 → fb2 → …`.
@@ -167,6 +176,8 @@ impl RequestCtx {
             native_responses: false,
             sse_tail: Vec::new(),
             failover_count: 0,
+            provider_retry_count: 0,
+            pending_retry_backoff_ms: None,
             attempted_providers: Vec::new(),
             session_id: None,
             request_uuid: uuid::Uuid::now_v7().to_string(),

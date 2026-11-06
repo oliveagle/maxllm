@@ -325,10 +325,16 @@ pub struct RouteConfig {
     /// `maxResponsesFailoverAttempts`. 0 disables request-level failover.
     #[serde(default = "default_max_failover_attempts")]
     pub max_failover_attempts: u32,
-    /// Number of retries before falling back.
+    /// How many times a transient upstream failure (HTTP 5xx) is retried on
+    /// the SAME provider before the request moves to the next provider of
+    /// the fallback chain. Deterministic rejections (429 quota, 401/403
+    /// auth, 404 missing model) and connect failures are not retried on the
+    /// same provider — they move on immediately. 0 (the default) disables
+    /// the same-provider retry and the request walks straight to the
+    /// fallback chain.
     #[serde(default)]
     pub num_retries: u32,
-    /// Retry backoff in milliseconds.
+    /// Backoff between those same-provider retries, in milliseconds.
     #[serde(default = "default_retry_backoff_ms")]
     pub retry_backoff_ms: u64,
     /// This route carries the `auto` sentinel model: provider selection
