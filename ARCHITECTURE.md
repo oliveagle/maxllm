@@ -290,9 +290,9 @@ pub struct CircuitBreaker {
 | Fallback | Try primary first; on circuit breaker open, use fallbacks in order |
 | Weighted | Proportional distribution based on provider weight (default 100) |
 | RoundRobin | Even distribution using atomic counter |
-| LeastConnections | Route to provider with lowest failure count |
-| LatencyBased | Route to lowest-latency provider (stub) |
-| CostBased | Route to cheapest provider (stub) |
+| LeastConnections | Provider with the fewest requests currently in flight (process-wide counter) |
+| LatencyBased | Provider with the lowest observed upstream latency (EWMA over successful attempts) |
+| CostBased | Cheapest provider by blended USD price per 1M tokens (model price table) |
 
 **Response Headers Added by Gateway:**
 
@@ -656,9 +656,9 @@ make clean           # cargo clean
 ## Future Roadmap
 
 - **Phase 9: Admin UI** -- Web dashboard for key/spend management, config hot-reload
-- **Phase 10: Advanced Protocols** -- MCP gateway, A2A, batch API, responses API
-- **LatencyBased Strategy** -- Track per-provider latency histogram for smart routing
-- **CostBased Strategy** -- Select cheapest provider dynamically
-- **Database Backends** -- SQLite/Postgres implementations of `AdminStore`
-- **Gemini Streaming** -- `streamGenerateContent?alt=sse` endpoint support
-- **Bedrock SigV4** -- AWS Signature V4 signing for Bedrock requests
+- **Phase 10: Advanced Protocols** -- MCP gateway, A2A, batch API
+- **Postgres backend** -- PostgreSQL implementation of `AdminStore` (SQLite is implemented)
+- **Bedrock SigV4** -- AWS Signature V4 signing for Bedrock requests (the `bedrock`
+  provider kind translates but cannot authenticate until the gateway signs
+  the request; blocked on reworking the request pipeline to buffer the body
+  before the upstream headers are flushed)

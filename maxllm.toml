@@ -416,3 +416,19 @@ plugins = []
 # fallback = ["together", "fireworks"]
 # strategy = "round_robin"
 # plugins = ["rate_limiter"]
+
+# Example: latency-based — route to the fastest healthy provider
+# [[routes]]
+# path = "/v1/fast"
+# provider = "groq"
+# fallback = ["together", "fireworks"]
+# strategy = "latency_based"
+
+# Example: cost-based — route to the cheapest provider; the ranking comes
+# from the model price table (each provider's default_model), so give the
+# cheaper provider a cheaper default_model
+# [[routes]]
+# path = "/v1/cheap"
+# provider = "groq"
+# fallback = ["together"]
+# strategy = "cost_based"

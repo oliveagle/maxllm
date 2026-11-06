@@ -448,7 +448,17 @@ key = "client_ip"
 | Fallback | `fallback` | Try primary provider, then fallbacks in order (default) |
 | Weighted | `weighted` | Distribute traffic by configured provider weights |
 | Round Robin | `round_robin` | Even distribution across all providers |
-| Least Connections | `least_connections` | Route to the least busy provider |
+| Least Connections | `least_connections` | Route to the provider with the fewest requests currently in flight |
+| Latency Based | `latency_based` | Route to the provider with the lowest observed upstream latency (EWMA over successful attempts) |
+| Cost Based | `cost_based` | Route to the cheapest provider by blended USD price per 1M tokens (from the model price table) |
+
+`latency_based` ranks providers by an exponentially weighted moving average
+of the time to the upstream's first byte; a provider with no measurement yet
+is ranked last, but stays eligible, so a fresh provider is never locked out.
+`cost_based` looks up each provider's `default_model` in the price table and
+ranks by input+output price per 1M tokens; a provider whose model has no
+price entry is ranked last but stays eligible, so the route is never left
+unserved over a missing price line.
 
 All strategies include automatic **circuit breaking**: providers are temporarily removed from rotation after consecutive failures (default: 3 failures, 60s recovery). The circuit breaker is lock-free (AtomicU32/U64).
 
@@ -787,6 +797,20 @@ Available at `GET /metrics` when enabled:
 | `request_duration_seconds` | provider | Histogram |
 | `active_requests` | &mdash; | Gauge |
 | `fallbacks_total` | from_provider, to_provider | Counter |
+| `http_failovers_total` | from_provider, to_provider, status | Counter |
+| `session_affinity_hits_total` | &mdash; | Counter |
+| `session_affinity_misses_total` | &mdash; | Counter |
+| `session_affinity_evictions_total` | &mdash; | Counter |
+| `session_affinity_size` | &mdash; | Gauge |
+| `circuit_breaker_state` | provider | Gauge |
+| `circuit_breaker_transitions_total` | provider | Gauge |
+| `circuit_breaker_quota_opens_total` | provider | Counter |
+
+`requests_total` counts each request that reached a provider, once, with the
+provider that served it (after any failover), the model and the upstream
+status; the status is `0` when the provider never answered (a connect or DNS
+failure). `active_requests` counts application requests in flight — the
+`/metrics` scrape itself is not counted, so the gauge reads 0 when idle.
 
 ### Response Headers
 
