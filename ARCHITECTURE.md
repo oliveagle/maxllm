@@ -336,6 +336,11 @@ Histogram buckets: `[0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0]` seconds.
 
 **Purpose:** Manage virtual API keys, teams, spend tracking, and budget enforcement.
 
+The gateway enforces the per-key limits it stores: a virtual key is
+authenticated (active / unexpired / within budget), its model allow-list is
+checked before the upstream is contacted, and its RPM / TPM / concurrency
+limits are enforced with 60-second sliding windows.
+
 **Core Models:**
 
 #### VirtualKey
@@ -350,8 +355,9 @@ pub struct VirtualKey {
     pub max_budget_usd: Option<f64>,
     pub budget_reset_days: Option<u32>,// Rolling budget window
     pub budget_spent_usd: f64,
-    pub rpm_limit: Option<u32>,
-    pub tpm_limit: Option<u64>,
+    pub rpm_limit: Option<u32>,       // Requests per minute (enforced)
+    pub tpm_limit: Option<u64>,       // Tokens per minute (enforced)
+    pub max_parallel_requests: Option<u32>, // In-flight limit (enforced)
     pub expires_at: Option<DateTime<Utc>>,
     pub is_active: bool,
     pub total_requests: u64,

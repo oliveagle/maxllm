@@ -814,7 +814,12 @@ it against the key store **before** the plugin chain runs:
    outside the list is answered with `403 model_not_allowed`; patterns
    support `*` and `?` (e.g. `gpt-4o*`), and an empty list allows every
    model.
-3. **Usage recording** — when the response carries token usage, the spend is
+3. **Per-key rate limits** — `rpm_limit` (requests per minute) is consumed
+   as requests arrive, `tpm_limit` (tokens per minute) is checked against
+   the tokens already spent in the current 60-second window, and
+   `max_parallel_requests` bounds in-flight requests; a key over its limit
+   gets `429 rate limit exceeded`.
+4. **Usage recording** — when the response carries token usage, the spend is
    charged to the key (counters, budget window and spend log) and shows up
    under `/admin/spend`. A key's rolling budget window is reset on its next
    request after it expires, so stale spend from a previous window never
