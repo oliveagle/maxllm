@@ -35,6 +35,16 @@ pub enum BudgetError {
     KeyNotFound(String),
 }
 
+impl BudgetError {
+    /// The HTTP status the gateway should answer with.
+    pub fn http_status(&self) -> u16 {
+        match self {
+            BudgetError::KeyBudgetExceeded { .. } | BudgetError::TeamBudgetExceeded { .. } => 402,
+            _ => 500,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // BudgetEnforcer
 // ---------------------------------------------------------------------------
@@ -51,6 +61,11 @@ impl BudgetEnforcer {
             store,
             cost_calculator,
         }
+    }
+
+    /// The store this enforcer reads keys and teams from.
+    pub fn store(&self) -> &Arc<dyn AdminStore> {
+        &self.store
     }
 
     /// Check whether the key (and its team, if any) still has budget remaining.
@@ -158,28 +173,38 @@ impl BudgetEnforcer {
     /// Call this periodically (e.g. once per minute from a background task).
     /// Returns the number of keys that were reset.
     pub fn reset_expired_budgets(&self) -> Result<usize, BudgetError> {
-        let now = Utc::now();
         let keys = self.store.list_keys(0, usize::MAX)?;
         let mut reset_count = 0;
 
         for mut key in keys {
-            if let (Some(reset_at), Some(reset_days)) = (key.budget_reset_at, key.budget_reset_days)
-            {
-                if now >= reset_at {
-                    tracing::info!(
-                        key_id = %key.id,
-                        old_spend = key.budget_spent_usd,
-                        "resetting expired budget"
-                    );
-                    key.budget_spent_usd = 0.0;
-                    key.budget_reset_at = Some(now + Duration::days(i64::from(reset_days)));
-                    self.store.update_key(key)?;
-                    reset_count += 1;
-                }
-            }
+            reset_count += usize::from(self.reset_key_budget_if_expired(&mut key)?);
         }
 
         Ok(reset_count)
+    }
+
+    /// Reset a single key's budget window if it has expired.
+    ///
+    /// Returns `true` when the window was reset. The request path calls this
+    /// on the key it is authenticating so an expired-window key is not
+    /// blocked on stale spend from the previous window — without scanning
+    /// every key in the store.
+    pub fn reset_key_budget_if_expired(&self, key: &mut VirtualKey) -> Result<bool, BudgetError> {
+        let now = Utc::now();
+        if let (Some(reset_at), Some(reset_days)) = (key.budget_reset_at, key.budget_reset_days) {
+            if now >= reset_at {
+                tracing::info!(
+                    key_id = %key.id,
+                    old_spend = key.budget_spent_usd,
+                    "resetting expired budget window"
+                );
+                key.budget_spent_usd = 0.0;
+                key.budget_reset_at = Some(now + Duration::days(i64::from(reset_days)));
+                self.store.update_key(key.clone())?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 }
 

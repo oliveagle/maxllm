@@ -25,7 +25,9 @@ pub enum CostError {
 /// Match a string against a pattern that supports `*` (any chars) and `?`
 /// (single char).  This is intentionally simple — it covers the patterns we
 /// care about (e.g. `gpt-4o*`, `claude-*-sonnet`).
-fn glob_match(pattern: &str, text: &str) -> bool {
+///
+/// Public because the virtual-key allow-list uses the same wildcard syntax.
+pub fn glob_match(pattern: &str, text: &str) -> bool {
     let pat: Vec<char> = pattern.chars().collect();
     let txt: Vec<char> = text.chars().collect();
     glob_match_inner(&pat, &txt)
