@@ -13,8 +13,10 @@
 //! Anthropic access are:
 //!
 //! - **Endpoint**: `/model/{model_id}/invoke` or `/model/{model_id}/invoke-with-response-stream`
-//! - **Auth**: AWS SigV4 signing (not API key). This is stubbed here and must
-//!   be handled by the gateway or an HTTP client middleware.
+//! - **Auth**: AWS SigV4 signing (not API key). The signature covers the
+//!   SHA-256 of the translated request body, so it can only be produced once
+//!   the whole body is known — the gateway signs the request after
+//!   translating it (see `maxllm_translate::aws_sigv4`).
 //! - **Body format**: Identical to Anthropic Messages API (minus the `model` field
 //!   in the body, since the model is in the URL).
 //!
@@ -34,8 +36,9 @@ const ANTHROPIC_VERSION: &str = "bedrock-2023-05-31";
 /// Translator for AWS Bedrock (Anthropic Claude models).
 ///
 /// The body translation reuses the same OpenAI-to-Anthropic logic as the
-/// `AnthropicTranslator`. Authentication (AWS SigV4) is NOT handled here;
-/// the gateway must sign requests before sending them upstream.
+/// `AnthropicTranslator`. Authentication (AWS SigV4) is NOT handled here —
+/// the gateway signs the translated request before sending it upstream,
+/// because the signature covers the payload hash.
 pub struct BedrockTranslator {
     /// Stores the last model ID for path construction.
     last_model_id: Mutex<String>,
@@ -55,6 +58,19 @@ impl BedrockTranslator {
     /// Returns the last model ID seen during request translation.
     pub fn last_model_id(&self) -> String {
         self.last_model_id.lock().unwrap().clone()
+    }
+
+    /// The Bedrock Runtime API path for a model.
+    ///
+    /// Non-streaming: `/model/{model_id}/invoke`
+    /// Streaming: `/model/{model_id}/invoke-with-response-stream`
+    pub fn path_for(model_id: &str, streaming: bool) -> String {
+        let suffix = if streaming {
+            "invoke-with-response-stream"
+        } else {
+            "invoke"
+        };
+        format!("/model/{model_id}/{suffix}")
     }
 }
 
@@ -106,15 +122,19 @@ impl ProviderTranslator for BedrockTranslator {
         Box::new(AnthropicToOpenAIStream::new())
     }
 
+    /// The default path. The gateway replaces it with the model-specific
+    /// path ([`BedrockTranslator::path_for`]) once the request body has been
+    /// translated and the model is known.
     fn upstream_path(&self) -> &str {
         &self.default_path
     }
 
     fn upstream_headers(&self, _api_key: &str) -> Vec<(String, String)> {
-        // NOTE: AWS SigV4 signing is NOT handled here. The gateway must sign
-        // the request using the AWS SDK or a SigV4 middleware. The api_key
-        // parameter is ignored; AWS credentials come from the environment or
-        // IAM role.
+        // NOTE: AWS SigV4 signing is NOT handled here — the signature covers
+        // the payload hash and can only be produced once the whole body is
+        // known. The gateway signs the translated request itself (see
+        // `maxllm_translate::aws_sigv4`). The api_key parameter is ignored;
+        // AWS credentials come from the environment or an IAM role.
         vec![
             ("Content-Type".to_string(), "application/json".to_string()),
             (
@@ -412,6 +432,33 @@ mod tests {
     #[test]
     fn test_name() {
         assert_eq!(BedrockTranslator::new().name(), "bedrock");
+    }
+
+    #[test]
+    fn test_path_for_uses_the_model_id() {
+        assert_eq!(
+            BedrockTranslator::path_for("anthropic.claude-sonnet-4-20250514-v1:0", false),
+            "/model/anthropic.claude-sonnet-4-20250514-v1:0/invoke"
+        );
+        assert_eq!(
+            BedrockTranslator::path_for("anthropic.claude-sonnet-4-20250514-v1:0", true),
+            "/model/anthropic.claude-sonnet-4-20250514-v1:0/invoke-with-response-stream"
+        );
+    }
+
+    #[test]
+    fn test_model_is_normalized_for_the_path() {
+        // The `@org/model` form is Bedrock's inference-profile syntax; the
+        // path carries the bare model id.
+        let body = serde_json::to_vec(&serde_json::json!({
+            "model": "@anthropic/claude-3-5-sonnet-20241022-v2:0",
+            "messages": [{"role": "user", "content": "Hi"}]
+        }))
+        .unwrap();
+
+        let t = BedrockTranslator::new();
+        t.translate_request(&body, None).unwrap();
+        assert_eq!(t.last_model_id(), "claude-3-5-sonnet-20241022-v2:0");
     }
 
     #[test]

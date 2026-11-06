@@ -8,6 +8,7 @@
 
 pub mod anthropic;
 pub mod anthropic_stream;
+pub mod aws_sigv4;
 pub mod azure_openai;
 pub mod bedrock;
 pub mod cohere;
