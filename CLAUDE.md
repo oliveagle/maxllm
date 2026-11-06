@@ -166,8 +166,8 @@ plugins = ["rate_limiter", "cors"]
 | Weighted | `weighted` | Distribute traffic by provider weight |
 | Round Robin | `round_robin` | Even distribution across providers |
 | Least Connections | `least_connections` | Route to least busy provider |
-| Latency Based | `latency_based` | Route to fastest provider (planned) |
-| Cost Based | `cost_based` | Route to cheapest provider (planned) |
+| Latency Based | `latency_based` | Route to fastest provider (lowest observed upstream latency) |
+| Cost Based | `cost_based` | Route to cheapest provider (blended USD price per 1M tokens) |
 
 ```toml
 [[routes]]
