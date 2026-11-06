@@ -6,12 +6,14 @@ use std::path::PathBuf;
 const STARTER_CONFIG: &str = r#"# MaxLLM Gateway Configuration
 # See https://github.com/yourorg/maxllm for documentation.
 
+# Global plugins run on every request. This is a TOP-LEVEL key: in TOML it
+# must come before any table header, otherwise it is parsed as
+# `server.global_plugins` and silently ignored (and no auth runs).
+global_plugins = ["request_id", "api_auth"]
+
 [server]
 listen = "0.0.0.0:8080"
 threads = 4
-
-# Global plugins run on every request
-global_plugins = ["request_id", "api_auth"]
 
 [metrics]
 enabled = true
@@ -30,8 +32,8 @@ keys = ["sk-maxllm-CHANGEME"]
 # --- Rate Limiting (optional) ---
 # [plugins.rate_limiter]
 # category = "rate_limit"
-# requests_per_second = 10
-# header = "Authorization"
+# requests_per_minute = 60
+# key = "client_ip"
 
 # --- CORS (optional) ---
 # [plugins.cors]
@@ -113,6 +115,28 @@ pub fn run(output: PathBuf) -> i32 {
         Err(e) => {
             eprintln!("Error writing {}: {e}", output.display());
             1
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The starter config must actually enable the plugins it declares:
+    /// `global_plugins` is a top-level key, so it has to appear before the
+    /// first table header — inside `[server]` it would be parsed as a
+    /// `server.global_plugins` key and silently ignored, leaving the
+    /// gateway with no auth plugin wired.
+    #[test]
+    fn starter_config_declares_global_plugins_at_the_top_level() {
+        let config = maxllm_config::Config::parse(STARTER_CONFIG).expect("starter config parses");
+        assert_eq!(config.global_plugins, vec!["request_id", "api_auth"]);
+        for name in &config.global_plugins {
+            assert!(
+                config.plugins.contains_key(name),
+                "plugin {name} must be defined by the starter config"
+            );
         }
     }
 }
