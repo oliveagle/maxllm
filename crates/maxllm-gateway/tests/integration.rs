@@ -4742,16 +4742,25 @@ async fn test_provider_inflight_gauge_returns_to_zero() {
         .unwrap();
     assert_eq!(resp.status(), 200);
 
-    let text = c.get(gw.url("/metrics")).send().await.unwrap().text().await.unwrap();
+    let text = c
+        .get(gw.url("/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
     let series = text
         .lines()
         .find(|l| {
-            l.starts_with("maxllm_provider_inflight_requests")
-                && l.contains("provider=\"a\"")
+            l.starts_with("maxllm_provider_inflight_requests") && l.contains("provider=\"a\"")
         })
         .unwrap_or_else(|| panic!("inflight series missing:\\n{text}"));
     let value: f64 = series.rsplit_once(' ').unwrap().1.parse().unwrap();
-    assert_eq!(value, 0.0, "the in-flight count must settle back to 0: {series}");
+    assert_eq!(
+        value, 0.0,
+        "the in-flight count must settle back to 0: {series}"
+    );
 }
 
 /// The least-connections strategy is no longer a proxy for the failure
@@ -4816,7 +4825,8 @@ async fn test_least_connections_skips_the_busy_provider() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     assert_eq!(
-        resp.headers()["X-MaxLLM-Provider"], "b",
+        resp.headers()["X-MaxLLM-Provider"],
+        "b",
         "the least-connections route must skip the busy provider"
     );
 
