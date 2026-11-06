@@ -11,12 +11,12 @@ dev:
 # Run the gateway (release)
 run: build
 	unset HTTPS_PROXY HTTP_PROXY http_proxy https_proxy; \
-	./target/release/maxllm --config maxllm.toml
+	./target/release/maxllm start --config maxllm.toml
 
 # Run the gateway (debug, with verbose logging)
 run-debug: dev
 	unset HTTPS_PROXY HTTP_PROXY http_proxy https_proxy; \
-	RUST_LOG=debug ./target/debug/maxllm --config maxllm.toml
+	RUST_LOG=debug ./target/debug/maxllm start --config maxllm.toml
 
 # Run unit tests only
 test:

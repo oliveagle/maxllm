@@ -124,8 +124,9 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 # Check status
 ./target/release/maxllm status
 
-# View config
-./target/release/maxllm config
+# Validate the config / list providers
+./target/release/maxllm config check
+./target/release/maxllm config providers
 
 # Create a virtual key
 export MAXLLM_ADMIN_KEY="your-master-key"
