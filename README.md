@@ -817,7 +817,7 @@ enabled = true
 | Model access control | Restrict which models a key can access |
 | Teams | Group keys into teams with team-level budgets |
 | Cost tracking | Automatic cost calculation with built-in model pricing |
-| Spend reporting | `/admin/spend` with per-key, per-model, per-provider breakdown |
+| Spend reporting | `/admin/spend/report` (per-key, per-model, per-provider) and `/admin/spend/logs` |
 
 #### How a virtual key is enforced
 
@@ -868,6 +868,7 @@ Available at `GET /metrics` when enabled:
 | `active_requests` | &mdash; | Gauge |
 | `fallbacks_total` | from_provider, to_provider | Counter |
 | `http_failovers_total` | from_provider, to_provider, status | Counter |
+| `provider_retries_total` | provider, status | Counter |
 | `session_affinity_hits_total` | &mdash; | Counter |
 | `session_affinity_misses_total` | &mdash; | Counter |
 | `session_affinity_evictions_total` | &mdash; | Counter |
