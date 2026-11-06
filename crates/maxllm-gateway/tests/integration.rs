@@ -4307,3 +4307,153 @@ session_sticky = true
     );
     assert_eq!(b_reqs.len(), 0, "the bound provider must not rotate away");
 }
+
+// ---------------------------------------------------------------------------
+// Gap-closure tests: requests_total producer, the active-requests gauge
+// balance on gateway-level errors, and the latency-/cost-based strategies.
+// ---------------------------------------------------------------------------
+
+const ROUTING_METRICS_CONFIG: &str = r#"
+global_plugins = ["request_id", "api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[metrics]
+enabled = true
+
+[plugins.request_id]
+category = "request_id"
+header_name = "X-Request-Id"
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.primary]
+kind = "openai"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+default_model = "gpt-4o"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "primary"
+"#;
+
+/// `maxllm_requests_total` was defined but never recorded — the README's
+/// metrics table listed a series the gateway never emitted. A served request
+/// must appear with its provider, model and upstream status labels.
+#[tokio::test]
+async fn test_requests_total_is_recorded_per_provider_model_status() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("ok")))
+        .mount(&upstream)
+        .await;
+
+    let gw = TestGateway::start(ROUTING_METRICS_CONFIG, &upstream.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&chat_body("gpt-4o", "hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let text = c
+        .get(gw.url("/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let series = text
+        .lines()
+        .find(|l| {
+            l.starts_with("maxllm_requests_total")
+                && l.contains("provider=\"primary\"")
+                && l.contains("model=\"gpt-4o\"")
+                && l.contains("status=\"200\"")
+        })
+        .unwrap_or_else(|| panic!("maxllm_requests_total series missing:\n{text}"));
+    let value: f64 = series.rsplit_once(' ').unwrap().1.parse().unwrap();
+    assert!(
+        value >= 1.0,
+        "requests_total must count the request: {series}"
+    );
+}
+
+/// The gateway-level error paths (405/404/plugin rejections/admin answers)
+/// decrement the active-request gauge themselves and answer the client — the
+/// logging hook must not decrement it again, or the gauge drifts negative.
+#[tokio::test]
+async fn test_active_requests_stays_balanced_after_gateway_level_errors() {
+    let upstream = MockServer::start().await;
+    let gw = TestGateway::start(ROUTING_METRICS_CONFIG, &upstream.uri()).await;
+    let c = client();
+
+    // 405: GET on an API route.
+    let resp = c
+        .get(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 405);
+
+    // 404: POST to a path with no route.
+    let resp = c
+        .post(gw.url("/v1/unknown"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&chat_body("gpt-4o", "hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+
+    // 401: missing auth (the plugin chain answers the request itself).
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .json(&chat_body("gpt-4o", "hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+
+    // Admin API (not enabled in this config — the handler still answers).
+    let resp = c
+        .get(gw.url("/admin/keys"))
+        .header("Authorization", "Bearer test-key-123")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+
+    let text = c
+        .get(gw.url("/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let series = text
+        .lines()
+        .find(|l| l.starts_with("maxllm_active_requests "))
+        .unwrap_or_else(|| panic!("maxllm_active_requests series missing:\n{text}"));
+    let value: f64 = series.rsplit_once(' ').unwrap().1.parse().unwrap();
+    assert_eq!(
+        value, 0.0,
+        "the gauge must be balanced after gateway-level errors, got {value}: {series}"
+    );
+    let _ = value;
+}

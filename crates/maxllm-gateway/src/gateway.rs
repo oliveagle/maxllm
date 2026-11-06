@@ -1112,9 +1112,10 @@ impl ProxyHttp for AiGateway {
             return Ok(true);
         }
 
-        METRICS.active_requests.inc();
-
-        // Metrics endpoint (bypasses plugins)
+        // Metrics endpoint (bypasses plugins). The scrape is not an
+        // application request: it is not counted in the active-request
+        // gauge, and the exposition must not include the scrape itself —
+        // otherwise the gauge could never read 0 while it is being scraped.
         if path == "/metrics" && hot.metrics_enabled {
             let body = METRICS.encode();
             let content_len = body.len().to_string();
@@ -1125,10 +1126,11 @@ impl ProxyHttp for AiGateway {
             session
                 .write_response_body(Some(Bytes::from(body)), true)
                 .await?;
-            METRICS.active_requests.dec();
             ctx.skip_logging = true;
             return Ok(true);
         }
+
+        METRICS.active_requests.inc();
 
         // Own the path for later use (after the borrow above is done)
         let path = path.to_string();
@@ -1140,6 +1142,7 @@ impl ProxyHttp for AiGateway {
             && path != "/v1/models"
         {
             METRICS.active_requests.dec();
+            ctx.skip_logging = true;
             return Self::send_error_response(
                 session,
                 405,
@@ -1150,7 +1153,12 @@ impl ProxyHttp for AiGateway {
 
         // Admin API endpoints
         if path.starts_with("/admin/") {
-            return self.handle_admin_request(session, &path).await;
+            let handled = self.handle_admin_request(session, &path).await?;
+            // The admin handler answers the request itself and already
+            // decremented the active-request gauge — the logging hook must
+            // not decrement it a second time.
+            ctx.skip_logging = true;
+            return Ok(handled);
         }
 
         // Extract client IP for plugins
@@ -1167,6 +1175,7 @@ impl ProxyHttp for AiGateway {
             .await?
         {
             METRICS.active_requests.dec();
+            ctx.skip_logging = true;
             resp.send(session).await?;
             return Ok(true);
         }
@@ -1176,6 +1185,7 @@ impl ProxyHttp for AiGateway {
             Some(idx) => idx,
             None => {
                 METRICS.active_requests.dec();
+                ctx.skip_logging = true;
                 return Self::send_error_response(
                     session,
                     404,
@@ -1213,6 +1223,7 @@ impl ProxyHttp for AiGateway {
             .await?
         {
             METRICS.active_requests.dec();
+            ctx.skip_logging = true;
             resp.send(session).await?;
             return Ok(true);
         }
@@ -1232,6 +1243,7 @@ impl ProxyHttp for AiGateway {
             Some(p) => p,
             None => {
                 METRICS.active_requests.dec();
+                ctx.skip_logging = true;
                 return Self::send_error_response(
                     session,
                     503,
@@ -3563,6 +3575,26 @@ impl ProxyHttp for AiGateway {
             .request_duration_seconds
             .with_label_values(&[&ctx.provider_name])
             .observe(duration.as_secs_f64());
+
+        // Every request that reached a provider is counted once: the provider
+        // that served it, the model and the upstream status. The status is
+        // `0` when the provider never answered (a connect or DNS failure).
+        METRICS
+            .requests_total
+            .with_label_values(&[
+                if ctx.provider_name.is_empty() {
+                    "none"
+                } else {
+                    &ctx.provider_name
+                },
+                if ctx.model.is_empty() {
+                    "unknown"
+                } else {
+                    &ctx.model
+                },
+                &ctx.upstream_status.to_string(),
+            ])
+            .inc();
 
         if ctx.tokens_in > 0 || ctx.tokens_out > 0 {
             METRICS
