@@ -78,6 +78,13 @@ impl Plugin for KeyAuthPlugin {
         session: &mut Session,
         ctx: &mut PluginCtx,
     ) -> pingora::Result<RequestAction> {
+        // A request that already passed the gateway's virtual-key
+        // authentication (see the `request_filter` hook) is trusted: the
+        // static key set configured here does not know about keys created
+        // through the admin API.
+        if ctx.extensions.get("virtual_key_auth").map(|v| v.as_str()) == Some("1") {
+            return Ok(RequestAction::Continue);
+        }
         let header_value = session
             .req_header()
             .headers
