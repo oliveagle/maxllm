@@ -799,6 +799,35 @@ enabled = true
 | Cost tracking | Automatic cost calculation with built-in model pricing |
 | Spend reporting | `/admin/spend` with per-key, per-model, per-provider breakdown |
 
+#### How a virtual key is enforced
+
+When a request carries an `sk-maxllm-…` bearer token, the gateway validates
+it against the key store **before** the plugin chain runs:
+
+1. **Authentication** — revoked keys get `401`, expired keys get `401`, and
+   keys whose budget (or team budget) is exhausted get `402`. The `key_auth`
+   plugin defers to this check, so static config keys keep working unchanged
+   and unknown tokens still hit the plugin's `401`.
+2. **Model access control** — when the key lists `allowed_models`, every
+   endpoint that resolves a model (chat, responses, embeddings, native and
+   passthrough routes) is checked before the upstream is contacted. A model
+   outside the list is answered with `403 model_not_allowed`; patterns
+   support `*` and `?` (e.g. `gpt-4o*`), and an empty list allows every
+   model.
+3. **Usage recording** — when the response carries token usage, the spend is
+   charged to the key (counters, budget window and spend log) and shows up
+   under `/admin/spend`. A key's rolling budget window is reset on its next
+   request after it expires, so stale spend from a previous window never
+   blocks it.
+
+```bash
+# Create a key restricted to a model family
+curl -X POST http://localhost:8080/admin/keys \
+  -H "Authorization: Bearer $MAXLLM_MASTER_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "ci-bot", "max_budget_usd": 50, "allowed_models": ["gpt-4o*"]}'
+```
+
 ## Observability
 
 ### Prometheus Metrics

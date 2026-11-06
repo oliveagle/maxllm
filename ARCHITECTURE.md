@@ -423,9 +423,11 @@ Client Request (OpenAI format)
     |
     v
 [request_filter]
+    |-- Virtual-key authentication (sk-maxllm-… tokens)
+    |     '-- active / unexpired / within budget -> 401 / 402 otherwise
     |-- Global PluginChain.run_request()
     |     |-- request_id: Generate UUID v7
-    |     |-- key_auth: Validate Bearer token
+    |     |-- key_auth: Validate Bearer token (defers to virtual-key auth)
     |     '-- Other global plugins
     |-- Route matching (by path prefix)
     |     '-- No match? -> 404
@@ -452,9 +454,10 @@ Client Request (OpenAI format)
     v
 [request_body_filter] (4 modes based on endpoint_type)
     |-- Translated: buffer body, extract model, translate OpenAI -> provider
+    |     '-- virtual-key model allow-list enforced here (403)
     |-- Responses: translate Responses -> chat, then chat -> provider
     |-- Native: buffer body, extract metadata from native format, forward as-is
-    '-- Passthrough: skip entirely (zero processing)
+    '-- Passthrough: raw forward (buffered only to check the model allow-list)
     |
     v
   +-----------------------+
