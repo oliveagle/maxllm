@@ -226,6 +226,8 @@ pub struct ProviderState {
     /// AWS region for Bedrock SigV4 signing (from the provider config).
     pub region: Option<String>,
     pub weight: u32,
+    /// Arbitrary provider tags from the config. Reserved for tag-based
+    /// routing; no routing rule consumes them yet.
     #[allow(dead_code)]
     pub tags: Vec<String>,
     pub default_model: Option<String>,

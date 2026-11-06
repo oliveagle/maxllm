@@ -236,7 +236,8 @@ pub struct ProviderConfig {
     /// Weight for load balancing (higher = more traffic).
     #[serde(default = "default_weight")]
     pub weight: u32,
-    /// Tags for tag-based routing.
+    /// Arbitrary tags on the provider (parsed and carried through, but not
+    /// yet consumed by any routing rule — reserved for tag-based routing).
     #[serde(default)]
     pub tags: Vec<String>,
 }

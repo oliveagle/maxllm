@@ -247,7 +247,7 @@ pub struct ProviderState {
     pub tls: bool,
     pub sni: String,
     pub weight: u32,
-    pub tags: Vec<String>,
+    pub tags: Vec<String>,   // reserved — no routing rule consumes these yet
     pub default_model: Option<String>,
 }
 ```
