@@ -56,7 +56,7 @@ A high-performance AI gateway built on [Pingora](https://github.com/cloudflare/p
 
 ## Features
 
-- **15 LLM providers** &mdash; OpenAI, Anthropic, Gemini, Azure, Bedrock, Groq, Together, Fireworks, Mistral, xAI, DeepSeek, Ollama, Cohere, DeepInfra, and any OpenAI-compatible endpoint
+- **15 LLM providers** &mdash; OpenAI, Anthropic, Gemini, Azure, Bedrock, Groq, Together, Fireworks, Mistral, xAI, DeepSeek, Ollama, Cohere, DeepInfra, OpenCode, and any OpenAI-compatible endpoint
 - **Three input modes** &mdash; OpenAI-format with translation, native provider format (Anthropic Messages API, Gemini, etc.), or raw pass-through
 - **Streaming support** &mdash; SSE streaming with real-time format translation (Anthropic SSE, Gemini SSE, Cohere SSE &rarr; OpenAI SSE)
 - **Smart routing** &mdash; Fallback chains, weighted load balancing, round-robin, least-connections, with per-provider circuit breakers
@@ -902,7 +902,7 @@ MaxLLM is a **proxy, not a client**. It uses zero HTTP client libraries. Pingora
 crates/
   maxllm-config/        # TOML config parsing, env var expansion, validation
   maxllm-plugin/        # Plugin trait, chain executor, 14 built-in plugins, guardrail framework
-  maxllm-translate/     # Provider translation (OpenAI <-> 15 provider formats)
+  maxllm-translate/     # Provider translation (OpenAI <-> 16 provider kinds)
   maxllm-admin/         # Virtual keys, teams, cost tracking, budget enforcement
   maxllm-gateway/       # Main binary: Pingora ProxyHttp implementation + routing
 ```

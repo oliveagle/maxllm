@@ -574,8 +574,8 @@ Client Response (translated: OpenAI format / native: provider format / passthrou
 ## Key Design Patterns
 
 ### 1. Trait-Based Abstraction
-- `Plugin` -- Pluggable middleware (10 implementations)
-- `ProviderTranslator` -- Format translation (14 implementations)
+- `Plugin` -- Pluggable middleware (14 built-in plugins in `maxllm-plugin`)
+- `ProviderTranslator` -- Format translation (8 translators covering the 16 provider kinds)
 - `StreamTranslator` -- Streaming response handling
 - `AdminStore` -- Persistence abstraction (swap InMemory for Postgres/SQLite)
 
@@ -597,7 +597,10 @@ Client Response (translated: OpenAI format / native: provider format / passthrou
 
 ### 5. Canonical Format Translation
 - All clients speak OpenAI format
-- Gateway translates to/from 14 provider formats transparently
+- Gateway translates to/from the 16 provider kinds transparently
+  (openai, anthropic, gemini, azure_openai, bedrock, groq, together,
+  fireworks, deepinfra, mistral, xai, deepseek, ollama, cohere,
+  openai_compat, opencode)
 - Streaming translation handles SSE chunk-by-chunk
 
 ---
@@ -646,16 +649,25 @@ Client Response (translated: OpenAI format / native: provider format / passthrou
 - Validates request translation (headers, path, body format)
 - Tests response translation back to OpenAI format
 
-**Test Categories (20 tests):**
+**Test Categories (97 tests: 93 mock-based, 4 live gated with `#[ignore]`):**
 
 | Category | Count | Description |
 |----------|-------|-------------|
-| Health & routing | 2 | Health check, unknown route 404 |
-| Authentication | 2 | Missing auth 401, wrong key 401 |
-| Proxy & translation | 5 | OpenAI passthrough, Anthropic translation, Gemini translation, model alias, auth stripping |
-| Headers | 3 | X-Request-Id, X-MaxLLM-Provider, CORS |
-| Resilience | 3 | Upstream 500, fallback on failure, concurrent requests |
-| Live providers | 4 | Ollama non-streaming, Ollama streaming, Gemini, Gemini system prompt (gated with `#[ignore]`) |
+| Health & routing | 3 | Health check, unknown route 404, `GET /v1/models` |
+| Authentication (static) | 6 | Missing/wrong key 401, valid auth, auth stripping, static key alongside virtual keys, static key bypasses model allowlist |
+| Virtual keys | 9 | Auth + spend, revoked 401, budget 402, RPM/TPM limits, per-key model allowlist (incl. glob), legacy `[auth]`/`[rate_limit]` |
+| Proxy & translation | 7 | OpenAI passthrough, Anthropic/Gemini translation + error normalisation, model alias, embeddings |
+| Responses API | 7 | chat-only translation, tool-choice nesting, images, SSE, error/mid-stream failure surfacing |
+| Native & passthrough | 6 | Responses passthrough (streaming/non-streaming), function-tool flattening, large-body usage, chat→native fallback |
+| OpenCode (zen) | 16 | session header injection/affinity, body normalisation, error envelopes, UA handling, models list, streaming usage |
+| Headers & metrics | 6 | X-Request-Id, X-MaxLLM-Provider, CORS, request/token/active/inflight metrics |
+| Bedrock SigV4 | 3 | signed request + model routing, error forwarding, streaming translation |
+| Routing strategies | 6 | latency, cost, least-connections, auto-model rotation (+session affinity, pool filtering) |
+| Resilience & failover | 15 | 500 passthrough, fallback on HTTP error / connect / DNS failure, 400-model rules, failover budget, same-provider retries, all-providers-fail |
+| Rate-limit learning | 4 | Retry-After header, body reset instant, Laya classification, non-rate-limit body |
+| Compaction | 4 | truncate, sliding window, threshold, skip header |
+| Concurrency | 1 | concurrent requests |
+| Live providers | 4 | Ollama non-streaming/streaming, Gemini, Gemini system prompt (gated with `#[ignore]`) |
 
 ---
 
@@ -678,6 +690,7 @@ make clean           # cargo clean
 
 ## Future Roadmap
 
-- **Phase 9: Admin UI** -- Web dashboard for key/spend management, config hot-reload
+- **Phase 9: Admin UI** -- Web dashboard for key/spend management (config
+  hot-reload itself is already implemented via the config file watcher)
 - **Phase 10: Advanced Protocols** -- MCP gateway, A2A, batch API
 - **Postgres backend** -- PostgreSQL implementation of `AdminStore` (SQLite is implemented)
