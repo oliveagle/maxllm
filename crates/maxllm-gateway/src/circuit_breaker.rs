@@ -189,7 +189,8 @@ impl CircuitBreaker {
         if reset_at_ms <= now {
             return; // already reset; nothing to force-open
         }
-        self.force_open_until_ms.store(reset_at_ms, Ordering::Relaxed);
+        self.force_open_until_ms
+            .store(reset_at_ms, Ordering::Relaxed);
         self.state.store(STATE_OPEN, Ordering::Relaxed);
         self.failures.store(self.max_fails, Ordering::Relaxed);
         self.quota_opens.fetch_add(1, Ordering::Relaxed);
@@ -261,6 +262,10 @@ impl CircuitBreaker {
         }
     }
 
+    /// Consecutive failures recorded against the breaker. Only the tests
+    /// read it directly — production code observes the state, not the count
+    /// (since the count is reset to zero once half-open probing starts).
+    #[cfg(test)]
     pub fn failure_count(&self) -> u32 {
         self.failures.load(Ordering::Relaxed)
     }
@@ -333,11 +338,13 @@ impl CircuitBreaker {
         self.successes_half_open
             .store(row.successes_half_open, Ordering::Relaxed);
         self.pending_probes.store(0, Ordering::Relaxed);
-        self.last_failure_at.store(row.last_failure_at, Ordering::Relaxed);
+        self.last_failure_at
+            .store(row.last_failure_at, Ordering::Relaxed);
         self.state.store(row.state, Ordering::Relaxed);
         self.force_open_until_ms
             .store(row.force_open_until, Ordering::Relaxed);
-        self.state_transitions.store(row.transitions, Ordering::Relaxed);
+        self.state_transitions
+            .store(row.transitions, Ordering::Relaxed);
         self.quota_opens.store(row.quota_opens, Ordering::Relaxed);
     }
 }

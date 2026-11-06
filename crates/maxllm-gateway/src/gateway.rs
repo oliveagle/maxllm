@@ -767,6 +767,22 @@ impl AiGateway {
         hot.routes.iter().position(|r| path.starts_with(&r.path))
     }
 
+    /// The provider's blended USD price per 1M tokens — the ranking key of
+    /// the cost-based strategy.
+    ///
+    /// A request-shaped workload is approximated by the same input/output
+    /// token count (the ranking only has to order the providers, and most
+    /// upstream pricing is dominated by the input side anyway). A provider
+    /// whose model has no price-table entry — an OpenAI-compatible channel
+    /// serving a custom name, say — is unpriced and ranked last, but stays
+    /// eligible: the strategy must never leave a route unserved over a
+    /// missing price line.
+    fn provider_cost(hot: &HotState, provider: &Arc<ProviderState>) -> Option<f64> {
+        let model = provider.default_model.as_deref()?;
+        let mc = hot.cost_calculator.get_model_cost(model)?;
+        Some(mc.input_cost_per_1m + mc.output_cost_per_1m)
+    }
+
     /// Select provider using the route's configured strategy.
     fn select_provider(
         &self,
@@ -856,6 +872,7 @@ impl AiGateway {
         if let Some(provider) = hot.providers.get(&route.provider) {
             candidates.push(ProviderTarget {
                 name: route.provider.clone(),
+                cost_per_1m: Self::provider_cost(hot, provider),
                 state: Arc::clone(provider),
                 is_primary: true,
             });
@@ -865,6 +882,7 @@ impl AiGateway {
             if let Some(provider) = hot.providers.get(fb_name) {
                 candidates.push(ProviderTarget {
                     name: fb_name.clone(),
+                    cost_per_1m: Self::provider_cost(hot, provider),
                     state: Arc::clone(provider),
                     is_primary: false,
                 });
@@ -1240,7 +1258,12 @@ impl ProxyHttp for AiGateway {
 
         // Select provider (with circuit breaker check and routing strategy)
         let _provider = match self.select_provider(&hot, route, ctx) {
-            Some(p) => p,
+            Some(p) => {
+                // The request is in flight for this provider — the
+                // least-connections strategy counts it.
+                crate::provider_stats::acquire(&ctx.provider_name);
+                p
+            }
             None => {
                 METRICS.active_requests.dec();
                 ctx.skip_logging = true;
@@ -2264,6 +2287,17 @@ impl ProxyHttp for AiGateway {
         ctx: &mut Self::CTX,
     ) -> pingora::Result<()> {
         let status = upstream_response.status.as_u16();
+
+        // Feed the latency-based router: a successful attempt updates the
+        // provider's latency estimate (time to the upstream's first byte).
+        // Failures are not counted — a provider that fails fast must not look
+        // like the fastest one; the circuit breaker is what punishes it.
+        if status < 400 {
+            if let Some(send_time) = ctx.upstream_send_time {
+                let elapsed_ms = send_time.elapsed().as_secs_f64() * 1000.0;
+                crate::provider_stats::record_latency(&ctx.provider_name, elapsed_ms);
+            }
+        }
 
         // Record circuit breaker state.
         //
@@ -3568,6 +3602,12 @@ impl ProxyHttp for AiGateway {
 
         METRICS.active_requests.dec();
 
+        // The request is done — it no longer counts towards the provider's
+        // in-flight load.
+        if !ctx.provider_name.is_empty() {
+            crate::provider_stats::release(&ctx.provider_name);
+        }
+
         let duration = ctx.request_start.elapsed();
 
         // Record metrics
@@ -3789,6 +3829,10 @@ impl AiGateway {
             ctx.original_provider = Some(failed_provider.clone());
         }
         ctx.provider_name = name.clone();
+        // The in-flight request moves with it: the failed provider is done
+        // with this request, the next one carries it now.
+        crate::provider_stats::release(&failed_provider);
+        crate::provider_stats::acquire(&name);
         // The fallback may speak a different contract than the provider that
         // just failed — the request path depends on it.
         ctx.native_responses = ctx.endpoint_type == EndpointType::Responses

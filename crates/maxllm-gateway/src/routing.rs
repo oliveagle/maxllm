@@ -19,6 +19,11 @@ pub struct ProviderTarget {
     pub name: String,
     pub state: Arc<ProviderState>,
     pub is_primary: bool,
+    /// Blended USD price per 1M tokens (input + output) — the ranking key of
+    /// the cost-based strategy. `None` when the provider has no price data
+    /// (no explicit per-provider pricing and no price-table entry for its
+    /// default model); such a provider is eligible but ranked last.
+    pub cost_per_1m: Option<f64>,
 }
 
 /// Provider selection engine.
@@ -61,20 +66,47 @@ impl ProviderSelector {
                 Some(healthy[idx % healthy.len()])
             }
             RoutingStrategy::LeastConnections => {
-                // Use failure count as proxy for "busy" (real impl would track active conns)
+                // The healthy provider with the fewest requests currently
+                // routed to it. The counter is per provider and process-wide
+                // (see `provider_stats`), so it survives a config reload.
                 healthy
                     .into_iter()
-                    .min_by_key(|c| c.state.circuit_breaker.failure_count())
+                    .min_by_key(|c| crate::provider_stats::inflight(&c.name))
             }
             RoutingStrategy::LatencyBased => {
-                // TODO: Track per-provider latency histogram
-                // For now, use the same as fallback (primary first)
-                healthy.into_iter().next()
+                // The healthy provider with the lowest observed upstream
+                // latency (an EWMA over the successful attempts). A provider
+                // without a measurement is ranked last — but still eligible
+                // when no candidate has been measured yet, so a fresh
+                // provider is never locked out.
+                let mut measured: Vec<(&ProviderTarget, f64)> = healthy
+                    .iter()
+                    .filter_map(|c| crate::provider_stats::latency_ms(&c.name).map(|ms| (*c, ms)))
+                    .collect();
+                if measured.is_empty() {
+                    return healthy.into_iter().next();
+                }
+                // Stable sort: equal latency keeps the candidate order, so
+                // the primary still wins a tie.
+                measured.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                Some(measured[0].0)
             }
             RoutingStrategy::CostBased => {
-                // TODO: Look up model cost and select cheapest provider
-                // For now, use the same as fallback (primary first)
-                healthy.into_iter().next()
+                // The cheapest healthy provider, by blended USD price per 1M
+                // tokens. A provider with no price data at all ranks last —
+                // but stays eligible when nothing is priced, so the route
+                // still serves traffic.
+                let mut priced: Vec<(&ProviderTarget, f64)> = healthy
+                    .iter()
+                    .filter_map(|c| c.cost_per_1m.map(|cost| (*c, cost)))
+                    .collect();
+                if priced.is_empty() {
+                    return healthy.into_iter().next();
+                }
+                // Stable sort: equal price keeps the candidate order, so the
+                // primary still wins a tie.
+                priced.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                Some(priced[0].0)
             }
         }
     }
@@ -128,6 +160,7 @@ mod tests {
                 total_connect_timeout: None,
             }),
             is_primary,
+            cost_per_1m: None,
         }
     }
 
@@ -157,6 +190,112 @@ mod tests {
         let mut ctx = RequestCtx::new();
         let selected = selector.select(&candidates, &mut ctx).unwrap();
         assert_eq!(selected.name, "fallback");
+    }
+
+    /// A candidate with an explicit blended price (cost-based ranking key).
+    fn make_priced_target(name: &str, cost_per_1m: f64) -> ProviderTarget {
+        let mut t = make_target(name, 100, false);
+        t.cost_per_1m = Some(cost_per_1m);
+        t
+    }
+
+    #[test]
+    fn test_latency_based_picks_the_lowest_latency() {
+        // Distinct provider names: the latency stats are process-wide.
+        crate::provider_stats::record_latency("lat-slow", 900.0);
+        crate::provider_stats::record_latency("lat-fast", 120.0);
+
+        let candidates = vec![
+            make_target("lat-slow", 100, true),
+            make_target("lat-fast", 100, false),
+        ];
+        let selector = ProviderSelector::new(RoutingStrategy::LatencyBased);
+        let mut ctx = RequestCtx::new();
+        let selected = selector.select(&candidates, &mut ctx).unwrap();
+        assert_eq!(selected.name, "lat-fast");
+    }
+
+    #[test]
+    fn test_latency_based_keeps_the_primary_on_a_tie() {
+        crate::provider_stats::record_latency("lat-tie-a", 250.0);
+        crate::provider_stats::record_latency("lat-tie-b", 250.0);
+
+        let candidates = vec![
+            make_target("lat-tie-a", 100, true),
+            make_target("lat-tie-b", 100, false),
+        ];
+        let selector = ProviderSelector::new(RoutingStrategy::LatencyBased);
+        let mut ctx = RequestCtx::new();
+        let selected = selector.select(&candidates, &mut ctx).unwrap();
+        assert_eq!(selected.name, "lat-tie-a");
+    }
+
+    #[test]
+    fn test_latency_based_falls_back_to_the_primary_without_measurements() {
+        // No measurement for either candidate: the route must still serve,
+        // using the primary (the cold-start order).
+        let candidates = vec![
+            make_target("lat-cold-a", 100, true),
+            make_target("lat-cold-b", 100, false),
+        ];
+        let selector = ProviderSelector::new(RoutingStrategy::LatencyBased);
+        let mut ctx = RequestCtx::new();
+        let selected = selector.select(&candidates, &mut ctx).unwrap();
+        assert_eq!(selected.name, "lat-cold-a");
+    }
+
+    #[test]
+    fn test_cost_based_picks_the_cheapest() {
+        let candidates = vec![
+            make_priced_target("cost-expensive", 12.0),
+            make_priced_target("cost-cheap", 0.5),
+        ];
+        let selector = ProviderSelector::new(RoutingStrategy::CostBased);
+        let mut ctx = RequestCtx::new();
+        let selected = selector.select(&candidates, &mut ctx).unwrap();
+        assert_eq!(selected.name, "cost-cheap");
+    }
+
+    #[test]
+    fn test_cost_based_ranks_an_unpriced_provider_last() {
+        let candidates = vec![
+            make_target("cost-unpriced", 100, true),
+            make_priced_target("cost-priced", 3.0),
+        ];
+        let selector = ProviderSelector::new(RoutingStrategy::CostBased);
+        let mut ctx = RequestCtx::new();
+        let selected = selector.select(&candidates, &mut ctx).unwrap();
+        assert_eq!(selected.name, "cost-priced");
+    }
+
+    #[test]
+    fn test_cost_based_falls_back_to_the_primary_without_prices() {
+        let candidates = vec![
+            make_target("cost-none-a", 100, true),
+            make_target("cost-none-b", 100, false),
+        ];
+        let selector = ProviderSelector::new(RoutingStrategy::CostBased);
+        let mut ctx = RequestCtx::new();
+        let selected = selector.select(&candidates, &mut ctx).unwrap();
+        assert_eq!(selected.name, "cost-none-a");
+    }
+
+    #[test]
+    fn test_least_connections_picks_the_least_busy() {
+        crate::provider_stats::acquire("busy-provider");
+        crate::provider_stats::acquire("busy-provider");
+
+        let candidates = vec![
+            make_target("busy-provider", 100, true),
+            make_target("idle-provider", 100, false),
+        ];
+        let selector = ProviderSelector::new(RoutingStrategy::LeastConnections);
+        let mut ctx = RequestCtx::new();
+        let selected = selector.select(&candidates, &mut ctx).unwrap();
+        assert_eq!(selected.name, "idle-provider");
+
+        crate::provider_stats::release("busy-provider");
+        crate::provider_stats::release("busy-provider");
     }
 
     #[test]

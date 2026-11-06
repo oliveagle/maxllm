@@ -11,6 +11,7 @@ mod ctx;
 mod gateway;
 mod laya_client;
 mod metrics;
+mod provider_stats;
 mod rate_limit;
 mod rate_limit_resolver;
 mod recorder;

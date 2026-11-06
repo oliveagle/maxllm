@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use std::io::Write;
 use std::process::{Child, Command};
 use std::time::Duration;
-use wiremock::matchers::{header, header_exists, method, path};
+use wiremock::matchers::{body_string_contains, header, header_exists, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 // ---------------------------------------------------------------------------
@@ -4456,4 +4456,225 @@ async fn test_active_requests_stays_balanced_after_gateway_level_errors() {
         "the gauge must be balanced after gateway-level errors, got {value}: {series}"
     );
     let _ = value;
+}
+
+const LATENCY_BASED_CONFIG: &str = r#"
+global_plugins = ["request_id", "api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[metrics]
+enabled = true
+
+[plugins.request_id]
+category = "request_id"
+header_name = "X-Request-Id"
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.slow]
+kind = "openai"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+default_model = "gpt-4o"
+
+[providers.fast]
+kind = "openai"
+base_url = "{FALLBACK_URL}"
+api_key = "fake-key"
+default_model = "gpt-4o"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "slow"
+fallback = ["fast"]
+strategy = "latency_based"
+"#;
+
+/// The latency-based strategy is no longer a stub. Both providers get
+/// measured without the primary ever being counted as a breaker failure:
+///
+/// 1. the primary answers 200 slowly — its latency estimate is recorded,
+/// 2. the next request carries a body the primary does not carry, so it
+///    answers 404, which fails the request over to the fallback *without*
+///    counting a breaker failure — the fallback gets measured too,
+/// 3. from then on the latency-based route picks the fastest healthy
+///    provider, and the slow primary is no longer contacted.
+#[tokio::test]
+async fn test_latency_based_moves_traffic_to_the_fastest_provider() {
+    let slow = MockServer::start().await;
+    let fast = MockServer::start().await;
+
+    // Mounted last → matched first: the warm-up request ("one") is served
+    // slowly, everything else gets the 404 that walks the request over.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("one"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(openai_response("from slow"))
+                .set_delay(Duration::from_millis(400)),
+        )
+        .mount(&slow)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(404)
+                .set_body_json(json!({"error": {"message": "invalid params, unknown model"}})),
+        )
+        .mount(&slow)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(openai_response("from fast"))
+                .set_delay(Duration::from_millis(10)),
+        )
+        .mount(&fast)
+        .await;
+
+    let gw = TestGateway::start_with_fallback(LATENCY_BASED_CONFIG, &slow.uri(), &fast.uri()).await;
+    let c = client();
+
+    // 1. No measurements yet: the primary (cold-start order) serves it.
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&chat_body("gpt-4o", "one"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["X-MaxLLM-Provider"], "slow");
+
+    // 2. The primary's 404 walks the request over to the fast fallback —
+    //    without tripping the slow breaker, so both stay healthy.
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&chat_body("gpt-4o", "two"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["X-MaxLLM-Provider"], "fast");
+
+    // 3. Both providers are measured and healthy: the fastest one wins.
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&chat_body("gpt-4o", "three"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()["X-MaxLLM-Provider"],
+        "fast",
+        "the latency-based route must prefer the fastest measured provider"
+    );
+
+    let slow_reqs = slow.received_requests().await.unwrap_or_default();
+    let fast_reqs = fast.received_requests().await.unwrap_or_default();
+    assert_eq!(
+        slow_reqs.len(),
+        2,
+        "the slow primary serves exactly the warm-up and the 404 walk"
+    );
+    assert_eq!(fast_reqs.len(), 2, "the fast fallback serves steps 2 and 3");
+}
+
+const COST_BASED_CONFIG: &str = r#"
+global_plugins = ["request_id", "api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[metrics]
+enabled = true
+
+[plugins.request_id]
+category = "request_id"
+header_name = "X-Request-Id"
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.expensive]
+kind = "openai"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+default_model = "gpt-4o"
+
+[providers.cheap]
+kind = "openai"
+base_url = "{FALLBACK_URL}"
+api_key = "fake-key"
+default_model = "gpt-4o-mini"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "expensive"
+fallback = ["cheap"]
+strategy = "cost_based"
+"#;
+
+/// The cost-based strategy is no longer a stub: with the built-in price
+/// table, gpt-4o is pricier than gpt-4o-mini, so traffic must land on the
+/// cheaper fallback even though it is not the primary.
+#[tokio::test]
+async fn test_cost_based_routes_to_the_cheapest_provider() {
+    let expensive = MockServer::start().await;
+    let cheap = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("expensive")))
+        .mount(&expensive)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("cheap")))
+        .mount(&cheap)
+        .await;
+
+    let gw =
+        TestGateway::start_with_fallback(COST_BASED_CONFIG, &expensive.uri(), &cheap.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&chat_body("gpt-4o", "hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()["X-MaxLLM-Provider"],
+        "cheap",
+        "cost-based routing must prefer the cheaper provider"
+    );
+
+    let expensive_reqs = expensive.received_requests().await.unwrap_or_default();
+    let cheap_reqs = cheap.received_requests().await.unwrap_or_default();
+    assert_eq!(
+        expensive_reqs.len(),
+        0,
+        "the expensive primary must not be asked"
+    );
+    assert_eq!(cheap_reqs.len(), 1);
 }
