@@ -13,3 +13,5 @@ DEEP_ANALYSIS.md
 
 # cargo-mutants results
 mutants.out/
+mutants.out.old/
+mutants.out.*/
