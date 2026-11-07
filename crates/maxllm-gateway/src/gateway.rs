@@ -4429,17 +4429,69 @@ impl AiGateway {
             || ctx.auto_requested
             || hot.auto_name.as_deref() == Some(ctx.model.as_str());
         if wants_auto && !hot.auto_pool.is_empty() {
-            return hot
+            // A genuine auto route picked its first provider in
+            // `select_provider` (session-sticky, then round-robin), so this
+            // walk only has to move forward to the next healthy entry.
+            if route.auto_model {
+                return hot
+                    .auto_pool
+                    .iter()
+                    .filter(|e| e.provider != ctx.provider_name)
+                    .filter(|e| !ctx.attempted_providers.contains(&e.provider))
+                    .find_map(|e| {
+                        hot.providers
+                            .get(&e.provider)
+                            .filter(|p| !p.circuit_breaker.is_open())
+                            .map(|p| (e.provider.clone(), Arc::clone(p)))
+                    });
+            }
+            // Sentinel carried by a request on a non-auto route: the pool is
+            // entered mid-request, so no `select_provider` slot ever rotated
+            // for it. Rotate here instead — walking the pool in order would
+            // pin every such request to the first working entry and leave the
+            // other 24 idle, which is the opposite of what `auto` promises.
+            //
+            // Session binding first: a conversation that already landed on a
+            // pool provider keeps it, so the upstream keeps its context.
+            if let Some(session_id) = ctx.session_id.as_deref() {
+                if let Some(pinned) = self.sessions.get(session_id) {
+                    let usable = pinned != ctx.provider_name
+                        && !ctx.attempted_providers.contains(&pinned)
+                        && hot.auto_pool.iter().any(|e| e.provider == pinned);
+                    if usable {
+                        if let Some(pair) = hot
+                            .providers
+                            .get(&pinned)
+                            .filter(|p| !p.circuit_breaker.is_open())
+                            .map(|p| (pinned.clone(), Arc::clone(p)))
+                        {
+                            METRICS.session_affinity_hits_total.inc();
+                            return Some(pair);
+                        }
+                    }
+                }
+            }
+            let healthy: Vec<&AutoPoolEntry> = hot
                 .auto_pool
                 .iter()
                 .filter(|e| e.provider != ctx.provider_name)
                 .filter(|e| !ctx.attempted_providers.contains(&e.provider))
-                .find_map(|e| {
+                .filter(|e| {
                     hot.providers
                         .get(&e.provider)
-                        .filter(|p| !p.circuit_breaker.is_open())
-                        .map(|p| (e.provider.clone(), Arc::clone(p)))
-                });
+                        .map(|p| !p.circuit_breaker.is_open())
+                        .unwrap_or(false)
+                })
+                .collect();
+            if healthy.is_empty() {
+                return None;
+            }
+            let idx = AUTO_POOL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as usize;
+            let entry = healthy[idx % healthy.len()];
+            return hot
+                .providers
+                .get(&entry.provider)
+                .map(|p| (entry.provider.clone(), Arc::clone(p)));
         }
 
         route

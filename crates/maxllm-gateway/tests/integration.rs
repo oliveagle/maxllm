@@ -4472,6 +4472,201 @@ auto_model = true
     assert_eq!(sent["model"], "model-b");
 }
 
+/// Spawn the gateway with three upstream placeholders — the route's own
+/// provider plus two auto-pool members — and wait until it answers `/health`.
+/// The auto-pool tests need one more upstream than [`TestGateway`] supports.
+async fn spawn_gateway_with_pool(
+    config: &str,
+    urls: [&str; 3],
+) -> (Child, String, tempfile::NamedTempFile) {
+    let port = portpicker::pick_unused_port().expect("no free port");
+    let config_str = config
+        .replace("{PORT}", &port.to_string())
+        .replace("{MOCK_URL}", urls[0])
+        .replace("{POOL_A_URL}", urls[1])
+        .replace("{POOL_B_URL}", urls[2]);
+    let mut config_file = tempfile::NamedTempFile::new().expect("temp file");
+    config_file
+        .write_all(config_str.as_bytes())
+        .expect("write config");
+    let child = Command::new(env!("CARGO_BIN_EXE_maxllm-server"))
+        .arg("--config")
+        .arg(config_file.path())
+        .env("RUST_LOG", "warn")
+        .env_remove("HTTPS_PROXY")
+        .env_remove("HTTP_PROXY")
+        .env_remove("https_proxy")
+        .env_remove("http_proxy")
+        .spawn()
+        .expect("spawn gateway");
+    let base = format!("http://127.0.0.1:{port}");
+    let c = client();
+    for _ in 0..40 {
+        if c.get(format!("{base}/health"))
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    (child, base, config_file)
+}
+
+/// Config shared by the two "sentinel on a non-auto route" tests: the route's
+/// own provider answers 404 (no model called `auto`), the pool has two healthy
+/// members that both answer 200.
+const SENTINEL_POOL_CONFIG: &str = r#"
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[providers.summary]
+kind = "openai"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+
+[providers.pool_a]
+kind = "openai"
+base_url = "{POOL_A_URL}"
+api_key = "fake-key"
+
+[providers.pool_b]
+kind = "openai"
+base_url = "{POOL_B_URL}"
+api_key = "fake-key"
+
+[auto_model]
+enabled = true
+name = "auto"
+
+[[auto_model.pool]]
+provider = "pool_a"
+model = "model-a"
+
+[[auto_model.pool]]
+provider = "pool_b"
+model = "model-b"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "summary"
+session_sticky = true
+"#;
+
+/// The sentinel on a non-auto route enters the pool mid-request, so it never
+/// passes through the `select_provider` rotation slot. It must still rotate:
+/// walking the pool in order would pin every such request to the first working
+/// entry and leave the rest idle. Four requests over a two-entry pool must use
+/// both entries.
+#[tokio::test]
+async fn test_auto_sentinel_on_a_non_auto_route_rotates_across_the_pool() {
+    let summary = MockServer::start().await;
+    let a = MockServer::start().await;
+    let b = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "error": {"code": "UnsupportedModel", "message": "unknown model"}
+        })))
+        .mount(&summary)
+        .await;
+    for mock in [&a, &b] {
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("ok")))
+            .mount(mock)
+            .await;
+    }
+
+    let (mut child, base, _cfg) =
+        spawn_gateway_with_pool(SENTINEL_POOL_CONFIG, [&summary.uri(), &a.uri(), &b.uri()]).await;
+    let c = client();
+
+    for i in 0..4 {
+        let resp = c
+            .post(format!("{base}/v1/chat/completions"))
+            .header("session-id", format!("rotate-{i}"))
+            .json(&chat_body("auto", "hi"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            200,
+            "request {i} must be served from the pool"
+        );
+    }
+
+    let a_reqs = a.received_requests().await.unwrap_or_default();
+    let b_reqs = b.received_requests().await.unwrap_or_default();
+    assert_eq!(a_reqs.len() + b_reqs.len(), 4, "every request served once");
+    assert!(
+        !a_reqs.is_empty() && !b_reqs.is_empty(),
+        "the sentinel must rotate over the pool, got a={} b={}",
+        a_reqs.len(),
+        b_reqs.len()
+    );
+
+    child.kill().ok();
+    child.wait().ok();
+}
+
+/// Once a sentinel request has landed on a pool provider, the session keeps
+/// using it: the upstream keeps its context instead of hopping between keys.
+#[tokio::test]
+async fn test_auto_sentinel_keeps_the_session_on_one_pool_provider() {
+    let summary = MockServer::start().await;
+    let a = MockServer::start().await;
+    let b = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "error": {"code": "UnsupportedModel", "message": "unknown model"}
+        })))
+        .mount(&summary)
+        .await;
+    for mock in [&a, &b] {
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("ok")))
+            .mount(mock)
+            .await;
+    }
+
+    let sticky_config = format!(
+        "[session_sticky]\nenabled = true\ntimeout_secs = 3600\nmax_entries = 100\n{}",
+        SENTINEL_POOL_CONFIG
+    );
+    let (mut child, base, _cfg) =
+        spawn_gateway_with_pool(&sticky_config, [&summary.uri(), &a.uri(), &b.uri()]).await;
+    let c = client();
+
+    for _ in 0..3 {
+        let resp = c
+            .post(format!("{base}/v1/chat/completions"))
+            .header("session-id", "sticky-session")
+            .json(&chat_body("auto", "hi"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    let a_reqs = a.received_requests().await.unwrap_or_default();
+    let b_reqs = b.received_requests().await.unwrap_or_default();
+    assert_eq!(a_reqs.len() + b_reqs.len(), 3, "every request served once");
+    assert!(
+        a_reqs.is_empty() || b_reqs.is_empty(),
+        "the session binding must keep all three on one provider, got a={} b={}",
+        a_reqs.len(),
+        b_reqs.len()
+    );
+
+    child.kill().ok();
+    child.wait().ok();
+}
+
 // ---------------------------------------------------------------------------
 // Gap-closure tests: requests_total producer, the active-requests gauge
 // balance on gateway-level errors, and the latency-/cost-based strategies.
