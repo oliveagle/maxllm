@@ -392,6 +392,29 @@ was tried (`provider=status`, `provider=connect`, `provider=dns`), so a
 trailing DNS failure on the last pool member no longer hides the real answers
 of the others (typically `404 UnsupportedModel`).
 
+The same rewrite covers a sentinel that only exists in the body: on a plain
+route the provider is picked before the body is read, so a request that lands on
+a pool member (a pinned session, or a route whose own provider is listed in the
+pool) gets its `model` rewritten to that entry's model instead of being rejected
+and bounced to a different member — which would also lose the upstream's prompt
+cache for every turn of the conversation.
+
+### Failover with a large request body
+
+Pingora keeps at most 64 KiB of the client body for a replay and silently drops
+the rest. An agent request is much larger (codex sends ~100 KB of instructions
+and tool schemas), so a failover used to hand the next upstream a truncated
+body: the upstream waited for the rest while the client waited for a response,
+and the turn went silent for minutes (measured: 391 s). The gateway keeps the
+client body itself (`ctx.client_body`) and re-feeds it whole — re-translated for
+the new provider, whose model name differs — through `request_body_filter`.
+
+That needs one condition in pingora-proxy to call the filter even when the
+replay buffer truncated. The one-line patch is vendored in
+`vendor/pingora-proxy` (see `vendor/README.md` and
+`vendor/pingora-proxy-maxllm.patch`); upstream 0.9.1 still has the old
+condition.
+
 ### A pool member that accepts the connection and hangs up
 
 A model server that crashed, or a supervisor still holding the listen socket

@@ -24,6 +24,25 @@ struct TestGateway {
     _config_file: tempfile::NamedTempFile,
 }
 
+/// Ports already handed to a gateway in this test binary.
+///
+/// `portpicker` only checks that a port is free *at the moment it is picked*,
+/// so two tests starting in parallel can be handed the same one. The gateway
+/// that loses the bind exits, and the winner's client then talks to the *other*
+/// test's gateway — which shows up as a random 200 with the wrong provider
+/// header in whichever test lost the race.
+static CLAIMED_PORTS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<u16>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+fn pick_gateway_port() -> u16 {
+    loop {
+        let port = portpicker::pick_unused_port().expect("no free port");
+        if CLAIMED_PORTS.lock().expect("port set").insert(port) {
+            return port;
+        }
+    }
+}
+
 impl TestGateway {
     /// Spawn the gateway binary with the given TOML config.
     /// The `{PORT}` placeholder is replaced with a random free port.
@@ -50,7 +69,7 @@ impl TestGateway {
         fallback_url: &str,
         laya_url: &str,
     ) -> Self {
-        let port = portpicker::pick_unused_port().expect("no free port");
+        let port = pick_gateway_port();
         let config_str = config_template
             .replace("{PORT}", &port.to_string())
             .replace("{MOCK_URL}", mock_url)
@@ -80,7 +99,7 @@ impl TestGateway {
             .spawn()
             .expect("failed to spawn gateway");
 
-        let gw = Self {
+        let mut gw = Self {
             child,
             port,
             _config_file: config_file,
@@ -93,6 +112,11 @@ impl TestGateway {
         loop {
             if tokio::time::Instant::now() > deadline {
                 panic!("Gateway did not start within 10 seconds");
+            }
+            // A gateway that lost a bind race is gone; without this the health
+            // poll below would answer from the *other* test's gateway.
+            if let Ok(Some(status)) = gw.child.try_wait() {
+                panic!("gateway exited during startup ({status}); was port {port} taken?");
             }
             if let Ok(resp) = client.get(&health_url).send().await {
                 if resp.status().is_success() {
@@ -4400,11 +4424,20 @@ provider = "summary"
         "the sentinel must be served by the auto pool, not fail with the upstream 404"
     );
 
+    // The sentinel lives in the body, and the provider has to be picked before
+    // the body is read, so the route's own provider unavoidably sees the
+    // literal sentinel once and rejects it. What matters is the retry: it must
+    // land in the pool carrying that entry's model, not "auto" again.
     let summary_reqs = summary.received_requests().await.unwrap_or_default();
     assert_eq!(
         summary_reqs.len(),
         1,
-        "the route's own provider is tried once before the switch"
+        "one wasted hop to the route's own provider, then the pool"
+    );
+    let sent: Value = serde_json::from_slice(&summary_reqs[0].body).expect("json body");
+    assert_eq!(
+        sent["model"], "auto",
+        "the first hop carries the literal sentinel"
     );
 
     let pool_reqs = pool.received_requests().await.unwrap_or_default();
@@ -4412,7 +4445,73 @@ provider = "summary"
     let sent: Value = serde_json::from_slice(&pool_reqs[0].body).expect("json body");
     assert_eq!(
         sent["model"], "model-b",
-        "the sentinel must never reach the upstream — the body carries the pool entry's model"
+        "the replayed body must carry the pool entry's model"
+    );
+}
+
+/// The sentinel can only be seen in the body on a route that does not declare
+/// `auto_model`, and the provider is chosen before the body is read. When the
+/// provider that was chosen is itself a pool member — a session pinned to one
+/// from an earlier turn, or a route whose own provider is listed in the pool —
+/// the body must be rewritten to that entry's model. Forwarding the literal
+/// sentinel would cost a 404 and a failover to a *different* member on every
+/// turn, throwing away the upstream's prompt cache for the conversation.
+#[tokio::test]
+async fn test_body_sentinel_is_rewritten_for_a_pool_member_on_a_plain_route() {
+    let member = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from-member")))
+        .expect(1)
+        .mount(&member)
+        .await;
+
+    let config = r#"
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[providers.member]
+kind = "openai"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+
+[auto_model]
+enabled = true
+name = "auto"
+
+[[auto_model.pool]]
+provider = "member"
+model = "model-member"
+
+# Not an auto route: the sentinel arrives in the body, too late to take part
+# in picking the provider — which happens to be a pool member anyway.
+[[routes]]
+path = "/v1/responses"
+endpoint_type = "responses"
+provider = "member"
+"#;
+    let gw = TestGateway::start(config, &member.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/responses"))
+        .json(&json!({"model": "auto", "input": "hi"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "the pool member serves the request directly (body: {})",
+        resp.text().await.unwrap_or_default()
+    );
+
+    let reqs = member.received_requests().await.unwrap_or_default();
+    assert_eq!(reqs.len(), 1, "one call, no wasted 404 hop");
+    let sent: Value = serde_json::from_slice(&reqs[0].body).expect("json body");
+    assert_eq!(
+        sent["model"], "model-member",
+        "the sentinel must be rewritten before it reaches the upstream"
     );
 }
 
@@ -6377,4 +6476,151 @@ fallback = ["member"]
             sent["model"]
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Large bodies and failover (pingora's 64 KiB replay buffer)
+// ---------------------------------------------------------------------------
+
+/// Accept, read only the request head, answer 404 and close — the shape of an
+/// upstream that rejects the model before reading the body it was given.
+fn spawn_early_404_upstream() -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind early-404 listener");
+    let addr = listener.local_addr().expect("local addr");
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            // Read only up to the end of the request head.
+            while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                }
+            }
+            let _ = stream.write_all(
+                b"HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+            );
+            let _ = stream.flush();
+            // Drop without reading the remaining body.
+        }
+    });
+    format!("http://{addr}")
+}
+
+const LARGE_BODY_FAILOVER_CONFIG: &str = r#"
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[providers.early_404]
+kind = "openai"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+
+[providers.alive]
+kind = "openai"
+base_url = "{FALLBACK_URL}"
+api_key = "fake-key"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "early_404"
+fallback = ["alive"]
+"#;
+
+/// A real codex request is ~100 KB (instructions + tool schemas). Pingora keeps
+/// only 64 KiB of the downstream body for replay, so a failover after a large
+/// body must not deadlock: either the retry is skipped (fast error) or the
+/// replayed body is whole. It must never leave the client waiting forever.
+#[tokio::test]
+async fn test_large_body_fails_over_with_the_whole_body() {
+    let alive = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from-alive")))
+        .mount(&alive)
+        .await;
+
+    let dead_url = spawn_early_404_upstream();
+    let gw =
+        TestGateway::start_with_fallback(LARGE_BODY_FAILOVER_CONFIG, &dead_url, &alive.uri()).await;
+
+    let filler = "x".repeat(100_000);
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": filler}],
+    });
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(20),
+        client()
+            .post(gw.url("/v1/chat/completions"))
+            .json(&body)
+            .send(),
+    )
+    .await
+    .expect("a large-body failover must not hang the client")
+    .expect("request completes");
+
+    assert_eq!(
+        outcome.status(),
+        200,
+        "the failover must replay the whole body, not a 64 KiB prefix (body: {})",
+        outcome.text().await.unwrap_or_default()
+    );
+    let served = alive.received_requests().await.unwrap_or_default();
+    assert_eq!(served.len(), 1, "the fallback is tried once");
+    let sent: Value = serde_json::from_slice(&served[0].body).expect("json body");
+    let content = sent["messages"][0]["content"].as_str().unwrap_or_default();
+    assert_eq!(
+        content.len(),
+        100_000,
+        "the replayed body must be complete, got {} bytes",
+        content.len()
+    );
+}
+
+/// Connect-refused primary, healthy fallback, 100 KB body: pingora replays the
+/// request from its 64 KiB body buffer, so this must not deadlock either.
+#[tokio::test]
+async fn test_large_body_survives_a_connect_failure() {
+    let alive = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from-alive")))
+        .mount(&alive)
+        .await;
+
+    // 127.0.0.1:1 — nothing listens, connect is refused immediately.
+    let gw = TestGateway::start_with_fallback(
+        LARGE_BODY_FAILOVER_CONFIG,
+        "http://127.0.0.1:1",
+        &alive.uri(),
+    )
+    .await;
+
+    let filler = "x".repeat(100_000);
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": filler}],
+    });
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(20),
+        client()
+            .post(gw.url("/v1/chat/completions"))
+            .json(&body)
+            .send(),
+    )
+    .await
+    .expect("a large-body connect failover must not hang")
+    .expect("request completes");
+
+    assert_eq!(
+        outcome.status(),
+        200,
+        "the fallback must serve the request (body: {})",
+        outcome.text().await.unwrap_or_default()
+    );
 }

@@ -861,6 +861,83 @@ impl AiGateway {
         Some(mc.input_cost_per_1m + mc.output_cost_per_1m)
     }
 
+    /// Pick a (provider, model) pair from the `[auto_model]` pool for this
+    /// request: the session binding first (a conversation stays on the
+    /// provider that first served it, so the upstream keeps its context), then
+    /// round-robin over the healthy entries. The chosen pair is recorded in
+    /// `ctx.auto_target`, so the body's `model` field is rewritten before it
+    /// reaches an upstream.
+    fn select_from_auto_pool(
+        &self,
+        hot: &HotState,
+        route: &RouteConfig,
+        ctx: &mut RequestCtx,
+    ) -> Option<Arc<ProviderState>> {
+        // 1. Session-sticky: a session pinned to a pool provider keeps
+        //    using it (a different key loses upstream context), unless
+        //    that provider's circuit is open.
+        if route.session_sticky && hot.session_sticky_enabled {
+            if let Some(session_id) = ctx.session_id.clone() {
+                match self.sessions.get(&session_id) {
+                    Some(pinned_name) => {
+                        if let Some(entry) =
+                            hot.auto_pool.iter().find(|e| e.provider == pinned_name)
+                        {
+                            if let Some(provider) = hot.providers.get(&entry.provider) {
+                                if !provider.circuit_breaker.is_open() {
+                                    METRICS.session_affinity_hits_total.inc();
+                                    ctx.provider_name = entry.provider.clone();
+                                    ctx.auto_target =
+                                        Some((entry.provider.clone(), entry.model.clone()));
+                                    ctx.model = entry.model.clone();
+                                    ctx.plugin_ctx.model = entry.model.clone();
+                                    ctx.native_responses = ctx.endpoint_type
+                                        == EndpointType::Responses
+                                        && provider.native_responses
+                                        && provider.responses_path.is_some();
+                                    return Some(Arc::clone(provider));
+                                }
+                            }
+                        }
+                        // Pinned provider unavailable (open circuit or no
+                        // longer in the pool) — fall through to
+                        // round-robin; the session re-pins on the next
+                        // successful response.
+                    }
+                    None => {
+                        METRICS.session_affinity_misses_total.inc();
+                    }
+                }
+            }
+        }
+        // 2. Round-robin over the healthy pool entries.
+        let healthy: Vec<&AutoPoolEntry> = hot
+            .auto_pool
+            .iter()
+            .filter(|e| {
+                hot.providers
+                    .get(&e.provider)
+                    .map(|p| !p.circuit_breaker.is_open())
+                    .unwrap_or(false)
+            })
+            .collect();
+        if healthy.is_empty() {
+            return None;
+        }
+        let idx = AUTO_POOL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as usize;
+        let entry = healthy[idx % healthy.len()];
+        let provider = Arc::clone(hot.providers.get(&entry.provider)?);
+        ctx.provider_name = entry.provider.clone();
+        ctx.auto_target = Some((entry.provider.clone(), entry.model.clone()));
+        ctx.model = entry.model.clone();
+        ctx.plugin_ctx.model = entry.model.clone();
+        // A native-Responses entry gets the request forwarded unchanged.
+        ctx.native_responses = ctx.endpoint_type == EndpointType::Responses
+            && provider.native_responses
+            && provider.responses_path.is_some();
+        Some(provider)
+    }
+
     /// Select provider using the route's configured strategy.
     fn select_provider(
         &self,
@@ -868,77 +945,28 @@ impl AiGateway {
         route: &RouteConfig,
         ctx: &mut RequestCtx,
     ) -> Option<Arc<ProviderState>> {
-        // Auto route: rotate over the [auto_model] pool instead of the
-        // route's fallback chain. Selection is session-sticky first (a
-        // conversation stays on the provider that first served it, so the
-        // upstream keeps its context), then round-robin over the healthy
-        // entries (breaker not open). The chosen (provider, model) pair is
-        // remembered in ctx.auto_target so the body's model field can be
-        // rewritten to the entry's model later.
-        if route.auto_model && !hot.auto_pool.is_empty() {
-            // 1. Session-sticky: a session pinned to a pool provider keeps
-            //    using it (a different key loses upstream context), unless
-            //    that provider's circuit is open.
-            if route.session_sticky && hot.session_sticky_enabled {
-                if let Some(session_id) = ctx.session_id.clone() {
-                    match self.sessions.get(&session_id) {
-                        Some(pinned_name) => {
-                            if let Some(entry) =
-                                hot.auto_pool.iter().find(|e| e.provider == pinned_name)
-                            {
-                                if let Some(provider) = hot.providers.get(&entry.provider) {
-                                    if !provider.circuit_breaker.is_open() {
-                                        METRICS.session_affinity_hits_total.inc();
-                                        ctx.provider_name = entry.provider.clone();
-                                        ctx.auto_target =
-                                            Some((entry.provider.clone(), entry.model.clone()));
-                                        ctx.model = entry.model.clone();
-                                        ctx.plugin_ctx.model = entry.model.clone();
-                                        ctx.native_responses = ctx.endpoint_type
-                                            == EndpointType::Responses
-                                            && provider.native_responses
-                                            && provider.responses_path.is_some();
-                                        return Some(Arc::clone(provider));
-                                    }
-                                }
-                            }
-                            // Pinned provider unavailable (open circuit or no
-                            // longer in the pool) — fall through to
-                            // round-robin; the session re-pins on the next
-                            // successful response.
-                        }
-                        None => {
-                            METRICS.session_affinity_misses_total.inc();
-                        }
-                    }
-                }
+        // The `auto` sentinel is served from the [auto_model] pool on *any*
+        // route, not only on routes that declare `auto_model = true`.
+        //
+        // When the sentinel is already known here — the path carries it
+        // (`/v1/responses/auto`) or the route declares `auto_model` — the pool
+        // is entered directly, with no wasted call to the route's own provider.
+        // When only the body carries it the model is not known yet (the
+        // provider has to be picked before the body is read), so the request
+        // takes one 404 from the route's provider and the failover walks into
+        // the pool — see `switch_to_fallback` for the replay that makes that
+        // safe for a ~100 KB agent request.
+        let wants_auto = route.auto_model
+            || ctx.auto_requested
+            || hot.auto_name.as_deref() == Some(ctx.model.as_str());
+        if wants_auto && !hot.auto_pool.is_empty() {
+            ctx.auto_requested = true;
+            if let Some(provider) = self.select_from_auto_pool(hot, route, ctx) {
+                return Some(provider);
             }
-            // 2. Round-robin over the healthy pool entries.
-            let healthy: Vec<&AutoPoolEntry> = hot
-                .auto_pool
-                .iter()
-                .filter(|e| {
-                    hot.providers
-                        .get(&e.provider)
-                        .map(|p| !p.circuit_breaker.is_open())
-                        .unwrap_or(false)
-                })
-                .collect();
-            if healthy.is_empty() {
-                return None;
-            }
-            let idx = AUTO_POOL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as usize;
-            let entry = healthy[idx % healthy.len()];
-            let provider = Arc::clone(hot.providers.get(&entry.provider)?);
-            ctx.provider_name = entry.provider.clone();
-            ctx.auto_target = Some((entry.provider.clone(), entry.model.clone()));
-            ctx.model = entry.model.clone();
-            ctx.plugin_ctx.model = entry.model.clone();
-            // A native-Responses entry gets the request forwarded unchanged.
-            ctx.native_responses = ctx.endpoint_type == EndpointType::Responses
-                && provider.native_responses
-                && provider.responses_path.is_some();
-            return Some(provider);
+            // Every pool entry is unhealthy — fall through to the route's own
+            // selection so the request still has somewhere to go.
+            ctx.auto_requested = false;
         }
 
         // Build list of all candidate providers for this route
@@ -1415,6 +1443,63 @@ impl AiGateway {
             }
         }
     }
+
+    /// Rewrite a body-level `auto` sentinel to the model of the pool entry the
+    /// request has already landed on.
+    ///
+    /// A route that is not an auto route only reveals the sentinel in the
+    /// request body (`{"model": "auto"}`), and the provider is picked before
+    /// the body is read, so the sentinel cannot influence that first hop. When
+    /// the picked provider is itself a pool member — the session is pinned to
+    /// one from an earlier turn, or the route's own provider is listed in the
+    /// pool — forwarding the literal sentinel makes the upstream answer 404 and
+    /// routes every single turn through a failover to a different member,
+    /// which also throws away the upstream's prompt cache for the whole
+    /// conversation. Rewriting the body to the entry's model keeps the request
+    /// where it already is.
+    ///
+    /// Only chunked requests are rewritten: a Content-Length-framed body whose
+    /// length changes would be truncated by the upstream.
+    async fn adopt_sentinel_model(
+        &self,
+        hot: &HotState,
+        session: &mut Session,
+        ctx: &mut RequestCtx,
+    ) -> pingora::Result<()> {
+        let Some(auto_name) = hot.auto_name.clone() else {
+            return Ok(());
+        };
+        if ctx.request_body_buf.is_empty() || ctx.provider_name.is_empty() {
+            return Ok(());
+        }
+        let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(&ctx.request_body_buf)
+        else {
+            return Ok(());
+        };
+        if parsed.get("model").and_then(|m| m.as_str()) != Some(auto_name.as_str()) {
+            return Ok(());
+        }
+        let Some((provider, model)) = hot
+            .auto_pool
+            .iter()
+            .find(|e| e.provider == ctx.provider_name)
+            .map(|e| (e.provider.clone(), e.model.clone()))
+        else {
+            return Ok(());
+        };
+        if let Some(obj) = parsed.as_object_mut() {
+            obj.insert("model".into(), serde_json::Value::String(model.clone()));
+        }
+        if let Ok(bytes) = serde_json::to_vec(&parsed) {
+            ctx.request_body_buf = bytes;
+        }
+        ctx.auto_requested = true;
+        ctx.auto_target = Some((provider, model.clone()));
+        ctx.model = model.clone();
+        Self::enforce_model_allowlist(session, ctx, &model, None).await?;
+        ctx.plugin_ctx.model = model;
+        Ok(())
+    }
 }
 
 /// Extract the model from a Gemini-style request path
@@ -1446,6 +1531,29 @@ fn route_timeout_secs(routes: &[RouteConfig], route_index: Option<usize>) -> Opt
 /// The route's request-level failover budget: how many providers one request
 /// may walk when the current provider fails. Unset (or absent) routes keep
 /// the built-in default, which matches litellm_lb_go's bound.
+/// Whether this request can be sent to another provider at all.
+///
+/// Pingora buffers at most `BODY_BUF_LIMIT` (64 KiB) of the client body for a
+/// retry and silently drops the excess. Once the whole body has been read from
+/// the client, replaying that prefix hands the next upstream an incomplete
+/// body while the client waits for a response — neither side can make
+/// progress, so both sit there until a timeout. That is a hang, not an error,
+/// and it is what a ~100 KB codex request used to do whenever its first
+/// provider answered 404.
+///
+/// So a failover is only started when the body is either still readable from
+/// the client (nothing consumed yet, e.g. a connect failure) or small enough
+/// to be replayed whole.
+fn body_is_replayable(session: &mut Session, ctx: &RequestCtx) -> bool {
+    // The body we already read is re-injected on the retry, so the replay
+    // buffer's truncation does not matter.
+    if ctx.client_body.is_some() {
+        return true;
+    }
+    let truncated = session.as_ref().retry_buffer_truncated();
+    !(truncated && session.as_mut().is_body_done())
+}
+
 fn max_failover_attempts(routes: &[RouteConfig], route_index: Option<usize>) -> u32 {
     route_index
         .and_then(|i| routes.get(i))
@@ -2205,6 +2313,22 @@ impl ProxyHttp for AiGateway {
         end_of_stream: bool,
         ctx: &mut Self::CTX,
     ) -> pingora::Result<()> {
+        // A retried request: pingora replays at most 64 KiB of the body. Feed
+        // the whole body we already read as the final chunk instead, and drop
+        // the truncated remainder it replays afterwards.
+        if ctx.replay_injected {
+            *body = None;
+            return Ok(());
+        }
+        let end_of_stream = match ctx.replay_body.take() {
+            Some(original) => {
+                ctx.replay_injected = true;
+                *body = Some(Bytes::from(original));
+                true
+            }
+            None => end_of_stream,
+        };
+
         // Session-sticky: the session identity may also live in the request
         // body (`metadata.user_id`, `client_metadata.session_id`,
         // `prompt_cache_key`). Only buffered bodies are inspected — the
@@ -2467,6 +2591,14 @@ impl ProxyHttp for AiGateway {
                         ctx.plugin_ctx.model = auto_model.clone();
                     }
                 }
+            } else if !ctx.keep_request_content_length {
+                // The client sent the sentinel in the body only (a plain chat
+                // or responses route, no `auto_model` on the route and no
+                // model in the path). The provider is already picked at this
+                // point; if it is a pool member, serve it with that entry's
+                // model instead of forwarding "auto" upstream.
+                let hot = self.hot.load();
+                self.adopt_sentinel_model(&hot, session, ctx).await?;
             }
         }
 
@@ -2895,7 +3027,7 @@ impl ProxyHttp for AiGateway {
     /// and one-api expose on their channel pools.
     async fn upstream_response_filter(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         upstream_response: &mut ResponseHeader,
         ctx: &mut Self::CTX,
     ) -> pingora::Result<()> {
@@ -3036,6 +3168,19 @@ impl ProxyHttp for AiGateway {
             return Ok(());
         };
         if !should_failover_status(status, ctx, provider) {
+            return Ok(());
+        }
+        // A body bigger than the replay buffer cannot be sent again: refuse the
+        // retry rather than deadlock both sides (see `body_is_replayable`).
+        if !body_is_replayable(session, ctx) {
+            info!(
+                provider = %ctx.provider_name,
+                status = %status,
+                "request body exceeds the 64 KiB replay buffer — returning the provider's error instead of a truncated retry"
+            );
+            ctx.attempt_trail
+                .push(format!("{}=toobig", ctx.provider_name));
+            self.record_event(EVENT_PROVIDER_RESPONSE, ctx, Some(status), None, None, None);
             return Ok(());
         }
         // A 5xx is a transient provider failure: when the route allows it
@@ -3365,6 +3510,15 @@ impl ProxyHttp for AiGateway {
 
             // A quota-exhausted provider must not keep the session pinned.
             self.unpin_session(ctx);
+
+            if !body_is_replayable(session, ctx) {
+                info!(
+                    status = status,
+                    provider = %provider_name,
+                    "429 failover refused — the request body exceeds the 64 KiB replay buffer"
+                );
+                return Ok(None);
+            }
 
             // Same failover budget as the header-time path: when it is spent,
             // the 429 reaches the client as-is.
@@ -4154,7 +4308,7 @@ impl ProxyHttp for AiGateway {
     /// response travels the regular response path.
     fn fail_to_connect(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         _peer: &HttpPeer,
         ctx: &mut Self::CTX,
         mut e: Box<pingora::Error>,
@@ -4163,6 +4317,11 @@ impl ProxyHttp for AiGateway {
         // it is always safe to replay it on another provider. The walk is
         // bounded by the route's failover budget.
         if !AiGateway::is_connect_failure(&e) {
+            return e;
+        }
+        // ... unless the body is already spent: a request whose body was read
+        // past the replay buffer cannot be offered to another provider.
+        if !body_is_replayable(session, ctx) {
             return e;
         }
         let max_attempts = {
@@ -4227,6 +4386,9 @@ impl ProxyHttp for AiGateway {
             .decide_reuse(client_reused && !session.as_ref().retry_buffer_truncated());
 
         if ctx.upstream_responded || e.esource() != &pingora::ErrorSource::Upstream {
+            return e;
+        }
+        if !body_is_replayable(session, ctx) {
             return e;
         }
         let starved = matches!(
@@ -4684,6 +4846,11 @@ impl AiGateway {
         ctx.body_translated = false;
         ctx.upstream_responded = false;
         ctx.request_body_buf.clear();
+        // Re-feed the whole client body on the retry: the new provider must
+        // see the request translated again (the model may change), and
+        // pingora's own replay buffer only holds the first 64 KiB.
+        ctx.replay_body = ctx.client_body.clone();
+        ctx.replay_injected = false;
         ctx.keep_request_content_length = false;
         if let Ok(mut guard) = ctx.stream_translator.lock() {
             *guard = None;

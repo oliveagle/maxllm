@@ -514,7 +514,11 @@ mod tests {
             enabled: true,
             ..Default::default()
         };
-        let resolver = RateLimitResolver::new(cfg, None, None, None);
+        // An unreachable laya endpoint: `None` would silently point at the
+        // developer's own decision server (DEFAULT_BASE_URL on port 18405), so
+        // the answer — and this test — would depend on what happens to be
+        // running on the machine.
+        let resolver = RateLimitResolver::new(cfg, Some("http://127.0.0.1:1"), None, None);
         let (decision, learned) = resolver
             .resolve(429, &headers(&[]), b"something entirely unexpected")
             .await;

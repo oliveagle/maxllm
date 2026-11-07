@@ -161,6 +161,19 @@ pub struct RequestCtx {
     /// saying anything" (safe to replay on the next provider). Reset by
     /// `switch_to_fallback` so every attempt starts out unanswered.
     pub upstream_responded: bool,
+    /// The original client body, re-fed on a retry.
+    ///
+    /// Pingora keeps at most 64 KiB of the downstream body for a replay and
+    /// silently drops the rest, so replaying a real agent request (~100 KB of
+    /// instructions and tool schemas) hands the next upstream a truncated body
+    /// while the client waits for a response. The body we already read is
+    /// re-injected as a single final chunk instead, and translated again for
+    /// the new provider (the auto pool rewrites the model, so the bytes of the
+    /// failed attempt are not reusable).
+    pub replay_body: Option<Vec<u8>>,
+    /// Set once `replay_body` has been re-injected: the chunks that follow are
+    /// the replay buffer's truncated prefix and are dropped.
+    pub replay_injected: bool,
 }
 
 impl RequestCtx {
@@ -216,6 +229,8 @@ impl RequestCtx {
             auto_requested: false,
             attempt_trail: Vec::new(),
             upstream_responded: false,
+            replay_body: None,
+            replay_injected: false,
         }
     }
 }
