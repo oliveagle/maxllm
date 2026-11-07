@@ -254,8 +254,9 @@ the full contract, is cheaper, and removes a whole class of translation bugs.
    (their upstreams speak a different wire protocol); embedding/rerank
    providers are not chat providers at all.
 5. **Gate it.** `python3 scripts/check_responses_policy.py --config <toml>`
-   fails on any `openai`-shaped provider (including `openai_compat`, `deepseek`,
-   `ollama`, `opencode`) left on translation without an exemption.
+   (`make policy`; a CI job runs it on `maxllm.toml`) fails on any
+   `openai`-shaped provider (including `openai_compat`, `deepseek`, `ollama`,
+   `opencode`) left on translation without an exemption.
    `--live` additionally posts a minimal Responses body to every native route
    and reports `404` as a hard failure (wrong `responses_path` — fix the path,
    do not disable native), `--only <substring>` narrows the run.
