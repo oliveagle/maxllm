@@ -6,6 +6,34 @@ opencode source (upstream `anomalyco/opencode` v2.0.16 and the native
 `open-responses` adapter in the oliveagle fork, `packages/llm/src/protocols/
 openai-responses.ts`) plus live verification against the production gateway.
 
+## Native forwarding is the rule; this translation is the fallback
+
+This document specifies the *translation* contract — what maxllm must emit when
+it rewrites a Responses request into chat completions. **Translation is not the
+default behaviour, and it is not the preferred behaviour.**
+
+Every provider whose upstream serves the Responses API is configured with
+`native_responses = true`, so the gateway forwards `/v1/responses` bodies
+byte-for-byte and the upstream itself produces the Responses stream. The
+translation described below is used only for upstreams that have no Responses
+route (the `anthropic` / `gemini` / `bedrock` / `cohere` translators, plus any
+`openai`-shaped upstream that has been probed and found to 404 on every
+documented Responses path, recorded as an exemption).
+
+The reason is that the conversions above are lossy by construction: the
+`previous_response_id` / `store` / `include` / `encrypted_content` /
+`text.verbosity` / `prompt_cache_key` / `service_tier` family, vendor
+extensions and the provider's own tool-call indexing cannot survive a round
+trip through the chat schema. Forwarding natively keeps them, and every bug
+class catalogued in this document (dropped fields, split parallel tool calls,
+`encrypted_content` leakage, interleaved argument fragments) exists only on the
+translation path.
+
+Operational rules, the probe that distinguishes "no route" (404) from
+"route exists but rejected the call" (400/401/403/429/5xx), the exemption
+protocol, and the `scripts/check_responses_policy.py` gate are specified in
+`CLAUDE.md` § "Responses Contract Policy (MUST)".
+
 ## Two clients, one contract
 
 The opencode CLI can talk to a Responses server in two ways:

@@ -207,6 +207,63 @@ Built-in cost map for 10+ model families (gpt-4o, claude-sonnet, gemini-flash, e
 | Bedrock | OpenAI -> Anthropic (reuses Anthropic translator) | Anthropic -> OpenAI | Anthropic SSE -> OpenAI SSE |
 | OpenAI-compat | Passthrough | Passthrough | Passthrough |
 
+## Responses Contract Policy (MUST)
+
+`/v1/responses` traffic takes exactly one of two paths:
+
+| path | when | mechanism |
+|------|------|-----------|
+| **native** — `native_responses = true` | the upstream serves the Responses contract | the request is forwarded byte-for-byte to the provider's own `/responses` route and the upstream emits the Responses SSE |
+| **translated** — the default for other kinds | the upstream has no Responses route | the gateway rewrites the body into `/chat/completions` and rebuilds the Responses stream from chat deltas |
+
+**Rule: if the upstream supports Responses, the provider MUST be configured
+native. Translation is a recorded fallback for upstreams that have no
+Responses route — never a default you land on because a derived path 404s.**
+
+Translation is lossy by construction: it only knows the fields it has been
+taught, so `previous_response_id`, `store`, `include`/`encrypted_content`,
+`text.verbosity`, `prompt_cache_key`, `service_tier`, reasoning summaries and
+vendor extensions are dropped or re-derived, and tool-call fragments are
+re-assembled by the gateway instead of the provider. Native forwarding keeps
+the full contract, is cheaper, and removes a whole class of translation bugs.
+
+### Procedure for every new or changed provider
+
+1. **Probe the route.** `curl -s -o /dev/null -w '%{http_code}' -X POST
+   "{base_url}{responses_path}" -H "Authorization: Bearer $KEY" -H
+   "Content-Type: application/json" -d '{"model":"<model>","input":"ping"}'`.
+   `404` (with a JSON "not found" body) = no route. `400` / `401` / `403` /
+   `429` / `5xx` = **route exists** (the body, credentials or quota were
+   rejected — not the path). Treat only a genuine 404 as "unsupported".
+2. **Configure native.** `native_responses = true`. `responses_path` is derived
+   from `upstream_path` (`…/chat/completions` → `…/responses`) when omitted; set
+   it explicitly when the vendor's route differs (zhipu: `/api/v1/responses`,
+   while the derived `/api/coding/paas/v4/responses` is a real 404).
+3. **Prove the path is in use, without spending quota.** Send `{"model": …}`
+   with no `input`: the gateway's translation path answers
+   `400 invalid Responses request: responses request is missing 'input'` before anything leaves the
+   process, while the native path returns the *upstream's* status/body. A
+   second check is to point `responses_path` at a bogus path for one call — the
+   upstream's own 404 (not the gateway's validation error) proves the route is
+   being used.
+4. **Record the exemption** when (and only when) step 1 finds no route on any
+   path the vendor documents: keep `native_responses = false`, add a config
+   comment `# no Responses route: 404 <path> @YYYY-MM-DD`, and add the provider
+   to `EXEMPT` in `scripts/check_responses_policy.py` with the same reason.
+   `kind = "anthropic" | "gemini" | "bedrock" | "cohere"` are exempt by kind
+   (their upstreams speak a different wire protocol); embedding/rerank
+   providers are not chat providers at all.
+5. **Gate it.** `python3 scripts/check_responses_policy.py --config <toml>`
+   fails on any `openai`-shaped provider (including `openai_compat`, `deepseek`,
+   `ollama`, `opencode`) left on translation without an exemption.
+   `--live` additionally posts a minimal Responses body to every native route
+   and reports `404` as a hard failure (wrong `responses_path` — fix the path,
+   do not disable native), `--only <substring>` narrows the run.
+
+Do not: leave `native_responses` unset on an OpenAI-shaped provider (the
+default is `false` for every kind except `opencode`), use translation to paper
+over a wrong `responses_path`, or add a provider without having run step 1.
+
 ## Configuration
 
 Config is TOML with `${ENV_VAR}` expansion. Key sections:

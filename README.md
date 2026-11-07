@@ -492,12 +492,17 @@ connect_timeout_secs = 30
 total_connect_timeout_secs = 60
 ```
 
-### Native Responses opt-in for any provider
+### Native Responses: required whenever the upstream serves it
 
 `kind = "opencode"` is not the only upstream that serves the Responses
-contract. Any `openai_compat` provider that does can opt in, and the gateway
-then forwards `/v1/responses` requests byte-for-byte instead of translating
-them down to chat completions:
+contract. **Any provider whose upstream serves it must be configured
+`native_responses = true`** — the gateway then forwards `/v1/responses`
+requests byte-for-byte instead of translating them down to chat completions.
+Translation is a fallback for upstreams with no Responses route, and each such
+fallback has to be a recorded exemption (a probed 404, noted in the config and
+in `scripts/check_responses_policy.py`), not a silent default. See
+`CLAUDE.md` § "Responses Contract Policy (MUST)" for the probe, the config
+rules and the gate:
 
 ```toml
 [providers.one_api_kimi]
@@ -524,15 +529,29 @@ posting a minimal Responses body to the derived path:
 | `deepseek` | `/v1/responses` | 200 |
 | `one_api_kimi` | `/coding/v1/responses` | quota 429 (route exists) |
 | `olefedora_gpu0_minicpmv47`, `coding_home_olefedora_gpu0`, `humanizer_gpu3` | `/v1/responses` | 200 (sglang / llama.cpp) |
-| `one_api_zhipu_1` | `/api/coding/paas/v4/responses` | 404 — zhipu's Responses path is `/api/v1/responses` |
+| `one_api_zhipu_1` | derived `/api/coding/paas/v4/responses` → **`/api/v1/responses`** | derived path 404; vendor path 429 (route exists, weekly quota exhausted until 2026-11-10 22:58:54) — so `responses_path` is set explicitly |
 
 Two ways to tell whether a request is being translated or forwarded natively:
 a translated request must carry `input` (the gateway rejects it with `400
-invalid Responses request: … missing 'input'` before it ever leaves the
-process), and `native_responses = true` forwards whatever the client sent.
+invalid Responses request: responses request is missing 'input'` before it
+ever leaves the process), while `native_responses = true` forwards whatever
+the client sent and the *upstream* answers — verified live: a body with no
+`input` gets kimi's own weekly-quota `429`, and volc's own
+`400 MissingParameter … missing \`input\` parameter` with a volc request id.
 Verify an opt-in end-to-end without depending on the upstream's quota by
 pointing `responses_path` at a bogus path for one call — the upstream's own
 404 (rather than the gateway's validation error) proves the path is in use.
+
+A derived path that 404s is **not** a reason to fall back to translation: probe
+the vendor's documented Responses route and set `responses_path` (zhipu is
+exactly that case). Only a provider with no Responses route at all keeps the
+chat translation, and that state is enumerated in
+`scripts/check_responses_policy.py`:
+
+```bash
+python3 scripts/check_responses_policy.py --config maxllm.toml          # static
+python3 scripts/check_responses_policy.py --config maxllm.toml --live   # probe routes
+```
 
 For pass-through routes, the path suffix after the route prefix is forwarded to the upstream provider (e.g., `/passthrough/anthropic/v1/messages` proxies to `https://api.anthropic.com/v1/messages`).
 

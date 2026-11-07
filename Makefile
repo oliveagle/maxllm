@@ -51,6 +51,15 @@ check:
 clippy:
 	cargo clippy --workspace -- -W clippy::all
 
+# Enforce the native-Responses-first policy on a provider config
+# (CLAUDE.md § Responses Contract Policy). --live posts a minimal Responses body
+# to every native route; 404 means a wrong responses_path, not "unsupported".
+policy:
+	python3 scripts/check_responses_policy.py --config maxllm.toml
+
+policy-live:
+	python3 scripts/check_responses_policy.py --config maxllm.toml --live
+
 # Performance test — non-streaming (requires wrk + running gateway + Ollama)
 perf:
 	@echo "Running wrk against /v1/ollama (non-streaming, 10s, 10 connections)..."

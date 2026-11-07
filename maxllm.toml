@@ -132,6 +132,9 @@ kind = "openai"
 base_url = "https://api.openai.com"
 api_key = "${OPENAI_API_KEY}"
 default_model = "gpt-4o"
+# The upstream serves the Responses contract: /v1/responses is
+# forwarded natively instead of being translated to chat.
+native_responses = true
 
 [providers.anthropic]
 kind = "anthropic"
@@ -186,6 +189,9 @@ default_model = "gemini-2.5-flash"
 kind = "ollama"
 base_url = "http://127.0.0.1:11434"
 default_model = "gemma3:1b"
+# Ollama serves /v1/responses as well (verified: POST -> model-not-found,
+# not path-not-found, so the route exists).
+native_responses = true
 
 # [providers.cohere]
 # kind = "cohere"

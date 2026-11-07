@@ -461,7 +461,9 @@ Client Request (OpenAI format)
 [request_body_filter] (4 modes based on endpoint_type)
     |-- Translated: buffer body, extract model, translate OpenAI -> provider
     |     '-- virtual-key model allow-list enforced here (403)
-    |-- Responses: translate Responses -> chat, then chat -> provider
+    |-- Responses: native upstream -> forward the body as-is when the provider
+    |     is configured native_responses (the default whenever the upstream
+    |     serves /responses); otherwise translate Responses -> chat -> provider
     |-- Native: buffer body, extract metadata from native format, forward as-is
     '-- Passthrough: raw forward (buffered only to check the model allow-list)
     |
@@ -483,7 +485,8 @@ Client Request (OpenAI format)
     v
 [upstream_response_body_filter] (4 modes based on endpoint_type)
     |-- Translated: streaming via StreamTranslator, non-streaming via translate_response()
-    |-- Responses: translate provider chat -> Responses (JSON or SSE events)
+    |-- Responses: forward the upstream's own Responses body (native), or
+    |     translate provider chat -> Responses JSON/SSE (fallback path only)
     |-- Native: extract usage from native format, forward body as-is
     |-- Passthrough: skip translation (run plugin chains only)
     '-- Run plugin chains on response body
@@ -657,7 +660,7 @@ Client Response (translated: OpenAI format / native: provider format / passthrou
 | Authentication (static) | 6 | Missing/wrong key 401, valid auth, auth stripping, static key alongside virtual keys, static key bypasses model allowlist |
 | Virtual keys | 9 | Auth + spend, revoked 401, budget 402, RPM/TPM limits, per-key model allowlist (incl. glob), legacy `[auth]`/`[rate_limit]` |
 | Proxy & translation | 7 | OpenAI passthrough, Anthropic/Gemini translation + error normalisation, model alias, embeddings |
-| Responses API | 7 | chat-only translation, tool-choice nesting, images, SSE, error/mid-stream failure surfacing |
+| Responses API | 7 | chat-only translation (the fallback path: native `native_responses` forwarding is the norm), tool-choice nesting, images, SSE, error/mid-stream failure surfacing |
 | Native & passthrough | 6 | Responses passthrough (streaming/non-streaming), function-tool flattening, large-body usage, chat→native fallback |
 | OpenCode (zen) | 16 | session header injection/affinity, body normalisation, error envelopes, UA handling, models list, streaming usage |
 | Headers & metrics | 6 | X-Request-Id, X-MaxLLM-Provider, CORS, request/token/active/inflight metrics |
