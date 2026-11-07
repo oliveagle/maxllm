@@ -4369,6 +4369,155 @@ auto_model = true
 
 /// Session-sticky wins over the round-robin: a session pinned to a pool
 /// provider keeps hitting it, so the upstream keeps its context.
+/// `[auto_models.<key>]` declares an extra pool next to the default
+/// `[auto_model]`. Each pool is its own sentinel, so `auto` must stay on the
+/// cloud pool and `auto_home` on the home pool — a request may never leak from
+/// one rotation set into the other.
+#[tokio::test]
+async fn test_named_auto_pools_keep_their_rotation_sets_apart() {
+    let cloud = MockServer::start().await;
+    let home = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from-cloud")))
+        .expect(1)
+        .mount(&cloud)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from-home")))
+        .expect(1)
+        .mount(&home)
+        .await;
+
+    let config = r#"
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[providers.cloud]
+kind = "openai"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+
+[providers.home]
+kind = "openai"
+base_url = "{FALLBACK_URL}"
+api_key = "fake-key"
+
+# The default pool: cloud vendors only.
+[auto_model]
+enabled = true
+
+[[auto_model.pool]]
+provider = "cloud"
+model = "model-cloud"
+
+# The home pool: local deployments only.
+[auto_models.auto_home]
+
+[[auto_models.auto_home.pool]]
+provider = "home"
+model = "model-home"
+
+[[routes]]
+path = "/v1/cloud"
+provider = "auto"
+auto_model = true
+
+[[routes]]
+path = "/v1/home"
+provider = "auto_home"
+auto_model = true
+"#;
+    let gw = TestGateway::start_with_fallback(config, &cloud.uri(), &home.uri()).await;
+    let c = client();
+
+    for (path, model) in [("/v1/cloud", "auto"), ("/v1/home", "auto_home")] {
+        let resp = c
+            .post(gw.url(path))
+            .json(&chat_body(model, "hi"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{path} must be served");
+    }
+
+    let cloud_reqs = cloud.received_requests().await.unwrap_or_default();
+    let home_reqs = home.received_requests().await.unwrap_or_default();
+    assert_eq!(cloud_reqs.len(), 1, "the cloud pool serves exactly one call");
+    assert_eq!(home_reqs.len(), 1, "the home pool serves exactly one call");
+
+    let cloud_body: Value = serde_json::from_slice(&cloud_reqs[0].body).expect("json body");
+    let home_body: Value = serde_json::from_slice(&home_reqs[0].body).expect("json body");
+    assert_eq!(cloud_body["model"], "model-cloud");
+    assert_eq!(home_body["model"], "model-home");
+    assert!(
+        home_body["model"] != "model-cloud" && cloud_body["model"] != "model-home",
+        "a request must never rotate over another pool's entries"
+    );
+}
+
+/// A client that carries a named sentinel in the body only (its base URL still
+/// points at a plain route) is adopted into that named pool: the provider it
+/// landed on is a member, so the body is rewritten to the entry's model and
+/// every later hop stays inside that pool.
+#[tokio::test]
+async fn test_body_sentinel_adopts_the_named_pool() {
+    let member = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from-member")))
+        .expect(1)
+        .mount(&member)
+        .await;
+
+    let config = r#"
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[providers.member]
+kind = "openai"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+
+[auto_models.auto_home]
+
+[[auto_models.auto_home.pool]]
+provider = "member"
+model = "model-home"
+
+# Not an auto route: the sentinel arrives in the body, after the provider was
+# picked — which happens to be a member of the auto_home pool.
+[[routes]]
+path = "/v1/responses"
+endpoint_type = "responses"
+provider = "member"
+"#;
+    let gw = TestGateway::start(config, &member.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/responses"))
+        .json(&json!({"model": "auto_home", "input": "hi"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "the pool member serves the request directly (body: {})",
+        resp.text().await.unwrap_or_default()
+    );
+
+    let reqs = member.received_requests().await.unwrap_or_default();
+    assert_eq!(reqs.len(), 1, "one call, no wasted hop");
+    let sent: Value = serde_json::from_slice(&reqs[0].body).expect("json body");
+    assert_eq!(
+        sent["model"], "model-home",
+        "the named sentinel must be rewritten before it reaches the upstream"
+    );
+}
+
 #[tokio::test]
 async fn test_auto_model_prefers_the_session_binding_over_round_robin() {
     let a = MockServer::start().await;

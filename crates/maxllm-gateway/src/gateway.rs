@@ -261,21 +261,60 @@ pub struct HotState {
     pub cost_calculator: Arc<maxllm_admin::CostCalculator>,
     pub guardrail_engine: Option<Arc<GuardrailEngine>>,
     pub models_response: Bytes,
-    /// The `auto` rotation pool: (provider, model) pairs that the sentinel
-    /// model rotates over. Empty when auto is disabled or not configured.
-    /// Entries whose provider is missing from the config are dropped at
-    /// build time, so the pool can only contain usable providers.
-    pub auto_pool: Vec<AutoPoolEntry>,
-    /// The sentinel model name clients send to mean "rotate" (`[auto_model].name`,
-    /// `auto` by default). `None` when auto rotation is disabled or its pool is
-    /// empty. Kept alongside the pool because a request can carry the sentinel
-    /// on a route that does not declare `auto_model = true`; the gateway must
-    /// still recognise the name as a rotation request rather than forwarding it
-    /// to an upstream that has never heard of a model called "auto".
-    pub auto_name: Option<String>,
+    /// The rotation pools, in declaration order. Each pool owns one sentinel
+    /// model name (`auto`, `auto_home`, …) and the (provider, model) pairs it
+    /// rotates over. Entries whose provider is missing from the config are
+    /// dropped at build time, so a pool can only contain usable providers.
+    pub auto_pools: Vec<AutoPoolState>,
 }
 
-/// One entry of the auto-rotation pool, resolved against the providers.
+/// One resolved rotation pool: the sentinel model clients send plus its
+/// entries.
+#[derive(Debug, Clone)]
+pub struct AutoPoolState {
+    pub name: String,
+    pub entries: Vec<AutoPoolEntry>,
+}
+
+impl AutoPoolState {
+    /// The pool entry for a provider, when that provider serves this pool.
+    pub fn entry_for(&self, provider: &str) -> Option<&AutoPoolEntry> {
+        self.entries.iter().find(|e| e.provider == provider)
+    }
+}
+
+impl HotState {
+    pub fn pool_named(&self, name: &str) -> Option<&AutoPoolState> {
+        self.auto_pools.iter().find(|p| p.name == name)
+    }
+
+    /// The pool this request rotates over: the pool it already entered, else
+    /// the sentinel carried by the model field, else — for a route that
+    /// declares `auto_model` — the pool its `provider` names (falling back to
+    /// the first declared pool, which keeps a single-pool config working).
+    fn request_pool<'a>(
+        &'a self,
+        route: &RouteConfig,
+        ctx: &RequestCtx,
+    ) -> Option<&'a AutoPoolState> {
+        if let Some(name) = ctx.auto_pool.as_deref() {
+            if let Some(pool) = self.pool_named(name) {
+                return Some(pool);
+            }
+        }
+        if let Some(pool) = self.pool_named(&ctx.model) {
+            return Some(pool);
+        }
+        if route.auto_model {
+            return self
+                .pool_named(&route.provider)
+                .or_else(|| self.auto_pools.first());
+        }
+        None
+    }
+}
+
+/// One entry of an auto-rotation pool, resolved against the providers.
 #[derive(Debug, Clone)]
 pub struct AutoPoolEntry {
     pub provider: String,
@@ -534,6 +573,38 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
         Some(Arc::new(engine))
     };
 
+    // The auto pools are self-contained: each lists its (provider, model)
+    // pairs explicitly, so the rotation set never depends on one-api's channel
+    // table (or on one-api running at all). Entries naming an unknown provider
+    // are dropped — a typo must not silently shrink a pool.
+    let mut auto_pools: Vec<AutoPoolState> = Vec::new();
+    for (name, auto) in config.auto_pools() {
+        if !auto.enabled {
+            continue;
+        }
+        let mut entries: Vec<AutoPoolEntry> = Vec::new();
+        for entry in &auto.pool {
+            if providers.contains_key(&entry.provider) {
+                entries.push(AutoPoolEntry {
+                    provider: entry.provider.clone(),
+                    model: entry.model.clone(),
+                });
+            } else {
+                warn!(
+                    pool = %name,
+                    provider = %entry.provider,
+                    "auto pool entry names an unknown provider — dropped"
+                );
+            }
+        }
+        if entries.is_empty() {
+            warn!(pool = %name, "auto pool has no usable entries — pool disabled");
+            continue;
+        }
+        info!(pool = %name, entries = entries.len(), "Auto pool ready");
+        auto_pools.push(AutoPoolState { name, entries });
+    }
+
     // Build the /v1/models response
     let models_response = {
         let mut seen = std::collections::HashSet::new();
@@ -577,6 +648,18 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
             }
         }
 
+        // Every auto pool is a model a client can ask for by name.
+        for pool in &auto_pools {
+            if seen.insert(pool.name.clone()) {
+                models.push(serde_json::json!({
+                    "id": pool.name,
+                    "object": "model",
+                    "created": created,
+                    "owned_by": "maxllm-auto",
+                }));
+            }
+        }
+
         let response = serde_json::json!({
             "object": "list",
             "data": models,
@@ -594,29 +677,6 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
         "Hot state built"
     );
 
-    // The auto pool is self-contained: it lists the (provider, model) pairs
-    // explicitly, so the rotation set never depends on one-api's channel
-    // table (or on one-api running at all). Entries naming an unknown
-    // provider are dropped — a typo must not silently shrink the pool.
-    let mut auto_pool: Vec<AutoPoolEntry> = Vec::new();
-    if let Some(auto) = config.auto_model.as_ref() {
-        if auto.enabled {
-            for entry in &auto.pool {
-                if providers.contains_key(&entry.provider) {
-                    auto_pool.push(AutoPoolEntry {
-                        provider: entry.provider.clone(),
-                        model: entry.model.clone(),
-                    });
-                } else {
-                    warn!(
-                        provider = %entry.provider,
-                        "auto_model pool entry names an unknown provider — dropped"
-                    );
-                }
-            }
-        }
-    }
-
     Ok(HotState {
         providers,
         session_sticky_enabled: config
@@ -632,13 +692,7 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
         cost_calculator,
         guardrail_engine,
         models_response,
-        auto_name: config
-            .auto_model
-            .as_ref()
-            .filter(|a| a.enabled)
-            .map(|a| a.name.clone())
-            .filter(|_| !auto_pool.is_empty()),
-        auto_pool,
+        auto_pools,
     })
 }
 
@@ -865,15 +919,15 @@ impl AiGateway {
         Some(mc.input_cost_per_1m + mc.output_cost_per_1m)
     }
 
-    /// Pick a (provider, model) pair from the `[auto_model]` pool for this
-    /// request: the session binding first (a conversation stays on the
-    /// provider that first served it, so the upstream keeps its context), then
-    /// round-robin over the healthy entries. The chosen pair is recorded in
-    /// `ctx.auto_target`, so the body's `model` field is rewritten before it
-    /// reaches an upstream.
+    /// Pick a (provider, model) pair from `pool` for this request: the session
+    /// binding first (a conversation stays on the provider that first served
+    /// it, so the upstream keeps its context), then round-robin over the
+    /// healthy entries. The chosen pair is recorded in `ctx.auto_target`, so
+    /// the body's `model` field is rewritten before it reaches an upstream.
     fn select_from_auto_pool(
         &self,
         hot: &HotState,
+        pool: &AutoPoolState,
         route: &RouteConfig,
         ctx: &mut RequestCtx,
     ) -> Option<Arc<ProviderState>> {
@@ -884,9 +938,7 @@ impl AiGateway {
             if let Some(session_id) = ctx.session_id.clone() {
                 match self.sessions.get(&session_id) {
                     Some(pinned_name) => {
-                        if let Some(entry) =
-                            hot.auto_pool.iter().find(|e| e.provider == pinned_name)
-                        {
+                        if let Some(entry) = pool.entry_for(&pinned_name) {
                             if let Some(provider) = hot.providers.get(&entry.provider) {
                                 if !provider.circuit_breaker.is_open() {
                                     METRICS.session_affinity_hits_total.inc();
@@ -915,8 +967,8 @@ impl AiGateway {
             }
         }
         // 2. Round-robin over the healthy pool entries.
-        let healthy: Vec<&AutoPoolEntry> = hot
-            .auto_pool
+        let healthy: Vec<&AutoPoolEntry> = pool
+            .entries
             .iter()
             .filter(|e| {
                 hot.providers
@@ -949,28 +1001,27 @@ impl AiGateway {
         route: &RouteConfig,
         ctx: &mut RequestCtx,
     ) -> Option<Arc<ProviderState>> {
-        // The `auto` sentinel is served from the [auto_model] pool on *any*
-        // route, not only on routes that declare `auto_model = true`.
+        // An auto sentinel (`auto`, `auto_home`, …) is served from its pool on
+        // *any* route, not only on routes that declare `auto_model = true`.
         //
         // When the sentinel is already known here — the path carries it
-        // (`/v1/responses/auto`) or the route declares `auto_model` — the pool
-        // is entered directly, with no wasted call to the route's own provider.
-        // When only the body carries it the model is not known yet (the
-        // provider has to be picked before the body is read), so the request
-        // takes one 404 from the route's provider and the failover walks into
-        // the pool — see `switch_to_fallback` for the replay that makes that
-        // safe for a ~100 KB agent request.
-        let wants_auto = route.auto_model
-            || ctx.auto_requested
-            || hot.auto_name.as_deref() == Some(ctx.model.as_str());
-        if wants_auto && !hot.auto_pool.is_empty() {
-            ctx.auto_requested = true;
-            if let Some(provider) = self.select_from_auto_pool(hot, route, ctx) {
+        // (`/v1/responses/auto`), the route declares `auto_model`, or an
+        // earlier hop already entered a pool — the pool is entered directly,
+        // with no wasted call to the route's own provider. When only the body
+        // carries it the model is not known yet (the provider has to be picked
+        // before the body is read), so the request takes one 404 from the
+        // route's provider and the failover walks into the pool — see
+        // `switch_to_fallback` for the replay that makes that safe for a
+        // ~100 KB agent request.
+        if let Some(pool) = hot.request_pool(route, ctx) {
+            let pool_name = pool.name.clone();
+            ctx.auto_pool = Some(pool_name);
+            if let Some(provider) = self.select_from_auto_pool(hot, pool, route, ctx) {
                 return Some(provider);
             }
             // Every pool entry is unhealthy — fall through to the route's own
             // selection so the request still has somewhere to go.
-            ctx.auto_requested = false;
+            ctx.auto_pool = None;
         }
 
         // Build list of all candidate providers for this route
@@ -1021,13 +1072,9 @@ impl AiGateway {
                                 // llama.cpp-style servers accept any model
                                 // name and quietly serve it with whatever
                                 // model they happen to be hosting.
-                                if let Some(entry) =
-                                    hot.auto_pool.iter().find(|e| e.provider == pinned_name)
-                                {
-                                    if ctx.auto_requested
-                                        || hot.auto_name.as_deref() == Some(ctx.model.as_str())
-                                    {
-                                        ctx.auto_requested = true;
+                                if let Some(pool) = hot.request_pool(route, ctx) {
+                                    if let Some(entry) = pool.entry_for(&pinned_name) {
+                                        ctx.auto_pool = Some(pool.name.clone());
                                         ctx.auto_target =
                                             Some((entry.provider.clone(), entry.model.clone()));
                                         ctx.model = entry.model.clone();
@@ -1470,9 +1517,6 @@ impl AiGateway {
         session: &mut Session,
         ctx: &mut RequestCtx,
     ) -> pingora::Result<()> {
-        let Some(auto_name) = hot.auto_name.clone() else {
-            return Ok(());
-        };
         if ctx.request_body_buf.is_empty() || ctx.provider_name.is_empty() {
             return Ok(());
         }
@@ -1480,13 +1524,21 @@ impl AiGateway {
         else {
             return Ok(());
         };
-        if parsed.get("model").and_then(|m| m.as_str()) != Some(auto_name.as_str()) {
+        // The body names the pool: `auto`, `auto_home`, or whatever sentinel
+        // the request carries. A model that is not a pool name is forwarded
+        // untouched.
+        let Some(sentinel) = parsed
+            .get("model")
+            .and_then(|m| m.as_str())
+            .map(str::to_string)
+        else {
             return Ok(());
-        }
-        let Some((provider, model)) = hot
-            .auto_pool
-            .iter()
-            .find(|e| e.provider == ctx.provider_name)
+        };
+        let Some(pool) = hot.pool_named(&sentinel) else {
+            return Ok(());
+        };
+        let Some((provider, model)) = pool
+            .entry_for(&ctx.provider_name)
             .map(|e| (e.provider.clone(), e.model.clone()))
         else {
             return Ok(());
@@ -1497,7 +1549,7 @@ impl AiGateway {
         if let Ok(bytes) = serde_json::to_vec(&parsed) {
             ctx.request_body_buf = bytes;
         }
-        ctx.auto_requested = true;
+        ctx.auto_pool = Some(pool.name.clone());
         ctx.auto_target = Some((provider, model.clone()));
         ctx.model = model.clone();
         Self::enforce_model_allowlist(session, ctx, &model, None).await?;
@@ -4689,25 +4741,23 @@ impl AiGateway {
         let hot = self.hot.load();
         let route = hot.routes.get(ctx.route_index?)?;
 
-        // Auto route: walk the [auto_model] pool (still skipping attempted
-        // and open-circuit entries) rather than the route's fallback chain.
+        // Auto pool: walk the entries of the pool this request rotates over
+        // (still skipping attempted and open-circuit entries) rather than the
+        // route's fallback chain.
         //
-        // The same pool is the destination for a request that carries the
+        // The same pool is the destination for a request that carries a
         // sentinel model on a route without `auto_model = true` — e.g. a
         // client that switched its model picker to "auto" while its base URL
         // still points at the summary route. The sentinel means "rotate"; no
         // upstream has a model by that name, so walking the route's own chain
         // would only collect 404s from every provider in it.
-        let wants_auto = route.auto_model
-            || ctx.auto_requested
-            || hot.auto_name.as_deref() == Some(ctx.model.as_str());
-        if wants_auto && !hot.auto_pool.is_empty() {
+        if let Some(pool) = hot.request_pool(route, ctx) {
             // A genuine auto route picked its first provider in
             // `select_provider` (session-sticky, then round-robin), so this
             // walk only has to move forward to the next healthy entry.
             if route.auto_model {
-                return hot
-                    .auto_pool
+                return pool
+                    .entries
                     .iter()
                     .filter(|e| e.provider != ctx.provider_name)
                     .filter(|e| !ctx.attempted_providers.contains(&e.provider))
@@ -4730,7 +4780,7 @@ impl AiGateway {
                 if let Some(pinned) = self.sessions.get(session_id) {
                     let usable = pinned != ctx.provider_name
                         && !ctx.attempted_providers.contains(&pinned)
-                        && hot.auto_pool.iter().any(|e| e.provider == pinned);
+                        && pool.entry_for(&pinned).is_some();
                     if usable {
                         if let Some(pair) = hot
                             .providers
@@ -4744,8 +4794,8 @@ impl AiGateway {
                     }
                 }
             }
-            let healthy: Vec<&AutoPoolEntry> = hot
-                .auto_pool
+            let healthy: Vec<&AutoPoolEntry> = pool
+                .entries
                 .iter()
                 .filter(|e| e.provider != ctx.provider_name)
                 .filter(|e| !ctx.attempted_providers.contains(&e.provider))
@@ -4835,21 +4885,28 @@ impl AiGateway {
         ctx.native_responses = ctx.endpoint_type == EndpointType::Responses
             && fallback.native_responses
             && fallback.responses_path.is_some();
-        // Auto route: refresh the (provider, model) target to the new pool
+        // Auto pool: refresh the (provider, model) target to the new pool
         // entry so the replayed body carries the right model.
         //
-        // This also covers the first switch of a request that asked for the
+        // This also covers the first switch of a request that asked for a
         // sentinel on a non-auto route: the provider just picked from the pool
-        // becomes the rotation target, and `auto_requested` keeps every later
-        // hop inside the pool instead of falling back to the route's chain.
+        // becomes the rotation target, and `ctx.auto_pool` keeps every later
+        // hop inside that same pool instead of falling back to the route's
+        // chain (or leaking into another pool).
         {
             let hot = self.hot.load();
-            if let Some(e) = hot.auto_pool.iter().find(|e| e.provider == name) {
-                if ctx.auto_target.is_some()
-                    || ctx.auto_requested
-                    || hot.auto_name.as_deref() == Some(ctx.model.as_str())
-                {
-                    ctx.auto_requested = true;
+            let pool = ctx
+                .auto_pool
+                .as_deref()
+                .and_then(|n| hot.pool_named(n))
+                .or_else(|| {
+                    hot.routes
+                        .get(ctx.route_index.unwrap_or(usize::MAX))
+                        .and_then(|route| hot.request_pool(route, ctx))
+                });
+            if let Some(pool) = pool {
+                if let Some(e) = pool.entry_for(&name) {
+                    ctx.auto_pool = Some(pool.name.clone());
                     ctx.auto_target = Some((e.provider.clone(), e.model.clone()));
                     ctx.model = e.model.clone();
                     ctx.plugin_ctx.model = e.model.clone();

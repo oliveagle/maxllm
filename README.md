@@ -329,11 +329,48 @@ plugins = ["rate_limiter"]
 
 ### Auto model (rotation)
 
-The `auto` sentinel model rotates across an explicit `[auto_model]` pool of
-`(provider, model)` pairs. The pool is declared in the gateway's own config,
-so the rotation set never reads one-api's channel table and stays stable even
-if one-api is not running. A route with `auto_model = true` selects from the
-pool instead of its own `provider`/`fallback` chain.
+An auto sentinel model rotates across an explicit pool of `(provider, model)`
+pairs. Pools are declared in the gateway's own config, so a rotation set never
+reads one-api's channel table and stays stable even if one-api is not running.
+A route with `auto_model = true` selects from a pool instead of its own
+`provider`/`fallback` chain.
+
+`[auto_model]` is the default pool (sentinel `auto`); `[auto_models.<key>]`
+declares further pools, each answering to its own sentinel name. Keep the
+rotation sets disjoint — e.g. cloud vendors under `auto` and home / on-prem
+GPUs under `auto_home`, so a request that asks for `auto` never lands on a
+machine at home (and vice versa):
+
+```toml
+[auto_model]              # sentinel "auto": cloud vendors
+enabled = true
+[[auto_model.pool]]
+provider = "one_api_volc_1"
+model = "deepseek-v4-flash"
+
+[auto_models.auto_home]   # sentinel "auto_home": home GPUs
+[[auto_models.auto_home.pool]]
+provider = "oleworkstation_minicpm"
+model = "minicpm5-2b-256k-swa-gpu3"
+
+[[routes]]
+path = "/v1/cloud"
+provider = "auto"          # a pool name, not a [providers.*] key
+auto_model = true
+
+[[routes]]
+path = "/v1/home"
+provider = "auto_home"     # selects that pool
+auto_model = true
+```
+
+A pool's sentinel is the table key (`[auto_models.auto_home]` → `auto_home`)
+unless the block sets `name`. For an `auto_model = true` route the route's
+`provider` names the pool it rotates over when it matches one; otherwise the
+first declared pool (the default `[auto_model]`) serves it. Every enabled pool
+is also listed by `GET /v1/models` with `owned_by: "maxllm-auto"`, so a client
+can discover the sentinels. Pool names must be unique, and a route naming a
+pool that is missing or disabled fails config validation at startup.
 
 Selection is **session-sticky first** — a session pinned to a pool provider
 keeps using it (unless that provider's circuit opens) so the upstream keeps
@@ -376,8 +413,11 @@ keeps its base URL on the summary route — only the model string changes — so
 its first attempt reaches that route's own provider, which has no model by
 that name and answers 404. Rather than walking the route's fallback chain
 (every entry of which would answer the same 404 and leave the client with a
-502), the walk switches into the `[auto_model]` pool, rewrites the body's
-`model` to the selected entry's model, and serves the request there. The cost
+502), the walk switches into the pool **named by the sentinel** (each pool is
+recognised by its own name: `auto_home` never enters the `auto` pool),
+rewrites the body's `model` to the selected entry's model, and serves the
+request there. `ctx.auto_pool` pins the pool for the rest of the request, so a
+failover never crosses from one rotation set into another. The cost
 is one rejected attempt (a few hundred milliseconds); the alternative is a
 hard failure for a model the client never meant to name.
 

@@ -63,30 +63,68 @@ pub struct Config {
     /// Guardrail definitions (content-level guardrails).
     #[serde(default)]
     pub guardrails: Vec<GuardrailConfig>,
-    /// Auto model: a sentinel model name that rotates across an explicit,
-    /// self-contained pool of (provider, model) pairs. The pool is declared
-    /// in the gateway's own config — it never reads one-api's channel table,
-    /// so the rotation set stays stable even if one-api is not running.
+    /// The default auto pool: a sentinel model name that rotates across an
+    /// explicit, self-contained pool of (provider, model) pairs. The pool is
+    /// declared in the gateway's own config — it never reads one-api's channel
+    /// table, so the rotation set stays stable even if one-api is not running.
     #[serde(default)]
     pub auto_model: Option<AutoModelConfig>,
+    /// Additional named pools (`[auto_models.<key>]`). Each key is its own
+    /// sentinel model, so a deployment can separate rotation sets — e.g.
+    /// `auto` over cloud vendors and `auto_home` over the local GPUs. A
+    /// request whose model equals a pool's name rotates over that pool only.
+    #[serde(default)]
+    pub auto_models: HashMap<String, AutoModelConfig>,
 }
 
-/// Configuration for the `auto` sentinel model.
+/// Configuration for one auto sentinel model.
 #[derive(Debug, Deserialize, Clone)]
 pub struct AutoModelConfig {
     /// Whether auto rotation is enabled.
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// The sentinel model name clients send (typically "auto"). Requests
-    /// whose body model equals this string get their model rewritten to the
-    /// selected pool entry's model.
-    #[serde(default = "default_auto_model_name")]
-    pub name: String,
+    /// The sentinel model name clients send. Requests whose body model equals
+    /// this string get their model rewritten to the selected pool entry's
+    /// model. Defaults to the table key under `[auto_models.<key>]`, and to
+    /// `auto` for the `[auto_model]` block.
+    #[serde(default)]
+    pub name: Option<String>,
     /// Explicit pool of (provider, model) pairs. Providers must be declared
     /// in `[providers.*]`; the gateway filters out entries whose provider is
     /// missing at startup.
     #[serde(default)]
     pub pool: Vec<AutoPoolEntry>,
+}
+
+impl AutoModelConfig {
+    /// The sentinel clients send: an explicit `name`, else the table key for a
+    /// named pool, else `auto` (the singular `[auto_model]` default).
+    pub fn sentinel_name(&self, table_key: Option<&str>) -> String {
+        match (self.name.as_deref(), table_key) {
+            (Some(name), _) if !name.is_empty() => name.to_string(),
+            (_, Some(key)) => key.to_string(),
+            _ => default_auto_model_name(),
+        }
+    }
+}
+
+impl Config {
+    /// Every auto pool in declaration order: the singular `[auto_model]`
+    /// first (sentinel `auto` unless renamed), then each `[auto_models.<key>]`
+    /// sorted by key so a hot reload resolves them deterministically.
+    pub fn auto_pools(&self) -> Vec<(String, &AutoModelConfig)> {
+        let mut pools = Vec::new();
+        if let Some(auto) = self.auto_model.as_ref() {
+            pools.push((auto.sentinel_name(None), auto));
+        }
+        let mut keys: Vec<&String> = self.auto_models.keys().collect();
+        keys.sort();
+        for key in keys {
+            let auto = &self.auto_models[key];
+            pools.push((auto.sentinel_name(Some(key.as_str())), auto));
+        }
+        pools
+    }
 }
 
 /// One entry of the auto-rotation pool.
@@ -572,20 +610,38 @@ impl Config {
                 "at least one provider must be configured".into(),
             ));
         }
+        // An auto pool's name is the sentinel model clients send, so it must
+        // exist and be unique — two pools answering to one name would make the
+        // rotation set depend on declaration order.
+        let pools = self.auto_pools();
+        let mut pool_names = std::collections::HashSet::new();
+        for (name, _) in &pools {
+            if name.is_empty() {
+                return Err(ConfigError::Validation(
+                    "an auto pool has an empty name — each pool needs a sentinel model name".into(),
+                ));
+            }
+            if !pool_names.insert(name.clone()) {
+                return Err(ConfigError::Validation(format!(
+                    "auto pool name '{name}' is declared twice — each pool needs its own sentinel"
+                )));
+            }
+        }
         for route in &self.routes {
-            // An auto route rotates over the [auto_model] pool instead of
-            // naming a single provider, so its `provider` field is a sentinel
-            // (not a [providers.*] key). Validate the pool instead.
+            // An auto route rotates over an auto pool instead of naming a
+            // single provider, so its `provider` field is a sentinel (not a
+            // [providers.*] key). It names the pool when it matches one and
+            // otherwise uses the default `[auto_model]` pool.
             if route.auto_model {
-                let pool_ok = self
-                    .auto_model
-                    .as_ref()
-                    .map(|a| a.enabled && !a.pool.is_empty())
-                    .unwrap_or(false);
+                let named = pools.iter().find(|(name, _)| name == &route.provider);
+                let pool_ok = match named {
+                    Some((_, auto)) => auto.enabled && !auto.pool.is_empty(),
+                    None => pools.iter().any(|(_, auto)| auto.enabled && !auto.pool.is_empty()),
+                };
                 if !pool_ok {
                     return Err(ConfigError::Validation(format!(
-                        "route '{}' is auto_model but [auto_model] is disabled or has an empty pool",
-                        route.path
+                        "route '{}' is auto_model but [auto_model] / [auto_models.{}] is missing, disabled or has an empty pool",
+                        route.path, route.provider
                     )));
                 }
                 continue;
@@ -1058,6 +1114,83 @@ auto_model = true
         let err = Config::parse(&toml).unwrap_err();
         assert!(
             err.to_string().contains("auto_model"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_named_auto_pool_uses_the_table_key_as_its_sentinel() {
+        let toml = format!(
+            r#"{PROVIDER_TOML}
+[auto_model]
+enabled = true
+pool = [{{ provider = "openai", model = "gpt-4o" }}]
+
+[auto_models.auto_home]
+pool = [{{ provider = "openai", model = "local-model" }}]
+"#
+        );
+        let config = Config::parse(&toml).unwrap();
+        let pools = config.auto_pools();
+        assert_eq!(pools.len(), 2);
+        assert_eq!(pools[0].0, "auto");
+        assert_eq!(pools[1].0, "auto_home");
+        assert_eq!(pools[1].1.pool[0].model, "local-model");
+    }
+
+    #[test]
+    fn test_named_auto_pool_honours_an_explicit_name() {
+        let toml = format!(
+            r#"{PROVIDER_TOML}
+[auto_models.anything]
+name = "auto_lan"
+pool = [{{ provider = "openai", model = "local-model" }}]
+"#
+        );
+        let config = Config::parse(&toml).unwrap();
+        let pools = config.auto_pools();
+        assert_eq!(pools.len(), 1);
+        assert_eq!(pools[0].0, "auto_lan");
+    }
+
+    #[test]
+    fn test_duplicate_auto_pool_names_are_rejected() {
+        let toml = format!(
+            r#"{PROVIDER_TOML}
+[auto_model]
+pool = [{{ provider = "openai", model = "gpt-4o" }}]
+
+[auto_models.auto]
+pool = [{{ provider = "openai", model = "local-model" }}]
+"#
+        );
+        let err = Config::parse(&toml).unwrap_err();
+        assert!(
+            err.to_string().contains("declared twice"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_auto_route_naming_a_disabled_pool_is_rejected() {
+        let toml = format!(
+            r#"{PROVIDER_TOML}
+[auto_model]
+pool = [{{ provider = "openai", model = "gpt-4o" }}]
+
+[auto_models.auto_home]
+enabled = false
+pool = [{{ provider = "openai", model = "local-model" }}]
+
+[[routes]]
+path = "/v1/responses/auto_home"
+provider = "auto_home"
+auto_model = true
+"#
+        );
+        let err = Config::parse(&toml).unwrap_err();
+        assert!(
+            err.to_string().contains("auto_home"),
             "unexpected error: {err}"
         );
     }
