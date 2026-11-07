@@ -436,4 +436,10 @@ mod tests {
         config.insert("rules".into(), toml::Value::Array(vec![]));
         assert!(PromptGuardPlugin::from_config("pg", &config).is_err());
     }
+
+    #[test]
+    fn test_prompt_guard_action_as_str_is_exact() {
+        assert_eq!(PromptGuardAction::Block.as_str(), "block");
+        assert_eq!(PromptGuardAction::LogOnly.as_str(), "log_only");
+    }
 }

@@ -493,4 +493,11 @@ mod tests {
         config.insert("patterns".into(), toml::Value::Array(vec![]));
         assert!(SecretScanPlugin::from_config("ss", &config).is_err());
     }
+
+    #[test]
+    fn test_secret_scan_action_as_str_is_exact() {
+        assert_eq!(SecretScanAction::Block.as_str(), "block");
+        assert_eq!(SecretScanAction::Redact.as_str(), "redact");
+        assert_eq!(SecretScanAction::LogOnly.as_str(), "log_only");
+    }
 }

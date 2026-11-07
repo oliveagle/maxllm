@@ -27,8 +27,14 @@ struct CachedResponse {
 
 impl CachedResponse {
     fn is_expired(&self) -> bool {
-        self.cached_at.elapsed() > self.ttl
+        expired_after(self.cached_at.elapsed(), self.ttl)
     }
+}
+
+/// Whether an elapsed duration is past the TTL. A response that has been
+/// cached for *exactly* the TTL is not yet expired.
+fn expired_after(elapsed: Duration, ttl: Duration) -> bool {
+    elapsed > ttl
 }
 
 /// Simple bounded cache with TTL. Evicts the oldest entry when full.
@@ -96,6 +102,21 @@ const EXT_CACHE_HEADERS: &str = "_cache_headers";
 /// Extension key signaling that caching is enabled for this request.
 const EXT_CACHE_ENABLED: &str = "_cache_enabled";
 
+/// Whether an `x-maxllm-no-cache` header value opts out of caching.
+fn no_cache_header(value: &str) -> bool {
+    value == "true"
+}
+
+/// Whether an `Accept` header value indicates a streaming request.
+fn streaming_accept_header(value: &str) -> bool {
+    value.contains("text/event-stream")
+}
+
+/// Whether an upstream status code is cacheable.
+fn cacheable_status(status: u16) -> bool {
+    status == 200
+}
+
 impl CachePlugin {
     pub fn from_config(name: &str, config: &toml::Table) -> Result<Self, PluginError> {
         let max_entries = config
@@ -143,7 +164,7 @@ impl Plugin for CachePlugin {
             .headers
             .get("x-maxllm-no-cache")
             .and_then(|v| v.to_str().ok())
-            .map(|v| v == "true")
+            .map(no_cache_header)
             .unwrap_or(false);
 
         if no_cache {
@@ -156,7 +177,7 @@ impl Plugin for CachePlugin {
             .headers
             .get("accept")
             .and_then(|v| v.to_str().ok())
-            .map(|v| v.contains("text/event-stream"))
+            .map(streaming_accept_header)
             .unwrap_or(false);
 
         if is_streaming {
@@ -196,7 +217,7 @@ impl Plugin for CachePlugin {
         ctx: &mut PluginCtx,
     ) -> pingora::Result<()> {
         // Only cache 200 OK responses.
-        if upstream_response.status.as_u16() != 200 {
+        if !cacheable_status(upstream_response.status.as_u16()) {
             ctx.extensions.remove(EXT_CACHE_ENABLED);
             return Ok(());
         }
@@ -372,5 +393,100 @@ mod tests {
             ttl: Duration::from_secs(3600),
         };
         assert!(!fresh.is_expired());
+    }
+
+    #[test]
+    fn test_expired_after_boundary() {
+        let ttl = Duration::from_secs(60);
+        assert!(expired_after(ttl + Duration::from_nanos(1), ttl));
+        assert!(!expired_after(ttl - Duration::from_nanos(1), ttl));
+        // Exactly-at-TTL is not expired (elapsed > ttl, not >=).
+        assert!(!expired_after(ttl, ttl));
+    }
+
+    #[test]
+    fn test_cache_name_is_configured_name() {
+        let plugin = CachePlugin::from_config("resp-cache", &toml::Table::new()).unwrap();
+        assert_eq!(plugin.name(), "resp-cache");
+    }
+
+    #[test]
+    fn test_bounded_cache_get_removes_expired_entry_from_order() {
+        let mut cache = BoundedCache::new(8);
+        let ttl = Duration::from_millis(1);
+        cache.insert(
+            "k".into(),
+            CachedResponse {
+                body: vec![],
+                headers: vec![],
+                cached_at: Instant::now() - Duration::from_secs(10),
+                ttl,
+            },
+        );
+        assert!(cache.get("k").is_none());
+        // The stale key must be dropped from the insertion order too.
+        assert!(cache.insertion_order.is_empty());
+    }
+
+    #[test]
+    fn test_bounded_cache_reinsert_keeps_a_single_order_entry() {
+        let mut cache = BoundedCache::new(8);
+        let entry = || CachedResponse {
+            body: vec![],
+            headers: vec![],
+            cached_at: Instant::now(),
+            ttl: Duration::from_secs(60),
+        };
+        cache.insert("k".into(), entry());
+        cache.insert("k".into(), entry());
+        assert_eq!(cache.insertion_order, vec!["k".to_string()]);
+        assert_eq!(cache.entries.len(), 1);
+    }
+
+    #[test]
+    fn test_bounded_cache_evicts_oldest_first() {
+        let mut cache = BoundedCache::new(2);
+        let entry = || CachedResponse {
+            body: vec![],
+            headers: vec![],
+            cached_at: Instant::now(),
+            ttl: Duration::from_secs(60),
+        };
+        cache.insert("a".into(), entry());
+        cache.insert("b".into(), entry());
+        cache.insert("c".into(), entry());
+        assert!(cache.get("a").is_none());
+        assert!(cache.get("b").is_some());
+        assert!(cache.get("c").is_some());
+        assert_eq!(
+            cache.insertion_order,
+            vec!["b".to_string(), "c".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_no_cache_header_parsing() {
+        assert!(no_cache_header("true"));
+        assert!(!no_cache_header("false"));
+        assert!(!no_cache_header("1"));
+        assert!(!no_cache_header(""));
+    }
+
+    #[test]
+    fn test_streaming_accept_header_parsing() {
+        assert!(streaming_accept_header("text/event-stream"));
+        assert!(streaming_accept_header(
+            "application/json, text/event-stream"
+        ));
+        assert!(!streaming_accept_header("application/json"));
+        assert!(!streaming_accept_header(""));
+    }
+
+    #[test]
+    fn test_cacheable_status_parsing() {
+        assert!(cacheable_status(200));
+        assert!(!cacheable_status(201));
+        assert!(!cacheable_status(404));
+        assert!(!cacheable_status(500));
     }
 }

@@ -396,4 +396,11 @@ mod tests {
         let plugin = RegexGuardPlugin::from_config("rg", &config).unwrap();
         assert_eq!(plugin.mode, GuardrailMode::Both);
     }
+
+    #[test]
+    fn test_regex_guard_action_as_str_is_exact() {
+        assert_eq!(RegexGuardAction::Block.as_str(), "block");
+        assert_eq!(RegexGuardAction::Redact.as_str(), "redact");
+        assert_eq!(RegexGuardAction::LogOnly.as_str(), "log_only");
+    }
 }

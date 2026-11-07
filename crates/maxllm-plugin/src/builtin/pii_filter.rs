@@ -459,4 +459,18 @@ mod tests {
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].pattern_name, "aws_key");
     }
+
+    #[test]
+    fn test_pii_action_as_str_is_exact() {
+        assert_eq!(PiiAction::Block.as_str(), "block");
+        assert_eq!(PiiAction::Redact.as_str(), "redact");
+        assert_eq!(PiiAction::LogOnly.as_str(), "log_only");
+    }
+
+    #[test]
+    fn test_guardrail_mode_as_str_is_exact() {
+        assert_eq!(GuardrailMode::PreCall.as_str(), "pre_call");
+        assert_eq!(GuardrailMode::PostCall.as_str(), "post_call");
+        assert_eq!(GuardrailMode::Both.as_str(), "both");
+    }
 }
