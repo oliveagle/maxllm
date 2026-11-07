@@ -817,3 +817,218 @@ impl Default for RateLimitLearningConfig {
         }
     }
 }
+
+#[cfg(test)]
+mod mutation_tests {
+    use super::*;
+
+    /// The serde default functions are part of the config contract: every
+    /// one of them is asserted here so a changed default fails a test
+    /// instead of silently changing the runtime behaviour.
+    #[test]
+    fn test_provider_defaults_are_exact() {
+        assert_eq!(default_max_fails(), 3);
+        assert_eq!(default_fail_timeout_secs(), 60);
+        assert_eq!(default_weight(), 100);
+        assert_eq!(default_retry_backoff_ms(), 500);
+        assert_eq!(default_max_failover_attempts(), 6);
+        assert!(!default_false());
+    }
+
+    #[test]
+    fn test_session_and_recording_defaults_are_exact() {
+        assert_eq!(default_session_timeout_secs(), 3600);
+        assert_eq!(default_session_max_entries(), 10_000);
+        assert_eq!(default_recording_dir(), "./recordings");
+        assert_eq!(default_recording_max_body_bytes(), 8192);
+        assert_eq!(default_recording_max_file_bytes(), 64 * 1024 * 1024);
+        assert_eq!(default_recording_retention_hours(), 168);
+    }
+
+    #[test]
+    fn test_auto_model_defaults_are_exact() {
+        assert_eq!(default_auto_model_name(), "auto");
+        assert!(default_true());
+    }
+
+    #[test]
+    fn test_guardrail_and_laya_defaults_are_exact() {
+        assert_eq!(default_guardrail_mode(), "pre_call");
+        assert_eq!(default_guardrail_action(), "block");
+        assert_eq!(default_laya_timeout_ms(), 1000);
+        assert_eq!(default_rate_limit_threshold(), 0.5);
+        assert_eq!(default_quota_cooldown_secs(), 300);
+        assert_eq!(default_max_learned_patterns(), 1000);
+    }
+
+    const PROVIDER_TOML: &str = r#"
+[server]
+listen = "0.0.0.0:8080"
+
+[providers.openai]
+kind = "openai"
+base_url = "https://api.openai.com"
+api_key = "sk-test"
+"#;
+
+    #[test]
+    fn test_auto_model_route_with_a_valid_pool_is_accepted() {
+        let toml = format!(
+            r#"{PROVIDER_TOML}
+[auto_model]
+enabled = true
+pool = [{{ provider = "openai", model = "gpt-4o" }}]
+
+[[routes]]
+path = "/v1/auto"
+provider = "auto"
+auto_model = true
+"#
+        );
+        let config = Config::parse(&toml).unwrap();
+        assert!(config.routes[0].auto_model);
+        let pool = config.auto_model.as_ref().unwrap();
+        assert!(pool.enabled);
+        assert_eq!(pool.pool.len(), 1);
+        assert_eq!(pool.pool[0].model, "gpt-4o");
+    }
+
+    #[test]
+    fn test_auto_model_route_with_an_empty_pool_is_rejected() {
+        let toml = format!(
+            r#"{PROVIDER_TOML}
+[auto_model]
+enabled = true
+
+[[routes]]
+path = "/v1/auto"
+provider = "auto"
+auto_model = true
+"#
+        );
+        let err = Config::parse(&toml).unwrap_err();
+        assert!(
+            err.to_string().contains("auto_model"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_auto_model_route_with_a_disabled_pool_is_rejected() {
+        let toml = format!(
+            r#"{PROVIDER_TOML}
+[auto_model]
+enabled = false
+pool = [{{ provider = "openai", model = "gpt-4o" }}]
+
+[[routes]]
+path = "/v1/auto"
+provider = "auto"
+auto_model = true
+"#
+        );
+        let err = Config::parse(&toml).unwrap_err();
+        assert!(
+            err.to_string().contains("auto_model"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_unknown_global_plugin_is_rejected() {
+        // Top-level TOML keys must appear before the first `[section]` header.
+        let toml = format!(
+            r#"global_plugins = ["does-not-exist"]
+{PROVIDER_TOML}"#
+        );
+        let err = Config::parse(&toml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("global_plugins references unknown plugin"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_known_global_plugin_is_accepted() {
+        // Top-level TOML keys must appear before the first `[section]` header.
+        let toml = format!(
+            r#"global_plugins = ["auth"]
+
+{PROVIDER_TOML}
+[plugins.auth]
+category = "key_auth"
+"#
+        );
+        let config = Config::parse(&toml).unwrap();
+        assert_eq!(config.global_plugins, vec!["auth"]);
+        assert_eq!(config.plugins["auth"].category, "key_auth");
+    }
+
+    #[test]
+    fn test_unknown_route_plugin_is_rejected() {
+        let toml = format!(
+            r#"{PROVIDER_TOML}
+[[routes]]
+path = "/v1/chat"
+provider = "openai"
+plugins = ["does-not-exist"]
+"#
+        );
+        let err = Config::parse(&toml).unwrap_err();
+        assert!(
+            err.to_string().contains("references unknown plugin"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_known_route_plugin_is_accepted() {
+        let toml = format!(
+            r#"{PROVIDER_TOML}
+[plugins.auth]
+category = "key_auth"
+
+[[routes]]
+path = "/v1/chat"
+provider = "openai"
+plugins = ["auth"]
+"#
+        );
+        let config = Config::parse(&toml).unwrap();
+        assert_eq!(config.routes[0].plugins, vec!["auth"]);
+    }
+
+    #[test]
+    fn test_unknown_fallback_provider_is_rejected() {
+        let toml = format!(
+            r#"{PROVIDER_TOML}
+[[routes]]
+path = "/v1/chat"
+provider = "openai"
+fallback = ["does-not-exist"]
+"#
+        );
+        let err = Config::parse(&toml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("fallback references unknown provider"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_config_without_any_provider_is_rejected() {
+        let toml = r#"
+[server]
+listen = "0.0.0.0:8080"
+"#;
+        let err = Config::parse(toml).unwrap_err();
+        // `providers` is a required TOML field, so an empty config fails at
+        // serde time (missing field) before validation runs.
+        assert!(
+            err.to_string().contains("providers"),
+            "unexpected error: {err}"
+        );
+    }
+}
