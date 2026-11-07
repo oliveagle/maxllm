@@ -652,9 +652,13 @@ mod tests {
     #[test]
     fn x_ratelimit_reset_requests_duration() {
         let h = headers(&[("x-ratelimit-reset-requests", "6m0s")]);
+        let before = now_ms();
         let (ms, src) = resolve_from_headers(&h).unwrap();
         assert_eq!(src, "x_ratelimit_reset_requests");
-        assert!(ms >= now_ms() + 359_000);
+        assert!(
+            ms >= before + 359_000 && ms <= now_ms() + 361_000,
+            "the duration is added to the clock, not multiplied"
+        );
     }
 
     #[test]
@@ -799,5 +803,352 @@ mod tests {
         assert_eq!(parse_duration_ms("120ms"), Some(120));
         assert_eq!(parse_duration_ms("45s"), Some(45_000));
         assert_eq!(parse_duration_ms("not-a-duration"), None);
+    }
+
+    // ── mutation-test hardening ─────────────────────────────────────────────
+
+    /// Epoch-ms of a UTC instant, for exact expectations.
+    fn utc_ms(y: i32, mo: u32, d: u32, h: u32, mi: u32, sec: u32) -> u64 {
+        chrono::NaiveDate::from_ymd_opt(y, mo, d)
+            .unwrap()
+            .and_hms_opt(h, mi, sec)
+            .unwrap()
+            .and_utc()
+            .timestamp_millis() as u64
+    }
+
+    /// Every absolute-reset header family resolves to its own label and
+    /// value — absolute instants win over relative durations.
+    #[test]
+    fn resolve_headers_absolute_families() {
+        let expect = utc_ms(2099, 1, 1, 0, 0, 0);
+        for name in [
+            "anthropic-ratelimit-requests-reset",
+            "anthropic-ratelimit-tokens-reset",
+            "anthropic-ratelimit-unified-reset",
+        ] {
+            let h = headers(&[(name, "2099-01-01T00:00:00Z")]);
+            let (ms, src) = resolve_from_headers(&h).unwrap();
+            assert_eq!(src, "anthropic_reset_header", "{name}");
+            assert_eq!(ms, expect, "{name}");
+        }
+
+        // OpenAI / GitHub style epoch-seconds reset.
+        let h = headers(&[("x-ratelimit-reset", "1700000000")]);
+        let (ms, src) = resolve_from_headers(&h).unwrap();
+        assert_eq!(src, "x_ratelimit_reset");
+        assert_eq!(ms, 1_700_000_000_000);
+
+        // An absolute header outranks every relative one.
+        let h = headers(&[
+            ("anthropic-ratelimit-requests-reset", "2099-01-01T00:00:00Z"),
+            ("x-ratelimit-reset-requests", "6m0s"),
+            ("retry-after", "120"),
+            ("ratelimit-reset", "30"),
+        ]);
+        let (ms, src) = resolve_from_headers(&h).unwrap();
+        assert_eq!(src, "anthropic_reset_header");
+        assert_eq!(ms, expect);
+    }
+
+    /// Every relative-reset header family adds its value to the clock.
+    #[test]
+    fn resolve_headers_relative_families() {
+        // x-ratelimit-reset-tokens (duration)
+        let h = headers(&[("x-ratelimit-reset-tokens", "1m30s")]);
+        let before = now_ms();
+        let (ms, src) = resolve_from_headers(&h).unwrap();
+        assert_eq!(src, "x_ratelimit_reset_tokens");
+        assert!(ms >= before + 90_000 && ms <= now_ms() + 90_000);
+
+        // Millisecond delays.
+        for name in ["retry-after-ms", "x-ms-retry-after-ms"] {
+            let h = headers(&[(name, "42000")]);
+            let before = now_ms();
+            let (ms, src) = resolve_from_headers(&h).unwrap();
+            assert_eq!(src, "retry_after_ms", "{name}");
+            assert!(ms >= before + 42_000 && ms <= now_ms() + 42_000, "{name}");
+        }
+
+        // IETF draft delay-seconds.
+        let h = headers(&[("ratelimit-reset", "30")]);
+        let before = now_ms();
+        let (ms, src) = resolve_from_headers(&h).unwrap();
+        assert_eq!(src, "ratelimit_reset");
+        assert!(ms >= before + 30_000 && ms <= now_ms() + 30_000);
+    }
+
+    /// A bare epoch second in the body becomes a reset candidate; out-of-range
+    /// epochs are ignored.
+    #[test]
+    fn body_epoch_seconds_candidate() {
+        let (_, cands) = parse_body_text("Rate limit: quota resets at epoch 3000000000");
+        assert_eq!(cands.len(), 1);
+        assert_eq!(cands[0].at_ms, 3_000_000_000_000);
+        assert_eq!(cands[0].raw, "epoch:3000000000");
+
+        // Before 2020 — outside the plausible window.
+        let (_, cands) = parse_body_text("Rate limit: quota resets at epoch 1000000000");
+        assert!(cands.is_empty(), "out-of-range epochs are dropped");
+    }
+
+    /// Two spellings of the same instant collapse into one candidate.
+    #[test]
+    fn body_dedupes_identical_candidates() {
+        let (_, cands) =
+            parse_body_text("quota resets at 2099-06-15 12:00:00 or 2099-06-15T12:00:00");
+        assert_eq!(cands.len(), 1, "the same instant twice is one candidate");
+        assert_eq!(cands[0].at_ms, utc_ms(2099, 6, 15, 12, 0, 0));
+    }
+
+    /// Billing / balance errors are ordinary failures — one phrase is enough.
+    #[test]
+    fn body_billing_phrases_are_ordinary_failures() {
+        for text in [
+            "insufficient funds on your account",
+            "billing problem, please contact support",
+            "账户余额不足，请充值",
+            "您的账户已欠费",
+        ] {
+            let (is_rl, _) = parse_body_text(text);
+            assert_eq!(is_rl, Some(false), "{text}");
+        }
+    }
+
+    /// Quota phrases — English and Chinese — are rate limits.
+    #[test]
+    fn body_quota_phrases_are_rate_limits() {
+        for text in [
+            "Too many requests",
+            "your request was throttled",
+            "触发限流",
+            "API 配额已用完",
+        ] {
+            let (is_rl, _) = parse_body_text(text);
+            assert_eq!(is_rl, Some(true), "{text}");
+        }
+    }
+
+    /// A non-ASCII word is not an ASCII identifier run.
+    #[test]
+    fn fingerprint_keeps_non_ascii_words_verbatim() {
+        let text = "é".repeat(13);
+        assert_eq!(
+            fingerprint(&text),
+            text,
+            "13 chars is not a value placeholder"
+        );
+    }
+
+    /// Identifier runs longer than 12 characters become `<V>` — including
+    /// the ones that contain `-` or `_`; exactly 12 stays readable.
+    #[test]
+    fn fingerprint_collapses_long_identifier_runs() {
+        assert_eq!(fingerprint("abcdefghijklmnop"), "<V>");
+        assert_eq!(fingerprint("abcdefghij-klmnop"), "<V>");
+        assert_eq!(fingerprint("abcdefghij_klmnop"), "<V>");
+        assert_eq!(fingerprint("abcdefghijkl"), "abcdefghijkl");
+    }
+
+    /// Whitespace runs collapse into a single space.
+    #[test]
+    fn fingerprint_collapses_whitespace_runs() {
+        assert_eq!(fingerprint("a  b"), "a b");
+        assert_eq!(fingerprint("a \t b"), "a b");
+    }
+
+    /// Digit runs inside a short identifier collapse to a single `#`.
+    #[test]
+    fn collapse_digits_collapses_runs() {
+        assert_eq!(collapse_digits("a1b22c333"), "a#b#c#");
+        assert_eq!(collapse_digits("abc"), "abc");
+        assert_eq!(collapse_digits(""), "");
+    }
+
+    /// Epoch-seconds headers are exact milliseconds.
+    #[test]
+    fn parse_epoch_seconds_is_exact() {
+        assert_eq!(
+            parse_epoch_seconds_ms("1700000000"),
+            Some(1_700_000_000_000)
+        );
+        assert_eq!(parse_epoch_seconds_ms("  42  "), Some(42_000));
+        assert_eq!(parse_epoch_seconds_ms("abc"), None);
+    }
+
+    /// The timestamp shapes the parser accepts.
+    #[test]
+    fn body_timestamp_shapes() {
+        // Lowercase `t` separator.
+        let (_, cands) = parse_body_text("quota resets 2099-06-15t12:00:00");
+        assert_eq!(cands.len(), 1);
+        assert_eq!(cands[0].at_ms, utc_ms(2099, 6, 15, 12, 0, 0));
+
+        // `Z` suffix — the raw keeps the zone marker.
+        let (_, cands) = parse_body_text("quota resets 2099-06-15 12:00:00Z");
+        assert_eq!(cands[0].at_ms, utc_ms(2099, 6, 15, 12, 0, 0));
+        assert_eq!(cands[0].raw, "2099-06-15 12:00:00Z");
+
+        // Lowercase `z`.
+        let (_, cands) = parse_body_text("quota resets 2099-06-15 12:00:00z");
+        assert_eq!(cands[0].at_ms, utc_ms(2099, 6, 15, 12, 0, 0));
+
+        // A space between the time and the zone offset.
+        let (_, cands) = parse_body_text("quota resets 2099-06-15 12:00:00 +08:00");
+        assert_eq!(cands[0].at_ms, utc_ms(2099, 6, 15, 4, 0, 0));
+
+        // Compact `±HHMM` without a zone name.
+        let (_, cands) = parse_body_text("quota resets 2099-06-15 12:00:00+0800");
+        assert_eq!(cands[0].at_ms, utc_ms(2099, 6, 15, 4, 0, 0));
+        assert_eq!(cands[0].raw, "2099-06-15 12:00:00+0800");
+
+        // `±HH:MM` keeps the minutes.
+        let (_, cands) = parse_body_text("quota resets 2099-06-15 12:00:00+08:30");
+        assert_eq!(cands[0].at_ms, utc_ms(2099, 6, 15, 3, 30, 0));
+        assert_eq!(cands[0].raw, "2099-06-15 12:00:00+08:30");
+
+        // A truncated offset (`±HH` only) still means whole hours.
+        let (_, cands) = parse_body_text("quota resets 2099-06-15 12:00:00+08");
+        assert_eq!(cands[0].at_ms, utc_ms(2099, 6, 15, 4, 0, 0));
+
+        // A date-only shape is midnight UTC.
+        let (_, cands) = parse_body_text("2099-06-15");
+        assert_eq!(cands.len(), 1);
+        assert_eq!(cands[0].at_ms, utc_ms(2099, 6, 15, 0, 0, 0));
+        assert_eq!(cands[0].raw, "2099-06-15");
+    }
+
+    /// The time shapes the parser accepts — and the ones it rejects.
+    #[test]
+    fn body_time_shapes() {
+        // `HH:MM` without seconds is read as a time shape but the final
+        // assembly needs seconds, so it yields no candidate at all.
+        let (_, cands) = parse_body_text("quota resets 2099-06-15 12:34");
+        assert!(
+            cands.is_empty(),
+            "a minute-only stamp is not a reset instant"
+        );
+
+        // An out-of-range hour falls back to the date-only shape.
+        let (_, cands) = parse_body_text("quota resets 2099-06-15 25:00");
+        assert_eq!(cands[0].at_ms, utc_ms(2099, 6, 15, 0, 0, 0));
+
+        // An out-of-range minute falls back to the date-only shape.
+        let (_, cands) = parse_body_text("quota resets 2099-06-15 12:60");
+        assert_eq!(cands[0].at_ms, utc_ms(2099, 6, 15, 0, 0, 0));
+
+        // A malformed time shape falls back to the date-only shape.
+        let (_, cands) = parse_body_text("quota resets 2099-06-15 12345");
+        assert_eq!(cands[0].at_ms, utc_ms(2099, 6, 15, 0, 0, 0));
+
+        // A trailing `.` without digits keeps the second precision.
+        let (_, cands) = parse_body_text("quota resets 2099-06-15 12:00:00.");
+        assert_eq!(cands[0].at_ms, utc_ms(2099, 6, 15, 12, 0, 0));
+
+        // A naive fractional second is "trailing input" for chrono's strict
+        // %S, so the naive shape yields no candidate.
+        let (_, cands) = parse_body_text("quota resets 2099-06-15 12:00:00.123");
+        assert!(
+            cands.is_empty(),
+            "the naive fraction is not a reset instant"
+        );
+
+        // With a zone suffix the RFC 3339 path parses and truncates to ms.
+        let (_, cands) = parse_body_text("quota resets 2099-06-15 12:00:00.123Z");
+        assert_eq!(cands[0].at_ms, utc_ms(2099, 6, 15, 12, 0, 0) + 123);
+        assert_eq!(cands[0].raw, "2099-06-15 12:00:00.123Z");
+    }
+
+    /// Malformed offsets and time shapes must not crash the scanner and
+    /// must keep their documented fallback behaviour.
+    #[test]
+    fn body_malformed_timestamp_shapes_are_safe() {
+        // A truncated zone offset (`+0`) is ignored — the stamp stays naive.
+        let (_, cands) = parse_body_text("quota resets 2099-06-15 12:00:00+0");
+        assert_eq!(cands.len(), 1);
+        assert_eq!(cands[0].at_ms, utc_ms(2099, 6, 15, 12, 0, 0));
+
+        // A non-numeric zone offset (`+0X`) is ignored too.
+        let (_, cands) = parse_body_text("quota resets 2099-06-15 12:00:00+0X");
+        assert_eq!(cands.len(), 1);
+        assert_eq!(cands[0].at_ms, utc_ms(2099, 6, 15, 12, 0, 0));
+
+        // A zone offset with a single minute digit falls back to whole hours.
+        let (_, cands) = parse_body_text("quota resets 2099-06-15 12:00:00+08:0");
+        assert_eq!(cands.len(), 1);
+        assert_eq!(cands[0].at_ms, utc_ms(2099, 6, 15, 4, 0, 0));
+
+        // A zone offset whose minutes are not digits falls back to whole hours.
+        let (_, cands) = parse_body_text("quota resets 2099-06-15 12:00:00+08:0X");
+        assert_eq!(cands.len(), 1);
+        assert_eq!(cands[0].at_ms, utc_ms(2099, 6, 15, 4, 0, 0));
+
+        // A time shape that is too short falls back to the date-only shape.
+        let (_, cands) = parse_body_text("quota resets 2099-06-15 12:3");
+        assert_eq!(cands.len(), 1);
+        assert_eq!(cands[0].at_ms, utc_ms(2099, 6, 15, 0, 0, 0));
+
+        // A dangling colon after the minutes is not a time shape.
+        let (_, cands) = parse_body_text("quota resets 2099-06-15 12:34:");
+        assert!(cands.is_empty());
+
+        // A single seconds digit is not a seconds shape.
+        let (_, cands) = parse_body_text("quota resets 2099-06-15 12:34:5");
+        assert!(cands.is_empty());
+    }
+
+    /// A ten-byte text that only looks like the start of a date is scanned
+    /// without running past its end.
+    #[test]
+    fn body_short_text_is_scanned_safely() {
+        let (_, cands) = parse_body_text("a123456789");
+        assert!(cands.is_empty());
+    }
+
+    /// Durations are parsed into milliseconds, and the bounds are exact.
+    #[test]
+    fn durations_are_parsed_in_milliseconds() {
+        assert_eq!(regex_lite::find_durations("1h30m"), vec![5_400_000]);
+        assert_eq!(regex_lite::find_durations("30m1h"), vec![5_400_000]);
+        assert_eq!(regex_lite::find_durations("5m30s"), vec![330_000]);
+        assert_eq!(regex_lite::find_durations("12m50s"), vec![770_000]);
+        assert_eq!(regex_lite::find_durations("45s"), vec![45_000]);
+        assert_eq!(regex_lite::find_durations("1s2s"), vec![3_000]);
+        assert_eq!(regex_lite::find_durations("2h"), vec![7_200_000]);
+        assert_eq!(regex_lite::find_durations("1m"), vec![60_000]);
+        // Milliseconds are not a duration (the unit contributes zero).
+        assert_eq!(regex_lite::find_durations("120ms"), Vec::<u64>::new());
+        assert_eq!(regex_lite::find_durations("1ms2s"), vec![2_000]);
+        // A millisecond unit consumes both of its characters, so the
+        // seconds that follow stay part of the same duration.
+        assert_eq!(regex_lite::find_durations("1h5ms2s"), vec![3_602_000]);
+        // Zero is not a duration either.
+        assert_eq!(regex_lite::find_durations("0s"), Vec::<u64>::new());
+        // Digits without a unit are not a duration.
+        assert_eq!(regex_lite::find_durations("5x"), Vec::<u64>::new());
+        // A week is the upper bound — seven days exactly is dropped.
+        assert_eq!(regex_lite::find_durations("168h"), Vec::<u64>::new());
+        assert_eq!(regex_lite::find_durations("167h"), vec![601_200_000]);
+    }
+
+    /// Only ten-digit numbers can be epoch seconds.
+    #[test]
+    fn epoch_numbers_must_be_ten_digits() {
+        assert_eq!(
+            regex_lite::find_epoch_numbers("1700000000"),
+            vec![1_700_000_000]
+        );
+        assert_eq!(
+            regex_lite::find_epoch_numbers("id 1700000000 ok"),
+            vec![1_700_000_000]
+        );
+        assert_eq!(
+            regex_lite::find_epoch_numbers("123456789"),
+            Vec::<u64>::new()
+        );
+        assert_eq!(
+            regex_lite::find_epoch_numbers("12345678901"),
+            Vec::<u64>::new()
+        );
     }
 }
