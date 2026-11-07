@@ -31,7 +31,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::{DateTime, FixedOffset, NaiveDateTime, TimeZone, Utc};
 
 /// The resolver's verdict for one upstream error observation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,7 +146,23 @@ fn header_str<'a>(headers: &'a http::HeaderMap, name: &str) -> Option<&'a str> {
 /// Returns `(is_rate_limit, candidates)` where `is_rate_limit` is `Some(true)`
 /// when a deterministic rate-limit phrase was found, `Some(false)` when a
 /// deterministic non-rate-limit phrase was found, `None` when inconclusive.
+#[cfg(test)]
 pub fn parse_body_text(text: &str) -> (Option<bool>, Vec<ResetCandidate>) {
+    parse_body_text_with_offset(text, 0)
+}
+
+/// Same as [`parse_body_text`], but interprets **zone-less** timestamps in the
+/// given fixed UTC offset (minutes east of UTC) instead of UTC.
+///
+/// Upstreams routinely omit the zone on quota messages — Zhipu writes
+/// `您的限额将在 2026-11-10 22:58:54 重置` in Beijing time with no offset — and
+/// reading that as UTC shifts the reset instant by the whole offset. The
+/// provider's `utc_offset` config supplies the assumption; everything that
+/// carries its own offset (`+0800`, `Z`, RFC 3339) is unaffected.
+pub fn parse_body_text_with_offset(
+    text: &str,
+    utc_offset_minutes: i32,
+) -> (Option<bool>, Vec<ResetCandidate>) {
     let lower = text.to_lowercase();
 
     // Quota / rate-limit signals (English + Chinese).
@@ -172,7 +188,7 @@ pub fn parse_body_text(text: &str) -> (Option<bool>, Vec<ResetCandidate>) {
     // HH:MM:SS ±HHMM|Z", date-only shapes — scanned positionally so a
     // timestamp embedded in prose (with or without a timezone suffix) is
     // found without depending on whitespace tokenisation.
-    let mut candidates = find_absolute_times(text);
+    let mut candidates = find_absolute_times(text, utc_offset_minutes);
 
     // Relative durations: "in 30s", "resets in 5m30s", "12m50s", "5分钟".
     for m in regex_lite::find_durations(&lower) {
@@ -358,7 +374,7 @@ fn parse_duration_ms(s: &str) -> Option<u64> {
 /// Naive timestamps without a timezone are interpreted as UTC — a bounded
 /// approximation that keeps the parse deterministic across deployment
 /// timezones. The laya layer still double-checks the chosen candidate.
-fn find_absolute_times(text: &str) -> Vec<ResetCandidate> {
+fn find_absolute_times(text: &str, utc_offset_minutes: i32) -> Vec<ResetCandidate> {
     let bytes = text.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
@@ -375,7 +391,7 @@ fn find_absolute_times(text: &str) -> Vec<ResetCandidate> {
             && bytes[i + 8].is_ascii_digit()
             && bytes[i + 9].is_ascii_digit();
         if is_date {
-            if let Some((at_ms, consumed, raw)) = parse_date_shape(&text[i..]) {
+            if let Some((at_ms, consumed, raw)) = parse_date_shape(&text[i..], utc_offset_minutes) {
                 out.push(ResetCandidate { at_ms, raw });
                 i += consumed;
                 continue;
@@ -386,10 +402,25 @@ fn find_absolute_times(text: &str) -> Vec<ResetCandidate> {
     out
 }
 
+/// Interpret a zone-less `NaiveDateTime` in the given fixed offset.
+///
+/// Offsets outside `-12:00 ..= +14:00` are rejected by the config validator,
+/// so `east_opt` failing here means the value never came from config.
+fn to_epoch_ms(dt: NaiveDateTime, utc_offset_minutes: i32) -> Option<u64> {
+    let offset = FixedOffset::east_opt(utc_offset_minutes * 60)?;
+    Some(
+        offset
+            .from_local_datetime(&dt)
+            .single()?
+            .timestamp_millis()
+            .max(0) as u64,
+    )
+}
+
 /// Parse one absolute timestamp starting at the beginning of `s` (which
 /// starts with the `YYYY-MM-DD` shape). Returns `(epoch_ms, consumed_bytes,
 /// raw_text)`; `None` when the tail does not form a complete timestamp.
-fn parse_date_shape(s: &str) -> Option<(u64, usize, String)> {
+fn parse_date_shape(s: &str, utc_offset_minutes: i32) -> Option<(u64, usize, String)> {
     let b = s.as_bytes();
 
     // Split the fixed date prefix.
@@ -414,7 +445,7 @@ fn parse_date_shape(s: &str) -> Option<(u64, usize, String)> {
     if !has_time {
         let dt =
             NaiveDateTime::parse_from_str(&format!("{date} 00:00:00"), "%Y-%m-%d %H:%M:%S").ok()?;
-        return Some((dt.and_utc().timestamp_millis() as u64, 10, date.to_string()));
+        return Some((to_epoch_ms(dt, utc_offset_minutes)?, 10, date.to_string()));
     }
 
     // Optional timezone suffix. A zone may be separated from the time by a
@@ -465,18 +496,19 @@ fn parse_date_shape(s: &str) -> Option<(u64, usize, String)> {
 
     // Assemble a canonical timestamp and parse it.
     let canonical = format!("{date}T{time}");
-    let dt = if tz.is_empty() {
-        // Naive local time — interpret as UTC (deterministic approximation).
-        NaiveDateTime::parse_from_str(&canonical, "%Y-%m-%dT%H:%M:%S")
-            .ok()?
-            .and_utc()
+    let at_ms = if tz.is_empty() {
+        // Zone-less local time — the provider's offset decides what it means
+        // (UTC when the provider does not configure one).
+        let dt = NaiveDateTime::parse_from_str(&canonical, "%Y-%m-%dT%H:%M:%S").ok()?;
+        to_epoch_ms(dt, utc_offset_minutes)?
     } else {
         DateTime::parse_from_rfc3339(&format!("{canonical}{tz}"))
             .ok()?
             .with_timezone(&Utc)
+            .timestamp_millis() as u64
     };
     let raw = s[..idx].trim_end().to_string();
-    Some((dt.timestamp_millis() as u64, idx, raw))
+    Some((at_ms, idx, raw))
 }
 
 /// Parse `HH:MM`, `HH:MM:SS` or `HH:MM:SS.fff` from the start of `s`.
@@ -675,6 +707,42 @@ mod tests {
     fn no_headers_no_reset() {
         let h = headers(&[("content-type", "application/json")]);
         assert!(resolve_from_headers(&h).is_none());
+    }
+
+    #[test]
+    fn body_chinese_reset_time_uses_provider_offset() {
+        // Zhipu's production message: Beijing time, no zone marker. Read as
+        // UTC it would land 8 hours late, which is exactly the bug the
+        // per-provider `utc_offset` fixes.
+        let msg = "您已达到每周/每月使用上限，您的限额将在 2026-11-10 22:58:54 重置。";
+        let (is_rl, cands) = parse_body_text_with_offset(msg, 8 * 60);
+        assert_eq!(is_rl, Some(true));
+        assert_eq!(cands.len(), 1);
+        // 2026-11-10 22:58:54 +08:00 == 14:58:54 UTC.
+        assert_eq!(cands[0].at_ms, utc_ms(2026, 11, 10, 14, 58, 54));
+
+        // Same text with no configured offset stays on the UTC reading.
+        let (_, as_utc) = parse_body_text_with_offset(msg, 0);
+        assert_eq!(as_utc[0].at_ms, utc_ms(2026, 11, 10, 22, 58, 54));
+        assert_eq!(as_utc[0].at_ms - cands[0].at_ms, 8 * 3600 * 1000);
+    }
+
+    #[test]
+    fn explicit_offset_wins_over_provider_offset() {
+        // A timestamp that carries its own offset must not be shifted by the
+        // provider's assumption.
+        let msg = "Rate limit. Quota resets at 2026-11-10 22:58:54 +0800 CST";
+        let (_, cands) = parse_body_text_with_offset(msg, -5 * 60);
+        assert_eq!(cands.len(), 1);
+        assert_eq!(cands[0].at_ms, utc_ms(2026, 11, 10, 14, 58, 54));
+    }
+
+    #[test]
+    fn negative_offset_applies_to_date_only_shape() {
+        let (_, cands) = parse_body_text_with_offset("quota resets 2026-11-10", -300);
+        assert_eq!(cands.len(), 1);
+        // Midnight in UTC-05:00 == 05:00 UTC.
+        assert_eq!(cands[0].at_ms, utc_ms(2026, 11, 10, 5, 0, 0));
     }
 
     #[test]

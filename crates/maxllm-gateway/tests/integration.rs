@@ -3888,6 +3888,126 @@ async fn test_429_body_rate_limit_fails_over_with_precise_reset() {
     assert_eq!(state, Some(1.0), "the breaker must be open (1)");
 }
 
+// --- per-provider `utc_offset` (zone-less reset timestamps) ---------------
+
+/// Render the wall-clock timestamp `hours` ahead of now, in the zone-less
+/// `%Y-%m-%d %H:%M:%S` shape upstreams write in their quota messages.
+fn zoneless_ts(hours: i64) -> String {
+    (chrono::Utc::now() + chrono::Duration::hours(hours))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string()
+}
+
+/// The learning config, with `utc_offset` added to the primary provider.
+fn rate_limit_config_with_offset(offset: &str) -> String {
+    RATE_LIMIT_LEARNING_CONFIG.replace(
+        "default_model = \"deepseek-v4.1-flash\"",
+        &format!("default_model = \"deepseek-v4.1-flash\"\nutc_offset = \"{offset}\""),
+    )
+}
+
+/// A zone-less Chinese quota message: the timestamp is Beijing wall-clock
+/// time with no marker (exactly Zhipu's `1310` shape).
+fn zoneless_quota_body(ts: &str) -> Value {
+    json!({
+        "error": {
+            "code": "1310",
+            "message": format!("您已达到每周/每月使用上限，您的限额将在 {ts} 重置。")
+        }
+    })
+}
+
+/// With `utc_offset = "+08:00"` the zone-less local time is 8 hours earlier
+/// in UTC. A stamp that is still "7 hours in the future" when read as UTC but
+/// already past when read as +08:00 must NOT force the breaker open: the
+/// upstream has already reset, so walling it off would be wrong.
+#[tokio::test]
+async fn test_429_zoneless_reset_honours_provider_utc_offset() {
+    let primary = MockServer::start().await;
+    let fallback = MockServer::start().await;
+
+    // Read as +08:00 this is one hour ago; read as UTC it would be 7h ahead.
+    let body = zoneless_quota_body(&zoneless_ts(7));
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(429).set_body_json(body))
+        .expect(1)
+        .mount(&primary)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from fallback")))
+        .expect(1)
+        .mount(&fallback)
+        .await;
+
+    let gw = TestGateway::start_with_fallback(
+        &rate_limit_config_with_offset("+08:00"),
+        &primary.uri(),
+        &fallback.uri(),
+    )
+    .await;
+
+    let resp = client()
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&chat_body("deepseek-v4.1-flash", "hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "the 429 must fail over to the fallback");
+
+    let state = metric_sample(&gw, "maxllm_circuit_breaker_state{provider=\"primary\"}").await;
+    assert_eq!(
+        state,
+        Some(0.0),
+        "the reset instant is in the past once +08:00 is honoured: no force-open"
+    );
+}
+
+/// The same message with no `utc_offset`: the zone-less stamp is read as UTC,
+/// lands in the future, and the breaker is force-opened until then. This is
+/// the pre-fix behaviour, kept as the contrast that proves the offset is what
+/// changes the outcome.
+#[tokio::test]
+async fn test_429_zoneless_reset_without_offset_reads_as_utc() {
+    let primary = MockServer::start().await;
+    let fallback = MockServer::start().await;
+
+    let body = zoneless_quota_body(&zoneless_ts(7));
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(429).set_body_json(body))
+        .expect(1)
+        .mount(&primary)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from fallback")))
+        .expect(1)
+        .mount(&fallback)
+        .await;
+
+    let gw = TestGateway::start_with_fallback(
+        RATE_LIMIT_LEARNING_CONFIG,
+        &primary.uri(),
+        &fallback.uri(),
+    )
+    .await;
+
+    let resp = client()
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&chat_body("deepseek-v4.1-flash", "hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "the 429 must fail over to the fallback");
+
+    let state = metric_sample(&gw, "maxllm_circuit_breaker_state{provider=\"primary\"}").await;
+    assert_eq!(
+        state,
+        Some(1.0),
+        "read as UTC the reset instant is in the future: the breaker is open"
+    );
+}
+
 #[tokio::test]
 async fn test_429_non_rate_limit_body_is_not_force_opened() {
     let primary = MockServer::start().await;

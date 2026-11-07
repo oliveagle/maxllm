@@ -725,10 +725,40 @@ The time expressions the body scan recognises are the shapes providers
 actually use:
 
 - RFC 3339 / ISO 8601 — `2026-11-06T23:59:59Z`, `2026-11-06T23:59:59.123+08:00`
-- space-separated — `2026-11-06 23:59:59` (naive, read as UTC)
+- space-separated — `2026-11-06 23:59:59` (zone-less: read in the
+  provider's `utc_offset`, UTC when it is not configured)
 - numeric offset with a trailing zone name — `2026-11-06 23:59:59 +0800 CST` (the Volcengine/ByteDance production shape)
 - relative durations — `12m50s`, `5m0s`, `45s`, `5分钟`
 - epoch seconds — `1793690399`
+
+#### Zone-less timestamps: per-provider `utc_offset`
+
+Many upstreams state the reset time in *their own* local time and write no
+zone marker at all. Zhipu's production message is the canonical case:
+
+```json
+{"code":"1310","message":"您已达到每周/每月使用上限，您的限额将在 2026-11-10 22:58:54 重置。"}
+```
+
+That `22:58:54` is Beijing time. Read as UTC it becomes `2026-11-11 06:58:54Z`
+— eight hours late, so the provider is walled off long after it is healthy
+again. Declare the offset on the provider and the zone-less stamps in *its*
+messages are read in that zone:
+
+```toml
+[providers.one_api_zhipu_1]
+kind = "openai_compat"
+base_url = "https://open.bigmodel.cn"
+api_key = "${ZHIPU_API_KEY}"
+default_model = "glm-5.3-flash"
+utc_offset = "+08:00"   # accepts +08:00 / +0800 / +08 / -05:30 / Z
+```
+
+Only zone-less stamps are affected. `Retry-After`,
+`x-ratelimit-reset-*` and any timestamp that carries its own offset
+(`+0800`, `Z`, RFC 3339) keep their own meaning — the config is an
+assumption for the ambiguous case, never an override. Unset means UTC, which
+is the pre-0.3.7 behaviour.
 
 The classification order is deliberate: **regex first, laya second, and only a
 confirmed non-rate-limit takes the non-rate-limit path.** Deterministic layers

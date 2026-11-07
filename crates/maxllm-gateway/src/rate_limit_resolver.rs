@@ -113,11 +113,14 @@ impl RateLimitResolver {
     /// Resolve the quota reset instant of one upstream error.
     ///
     /// `body` may be empty — the resolver then relies on headers and laya.
+    /// `utc_offset_minutes` is the provider's fixed offset (0 = UTC); it only
+    /// affects zone-less timestamps found in `body`.
     pub async fn resolve(
         &self,
         status: u16,
         headers: &http::HeaderMap,
         body: &[u8],
+        utc_offset_minutes: i32,
     ) -> (RateLimitDecision, Option<LearnedUpdate>) {
         if !self.config.enabled {
             // Learning disabled: keep the pre-learning behaviour — the
@@ -137,7 +140,8 @@ impl RateLimitResolver {
         }
 
         let text = String::from_utf8_lossy(body);
-        let (is_rate_limit, candidates) = rate_limit::parse_body_text(&text);
+        let (is_rate_limit, candidates) =
+            rate_limit::parse_body_text_with_offset(&text, utc_offset_minutes);
         let fingerprint = if text.trim().is_empty() {
             None
         } else {
@@ -246,6 +250,7 @@ impl RateLimitResolver {
         _status: u16,
         headers: &http::HeaderMap,
         body: &[u8],
+        utc_offset_minutes: i32,
     ) -> (RateLimitDecision, Option<LearnedUpdate>) {
         if !self.config.enabled {
             return (RateLimitDecision::QuotaUnknown, None);
@@ -260,7 +265,8 @@ impl RateLimitResolver {
             );
         }
         let text = String::from_utf8_lossy(body);
-        let (is_rate_limit, candidates) = rate_limit::parse_body_text(&text);
+        let (is_rate_limit, candidates) =
+            rate_limit::parse_body_text_with_offset(&text, utc_offset_minutes);
         let fingerprint = if text.trim().is_empty() {
             None
         } else {
@@ -444,7 +450,7 @@ mod tests {
     #[tokio::test]
     async fn disabled_resolver_defers_to_caller() {
         let resolver = RateLimitResolver::new(ResolverConfig::default(), None, None, None);
-        let (decision, learned) = resolver.resolve(429, &headers(&[]), b"rate limit").await;
+        let (decision, learned) = resolver.resolve(429, &headers(&[]), b"rate limit", 0).await;
         assert_eq!(decision, RateLimitDecision::QuotaUnknown);
         assert!(learned.is_none());
     }
@@ -458,7 +464,7 @@ mod tests {
         let resolver = RateLimitResolver::new(cfg, None, None, None);
         let h = headers(&[("retry-after", "60")]);
         let (decision, learned) = resolver
-            .resolve(429, &h, b"It will reset at 2099-01-01 00:00:00")
+            .resolve(429, &h, b"It will reset at 2099-01-01 00:00:00", 0)
             .await;
         match decision {
             RateLimitDecision::QuotaUntil { source, .. } => {
@@ -477,7 +483,7 @@ mod tests {
         };
         let resolver = RateLimitResolver::new(cfg, None, None, None);
         let body = br#"{"error":{"code":"AccountQuotaExceeded","message":"You have exceeded the monthly usage quota. It will reset at 2026-11-06 23:59:59 +0800 CST. Request id: 021793713952"}}}"#;
-        let (decision, learned) = resolver.resolve(429, &headers(&[]), body).await;
+        let (decision, learned) = resolver.resolve(429, &headers(&[]), body, 0).await;
         match decision {
             RateLimitDecision::QuotaUntil {
                 reset_at_ms,
@@ -504,7 +510,7 @@ mod tests {
         let resolver = RateLimitResolver::new(cfg, None, None, None);
         let body =
             br#"{"error":{"message":"Insufficient balance. Please recharge your account."}}"#;
-        let (decision, _) = resolver.resolve(429, &headers(&[]), body).await;
+        let (decision, _) = resolver.resolve(429, &headers(&[]), body, 0).await;
         assert_eq!(decision, RateLimitDecision::OrdinaryFailure);
     }
 
@@ -520,7 +526,7 @@ mod tests {
         // running on the machine.
         let resolver = RateLimitResolver::new(cfg, Some("http://127.0.0.1:1"), None, None);
         let (decision, learned) = resolver
-            .resolve(429, &headers(&[]), b"something entirely unexpected")
+            .resolve(429, &headers(&[]), b"something entirely unexpected", 0)
             .await;
         assert_eq!(decision, RateLimitDecision::QuotaUnknown);
         assert!(learned.is_some());

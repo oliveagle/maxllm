@@ -233,6 +233,17 @@ pub struct ProviderConfig {
     /// TLS handshake), in seconds. Unset means no separate total budget.
     #[serde(default)]
     pub total_connect_timeout_secs: Option<u64>,
+    /// Fixed UTC offset used to interpret **zone-less** reset timestamps in
+    /// upstream rate-limit messages, e.g. Zhipu's
+    /// `您的限额将在 2026-11-10 22:58:54 重置` (Beijing time, but written
+    /// without a zone). Accepts `+08:00`, `+0800`, `+08`, `-05:30` and `Z`.
+    /// Unset means UTC.
+    ///
+    /// Only text-derived instants use it. `Retry-After`,
+    /// `x-ratelimit-reset-*` and RFC 3339 timestamps that carry their own
+    /// offset are unaffected.
+    #[serde(default)]
+    pub utc_offset: Option<String>,
     /// Weight for load balancing (higher = more traffic).
     #[serde(default = "default_weight")]
     pub weight: u32,
@@ -240,6 +251,59 @@ pub struct ProviderConfig {
     /// yet consumed by any routing rule — reserved for tag-based routing).
     #[serde(default)]
     pub tags: Vec<String>,
+}
+
+/// Parse a fixed UTC offset into minutes east of UTC.
+///
+/// Accepted shapes: `Z` / `UTC` / `+00:00`, `+08:00`, `+0800`, `+08`,
+/// `-05:30`, `-0530`, `-05`. Range is checked to `-12:00 ..= +14:00`.
+pub fn parse_utc_offset(raw: &str) -> Option<i32> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return None;
+    }
+    if t.eq_ignore_ascii_case("z") || t.eq_ignore_ascii_case("utc") || t == "GMT" {
+        return Some(0);
+    }
+    let bytes = t.as_bytes();
+    let sign = match bytes[0] {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let rest = &t[1..];
+    let (hh, mm) = match rest.len() {
+        2 => (rest, "00"),
+        4 => (&rest[..2], &rest[2..]),
+        5 if rest.as_bytes()[2] == b':' => (&rest[..2], &rest[3..]),
+        _ => return None,
+    };
+    if !hh.bytes().all(|b| b.is_ascii_digit()) || !mm.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let hours: i32 = hh.parse().ok()?;
+    let minutes: i32 = mm.parse().ok()?;
+    if minutes > 59 || hours > 14 {
+        return None;
+    }
+    let total = sign * (hours * 60 + minutes);
+    if !(-12 * 60..=14 * 60).contains(&total) {
+        return None;
+    }
+    Some(total)
+}
+
+impl ProviderConfig {
+    /// The provider's fixed UTC offset in minutes east of UTC (0 when unset).
+    ///
+    /// Validated at config load, so an invalid value never reaches here.
+    #[must_use]
+    pub fn utc_offset_minutes(&self) -> i32 {
+        self.utc_offset
+            .as_deref()
+            .and_then(parse_utc_offset)
+            .unwrap_or(0)
+    }
 }
 
 fn default_max_fails() -> u32 {
@@ -549,6 +613,15 @@ impl Config {
                 )));
             }
         }
+        for (name, provider) in &self.providers {
+            if let Some(raw) = provider.utc_offset.as_deref() {
+                if parse_utc_offset(raw).is_none() {
+                    return Err(ConfigError::Validation(format!(
+                        "provider '{name}' has invalid utc_offset '{raw}' (expected e.g. \"+08:00\", \"+0800\" or \"Z\")"
+                    )));
+                }
+            }
+        }
         for route in &self.routes {
             for name in &route.plugins {
                 if !self.plugins.contains_key(name) {
@@ -577,6 +650,61 @@ fn expand_env_vars(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn utc_offset_shapes_parse() {
+        for (raw, want) in [
+            ("+08:00", 480),
+            ("+0800", 480),
+            ("+08", 480),
+            ("-05:30", -330),
+            ("-0530", -330),
+            ("-05", -300),
+            ("Z", 0),
+            ("utc", 0),
+            ("GMT", 0),
+            ("+14:00", 840),
+            ("-12:00", -720),
+        ] {
+            assert_eq!(parse_utc_offset(raw), Some(want), "{raw}");
+        }
+        for raw in [
+            "",
+            "8:00",
+            "08:00",
+            "+8:0",
+            "+15:00",
+            "-13:00",
+            "+08:60",
+            "Asia/Shanghai",
+            "++08",
+        ] {
+            assert_eq!(parse_utc_offset(raw), None, "{raw}");
+        }
+    }
+
+    #[test]
+    fn provider_utc_offset_is_validated_at_load() {
+        let base = r#"
+[server]
+listen = "0.0.0.0:8080"
+
+[providers.zhipu]
+kind = "openai_compat"
+base_url = "https://open.bigmodel.cn"
+default_model = "glm-5.3-flash"
+"#;
+        let ok = format!("{base}utc_offset = \"+08:00\"\n");
+        let config = Config::parse(&ok).unwrap();
+        assert_eq!(config.providers["zhipu"].utc_offset_minutes(), 480);
+
+        let unset = Config::parse(base).unwrap();
+        assert_eq!(unset.providers["zhipu"].utc_offset_minutes(), 0);
+
+        let bad = format!("{base}utc_offset = \"Asia/Shanghai\"\n");
+        let err = Config::parse(&bad).unwrap_err().to_string();
+        assert!(err.contains("utc_offset"), "{err}");
+    }
 
     #[test]
     fn test_parse_minimal_config() {

@@ -159,6 +159,7 @@ mod tests {
                 responses_path: None,
                 connect_timeout: std::time::Duration::from_secs(10),
                 total_connect_timeout: None,
+                utc_offset_minutes: 0,
             }),
             is_primary,
             cost_per_1m: None,

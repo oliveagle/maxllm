@@ -242,6 +242,9 @@ pub struct ProviderState {
     pub connect_timeout: Duration,
     /// Total budget for the upstream connection (TCP connect + TLS).
     pub total_connect_timeout: Option<Duration>,
+    /// Fixed UTC offset (minutes east of UTC) used to read zone-less reset
+    /// timestamps in this upstream's rate-limit messages. 0 = UTC.
+    pub utc_offset_minutes: i32,
 }
 
 /// Hot-reloadable state — swapped atomically on config change.
@@ -425,6 +428,7 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
                         .unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECS),
                 ),
                 total_connect_timeout: conf.total_connect_timeout_secs.map(Duration::from_secs),
+                utc_offset_minutes: conf.utc_offset_minutes(),
             }),
         );
     }
@@ -3431,6 +3435,11 @@ impl ProxyHttp for AiGateway {
 
             let resolver = self.rate_limit_resolver.clone();
             let provider_name = ctx.provider_name.clone();
+            let utc_offset_minutes = hot
+                .providers
+                .get(&provider_name)
+                .map(|p| p.utc_offset_minutes)
+                .unwrap_or(0);
             // The Pingora body filter is sync; the resolver is async (it may
             // call laya over HTTP). Bridge the boundary with block_on on the
             // current tokio runtime — the call is bounded by the laya
@@ -3438,12 +3447,16 @@ impl ProxyHttp for AiGateway {
             // retry, so the failover decision is still on-path.
             let (decision, learned) = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::try_current().map(|rt| {
-                    rt.block_on(async { resolver.resolve(status, &headers, &body_bytes).await })
+                    rt.block_on(async {
+                        resolver
+                            .resolve(status, &headers, &body_bytes, utc_offset_minutes)
+                            .await
+                    })
                 })
             })
             .unwrap_or_else(|_| {
                 // No runtime context (defensive): deterministic-only decision.
-                resolver.resolve_sync(status, &headers, &body_bytes)
+                resolver.resolve_sync(status, &headers, &body_bytes, utc_offset_minutes)
             });
 
             // Persist what we learned (fire-and-forget; the DB write is
@@ -5927,6 +5940,7 @@ mod failover_policy_tests {
             responses_path: None,
             connect_timeout: Duration::from_secs(10),
             total_connect_timeout: None,
+            utc_offset_minutes: 0,
         }
     }
 
