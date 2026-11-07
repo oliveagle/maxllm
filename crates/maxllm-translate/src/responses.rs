@@ -3922,4 +3922,428 @@ mod tests {
         assert_eq!(msg["role"], "tool");
         assert_eq!(msg["content"], Value::String(String::new()));
     }
+
+    // ── mutation-test hardening: argument/branch pins ──────────────────
+
+    #[test]
+    fn test_plain_string_summary_reasoning_attaches_to_assistant() {
+        // A `reasoning` item may carry its summary as a bare string.
+        let body = br#"{
+            "model":"deepseek-flash",
+            "input":[
+                {"type":"reasoning","id":"rs_1","summary":"string summary"},
+                {"type":"message","role":"assistant","content":"answer"}
+            ]
+        }"#;
+        let out = responses_request_to_chat(body).unwrap();
+        let v: Value = serde_json::from_slice(&out.body).unwrap();
+        let msgs = v["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["reasoning_content"], "string summary");
+    }
+
+    #[test]
+    fn test_object_summary_reasoning_attaches_to_assistant() {
+        // A `summary` may be a single block object instead of an array.
+        let body = br#"{
+            "model":"deepseek-flash",
+            "input":[
+                {"type":"reasoning","id":"rs_1",
+                 "summary":{"type":"summary_text","text":"object summary"}},
+                {"type":"message","role":"assistant","content":"answer"}
+            ]
+        }"#;
+        let out = responses_request_to_chat(body).unwrap();
+        let v: Value = serde_json::from_slice(&out.body).unwrap();
+        let msgs = v["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["reasoning_content"], "object summary");
+    }
+
+    #[test]
+    fn test_whitespace_reasoning_is_replaced_with_the_placeholder() {
+        // Whitespace-only `reasoning_content` counts as missing: thinking
+        // upstreams reject an empty reasoning string, so the placeholder
+        // must be restored.
+        let body = br#"{
+            "model":"deepseek-flash",
+            "input":[
+                {"type":"message","role":"user","content":"create a file"},
+                {"type":"message","role":"assistant","content":"ok","reasoning_content":"   "},
+                {"type":"function_call","id":"fc_1","call_id":"call_1","name":"shell","arguments":"{}"},
+                {"type":"function_call_output","call_id":"call_1","output":"done"}
+            ]
+        }"#;
+        let out = responses_request_to_chat(body).unwrap();
+        let v: Value = serde_json::from_slice(&out.body).unwrap();
+        let msgs = v["messages"].as_array().unwrap();
+        assert_eq!(
+            msgs[1]["reasoning_content"],
+            crate::opencode::REASONING_PLACEHOLDER
+        );
+    }
+
+    #[test]
+    fn test_roles_normalize_system_developer_and_tool() {
+        let body = br#"{
+            "model":"m",
+            "input":[
+                {"type":"message","role":"system","content":"sys"},
+                {"type":"message","role":"developer","content":"dev"},
+                {"type":"message","role":"assistant","content":"hi"},
+                {"type":"function_call","id":"fc_1","call_id":"c1","name":"f","arguments":"{}"},
+                {"type":"function_call_output","call_id":"c1","output":"ok"},
+                {"type":"message","role":"tool","content":"the tool answer"}
+            ]
+        }"#;
+        let out = responses_request_to_chat(body).unwrap();
+        let v: Value = serde_json::from_slice(&out.body).unwrap();
+        let msgs = v["messages"].as_array().unwrap();
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[1]["role"], "system");
+        assert_eq!(msgs[3]["role"], "assistant");
+        assert_eq!(msgs[4]["role"], "tool");
+        assert_eq!(msgs[5]["role"], "tool");
+    }
+
+    #[test]
+    fn test_empty_delta_content_does_not_open_the_message_item() {
+        // An empty delta must not open an output item: `delta_content_text`
+        // returns None for "".
+        let sse = chat_sse(&[
+            r#"{"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":""}}]}"#,
+            r#"{"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        ]);
+        let mut t = ResponsesStreamTranslator::new(Box::new(crate::NativePassthroughStream));
+        let s = String::from_utf8(t.process_chunk(sse.as_bytes(), true)).unwrap();
+        assert!(!s.contains("response.output_item.added"));
+        assert!(!s.contains("response.output_text.delta"));
+        assert!(s.contains("event: response.completed"));
+    }
+
+    #[test]
+    fn test_non_image_file_url_is_dropped() {
+        // A file_url without an image extension is not an image part.
+        let content = json!([
+            {"type":"input_text","text":"report attached"},
+            {"type":"input_file","filename":"doc","file_url":"https://example.com/report.pdf"}
+        ]);
+        let out = content_to_chat_content(&content);
+        assert_eq!(out, Value::String("report attached".into()));
+    }
+
+    #[test]
+    fn test_nested_function_tool_choice_is_passed_through() {
+        // A `tool_choice` that already carries the nested chat shape must be
+        // forwarded untouched (the flat-function rewrite only applies to the
+        // flat Responses shape).
+        let req = json!({
+            "model": "m",
+            "input": [{"role":"user","content":"hi"}],
+            "tool_choice": {"type":"function","function":{"name":"f"},"name":"f"}
+        });
+        let out = responses_request_to_chat(&serde_json::to_vec(&req).unwrap()).unwrap();
+        let v: Value = serde_json::from_slice(&out.body).unwrap();
+        assert_eq!(v["tool_choice"], req["tool_choice"]);
+    }
+
+    #[test]
+    fn test_allowed_tools_with_required_mode_stays_required() {
+        let req = json!({
+            "model": "m",
+            "input": [{"role":"user","content":"hi"}],
+            "tool_choice": {
+                "type": "allowed_tools",
+                "mode": "required",
+                "tools": [{"name":"a"},{"name":"b"}]
+            }
+        });
+        let out = responses_request_to_chat(&serde_json::to_vec(&req).unwrap()).unwrap();
+        let v: Value = serde_json::from_slice(&out.body).unwrap();
+        assert_eq!(v["tool_choice"], "required");
+    }
+
+    #[test]
+    fn test_nested_function_tool_is_not_rewrapped() {
+        // A tool that is already in the chat shape must not be re-wrapped
+        // into {"type":"function","function":{...}} again.
+        let req = json!({
+            "model": "m",
+            "input": [{"role":"user","content":"hi"}],
+            "tools": [
+                {"type":"function","function":{"name":"f","description":"d","parameters":{"type":"object"}}}
+            ]
+        });
+        let out = responses_request_to_chat(&serde_json::to_vec(&req).unwrap()).unwrap();
+        let v: Value = serde_json::from_slice(&out.body).unwrap();
+        assert_eq!(v["tools"], req["tools"]);
+    }
+
+    #[test]
+    fn test_content_filter_finish_reason_becomes_incomplete() {
+        let chat = br#"{
+            "id":"chatcmpl-1","object":"chat.completion","created":1700000000,
+            "model":"m","choices":[{"index":0,"finish_reason":"content_filter",
+                "message":{"role":"assistant","content":"partial"}}]
+        }"#;
+        let out = chat_response_to_responses(chat).unwrap();
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["status"], "incomplete");
+        assert_eq!(v["incomplete_details"]["reason"], "content_filter");
+    }
+
+    #[test]
+    fn test_text_and_tool_calls_both_become_output_items() {
+        // A message item is emitted even when the model produced tool calls,
+        // as long as it also produced text.
+        let chat = br#"{
+            "id":"chatcmpl-1","object":"chat.completion","created":1700000000,
+            "model":"m","choices":[{"index":0,"finish_reason":"tool_calls",
+                "message":{"role":"assistant","content":"calling the tool",
+                    "tool_calls":[{"id":"call_1","type":"function",
+                        "function":{"name":"f","arguments":"{}"}}]}}]
+        }"#;
+        let out = chat_response_to_responses(chat).unwrap();
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        let output = v["output"].as_array().unwrap();
+        let kinds: Vec<&str> = output.iter().map(|i| i["type"].as_str().unwrap()).collect();
+        assert!(
+            kinds.contains(&"message"),
+            "message item missing: {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&"function_call"),
+            "function_call missing: {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn test_reasoning_content_becomes_a_reasoning_item() {
+        let chat = br#"{
+            "id":"chatcmpl-1","object":"chat.completion","created":1700000000,
+            "model":"m","choices":[{"index":0,"finish_reason":"stop",
+                "message":{"role":"assistant","content":"answer",
+                    "reasoning_content":"step by step"}}]
+        }"#;
+        let out = chat_response_to_responses(chat).unwrap();
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        let output = v["output"].as_array().unwrap();
+        assert_eq!(output[0]["type"], "reasoning");
+        assert_eq!(output[0]["summary"][0]["text"], "step by step");
+    }
+
+    #[test]
+    fn test_reasoning_string_becomes_a_reasoning_item() {
+        let chat = br#"{
+            "id":"chatcmpl-1","object":"chat.completion","created":1700000000,
+            "model":"m","choices":[{"index":0,"finish_reason":"stop",
+                "message":{"role":"assistant","content":"answer","reasoning":"reasoned"}}]
+        }"#;
+        let out = chat_response_to_responses(chat).unwrap();
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        let output = v["output"].as_array().unwrap();
+        assert_eq!(output[0]["type"], "reasoning");
+        assert_eq!(output[0]["summary"][0]["text"], "reasoned");
+    }
+
+    #[test]
+    fn test_empty_reasoning_string_does_not_open_a_reasoning_item() {
+        let chat = br#"{
+            "id":"chatcmpl-1","object":"chat.completion","created":1700000000,
+            "model":"m","choices":[{"index":0,"finish_reason":"stop",
+                "message":{"role":"assistant","content":"answer","reasoning":""}}]
+        }"#;
+        let out = chat_response_to_responses(chat).unwrap();
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        let output = v["output"].as_array().unwrap();
+        let kinds: Vec<&str> = output.iter().map(|i| i["type"].as_str().unwrap()).collect();
+        assert!(
+            !kinds.contains(&"reasoning"),
+            "empty reasoning became an item: {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn test_usage_total_falls_back_to_the_sum_of_parts() {
+        let chat = br#"{
+            "id":"chatcmpl-1","object":"chat.completion","created":1700000000,
+            "model":"m","choices":[{"index":0,"finish_reason":"stop",
+                "message":{"role":"assistant","content":"hi"}}],
+            "usage":{"prompt_tokens":2,"completion_tokens":3}
+        }"#;
+        let out = chat_response_to_responses(chat).unwrap();
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["usage"]["total_tokens"], 5);
+        assert_eq!(v["usage"]["input_tokens"], 2);
+        assert_eq!(v["usage"]["output_tokens"], 3);
+    }
+
+    #[test]
+    fn test_null_error_chunk_does_not_fail_the_stream() {
+        let sse = chat_sse(&[
+            r#"{"id":"c","object":"chat.completion.chunk","created":1,"model":"m","error":null,"choices":[{"index":0,"delta":{"content":"hi"}}]}"#,
+            r#"{"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        ]);
+        let mut t = ResponsesStreamTranslator::new(Box::new(crate::NativePassthroughStream));
+        let s = String::from_utf8(t.process_chunk(sse.as_bytes(), true)).unwrap();
+        assert!(!s.contains("response.failed"));
+        assert!(s.contains("response.output_text.delta"));
+    }
+
+    #[test]
+    fn test_error_chunk_fails_the_stream() {
+        let sse = chat_sse(&[
+            r#"{"id":"c","object":"chat.completion.chunk","created":1,"model":"m","error":{"message":"boom","code":429,"type":"rate_limit"}}"#,
+        ]);
+        let mut t = ResponsesStreamTranslator::new(Box::new(crate::NativePassthroughStream));
+        let s = String::from_utf8(t.process_chunk(sse.as_bytes(), true)).unwrap();
+        assert!(s.contains("event: response.failed"));
+        let failed: Value = s
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter_map(|d| serde_json::from_str::<Value>(d).ok())
+            .find(|v| v["type"] == "response.failed")
+            .expect("no response.failed event");
+        assert_eq!(failed["response"]["error"]["message"], "boom");
+        assert_eq!(failed["response"]["error"]["code"], "429");
+    }
+
+    #[test]
+    fn test_streamed_tool_call_id_survives_into_the_completed_response() {
+        // The function_call item id must survive into the terminal
+        // response.completed object.
+        let sse = chat_sse(&[
+            r#"{"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"f","arguments":"{}"}}]}}]}"#,
+            r#"{"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ]);
+        let mut t = ResponsesStreamTranslator::new(Box::new(crate::NativePassthroughStream));
+        let s = String::from_utf8(t.process_chunk(sse.as_bytes(), true)).unwrap();
+        let completed: Value = s
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter_map(|d| serde_json::from_str::<Value>(d).ok())
+            .find(|v| v["type"] == "response.completed")
+            .expect("no response.completed event");
+        let calls: Vec<&Value> = completed["response"]["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|i| i["type"] == "function_call")
+            .collect();
+        assert_eq!(calls.len(), 1);
+        assert!(
+            calls[0]["id"].as_str().unwrap_or("").starts_with("fc_"),
+            "function_call id lost: {}",
+            calls[0]["id"]
+        );
+    }
+
+    #[test]
+    fn test_stream_emits_created_exactly_once() {
+        let sse = chat_sse(&[
+            r#"{"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"hi"}}]}"#,
+            r#"{"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        ]);
+        let mut t = ResponsesStreamTranslator::new(Box::new(crate::NativePassthroughStream));
+        let s = String::from_utf8(t.process_chunk(sse.as_bytes(), true)).unwrap();
+        assert_eq!(
+            s.matches("event: response.created").count(),
+            1,
+            "response.created must be emitted exactly once"
+        );
+        let events: Vec<&str> = s
+            .lines()
+            .filter(|l| l.starts_with("event: "))
+            .map(|l| &l[7..])
+            .collect();
+        assert_eq!(
+            events.first().copied(),
+            Some("response.created"),
+            "response.created must be the first event, got {events:?}"
+        );
+    }
+
+    #[test]
+    fn test_crlf_stream_is_split_into_events() {
+        let sse = chat_sse(&[
+            r#"{"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"hi"}}]}"#,
+            r#"{"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        ])
+        .replace("\n\n", "\r\n\r\n");
+        let mut t = ResponsesStreamTranslator::new(Box::new(crate::NativePassthroughStream));
+        let s = String::from_utf8(t.process_chunk(sse.as_bytes(), true)).unwrap();
+        assert!(s.contains("response.output_text.delta"));
+        assert!(s.contains("event: response.completed"));
+    }
+
+    #[test]
+    fn test_leading_crlf_is_tolerated() {
+        // Some upstreams open the SSE body with a blank \r\n line. The
+        // normalizer must not index before the start of the buffer.
+        let sse = format!(
+            "\r\n{}",
+            chat_sse(&[
+                r#"{"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"hi"}}]}"#,
+                r#"{"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+            ])
+        );
+        let mut t = ResponsesStreamTranslator::new(Box::new(crate::NativePassthroughStream));
+        let s = String::from_utf8(t.process_chunk(sse.as_bytes(), true)).unwrap();
+        assert!(s.contains("response.output_text.delta"));
+        assert!(s.contains("event: response.completed"));
+    }
+
+    #[test]
+    fn test_summarize_counts_input_items_and_flags() {
+        let req: ResponsesRequest =
+            serde_json::from_slice(br#"{"model":"m","input":[{"role":"user","content":"a"},{"role":"user","content":"b"},{"role":"user","content":"c"}],"instructions":"sys","stream":true}"#)
+                .unwrap();
+        let summary = req.summarize();
+        assert_eq!(summary.model, "m");
+        assert!(summary.has_instructions);
+        assert_eq!(summary.input_items, 3);
+        assert!(summary.streaming);
+
+        let req: ResponsesRequest =
+            serde_json::from_slice(br#"{"model":"m","input":"plain question"}"#).unwrap();
+        let summary = req.summarize();
+        assert_eq!(summary.input_items, 1);
+        assert!(!summary.has_instructions);
+        assert!(!summary.streaming);
+
+        let req: ResponsesRequest = serde_json::from_slice(br#"{"model":"m"}"#).unwrap();
+        let summary = req.summarize();
+        assert_eq!(summary.input_items, 0);
+        assert_eq!(summary.model, "m");
+    }
+
+    #[test]
+    fn test_trailing_carriage_return_does_not_panic() {
+        // A lone \r at the very end of the stream must be handled by the
+        // CRLF normalizer without reading past the end of the buffer.
+        let mut sse = chat_sse(&[
+            r#"{"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"hi"}}]}"#,
+            r#"{"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        ]);
+        sse.push('\r');
+        let mut t = ResponsesStreamTranslator::new(Box::new(crate::NativePassthroughStream));
+        let s = String::from_utf8(t.process_chunk(sse.as_bytes(), true)).unwrap();
+        assert!(s.contains("event: response.completed"));
+    }
+
+    #[test]
+    fn test_created_at_defaults_to_now() {
+        let chat = br#"{
+            "id":"chatcmpl-1","object":"chat.completion","model":"m",
+            "choices":[{"index":0,"finish_reason":"stop",
+                "message":{"role":"assistant","content":"hi"}}]
+        }"#;
+        let out = chat_response_to_responses(chat).unwrap();
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        let created_at = v["created_at"].as_u64().expect("created_at missing");
+        assert!(
+            created_at > 1_600_000_000,
+            "created_at {created_at} is not a plausible unix timestamp"
+        );
+    }
 }
