@@ -779,6 +779,39 @@ default_cooldown_secs = 300        # used when no layer resolved an instant
 max_learned_patterns = 1000        # learned-shape store cap
 ```
 
+#### Providers that never say when (Kimi)
+
+Not every upstream states a reset instant. Kimi's weekly limit answers with
+
+```json
+{"error":{"message":"You've reached our weekly (7-day) usage limit. Your quota will
+ reset when the current 7-day window ends. ...","type":"exceeded_current_quota_error"}}
+```
+
+and nothing else — no `Retry-After`, no `x-ratelimit-*`, no timestamp (verified
+against the live endpoint: the only headers are nginx's `Date`, `X-Trace-Id`
+and `server-timing`). The instant genuinely cannot be computed, so the gateway
+falls back to `default_cooldown_secs` and re-probes the provider whenever a
+request walks past it.
+
+`scripts/quota_probe.py` measures the recovery instead, by probing the
+provider **directly at its `base_url`** (the gateway's breaker is open — that
+is the point) with the cheapest possible request:
+
+```bash
+python3 scripts/quota_probe.py --config maxllm.toml --provider one_api_kimi \
+    --interval 600 --log logs/quota-probe-kimi.jsonl
+# 2026-11-08 00:13:06+0800 BAD  429  254ms elapsed=    0.3s {"message": "You've reached our weekly ..."}
+# ... 600 s later ...
+# 2026-11-08 04:41:12+0800 ok   200  812ms elapsed=14406.0s ok
+# RECOVERED after 14406s (25 probes)
+```
+
+`--once` gives a single verdict (exit 0 = 200, 1 = still down) for a health
+check or a cron entry; the JSONL log then answers "how long was it down" after
+the fact. This is the only reliable way to learn an unknown reset: the moment
+it happens, not in advance.
+
 Prometheus metrics: `maxllm_circuit_breaker_quota_opens_total{provider}`
 counts each quota force-open (exact instant *or* default cooldown);
 `maxllm_circuit_breaker_state{provider}` reflects the force-open (1 = open).
