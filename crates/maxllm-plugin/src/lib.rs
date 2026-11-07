@@ -73,6 +73,9 @@ impl HttpResponse {
 
 /// The core plugin trait. Each method maps to a Pingora ProxyHttp lifecycle hook.
 /// Default implementations are no-ops so plugins only override what they need.
+// Clippy 1.99's double_must_use flags async_trait-generated boxed futures; the
+// #[must_use] on them is intentional, so silence the false positive here.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Plugin: Send + Sync {
     /// Plugin name, e.g. "key_auth".

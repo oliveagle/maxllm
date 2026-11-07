@@ -110,6 +110,9 @@ pub struct GuardrailOutput<'a> {
 ///
 /// Unlike plugins (which operate on raw HTTP), guardrails operate on parsed
 /// message content. They inspect the actual text being sent to/from the LLM.
+// Clippy 1.99's double_must_use flags async_trait-generated boxed futures; the
+// #[must_use] on them is intentional, so silence the false positive here.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Guardrail: Send + Sync {
     /// Provider name (e.g., "prompt_guard", "webhook").
