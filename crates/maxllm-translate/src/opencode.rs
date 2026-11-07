@@ -1008,4 +1008,98 @@ mod tests {
         let out = st.process_chunk(b"data: hello\n\n", false);
         assert_eq!(out, b"data: hello\n\n");
     }
+
+    // ── mutation-test hardening: argument/branch pins ──────────────────
+
+    #[test]
+    fn test_placeholder_only_reasoning_is_kept() {
+        // `reasoning_content` that IS exactly the placeholder is not an echo
+        // (there is nothing around it to collapse); it must survive.
+        let out = norm(json!({"model":"m","messages":[
+            {"role":"assistant","content":"","reasoning_content":REASONING_PLACEHOLDER}]}));
+        assert_eq!(
+            out["messages"][0]["reasoning_content"],
+            REASONING_PLACEHOLDER
+        );
+    }
+
+    #[test]
+    fn test_whitespace_reasoning_is_replaced_by_the_dialect_variant() {
+        // Whitespace-only `reasoning_content` counts as missing, so the
+        // mirrored variant text must replace it.
+        let out = norm(json!({"model":"m","messages":[
+            {"role":"assistant","content":"","reasoning_content":"   ","reasoning":"real thinking"}]}));
+        assert_eq!(out["messages"][0]["reasoning_content"], "real thinking");
+    }
+
+    #[test]
+    fn test_present_reasoning_is_not_overwritten_by_the_variant() {
+        // Real reasoning content must win over the alternate dialect.
+        let out = norm(json!({"model":"m","messages":[
+            {"role":"assistant","content":"","reasoning_content":"keep","reasoning":"other"}]}));
+        assert_eq!(out["messages"][0]["reasoning_content"], "keep");
+    }
+
+    #[test]
+    fn test_whitespace_reasoning_with_tool_calls_gets_the_placeholder() {
+        let out = norm(json!({"model":"m","messages":[
+            {"role":"assistant","content":"","reasoning_content":"  ",
+             "tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}}]}]}));
+        assert_eq!(
+            out["messages"][0]["reasoning_content"],
+            REASONING_PLACEHOLDER
+        );
+    }
+
+    #[test]
+    fn test_valid_tool_response_survives_the_orphan_repair() {
+        // A tool response that answers a call issued before it must be kept.
+        let out = norm(json!({"model":"m","messages":[
+            {"role":"user","content":"q"},
+            {"role":"assistant","content":"","tool_calls":[
+                {"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}}]},
+            {"role":"tool","tool_call_id":"c1","content":"ok"}]}));
+        let msgs = out["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[2]["role"], "tool");
+        assert_eq!(msgs[2]["tool_call_id"], "c1");
+        assert_eq!(msgs[2]["content"], "ok");
+    }
+
+    #[test]
+    fn test_translator_name_and_response_passthrough() {
+        let t = OpenCodeTranslator::new("opencode_go", "/zen/go/v1/chat/completions");
+        assert_eq!(t.name(), "opencode_go");
+        assert_eq!(t.upstream_path(), "/zen/go/v1/chat/completions");
+        let body = br#"{"id":"x","object":"chat.completion","choices":[]}"#;
+        let out = t.translate_response(body).unwrap();
+        assert_eq!(out, body.to_vec());
+    }
+
+    #[test]
+    fn test_orphan_tool_response_to_an_earlier_call_is_kept() {
+        // The tool response does not *immediately* follow its assistant call
+        // (a user message sits in between), but it still answers a call that
+        // was issued earlier, so the orphan repair must keep it. (The
+        // assistant branch also inserts a synthetic answer for the call it
+        // saw as unanswered — that is separate and unchanged.)
+        let out = norm(json!({"model":"m","messages":[
+            {"role":"assistant","content":"","tool_calls":[
+                {"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}}]},
+            {"role":"user","content":"q"},
+            {"role":"tool","tool_call_id":"c1","content":"ok"}]}));
+        let msgs = out["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(
+            msgs[1]["role"], "tool",
+            "synthetic answer for the unseen call"
+        );
+        assert_eq!(msgs[2]["role"], "user");
+        assert_eq!(
+            msgs[3]["role"], "tool",
+            "the earlier-issued call keeps its response"
+        );
+        assert_eq!(msgs[3]["tool_call_id"], "c1");
+        assert_eq!(msgs[3]["content"], "ok");
+    }
 }
