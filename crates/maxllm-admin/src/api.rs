@@ -373,6 +373,130 @@ mod tests {
     }
 
     #[test]
+    fn resilience_store_passthrough() {
+        let api = setup();
+
+        // Circuit-breaker state round-trips through the store.
+        let row = crate::models::CircuitBreakerStateRow {
+            provider: "p1".into(),
+            state: 1,
+            failures: 3,
+            last_failure_at: 1234,
+            force_open_until: 99999,
+            successes_half_open: 0,
+            transitions: 2,
+            quota_opens: 1,
+            updated_at: chrono::Utc::now(),
+        };
+        api.save_circuit_breaker_state(row).unwrap();
+        let rows = api.load_circuit_breaker_states().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].provider, "p1");
+        assert_eq!(rows[0].state, 1);
+        assert_eq!(rows[0].failures, 3);
+
+        // Session bindings round-trip and can be dropped.
+        api.save_session_binding("sess-1", "provider-a").unwrap();
+        let bindings = api.load_session_bindings().unwrap();
+        assert_eq!(
+            bindings,
+            vec![("sess-1".to_string(), "provider-a".to_string())]
+        );
+        api.delete_session_binding("sess-1").unwrap();
+        assert!(api.load_session_bindings().unwrap().is_empty());
+
+        // Rate-limit patterns round-trip by fingerprint.
+        let row = crate::models::RateLimitPatternRow {
+            fingerprint: "fp-1".into(),
+            is_rate_limit: true,
+            reset_expression: Some("duration".into()),
+            sample_message: "rate limit 30s".into(),
+            hits: 1,
+            updated_at: chrono::Utc::now(),
+        };
+        api.save_rate_limit_pattern(row).unwrap();
+        let found = api
+            .get_rate_limit_pattern("fp-1")
+            .unwrap()
+            .expect("pattern");
+        assert!(found.is_rate_limit);
+        assert!(api.get_rate_limit_pattern("missing").unwrap().is_none());
+
+        // Request logs round-trip.
+        let log = crate::models::RequestLog {
+            id: "r1".into(),
+            timestamp: chrono::Utc::now(),
+            provider: "p1".into(),
+            model: "m".into(),
+            tokens_in: 1,
+            tokens_out: 2,
+            cost_usd: 0.0,
+            latency_ms: 5,
+            status: 200,
+            request_id: None,
+            client_ip: None,
+            route_path: "/v1/chat".into(),
+            endpoint_type: "chat".into(),
+            fallback_used: false,
+            error: None,
+        };
+        api.record_log(log).unwrap();
+    }
+
+    #[test]
+    fn team_member_removal_routes() {
+        let api = setup();
+
+        // Create a team and a key, add a member, then remove it via the
+        // `/admin/teams/{team}/members/{key}` path.
+        let body = serde_json::to_vec(&serde_json::json!({ "name": "eng" })).unwrap();
+        let resp = api.handle_request("POST", "/admin/teams", &body, MASTER_KEY);
+        let team_id = parse_json(&resp)["id"].as_str().unwrap().to_string();
+
+        let body = serde_json::to_vec(&serde_json::json!({ "name": "k1" })).unwrap();
+        let resp = api.handle_request("POST", "/admin/keys", &body, MASTER_KEY);
+        let key_id = parse_json(&resp)["key_id"].as_str().unwrap().to_string();
+
+        let body = serde_json::to_vec(&serde_json::json!({ "key_id": key_id })).unwrap();
+        let resp = api.handle_request(
+            "POST",
+            &format!("/admin/teams/{team_id}/members"),
+            &body,
+            MASTER_KEY,
+        );
+        assert_eq!(resp.status, 200);
+
+        let resp = api.handle_request(
+            "DELETE",
+            &format!("/admin/teams/{team_id}/members/{key_id}"),
+            &[],
+            MASTER_KEY,
+        );
+        assert_eq!(resp.status, 200);
+
+        // An unmatched teams path is a 404.
+        let resp = api.handle_request("DELETE", "/admin/teams/x", &[], MASTER_KEY);
+        assert_eq!(resp.status, 404);
+    }
+
+    #[test]
+    fn unknown_admin_route_is_404() {
+        let api = setup();
+        for (method, path) in [
+            ("GET", "/admin/nope"),
+            ("POST", "/admin/spend"),
+            ("PUT", "/admin/keys"),
+        ] {
+            let resp = api.handle_request(method, path, &[], MASTER_KEY);
+            assert_eq!(resp.status, 404, "{method} {path}");
+        }
+        // Trailing slashes are normalised.
+        let body = serde_json::to_vec(&serde_json::json!({ "name": "t" })).unwrap();
+        let resp = api.handle_request("POST", "/admin/teams/", &body, MASTER_KEY);
+        assert_eq!(resp.status, 201);
+    }
+
+    #[test]
     fn create_and_list_teams() {
         let api = setup();
 

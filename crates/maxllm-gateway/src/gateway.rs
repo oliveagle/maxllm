@@ -5626,3 +5626,281 @@ mod failover_policy_tests {
         assert!(!should_failover_status(400, &ctx(""), &p));
     }
 }
+
+#[cfg(test)]
+mod helper_function_tests {
+    use super::*;
+    use maxllm_config::ProviderKind;
+
+    /// Every provider kind maps to a non-empty `owned_by` label.
+    #[test]
+    fn test_provider_owned_by_labels() {
+        for (kind, expected) in [
+            (ProviderKind::OpenAI, "openai"),
+            (ProviderKind::Anthropic, "anthropic"),
+            (ProviderKind::Gemini, "google"),
+            (ProviderKind::AzureOpenai, "azure-openai"),
+            (ProviderKind::Bedrock, "aws-bedrock"),
+            (ProviderKind::Groq, "groq"),
+            (ProviderKind::Together, "together"),
+            (ProviderKind::Fireworks, "fireworks"),
+            (ProviderKind::DeepInfra, "deepinfra"),
+            (ProviderKind::Mistral, "mistral"),
+            (ProviderKind::XAI, "xai"),
+            (ProviderKind::DeepSeek, "deepseek"),
+            (ProviderKind::Ollama, "ollama"),
+            (ProviderKind::Cohere, "cohere"),
+            (ProviderKind::OpenaiCompat, "custom"),
+            (ProviderKind::OpenCode, "opencode"),
+        ] {
+            assert_eq!(provider_owned_by(kind), expected, "{kind:?}");
+        }
+    }
+
+    /// The circuit breaker registry hands out the same breaker for a name.
+    #[test]
+    fn test_existing_breaker_registry() {
+        let name = "maxllm-test-breaker-registry";
+        assert!(
+            existing_breaker(name).is_none(),
+            "unknown name has no breaker"
+        );
+        let breaker = breaker_for(name, 3, 60);
+        let found = existing_breaker(name).expect("registered breaker");
+        assert!(
+            Arc::ptr_eq(&breaker, &found),
+            "the registry hands out the same breaker"
+        );
+    }
+
+    /// The model id is taken from the `/models/<id>` path segment.
+    #[test]
+    fn test_model_from_request_path() {
+        assert_eq!(
+            model_from_request_path("/v1/models/gpt-4o"),
+            Some("gpt-4o".to_string())
+        );
+        // The id ends at the first `:`, `/` or `?`.
+        assert_eq!(
+            model_from_request_path("/v1/models/gpt-4o:stream"),
+            Some("gpt-4o".to_string())
+        );
+        assert_eq!(
+            model_from_request_path("/v1/models/gpt-4o/chat"),
+            Some("gpt-4o".to_string())
+        );
+        assert_eq!(
+            model_from_request_path("/v1/models/gpt-4o?x=1"),
+            Some("gpt-4o".to_string())
+        );
+        // No marker, or an empty id.
+        assert_eq!(model_from_request_path("/v1/models"), None);
+        assert_eq!(model_from_request_path("/v1/models/"), None);
+        assert_eq!(model_from_request_path("/v1/chat/completions"), None);
+    }
+
+    /// `Retry-After` is either delay-seconds or an HTTP date.
+    #[test]
+    fn test_parse_retry_after_secs() {
+        assert_eq!(parse_retry_after_secs("120"), Some(120));
+        assert_eq!(parse_retry_after_secs("  45  "), Some(45));
+        assert_eq!(parse_retry_after_secs("not-a-date"), None);
+
+        // A future HTTP date becomes the remaining seconds.
+        let future = chrono::Utc::now() + chrono::Duration::seconds(60);
+        let secs = parse_retry_after_secs(&future.to_rfc2822()).expect("http date");
+        assert!((55..=60).contains(&secs), "about a minute left: {secs}");
+
+        // A past HTTP date never goes negative.
+        let past = chrono::Utc::now() - chrono::Duration::seconds(600);
+        assert_eq!(parse_retry_after_secs(&past.to_rfc2822()), Some(0));
+    }
+
+    /// Provider error bodies are normalised to the OpenAI error envelope.
+    #[test]
+    fn test_normalize_anthropic_error() {
+        let body = br#"{"type":"error","error":{"type":"rate_limit_error","message":"Rate limit reached"}}"#;
+        let out = normalize_error_response(body, 429, ProviderKind::Anthropic).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["error"]["message"], "Rate limit reached");
+        assert_eq!(v["error"]["type"], "rate_limit_error");
+        assert_eq!(v["error"]["code"], 429);
+    }
+
+    #[test]
+    fn test_normalize_bedrock_error() {
+        let body = br#"{"type":"error","error":{"type":"throttlingException","message":"Too many tokens"}}"#;
+        let out = normalize_error_response(body, 400, ProviderKind::Bedrock).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["error"]["message"], "Too many tokens");
+        assert_eq!(v["error"]["type"], "throttlingException");
+        assert_eq!(v["error"]["code"], 400);
+    }
+
+    #[test]
+    fn test_normalize_cohere_error() {
+        let body = br#"{"message":"Cohere daily limit"}"#;
+        let out = normalize_error_response(body, 429, ProviderKind::Cohere).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["error"]["message"], "Cohere daily limit");
+        assert_eq!(v["error"]["type"], "api_error");
+        assert_eq!(v["error"]["code"], 429);
+    }
+
+    #[test]
+    fn test_normalize_gemini_error() {
+        let body =
+            br#"{"error":{"code":429,"message":"Quota exceeded","status":"RESOURCE_EXHAUSTED"}}"#;
+        let out = normalize_error_response(body, 429, ProviderKind::Gemini).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["error"]["message"], "Quota exceeded");
+        assert_eq!(v["error"]["type"], "RESOURCE_EXHAUSTED");
+        assert_eq!(v["error"]["code"], 429);
+    }
+
+    /// A body that already carries the OpenAI envelope is passed through.
+    #[test]
+    fn test_normalize_openai_error_passes_through() {
+        let body = br#"{"error":{"message":"m","type":"t","code":7}}"#;
+        assert!(normalize_error_response(body, 400, ProviderKind::OpenAI).is_none());
+        // A body that is not JSON is passed through as well.
+        assert!(normalize_error_response(b"not json", 400, ProviderKind::OpenAI).is_none());
+    }
+
+    /// `find_bytes` honours its bounds.
+    #[test]
+    fn test_find_bytes_bounds() {
+        assert_eq!(find_bytes(b"abcabc", b"abc", 0), Some(0));
+        assert_eq!(find_bytes(b"abcabc", b"abc", 3), Some(3));
+        assert_eq!(find_bytes(b"abcabc", b"abc", 1), Some(3));
+        assert_eq!(find_bytes(b"abc", b"xyz", 0), None);
+        // `from` past the end and an empty needle are both "not found".
+        assert_eq!(find_bytes(b"abc", b"a", 3), None);
+        assert_eq!(find_bytes(b"abc", b"", 0), None);
+    }
+
+    /// The upstream cost may also sit in a plain `cost` field.
+    #[test]
+    fn test_extract_usage_cost_plain_cost_field() {
+        let u = serde_json::json!({"prompt_tokens":1,"cost":0.00001245});
+        assert_eq!(extract_usage_cost(&u), Some(0.00001245));
+        // Zero and negative costs are not costs.
+        assert_eq!(extract_usage_cost(&serde_json::json!({"cost":0})), None);
+        assert_eq!(extract_usage_cost(&serde_json::json!({"cost":-1.0})), None);
+        assert_eq!(
+            extract_usage_cost(&serde_json::json!({"cost":"free"})),
+            None
+        );
+    }
+
+    /// A `data:` line is parsed for its usage payload directly.
+    #[test]
+    fn test_parse_usage_line_directly() {
+        let mut c = RequestCtx::new();
+        parse_usage_line(
+            b"data: {\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":5}}",
+            &mut c,
+        );
+        assert_eq!(c.tokens_in, 11);
+        assert_eq!(c.tokens_out, 5);
+
+        // The Responses envelope nests the usage under `response`.
+        let mut c = RequestCtx::new();
+        parse_usage_line(
+            b"data: {\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}",
+            &mut c,
+        );
+        assert_eq!(c.tokens_in, 3);
+        assert_eq!(c.tokens_out, 2);
+
+        // A line that is not JSON changes nothing.
+        let mut c = RequestCtx::new();
+        parse_usage_line(b"data: {not json}", &mut c);
+        assert_eq!(c.tokens_in, 0);
+    }
+
+    /// A usage line that is not the first one in the chunk is still found.
+    #[test]
+    fn test_usage_in_a_later_sse_line_is_extracted() {
+        let mut c = RequestCtx::new();
+        let chunk = b"data: {\"id\":\"1\",\"choices\":[]}\ndata: {\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1}}\n\n";
+        extract_stream_usage(chunk, &mut c, true);
+        assert_eq!(c.tokens_in, 3);
+        assert_eq!(c.tokens_out, 1);
+    }
+
+    /// A final partial line that is not a `data:` line is not parsed by the
+    /// line path. The usage object here uses a space after the colon, so the
+    /// raw `"usage":{` marker scan cannot see it either — only a data-line
+    /// parse could, and this line is not a data line.
+    #[test]
+    fn test_final_partial_line_must_be_a_data_line() {
+        let mut c = RequestCtx::new();
+        let chunk = b"xxxxx{\"usage\": {\"prompt_tokens\":5,\"completion_tokens\":2}}";
+        extract_stream_usage(chunk, &mut c, true);
+        assert_eq!(c.tokens_in, 0, "a non-data line carries no usage");
+        assert_eq!(c.tokens_out, 0);
+    }
+
+    /// The streaming tail is bounded, and a partial line at the cap is kept
+    /// whole instead of being dropped.
+    #[test]
+    fn test_sse_tail_cap_boundary() {
+        // Exactly 16 KiB of partial line: still below the cap, so the whole
+        // line is kept for the next chunk.
+        let mut c = RequestCtx::new();
+        let partial = vec![b'x'; 16 * 1024];
+        extract_stream_usage(&partial, &mut c, false);
+        assert_eq!(c.sse_tail.len(), 16 * 1024, "the tail keeps the whole line");
+
+        // One byte past the cap: the line is dropped and only the last KiB
+        // is carried over.
+        let mut c = RequestCtx::new();
+        let mut partial = vec![b'x'; 16 * 1024 + 1];
+        partial.extend_from_slice(b"TAIL-MARKER");
+        extract_stream_usage(&partial, &mut c, false);
+        assert_eq!(c.sse_tail.len(), 1024, "the tail keeps a bounded fragment");
+        assert!(
+            c.sse_tail.ends_with(b"TAIL-MARKER"),
+            "the fragment is the end of the dropped line"
+        );
+    }
+}
+
+#[cfg(test)]
+mod auth_plugin_wiring_tests {
+    use super::*;
+    use maxllm_config::Config;
+
+    const BASE: &str = r#"
+[server]
+listen = "0.0.0.0:8080"
+
+[providers.opencode]
+kind = "opencode"
+base_url = "https://opencode.ai"
+api_key = "sk-test"
+"#;
+
+    fn hot_state(toml: &str) -> HotState {
+        let config = Config::parse(toml).unwrap();
+        build_hot_state(&config).unwrap()
+    }
+
+    /// `[auth] api_keys` becomes a `key_auth` plugin — but only when it
+    /// actually carries keys.
+    #[test]
+    fn test_auth_section_wires_a_key_auth_plugin() {
+        let state = hot_state(&format!("{BASE}\n[auth]\napi_keys = [\"sk-a\"]\n"));
+        assert!(
+            !state.global_chain.is_empty(),
+            "the auth plugin is installed"
+        );
+    }
+
+    #[test]
+    fn test_empty_auth_section_installs_no_plugin() {
+        let state = hot_state(&format!("{BASE}\n[auth]\n"));
+        assert!(state.global_chain.is_empty(), "no keys, no auth plugin");
+    }
+}
