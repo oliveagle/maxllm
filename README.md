@@ -492,6 +492,48 @@ connect_timeout_secs = 30
 total_connect_timeout_secs = 60
 ```
 
+### Native Responses opt-in for any provider
+
+`kind = "opencode"` is not the only upstream that serves the Responses
+contract. Any `openai_compat` provider that does can opt in, and the gateway
+then forwards `/v1/responses` requests byte-for-byte instead of translating
+them down to chat completions:
+
+```toml
+[providers.one_api_kimi]
+kind = "openai_compat"
+base_url = "https://api.kimi.com"
+upstream_path = "/coding/v1/chat/completions"   # the chat half
+default_model = "kimi-for-coding"               # 1M context (see /coding/v1/models)
+native_responses = true
+responses_path = "/coding/v1/responses"         # optional: derived from upstream_path
+```
+
+The path is derived from `upstream_path` (`…/chat/completions` →
+`…/responses`) when `responses_path` is omitted, so `native_responses = true`
+alone usually suffices. Verified against the live endpoints on 2026-11-08 by
+posting a minimal Responses body to the derived path:
+
+| provider | derived path | result |
+|---|---|---|
+| `one_api_volc_1/2` | `/api/coding/v3/responses` | 200 |
+| `one_api_volc_t_1` | `/api/plan/v3/responses` | 200 |
+| `one_api_minimax` | `/v1/responses` | 200 |
+| `one_api_xiaomi` | `/v1/responses` | 200 |
+| `one_api_ollama_local` | `/v1/responses` | 200 |
+| `deepseek` | `/v1/responses` | 200 |
+| `one_api_kimi` | `/coding/v1/responses` | quota 429 (route exists) |
+| `olefedora_gpu0_minicpmv47`, `coding_home_olefedora_gpu0`, `humanizer_gpu3` | `/v1/responses` | 200 (sglang / llama.cpp) |
+| `one_api_zhipu_1` | `/api/coding/paas/v4/responses` | 404 — zhipu's Responses path is `/api/v1/responses` |
+
+Two ways to tell whether a request is being translated or forwarded natively:
+a translated request must carry `input` (the gateway rejects it with `400
+invalid Responses request: … missing 'input'` before it ever leaves the
+process), and `native_responses = true` forwards whatever the client sent.
+Verify an opt-in end-to-end without depending on the upstream's quota by
+pointing `responses_path` at a bogus path for one call — the upstream's own
+404 (rather than the gateway's validation error) proves the path is in use.
+
 For pass-through routes, the path suffix after the route prefix is forwarded to the upstream provider (e.g., `/passthrough/anthropic/v1/messages` proxies to `https://api.anthropic.com/v1/messages`).
 
 ### Shutdown behaviour
