@@ -153,6 +153,14 @@ pub struct RequestCtx {
     /// only the last one (a trailing DNS failure used to mask the real
     /// "model not found" answer of the whole chain).
     pub attempt_trail: Vec<String>,
+    /// Set as soon as this attempt's upstream produced response headers.
+    ///
+    /// `error_while_proxy` uses it to tell "the upstream answered and then
+    /// broke" (never replayed — the request may have been executed and
+    /// billed) from "the upstream accepted the connection and hung up before
+    /// saying anything" (safe to replay on the next provider). Reset by
+    /// `switch_to_fallback` so every attempt starts out unanswered.
+    pub upstream_responded: bool,
 }
 
 impl RequestCtx {
@@ -207,6 +215,7 @@ impl RequestCtx {
             auto_target: None,
             auto_requested: false,
             attempt_trail: Vec::new(),
+            upstream_responded: false,
         }
     }
 }

@@ -6134,3 +6134,247 @@ async fn test_static_key_still_works_alongside_virtual_keys() {
     let logs: Value = resp.json().await.unwrap();
     assert_eq!(logs.as_array().unwrap().len(), 0);
 }
+
+// ---------------------------------------------------------------------------
+// Upstream accepts the connection, then hangs up before answering
+// ---------------------------------------------------------------------------
+
+/// A TCP listener that accepts every connection and immediately closes it.
+///
+/// This is the signature of a model server that crashed (or is being
+/// restarted) while its supervisor still holds the listen socket: curl says
+/// "Empty reply from server", pingora says `ConnectionClosed` while reading
+/// the response headers, and — before `error_while_proxy` learned to replay —
+/// the client got a hard 502 even though the rest of the pool was idle.
+fn spawn_hang_up_upstream() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind hang-up listener");
+    let addr = listener.local_addr().expect("local addr");
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            // Dropping the stream closes it without writing a byte.
+            drop(stream);
+        }
+    });
+    format!("http://{addr}")
+}
+
+const HANG_UP_FALLBACK_CONFIG: &str = r#"
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[providers.dead]
+kind = "openai"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+
+[providers.alive]
+kind = "openai"
+base_url = "{FALLBACK_URL}"
+api_key = "fake-key"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "dead"
+fallback = ["alive"]
+"#;
+
+#[tokio::test]
+async fn test_upstream_hanging_up_before_answering_fails_over() {
+    let alive = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from-alive")))
+        .mount(&alive)
+        .await;
+
+    let dead_url = spawn_hang_up_upstream();
+    let gw =
+        TestGateway::start_with_fallback(HANG_UP_FALLBACK_CONFIG, &dead_url, &alive.uri()).await;
+
+    let resp = client()
+        .post(gw.url("/v1/chat/completions"))
+        .json(&chat_body("gpt-4o", "hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "a socket that closes before the response headers must fail over, not 502"
+    );
+    let body = resp.text().await.unwrap_or_default();
+    assert!(
+        body.contains("from-alive"),
+        "the fallback provider must serve the request, got: {body}"
+    );
+
+    let reqs = alive.received_requests().await.unwrap_or_default();
+    assert_eq!(
+        reqs.len(),
+        1,
+        "the fallback provider must have been called once"
+    );
+}
+
+const HANG_UP_POOL_CONFIG: &str = r#"
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[providers.dead]
+kind = "openai"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+
+[providers.alive]
+kind = "openai"
+base_url = "{FALLBACK_URL}"
+api_key = "fake-key"
+
+[auto_model]
+enabled = true
+name = "auto"
+
+[[auto_model.pool]]
+provider = "dead"
+model = "model-dead"
+
+[[auto_model.pool]]
+provider = "alive"
+model = "model-alive"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "alive"
+auto_model = true
+"#;
+
+/// The pool rotation is only useful if a dead member costs one failed attempt
+/// instead of the whole request: `auto` must stay green while a member is
+/// down, whichever order the round-robin happens to pick.
+#[tokio::test]
+async fn test_auto_rotation_survives_a_pool_member_that_hangs_up() {
+    let alive = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from-alive")))
+        .mount(&alive)
+        .await;
+
+    let dead_url = spawn_hang_up_upstream();
+    let gw = TestGateway::start_with_fallback(HANG_UP_POOL_CONFIG, &dead_url, &alive.uri()).await;
+
+    for i in 0..4 {
+        let resp = client()
+            .post(gw.url("/v1/chat/completions"))
+            .json(&chat_body("auto", "hi"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            200,
+            "auto request #{i} must survive the dead pool member"
+        );
+        let body = resp.text().await.unwrap_or_default();
+        assert!(
+            body.contains("from-alive"),
+            "request #{i} must be served by the healthy member, got: {body}"
+        );
+    }
+
+    let reqs = alive.received_requests().await.unwrap_or_default();
+    assert!(
+        reqs.len() >= 4,
+        "every request must reach the healthy member, got {}",
+        reqs.len()
+    );
+    let sent: Value = serde_json::from_slice(&reqs[0].body).expect("json body");
+    assert_eq!(
+        sent["model"], "model-alive",
+        "the replayed attempt must carry the pool entry's model"
+    );
+}
+
+/// A session pinned to a pool member that also sits in the route's fallback
+/// chain must get the entry's model, not the raw sentinel.
+///
+/// This is the `/v1/responses` shape on the NAS: the route's provider does not
+/// know `auto` (404), but its fallback chain lists the pool members, so the
+/// session pins inside the chain. Before this fix the second request went
+/// straight to the pinned member with `"model": "auto"` in the body — a strict
+/// upstream answered 400 while a llama.cpp-style server accepted it and served
+/// whatever model it was hosting.
+#[tokio::test]
+async fn test_sentinel_rewritten_when_the_session_is_pinned_to_a_pool_member() {
+    let summary = MockServer::start().await;
+    let member = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "error": {"code": "UnsupportedModel", "message": "unknown model"}
+        })))
+        .mount(&summary)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from-member")))
+        .mount(&member)
+        .await;
+
+    let config = r#"
+[session_sticky]
+enabled = true
+timeout_secs = 3600
+max_entries = 100
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[providers.summary]
+kind = "openai"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+
+[providers.member]
+kind = "openai"
+base_url = "{FALLBACK_URL}"
+api_key = "fake-key"
+
+[auto_model]
+enabled = true
+name = "auto"
+
+[[auto_model.pool]]
+provider = "member"
+model = "model-member"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "summary"
+fallback = ["member"]
+"#;
+    let gw = TestGateway::start_with_fallback(config, &summary.uri(), &member.uri()).await;
+    let c = client();
+
+    for i in 0..2 {
+        let resp = c
+            .post(gw.url("/v1/chat/completions"))
+            .header("session-id", "pinned-in-chain")
+            .json(&chat_body("auto", "hi"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "request {i} must succeed");
+    }
+
+    let reqs = member.received_requests().await.unwrap_or_default();
+    assert_eq!(reqs.len(), 2, "one call per request");
+    for (i, r) in reqs.iter().enumerate() {
+        let sent: Value = serde_json::from_slice(&r.body).expect("json body");
+        assert_eq!(
+            sent["model"], "model-member",
+            "request {i} must carry the pool entry's model, got {}",
+            sent["model"]
+        );
+    }
+}

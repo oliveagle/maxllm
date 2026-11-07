@@ -381,10 +381,48 @@ that name and answers 404. Rather than walking the route's fallback chain
 is one rejected attempt (a few hundred milliseconds); the alternative is a
 hard failure for a model the client never meant to name.
 
+A session that is already pinned to a pool member keeps that member, and the
+rewrite still applies: the pinned entry's model replaces the sentinel, so the
+sentinel itself never reaches an upstream. That matters for members that do
+not validate model names — a llama.cpp-style server accepts `auto` and quietly
+serves whatever model it happens to host.
+
 When a request runs out of attempts, the 502 message lists every provider that
 was tried (`provider=status`, `provider=connect`, `provider=dns`), so a
 trailing DNS failure on the last pool member no longer hides the real answers
 of the others (typically `404 UnsupportedModel`).
+
+### A pool member that accepts the connection and hangs up
+
+A model server that crashed, or a supervisor still holding the listen socket
+while the worker is gone, accepts the TCP connection and closes it before
+sending a single byte. Pingora reports that as `ConnectionClosed` while reading
+the response headers, and by default only replays such an error on a *reused*
+connection — so a dead pool member used to hand the client a hard 502 while the
+rest of the pool sat idle, which is exactly how a client ends up in a
+multi-minute backoff loop.
+
+The gateway now treats "the upstream died before answering" (`upstream_responded
+== false`, connection closed / read error / read timeout) like a connect
+failure: it counts against the member's circuit breaker, unpins the session and
+replays the request on the next pool entry or fallback, bounded by the route's
+failover budget. Errors that arrive *after* the upstream produced headers are
+never replayed — that request may already have been executed and billed.
+
+### Checking pool health
+
+`scripts/pool_health.py` probes every pool entry through its own
+`/v1/responses/<provider>` route (no rotation, no failover, so each answer is
+attributable) and prints status, latency and the upstream's error message:
+
+```bash
+python3 scripts/pool_health.py --config maxllm.toml --env-file maxllm.env
+# pool=25 healthy=12 failed=13 elapsed=32.7s
+# ok   200   1463ms one_api_volc_1   deepseek-v4-flash   text='ok'
+# BAD  403    102ms one_api_zhipu_1  glm-5.3-flash       {"code": "model_access_denied", ...}
+```
+
+It exits non-zero when any member fails, so it can gate a deploy.
 
 ## OpenCode (opencode.ai "zen") conversion
 

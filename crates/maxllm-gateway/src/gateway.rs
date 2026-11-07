@@ -978,6 +978,30 @@ impl AiGateway {
                             if !pinned.state.circuit_breaker.is_open() {
                                 ctx.provider_name = pinned_name.clone();
                                 ctx.fallback_used = pinned_name != route.provider;
+                                // The client asked for the sentinel while its
+                                // base URL points at a route whose chain
+                                // happens to contain auto-pool members. The
+                                // pinned provider is one of them, so rewrite
+                                // the body's model to that entry's model and
+                                // keep the request in the pool for any later
+                                // hop. Without this the literal sentinel goes
+                                // upstream: strict upstreams answer 404, and
+                                // llama.cpp-style servers accept any model
+                                // name and quietly serve it with whatever
+                                // model they happen to be hosting.
+                                if let Some(entry) =
+                                    hot.auto_pool.iter().find(|e| e.provider == pinned_name)
+                                {
+                                    if ctx.auto_requested
+                                        || hot.auto_name.as_deref() == Some(ctx.model.as_str())
+                                    {
+                                        ctx.auto_requested = true;
+                                        ctx.auto_target =
+                                            Some((entry.provider.clone(), entry.model.clone()));
+                                        ctx.model = entry.model.clone();
+                                        ctx.plugin_ctx.model = entry.model.clone();
+                                    }
+                                }
                                 if ctx.fallback_used {
                                     ctx.original_provider = Some(route.provider.clone());
                                 }
@@ -2876,6 +2900,7 @@ impl ProxyHttp for AiGateway {
         ctx: &mut Self::CTX,
     ) -> pingora::Result<()> {
         let status = upstream_response.status.as_u16();
+        ctx.upstream_responded = true;
 
         // Feed the latency-based router: a successful attempt updates the
         // provider's latency estimate (time to the upstream's first byte).
@@ -4168,6 +4193,79 @@ impl ProxyHttp for AiGateway {
         e
     }
 
+    /// An error on an established upstream connection.
+    ///
+    /// Pingora's default only replays an error of this kind when the upstream
+    /// connection was *reused* (`RetryType::ReusedOnly`), because a fresh
+    /// connection may have delivered the request body to a live upstream that
+    /// is still working on it. That rule is right for a proxy in front of an
+    /// idempotent web app and wrong for this gateway, where the failure that
+    /// matters is a listener that accepts the TCP connection and then hangs up
+    /// without a single response byte — a model server that crashed and is
+    /// being restarted, or a supervisor that holds the port while the worker
+    /// is dead. The client used to get a hard 502 from that, even though a
+    /// dozen other pool members were idle, and codex then sat in its own
+    /// backoff for minutes.
+    ///
+    /// So: when *nothing* came back (`upstream_responded == false`) and the
+    /// failure is the connection dying rather than an HTTP answer, treat it
+    /// exactly like a connect failure — count it against the breaker, unpin
+    /// the session, and replay the request on the next provider of the pool
+    /// or fallback chain, bounded by the route's failover budget.
+    fn error_while_proxy(
+        &self,
+        peer: &HttpPeer,
+        session: &mut Session,
+        mut e: Box<pingora::Error>,
+        ctx: &mut Self::CTX,
+        client_reused: bool,
+    ) -> Box<pingora::Error> {
+        // Keep pingora's annotations (peer context + its reuse decision)
+        // before adding ours on top.
+        e = e.more_context(format!("Peer: {}", peer));
+        e.retry
+            .decide_reuse(client_reused && !session.as_ref().retry_buffer_truncated());
+
+        if ctx.upstream_responded || e.esource() != &pingora::ErrorSource::Upstream {
+            return e;
+        }
+        let starved = matches!(
+            e.etype(),
+            pingora::ErrorType::ConnectionClosed
+                | pingora::ErrorType::ReadError
+                | pingora::ErrorType::ReadTimedout
+                | pingora::ErrorType::WriteError
+                | pingora::ErrorType::WriteTimedout
+        );
+        if !starved {
+            return e;
+        }
+        let max_attempts = {
+            let hot = self.hot.load();
+            max_failover_attempts(&hot.routes, ctx.route_index)
+        };
+        if ctx.failover_count >= max_attempts {
+            return e;
+        }
+
+        self.record_provider_connect_failure(ctx);
+        self.unpin_session(ctx);
+        self.record_event(EVENT_ERROR, ctx, Some(502), None, Some(e.to_string()), None);
+        ctx.attempt_trail
+            .push(format!("{}=closed", ctx.provider_name));
+
+        let Some((failed_provider, next_provider)) = self.switch_to_fallback(ctx) else {
+            return e;
+        };
+        info!(
+            provider = %next_provider,
+            failed_provider = %failed_provider,
+            "upstream closed the connection before answering — retrying the request on the fallback provider"
+        );
+        e.set_retry(true);
+        e
+    }
+
     /// Pingora's default `fail_to_proxy` writes an empty-body error response,
     /// leaving clients to guess what failed (a connect timeout and a DNS
     /// failure look identical). Answer with a JSON error body in the same
@@ -4584,6 +4682,7 @@ impl AiGateway {
             }
         }
         ctx.body_translated = false;
+        ctx.upstream_responded = false;
         ctx.request_body_buf.clear();
         ctx.keep_request_content_length = false;
         if let Ok(mut guard) = ctx.stream_translator.lock() {
