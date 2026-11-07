@@ -504,4 +504,57 @@ mod tests {
         let verdict = guard.check_input(&input).await;
         assert!(matches!(verdict, GuardrailVerdict::Pass));
     }
+    fn regex_guard_config() -> GuardrailConfig {
+        let mut params = toml::Table::new();
+        let mut rule = toml::Table::new();
+        rule.insert("name".into(), toml::Value::String("r1".into()));
+        rule.insert("regex".into(), toml::Value::String("secret".into()));
+        params.insert(
+            "rules".into(),
+            toml::Value::Array(vec![toml::Value::Table(rule)]),
+        );
+        GuardrailConfig {
+            name: "test-regex".into(),
+            provider: "regex_guard".into(),
+            mode: "pre_call".into(),
+            default_on: true,
+            action: "block".into(),
+            params,
+        }
+    }
+
+    /// Every built-in guardrail reports the provider name it implements.
+    #[test]
+    fn test_guardrail_names_are_the_provider_names() {
+        assert_eq!(
+            PromptGuardGuardrail::from_config(&prompt_guard_config())
+                .unwrap()
+                .name(),
+            "prompt_guard"
+        );
+        assert_eq!(
+            PiiFilterGuardrail::from_config(&pii_config("block"))
+                .unwrap()
+                .name(),
+            "pii_filter"
+        );
+        assert_eq!(
+            SecretScanGuardrail::from_config(&secret_config())
+                .unwrap()
+                .name(),
+            "secret_scan"
+        );
+        assert_eq!(
+            KeywordBlockGuardrail::from_config(&keyword_config())
+                .unwrap()
+                .name(),
+            "keyword_block"
+        );
+        assert_eq!(
+            RegexGuardGuardrail::from_config(&regex_guard_config())
+                .unwrap()
+                .name(),
+            "regex_guard"
+        );
+    }
 }

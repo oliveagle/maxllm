@@ -734,4 +734,217 @@ mod tests {
         assert!(matches!(verdict, GuardrailVerdict::Pass));
         assert!(applied.is_empty());
     }
+    // -----------------------------------------------------------------------
+    // Mutation coverage: engine mode predicates, post-call dispatch and the
+    // response content extractor.
+    // -----------------------------------------------------------------------
+
+    fn mock_entry(
+        name: &str,
+        mode: GuardrailMode,
+        default_on: bool,
+        action: GuardrailAction,
+        verdict: GuardrailVerdict,
+    ) -> GuardrailEntry {
+        struct Mock {
+            v: GuardrailVerdict,
+        }
+        #[async_trait]
+        impl Guardrail for Mock {
+            fn name(&self) -> &str {
+                "mock"
+            }
+            async fn check_input(&self, _: &GuardrailInput<'_>) -> GuardrailVerdict {
+                self.v.clone()
+            }
+            async fn check_output(&self, _: &GuardrailOutput<'_>) -> GuardrailVerdict {
+                self.v.clone()
+            }
+        }
+        GuardrailEntry {
+            name: name.into(),
+            guardrail: Arc::new(Mock { v: verdict }),
+            mode,
+            default_on,
+            action,
+        }
+    }
+
+    #[test]
+    fn test_has_pre_call_reflects_the_configured_modes() {
+        let empty = GuardrailEngine::new(vec![]);
+        assert!(!empty.has_pre_call());
+        assert!(!empty.has_post_call());
+
+        let pre_only = GuardrailEngine::new(vec![mock_entry(
+            "g",
+            GuardrailMode::PreCall,
+            true,
+            GuardrailAction::Block,
+            GuardrailVerdict::Pass,
+        )]);
+        assert!(pre_only.has_pre_call());
+        assert!(!pre_only.has_post_call());
+
+        let post_only = GuardrailEngine::new(vec![mock_entry(
+            "g",
+            GuardrailMode::PostCall,
+            true,
+            GuardrailAction::Block,
+            GuardrailVerdict::Pass,
+        )]);
+        assert!(!post_only.has_pre_call());
+        assert!(post_only.has_post_call());
+
+        let both = GuardrailEngine::new(vec![mock_entry(
+            "g",
+            GuardrailMode::Both,
+            true,
+            GuardrailAction::Block,
+            GuardrailVerdict::Pass,
+        )]);
+        assert!(both.has_pre_call());
+        assert!(both.has_post_call());
+    }
+
+    #[tokio::test]
+    async fn test_run_post_call_runs_post_call_and_both_guardrails() {
+        let engine = GuardrailEngine::new(vec![
+            mock_entry(
+                "post",
+                GuardrailMode::PostCall,
+                true,
+                GuardrailAction::Block,
+                GuardrailVerdict::Pass,
+            ),
+            mock_entry(
+                "both",
+                GuardrailMode::Both,
+                true,
+                GuardrailAction::Block,
+                GuardrailVerdict::Pass,
+            ),
+            mock_entry(
+                "pre-only",
+                GuardrailMode::PreCall,
+                true,
+                GuardrailAction::Block,
+                GuardrailVerdict::Block {
+                    guardrail: "pre-only".into(),
+                    reason: "must not run".into(),
+                },
+            ),
+        ]);
+        let output = GuardrailOutput {
+            content: "hello",
+            model: "gpt-4",
+        };
+        let (verdict, applied) = engine.run_post_call(&output, None, None).await;
+        assert!(matches!(verdict, GuardrailVerdict::Pass));
+        assert_eq!(applied, vec!["post".to_string(), "both".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_run_post_call_returns_the_first_block() {
+        let engine = GuardrailEngine::new(vec![mock_entry(
+            "blocker",
+            GuardrailMode::PostCall,
+            true,
+            GuardrailAction::Block,
+            GuardrailVerdict::Block {
+                guardrail: "blocker".into(),
+                reason: "nope".into(),
+            },
+        )]);
+        let output = GuardrailOutput {
+            content: "hello",
+            model: "gpt-4",
+        };
+        let (verdict, applied) = engine.run_post_call(&output, None, None).await;
+        match verdict {
+            GuardrailVerdict::Block { guardrail, reason } => {
+                assert_eq!(guardrail, "blocker");
+                assert_eq!(reason, "nope");
+            }
+            other => panic!("expected Block, got {:?}", other),
+        }
+        assert_eq!(applied, vec!["blocker".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_run_post_call_applies_content_modification() {
+        let engine = GuardrailEngine::new(vec![mock_entry(
+            "redactor",
+            GuardrailMode::PostCall,
+            true,
+            GuardrailAction::Redact,
+            GuardrailVerdict::Modify {
+                guardrail: "redactor".into(),
+                content: "REDACTED".into(),
+                reason: "pii".into(),
+            },
+        )]);
+        let output = GuardrailOutput {
+            content: "secret text",
+            model: "gpt-4",
+        };
+        let (verdict, applied) = engine.run_post_call(&output, None, None).await;
+        match verdict {
+            GuardrailVerdict::Modify { content, .. } => assert_eq!(content, "REDACTED"),
+            other => panic!("expected Modify, got {:?}", other),
+        }
+        assert_eq!(applied, vec!["redactor".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_run_post_call_passes_unmodified_content_through() {
+        let engine = GuardrailEngine::new(vec![mock_entry(
+            "passer",
+            GuardrailMode::PostCall,
+            true,
+            GuardrailAction::Block,
+            GuardrailVerdict::Pass,
+        )]);
+        let output = GuardrailOutput {
+            content: "unchanged",
+            model: "gpt-4",
+        };
+        let (verdict, applied) = engine.run_post_call(&output, None, None).await;
+        assert!(matches!(verdict, GuardrailVerdict::Pass));
+        assert_eq!(applied, vec!["passer".to_string()]);
+    }
+
+    #[test]
+    fn test_extract_response_content_joins_message_contents() {
+        let body = serde_json::json!({
+            "choices": [
+                {"message": {"content": "first"}},
+                {"message": {"content": "second"}},
+            ]
+        });
+        assert_eq!(extract_response_content(&body), "first\nsecond");
+        assert_eq!(extract_response_content(&serde_json::json!({})), "");
+    }
+
+    #[test]
+    fn test_extract_response_content_joins_delta_contents() {
+        let body = serde_json::json!({
+            "choices": [
+                {"delta": {"content": "chunk1"}},
+                {"delta": {"content": "chunk2"}},
+            ]
+        });
+        assert_eq!(extract_response_content(&body), "chunk1\nchunk2");
+    }
+
+    #[test]
+    fn test_extract_response_content_reads_both_shapes() {
+        let body = serde_json::json!({
+            "choices": [
+                {"message": {"content": "full"}},
+                {"delta": {"content": "part"}},
+            ]
+        });
+        assert_eq!(extract_response_content(&body), "full\npart");
+    }
 }
