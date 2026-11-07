@@ -85,6 +85,13 @@ pub struct AutoCompactionPlugin {
     summarize_model: Option<String>,
 }
 
+/// Whether the per-request opt-out header value asks to skip compaction.
+///
+/// The header value is matched case-insensitively by the caller.
+fn should_skip_compaction(value: &str) -> bool {
+    value == "true" || value == "1"
+}
+
 impl AutoCompactionPlugin {
     pub fn from_config(name: &str, config: &toml::Table) -> Result<Self, PluginError> {
         let threshold_tokens = config
@@ -204,7 +211,7 @@ impl Plugin for AutoCompactionPlugin {
         // Honour the per-request opt-out header.
         if let Some(val) = session.req_header().headers.get(SKIP_COMPACTION_HEADER) {
             let v = val.to_str().unwrap_or("").to_ascii_lowercase();
-            if v == "true" || v == "1" {
+            if should_skip_compaction(&v) {
                 tracing::debug!(
                     plugin = self.name.as_str(),
                     "auto-compaction skipped via {} header",
@@ -650,5 +657,390 @@ mod tests {
         });
         let tokens = AutoCompactionPlugin::estimate_body_tokens(&body);
         assert!(tokens > 0);
+    }
+}
+
+#[cfg(test)]
+mod mutation_tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // Strategy / naming / token estimation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_strategy_as_str_is_exact() {
+        assert_eq!(CompactionStrategy::Truncate.as_str(), "truncate");
+        assert_eq!(CompactionStrategy::SlidingWindow.as_str(), "sliding_window");
+        assert_eq!(CompactionStrategy::Llm.as_str(), "llm");
+    }
+
+    #[test]
+    fn test_plugin_name_is_the_configured_name() {
+        let plugin = AutoCompactionPlugin::from_config("compact", &toml::Table::new()).unwrap();
+        assert_eq!(plugin.name(), "compact");
+    }
+
+    #[test]
+    fn test_estimate_message_tokens_counts_string_content() {
+        // Role overhead (4) + "aaaa".len()/4 = 1 → 5.
+        let msg = serde_json::json!({"role": "user", "content": "aaaa"});
+        assert_eq!(AutoCompactionPlugin::estimate_message_tokens(&msg), 5);
+    }
+
+    #[test]
+    fn test_estimate_message_tokens_counts_array_parts() {
+        let msg = serde_json::json!({"role": "user", "content": [
+            {"type": "text", "text": "aaaaaaaa"}, // 8 bytes → 2 tokens
+        ]});
+        assert_eq!(AutoCompactionPlugin::estimate_message_tokens(&msg), 6);
+    }
+
+    #[test]
+    fn test_estimate_message_tokens_without_content_is_role_overhead() {
+        let msg = serde_json::json!({"role": "user"});
+        assert_eq!(AutoCompactionPlugin::estimate_message_tokens(&msg), 4);
+    }
+
+    #[test]
+    fn test_estimate_body_tokens_sums_exactly() {
+        let body = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": "aaaa"},        // 5
+                {"role": "assistant", "content": "aaaaaaaa"} // 4 + 2 = 6
+            ]
+        });
+        assert_eq!(AutoCompactionPlugin::estimate_body_tokens(&body), 11);
+        assert_eq!(
+            AutoCompactionPlugin::estimate_body_tokens(&serde_json::json!({})),
+            0
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Helpers
+    // -----------------------------------------------------------------------
+
+    fn params<'a>(
+        strategy: &'a str,
+        threshold: usize,
+        window_size: usize,
+        preserve_system: bool,
+        min_messages: usize,
+    ) -> CompactionParams<'a> {
+        CompactionParams {
+            strategy,
+            threshold,
+            window_size,
+            preserve_system,
+            min_messages,
+            llm_provider: None,
+            llm_model: None,
+        }
+    }
+
+    fn assert_compacted(
+        body: &mut serde_json::Value,
+        p: CompactionParams<'_>,
+    ) -> Vec<serde_json::Value> {
+        match compact_messages(body, p) {
+            CompactionResult::Compacted => body["messages"].as_array().unwrap().clone(),
+            other => panic!("expected Compacted, got {:?}", variant_name(&other)),
+        }
+    }
+
+    fn variant_name(r: &CompactionResult) -> &'static str {
+        match r {
+            CompactionResult::NoOp => "NoOp",
+            CompactionResult::Compacted => "Compacted",
+            CompactionResult::NeedsLlm(_) => "NeedsLlm",
+        }
+    }
+
+    fn assert_noop(body: &mut serde_json::Value, p: CompactionParams<'_>) {
+        match compact_messages(body, p) {
+            CompactionResult::NoOp => {}
+            other => panic!("expected NoOp, got {}", variant_name(&other)),
+        }
+    }
+
+    /// system + four users each of 6 tokens (4 role + 2 content).
+    fn truncate_body() -> serde_json::Value {
+        serde_json::json!({"messages": [
+            {"role": "system", "content": "aaaa"},
+            {"role": "user", "content": "aaaaaaaa"}, // u1
+            {"role": "user", "content": "aaaaaaaa"}, // u2
+            {"role": "user", "content": "aaaaaaaa"}, // u3
+            {"role": "user", "content": "aaaaaaaa"}, // u4
+        ]})
+    }
+
+    // -----------------------------------------------------------------------
+    // Truncate strategy
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_truncate_under_threshold_is_noop() {
+        let mut body = truncate_body(); // 5 + 6*4 = 29 tokens
+        assert_noop(&mut body, params("truncate", 100, 20, true, 2));
+    }
+
+    #[test]
+    fn test_truncate_all_fit_returns_noop() {
+        let mut body = truncate_body();
+        // Everything fits under the threshold → nothing dropped → NoOp.
+        assert_noop(&mut body, params("truncate", 1000, 20, true, 0));
+    }
+
+    #[test]
+    fn test_truncate_drops_oldest_keeps_system_when_tokens_exceed() {
+        let mut body = truncate_body(); // 29 tokens
+                                        // Reversed walk: u4 (5+6=11<=12 keep), u3 (11+6=17>12, kept.len()=1<1
+                                        // false → skip), u2 skip, u1 skip → [system, u4].
+        let final_msgs = assert_compacted(&mut body, params("truncate", 12, 20, true, 1));
+        assert_eq!(final_msgs.len(), 2);
+        assert_eq!(final_msgs[0]["role"], "system");
+        assert_eq!(final_msgs[1]["content"], "aaaaaaaa");
+    }
+
+    #[test]
+    fn test_truncate_min_messages_forces_keeps_beyond_threshold() {
+        let mut body = truncate_body();
+        // threshold so low nothing fits by tokens, but min_messages=2 keeps
+        // the two newest: u4 and u3.
+        let final_msgs = assert_compacted(&mut body, params("truncate", 2, 20, true, 2));
+        assert_eq!(final_msgs.len(), 3);
+        assert_eq!(final_msgs[0]["role"], "system");
+        assert_eq!(final_msgs[1]["content"], "aaaaaaaa");
+        assert_eq!(final_msgs[2]["content"], "aaaaaaaa");
+    }
+
+    #[test]
+    fn test_truncate_without_preserving_system_drops_system_messages() {
+        let mut body = truncate_body();
+        let final_msgs = assert_compacted(&mut body, params("truncate", 12, 20, false, 1));
+        // The system message is dropped too; the two newest users survive
+        // (u3 at 6+6=12 <= 12 and u4 at 0+6=6 <= 12).
+        assert!(final_msgs.iter().all(|m| m["role"] != "system"));
+        assert_eq!(final_msgs.len(), 2);
+        assert_eq!(final_msgs[0]["content"], "aaaaaaaa");
+        assert_eq!(final_msgs[1]["content"], "aaaaaaaa");
+    }
+
+    #[test]
+    fn test_truncate_missing_messages_is_noop() {
+        let mut body = serde_json::json!({"model": "gpt-4o"});
+        assert_noop(&mut body, params("truncate", 10, 20, true, 2));
+    }
+
+    #[test]
+    fn test_compact_unknown_strategy_is_noop() {
+        let mut body = truncate_body();
+        assert_noop(&mut body, params("bogus", 2, 20, true, 2));
+    }
+
+    // -----------------------------------------------------------------------
+    // Sliding window strategy
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sliding_window_over_window_keeps_last_n() {
+        let mut body = serde_json::json!({"messages": [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "u1"},
+            {"role": "user", "content": "u2"},
+            {"role": "user", "content": "u3"},
+            {"role": "user", "content": "u4"},
+            {"role": "user", "content": "u5"},
+            {"role": "user", "content": "u6"},
+        ]});
+        // 6 non-system > window 4 → drop 2 → [system, u3, u4, u5, u6].
+        let final_msgs = assert_compacted(&mut body, params("sliding_window", 0, 4, true, 0));
+        assert_eq!(final_msgs.len(), 5);
+        assert_eq!(final_msgs[0]["role"], "system");
+        assert_eq!(final_msgs[1]["content"], "u3");
+        assert_eq!(final_msgs[4]["content"], "u6");
+    }
+
+    #[test]
+    fn test_sliding_window_under_window_is_noop() {
+        let mut body = serde_json::json!({"messages": [
+            {"role": "user", "content": "u1"},
+            {"role": "user", "content": "u2"},
+        ]});
+        assert_noop(&mut body, params("sliding_window", 0, 4, true, 0));
+    }
+
+    #[test]
+    fn test_sliding_window_system_messages_do_not_count_toward_window() {
+        let mut body = serde_json::json!({"messages": [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "u1"},
+            {"role": "user", "content": "u2"},
+        ]});
+        // total len 3 > window 2, but only 2 non-system → fits → NoOp.
+        assert_noop(&mut body, params("sliding_window", 0, 2, true, 0));
+    }
+
+    // -----------------------------------------------------------------------
+    // LLM strategy
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_llm_under_threshold_is_noop() {
+        let mut body = truncate_body();
+        let mut p = params("llm", 1000, 20, true, 2);
+        p.llm_provider = Some("openai");
+        p.llm_model = Some("gpt-4o-mini");
+        assert_noop(&mut body, p);
+    }
+
+    #[test]
+    fn test_llm_without_provider_is_noop() {
+        let mut body = truncate_body();
+        assert_noop(&mut body, params("llm", 2, 20, true, 2));
+    }
+
+    #[test]
+    fn test_llm_without_model_is_noop() {
+        let mut body = truncate_body();
+        let mut p = params("llm", 2, 20, true, 2);
+        p.llm_provider = Some("openai");
+        p.llm_model = None;
+        assert_noop(&mut body, p);
+    }
+
+    #[test]
+    fn test_llm_few_non_system_messages_is_noop() {
+        // 2 non-system == min_messages → NoOp.
+        let mut body = serde_json::json!({"messages": [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "aaaaaaaaaaaaaaaa"}, // over threshold
+            {"role": "user", "content": "aaaaaaaaaaaaaaaa"},
+        ]});
+        let mut p = params("llm", 2, 20, true, 2);
+        p.llm_provider = Some("openai");
+        p.llm_model = Some("gpt-4o-mini");
+        assert_noop(&mut body, p);
+    }
+
+    #[test]
+    fn test_llm_strategy_splits_summary_and_keeps() {
+        // 5 non-system; keep_count = (5/2).max(2) = 2.
+        let mut body = serde_json::json!({"messages": [
+            {"role": "system", "content": "SYS"},
+            {"role": "user", "content": "c1"},
+            {"role": "user", "content": "c2"},
+            {"role": "user", "content": "c3"},
+            {"role": "user", "content": "c4"},
+            {"role": "user", "content": "c5"},
+        ]});
+        let mut p = params("llm", 2, 20, true, 2);
+        p.llm_provider = Some("openai");
+        p.llm_model = Some("gpt-4o-mini");
+        let tokens = AutoCompactionPlugin::estimate_body_tokens(&body);
+        assert!(tokens > 2);
+        match compact_messages(&mut body, p) {
+            CompactionResult::NeedsLlm(data) => {
+                assert_eq!(data.provider, "openai");
+                assert_eq!(data.model, "gpt-4o-mini");
+                assert_eq!(data.system_messages.len(), 1);
+                assert_eq!(data.system_messages[0]["content"], "SYS");
+                assert_eq!(data.to_keep.len(), 2);
+                assert_eq!(data.to_keep[0]["content"], "c4");
+                assert_eq!(data.to_keep[1]["content"], "c5");
+                assert_eq!(data.summary_text, "user: c1\nuser: c2\nuser: c3");
+            }
+            other => panic!("expected NeedsLlm, got {}", variant_name(&other)),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // apply_llm_compaction via a local HTTP mock
+    // -----------------------------------------------------------------------
+
+    /// Serve one canned chat-completions response over a local listener.
+    async fn spawn_mock_llm(response_body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn test_apply_llm_compaction_rewrites_body_on_success() {
+        let base_url =
+            spawn_mock_llm(r#"{"choices":[{"message":{"content":"SUMMARY TEXT"}}]}"#).await;
+        let mut body = serde_json::json!({"messages": [
+            {"role": "system", "content": "SYS"},
+            {"role": "user", "content": "c1"},
+        ]});
+        let data = LlmCompactionData {
+            provider: "openai".into(),
+            model: "gpt-4o-mini".into(),
+            summary_text: "user: c1".into(),
+            system_messages: vec![serde_json::json!({"role": "system", "content": "SYS"})],
+            to_keep: vec![serde_json::json!({"role": "user", "content": "c2"})],
+        };
+        let client = reqwest::Client::new();
+        let modified = apply_llm_compaction(&mut body, data, "key", &base_url, &client).await;
+        assert!(modified);
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0]["content"], "SYS");
+        assert_eq!(
+            msgs[1]["content"],
+            "[Summary of earlier conversation]\nSUMMARY TEXT"
+        );
+        assert_eq!(msgs[2]["content"], "c2");
+    }
+
+    #[tokio::test]
+    async fn test_apply_llm_compaction_is_a_noop_when_the_call_fails() {
+        // A listener that closes immediately makes reqwest fail the request.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            drop(socket);
+        });
+        let base_url = format!("http://{addr}");
+        let mut body = serde_json::json!({"messages": [{"role": "user", "content": "c1"}]});
+        let data = LlmCompactionData {
+            provider: "openai".into(),
+            model: "gpt-4o-mini".into(),
+            summary_text: "user: c1".into(),
+            system_messages: vec![],
+            to_keep: vec![],
+        };
+        let client = reqwest::Client::new();
+        let modified = apply_llm_compaction(&mut body, data, "key", &base_url, &client).await;
+        assert!(!modified);
+    }
+
+    #[test]
+    fn test_should_skip_compaction_accepts_true_and_one() {
+        assert!(should_skip_compaction("true"));
+        assert!(should_skip_compaction("1"));
+    }
+
+    #[test]
+    fn test_should_skip_compaction_rejects_everything_else() {
+        assert!(!should_skip_compaction("false"));
+        assert!(!should_skip_compaction("0"));
+        assert!(!should_skip_compaction(""));
+        assert!(!should_skip_compaction("yes"));
+        assert!(!should_skip_compaction("trueish"));
     }
 }

@@ -10,3 +10,6 @@
 ROADMAP.md
 DEEP_ANALYSIS.md
 *.db
+
+# cargo-mutants results
+mutants.out/
