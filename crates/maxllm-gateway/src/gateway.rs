@@ -263,6 +263,13 @@ pub struct HotState {
     /// Entries whose provider is missing from the config are dropped at
     /// build time, so the pool can only contain usable providers.
     pub auto_pool: Vec<AutoPoolEntry>,
+    /// The sentinel model name clients send to mean "rotate" (`[auto_model].name`,
+    /// `auto` by default). `None` when auto rotation is disabled or its pool is
+    /// empty. Kept alongside the pool because a request can carry the sentinel
+    /// on a route that does not declare `auto_model = true`; the gateway must
+    /// still recognise the name as a rotation request rather than forwarding it
+    /// to an upstream that has never heard of a model called "auto".
+    pub auto_name: Option<String>,
 }
 
 /// One entry of the auto-rotation pool, resolved against the providers.
@@ -621,6 +628,12 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
         cost_calculator,
         guardrail_engine,
         models_response,
+        auto_name: config
+            .auto_model
+            .as_ref()
+            .filter(|a| a.enabled)
+            .map(|a| a.name.clone())
+            .filter(|_| !auto_pool.is_empty()),
         auto_pool,
     })
 }
@@ -2086,11 +2099,12 @@ impl ProxyHttp for AiGateway {
             // An auto route rewrites the request body's model field to the
             // selected pool entry's model, so the body size changes and the
             // request must travel chunked — never verbatim passthrough.
-            let is_auto_route = hot
-                .routes
-                .get(ctx.route_index.unwrap_or(usize::MAX))
-                .map(|r| r.auto_model)
-                .unwrap_or(false);
+            let is_auto_route = ctx.auto_target.is_some()
+                || hot
+                    .routes
+                    .get(ctx.route_index.unwrap_or(usize::MAX))
+                    .map(|r| r.auto_model)
+                    .unwrap_or(false);
             // A Responses body rewritten into chat completions has an
             // unpredictable size (the chat form can be larger than the
             // Responses form), so it travels chunked instead of keeping the
@@ -3048,6 +3062,8 @@ impl ProxyHttp for AiGateway {
         // answer is recorded by `response_filter` on the surviving attempt).
         // Recorded before the switch so the provider label matches the status.
         self.record_event(EVENT_PROVIDER_RESPONSE, ctx, Some(status), None, None, None);
+        ctx.attempt_trail
+            .push(format!("{}={}", ctx.provider_name, status));
         let Some((failed_provider, next_provider)) = self.switch_to_fallback(ctx) else {
             return Ok(());
         };
@@ -4137,6 +4153,8 @@ impl ProxyHttp for AiGateway {
         self.record_provider_connect_failure(ctx);
         self.unpin_session(ctx);
         self.record_event(EVENT_ERROR, ctx, Some(502), None, Some(e.to_string()), None);
+        ctx.attempt_trail
+            .push(format!("{}=connect", ctx.provider_name));
 
         let Some((failed_provider, next_provider)) = self.switch_to_fallback(ctx) else {
             return e;
@@ -4176,7 +4194,15 @@ impl ProxyHttp for AiGateway {
         };
 
         if code > 0 {
-            let message = e.to_string();
+            // The error pingora hands over describes the *last* attempt only.
+            // For a request that walked several providers that is misleading:
+            // a trailing DNS failure on the last pool member used to hide the
+            // real "the upstream does not know this model" answer of all the
+            // others. Append the per-attempt trail so the client sees the walk.
+            let mut message = e.to_string();
+            if !_ctx.attempt_trail.is_empty() {
+                message.push_str(&format!(" (attempts: {})", _ctx.attempt_trail.join(", ")));
+            }
             let body = serde_json::json!({
                 "error": {
                     "message": message,
@@ -4392,7 +4418,17 @@ impl AiGateway {
 
         // Auto route: walk the [auto_model] pool (still skipping attempted
         // and open-circuit entries) rather than the route's fallback chain.
-        if route.auto_model {
+        //
+        // The same pool is the destination for a request that carries the
+        // sentinel model on a route without `auto_model = true` — e.g. a
+        // client that switched its model picker to "auto" while its base URL
+        // still points at the summary route. The sentinel means "rotate"; no
+        // upstream has a model by that name, so walking the route's own chain
+        // would only collect 404s from every provider in it.
+        let wants_auto = route.auto_model
+            || ctx.auto_requested
+            || hot.auto_name.as_deref() == Some(ctx.model.as_str());
+        if wants_auto && !hot.auto_pool.is_empty() {
             return hot
                 .auto_pool
                 .iter()
@@ -4476,12 +4512,23 @@ impl AiGateway {
             && fallback.responses_path.is_some();
         // Auto route: refresh the (provider, model) target to the new pool
         // entry so the replayed body carries the right model.
-        if ctx.auto_target.is_some() {
+        //
+        // This also covers the first switch of a request that asked for the
+        // sentinel on a non-auto route: the provider just picked from the pool
+        // becomes the rotation target, and `auto_requested` keeps every later
+        // hop inside the pool instead of falling back to the route's chain.
+        {
             let hot = self.hot.load();
             if let Some(e) = hot.auto_pool.iter().find(|e| e.provider == name) {
-                ctx.auto_target = Some((e.provider.clone(), e.model.clone()));
-                ctx.model = e.model.clone();
-                ctx.plugin_ctx.model = e.model.clone();
+                if ctx.auto_target.is_some()
+                    || ctx.auto_requested
+                    || hot.auto_name.as_deref() == Some(ctx.model.as_str())
+                {
+                    ctx.auto_requested = true;
+                    ctx.auto_target = Some((e.provider.clone(), e.model.clone()));
+                    ctx.model = e.model.clone();
+                    ctx.plugin_ctx.model = e.model.clone();
+                }
             }
         }
         ctx.body_translated = false;
@@ -4526,6 +4573,7 @@ impl AiGateway {
         }
         self.record_provider_connect_failure(ctx);
         self.unpin_session(ctx);
+        ctx.attempt_trail.push(format!("{}=dns", ctx.provider_name));
         if let Some((failed_provider, next_provider)) = self.switch_to_fallback(ctx) {
             info!(
                 provider = %next_provider,

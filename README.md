@@ -370,6 +370,22 @@ Pool entries naming an unknown provider are dropped at startup (with a warn),
 so a typo cannot silently shrink the pool. The auto route must come before
 any broader prefix route (`match_route` takes the first prefix match).
 
+The sentinel is recognised on **any** route, not only on routes that declare
+`auto_model = true`. A client that selects `auto` in its model picker usually
+keeps its base URL on the summary route — only the model string changes — so
+its first attempt reaches that route's own provider, which has no model by
+that name and answers 404. Rather than walking the route's fallback chain
+(every entry of which would answer the same 404 and leave the client with a
+502), the walk switches into the `[auto_model]` pool, rewrites the body's
+`model` to the selected entry's model, and serves the request there. The cost
+is one rejected attempt (a few hundred milliseconds); the alternative is a
+hard failure for a model the client never meant to name.
+
+When a request runs out of attempts, the 502 message lists every provider that
+was tried (`provider=status`, `provider=connect`, `provider=dns`), so a
+trailing DNS failure on the last pool member no longer hides the real answers
+of the others (typically `404 UnsupportedModel`).
+
 ## OpenCode (opencode.ai "zen") conversion
 
 `kind = "opencode"` proxies `https://opencode.ai` with OpenAI-compatible wire

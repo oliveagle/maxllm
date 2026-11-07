@@ -4318,6 +4318,160 @@ session_sticky = true
     assert_eq!(b_reqs.len(), 0, "the bound provider must not rotate away");
 }
 
+/// A client that selects the `auto` model on a route that does **not**
+/// declare `auto_model = true` (a model-picker switch without moving the base
+/// URL onto the auto route) must still rotate: the sentinel is a rotation
+/// request, not an upstream model name. The first attempt hits the route's own
+/// provider and fails with the upstream's "unknown model" answer; the walk
+/// then switches into the `[auto_model]` pool — instead of the route's
+/// fallback chain, which would collect the same 404 from every provider — and
+/// rewrites the body's model to the pool entry's model.
+#[tokio::test]
+async fn test_auto_sentinel_on_a_non_auto_route_fails_over_to_the_pool() {
+    let summary = MockServer::start().await;
+    let pool = MockServer::start().await;
+
+    // The route's own provider has never heard of a model called "auto".
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "error": {
+                "code": "UnsupportedModel",
+                "message": "The requested model does not support this feature."
+            }
+        })))
+        .mount(&summary)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from-pool")))
+        .mount(&pool)
+        .await;
+
+    let config = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.summary]
+kind = "openai"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+
+[providers.pooled]
+kind = "openai"
+base_url = "{FALLBACK_URL}"
+api_key = "fake-key"
+
+[auto_model]
+enabled = true
+name = "auto"
+
+[[auto_model.pool]]
+provider = "pooled"
+model = "model-b"
+
+# The route itself is NOT an auto route — it is the summary route the client
+# happens to be pointing at.
+[[routes]]
+path = "/v1/chat/completions"
+provider = "summary"
+"#;
+    let gw = TestGateway::start_with_fallback(config, &summary.uri(), &pool.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .header("session-id", "sess-auto-off-route")
+        .json(&chat_body("auto", "hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "the sentinel must be served by the auto pool, not fail with the upstream 404"
+    );
+
+    let summary_reqs = summary.received_requests().await.unwrap_or_default();
+    assert_eq!(
+        summary_reqs.len(),
+        1,
+        "the route's own provider is tried once before the switch"
+    );
+
+    let pool_reqs = pool.received_requests().await.unwrap_or_default();
+    assert_eq!(pool_reqs.len(), 1, "the pool provider must serve the retry");
+    let sent: Value = serde_json::from_slice(&pool_reqs[0].body).expect("json body");
+    assert_eq!(
+        sent["model"], "model-b",
+        "the sentinel must never reach the upstream — the body carries the pool entry's model"
+    );
+}
+
+/// The same sentinel on a route that *does* declare `auto_model = true` keeps
+/// its old behaviour: the pool is used from the first attempt, with no wasted
+/// call to the route's `provider` sentinel.
+#[tokio::test]
+async fn test_auto_sentinel_on_an_auto_route_skips_the_route_provider() {
+    let pool = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from-pool")))
+        .mount(&pool)
+        .await;
+
+    let config = r#"
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[providers.pooled]
+kind = "openai"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+
+[auto_model]
+enabled = true
+name = "auto"
+
+[[auto_model.pool]]
+provider = "pooled"
+model = "model-b"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "pooled"
+auto_model = true
+"#;
+    let gw = TestGateway::start(config, &pool.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .json(&chat_body("auto", "hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let reqs = pool.received_requests().await.unwrap_or_default();
+    assert_eq!(
+        reqs.len(),
+        1,
+        "exactly one upstream call — no wasted attempt"
+    );
+    let sent: Value = serde_json::from_slice(&reqs[0].body).expect("json body");
+    assert_eq!(sent["model"], "model-b");
+}
+
 // ---------------------------------------------------------------------------
 // Gap-closure tests: requests_total producer, the active-requests gauge
 // balance on gateway-level errors, and the latency-/cost-based strategies.

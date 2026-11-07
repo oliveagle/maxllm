@@ -139,6 +139,20 @@ pub struct RequestCtx {
     /// Set when the route carries the `auto` sentinel; the request body's
     /// model field is rewritten to this model before it is sent upstream.
     pub auto_target: Option<(String, String)>,
+    /// Set when the client asked for the auto sentinel model (`[auto_model].name`)
+    /// but the matched route does not declare `auto_model = true` — a client
+    /// that switched its model picker to "auto" without moving the base URL
+    /// onto the auto route. The first attempt still goes to the route's own
+    /// provider; once that provider answers an error (the sentinel is not a
+    /// model any upstream knows), the walk switches to the auto pool instead
+    /// of the route's fallback chain and rewrites the body's model field.
+    pub auto_requested: bool,
+    /// One entry per failed upstream attempt, in order: `provider=status`,
+    /// `provider=connect`, `provider=dns`. Appended to the error handed back
+    /// to the client so a 502 names every provider that failed instead of
+    /// only the last one (a trailing DNS failure used to mask the real
+    /// "model not found" answer of the whole chain).
+    pub attempt_trail: Vec<String>,
 }
 
 impl RequestCtx {
@@ -191,6 +205,8 @@ impl RequestCtx {
             rate_limit_body_buf: Vec::new(),
             rate_limit_headers: Vec::new(),
             auto_target: None,
+            auto_requested: false,
+            attempt_trail: Vec::new(),
         }
     }
 }
