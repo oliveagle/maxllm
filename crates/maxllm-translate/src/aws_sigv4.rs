@@ -383,6 +383,65 @@ mod tests {
         assert_eq!(format_amz_date(1_735_689_600), "20250101T000000Z");
     }
 
+    /// The minute field is `rem % 3600 / 60` — a *division*, not a second
+    /// modulo. `01:02:00` (rem = 3720) pins that: `3720 % 3600 = 120`,
+    /// `120 / 60 = 2` minutes, while `120 % 60 = 0` would print `01:00:00`.
+    #[test]
+    fn test_format_amz_date_minutes_come_from_a_division() {
+        assert_eq!(format_amz_date(3720), "19700101T010200Z");
+        assert_eq!(format_amz_date(3720 + 59), "19700101T010259Z");
+    }
+
+    /// The days-from-civil correction (`+ doe / 36524`) and the
+    /// `doe / 146_096` century term are only non-zero once the day counter
+    /// leaves the first 400-year era — 1970-03-01 is the first day where
+    /// the correction shifts the year.
+    #[test]
+    fn test_format_amz_date_civil_correction_terms() {
+        // 59 days after the epoch: doe = 135139, doe / 36524 = 3.
+        assert_eq!(format_amz_date(59 * 86_400), "19700301T000000Z");
+        // 2000-02-29: the last day of the 400-year era (doe = 146096), where
+        // the century term flips the year.
+        assert_eq!(format_amz_date(951_782_400), "20000229T000000Z");
+    }
+
+    /// `amz_date_now()` must return the current UTC instant in the
+    /// canonical X-Amz-Date shape — not an empty string.
+    #[test]
+    fn test_amz_date_now_tracks_the_wall_clock() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock is after the epoch")
+            .as_secs();
+        let s = amz_date_now();
+        assert_eq!(s.len(), 16, "YYYYMMDDTHHMMSSZ: {s}");
+        assert_eq!(&s[8..9], "T");
+        assert!(s.ends_with('Z'));
+        assert!(
+            s[..8]
+                .chars()
+                .chain(s[9..15].chars())
+                .all(|c| c.is_ascii_digit()),
+            "digits only: {s}"
+        );
+
+        let secs_of_day = |x: &str| -> u64 {
+            let h: u64 = x[9..11].parse().unwrap();
+            let m: u64 = x[11..13].parse().unwrap();
+            let sec: u64 = x[13..15].parse().unwrap();
+            h * 3600 + m * 60 + sec
+        };
+        let expected = format_amz_date(now);
+        // Allow a couple of seconds of drift, and tolerate the day rolling
+        // over between the two clock reads.
+        let delta = secs_of_day(&s) as i64 - secs_of_day(&expected) as i64;
+        let delta = delta.rem_euclid(86_400);
+        assert!(
+            delta <= 5 || delta >= 86_395,
+            "amz_date_now must track the clock: {s} vs {expected}"
+        );
+    }
+
     /// The empty-string SHA-256 is a well-known constant.
     #[test]
     fn test_empty_sha256() {
