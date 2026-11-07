@@ -4444,7 +4444,11 @@ auto_model = true
 
     let cloud_reqs = cloud.received_requests().await.unwrap_or_default();
     let home_reqs = home.received_requests().await.unwrap_or_default();
-    assert_eq!(cloud_reqs.len(), 1, "the cloud pool serves exactly one call");
+    assert_eq!(
+        cloud_reqs.len(),
+        1,
+        "the cloud pool serves exactly one call"
+    );
     assert_eq!(home_reqs.len(), 1, "the home pool serves exactly one call");
 
     let cloud_body: Value = serde_json::from_slice(&cloud_reqs[0].body).expect("json body");

@@ -636,7 +636,9 @@ impl Config {
                 let named = pools.iter().find(|(name, _)| name == &route.provider);
                 let pool_ok = match named {
                     Some((_, auto)) => auto.enabled && !auto.pool.is_empty(),
-                    None => pools.iter().any(|(_, auto)| auto.enabled && !auto.pool.is_empty()),
+                    None => pools
+                        .iter()
+                        .any(|(_, auto)| auto.enabled && !auto.pool.is_empty()),
                 };
                 if !pool_ok {
                     return Err(ConfigError::Validation(format!(
