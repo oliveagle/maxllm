@@ -10,7 +10,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.3.5"
+version = "0.3.6"
 edition = "2021"
 license = "Apache-2.0"
 
@@ -22,3 +22,10 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ahash = "0.8"
+
+# `vendor/pingora-proxy` is upstream pingora-proxy 0.8.0 with one local change:
+# a request body larger than pingora's 64 KiB retry buffer is still handed to
+# `request_body_filter` (as an empty final chunk) instead of being dropped,
+# which used to deadlock any failover of a large request. See vendor/README.md.
+[patch.crates-io]
+pingora-proxy = { path = "vendor/pingora-proxy" }

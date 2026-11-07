@@ -1641,7 +1641,7 @@ dependencies = [
 
 [[package]]
 name = "maxllm-admin"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "ahash 0.8.12",
  "chrono",
@@ -1659,7 +1659,7 @@ dependencies = [
 
 [[package]]
 name = "maxllm-cli"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "clap",
  "dirs",
@@ -1674,7 +1674,7 @@ dependencies = [
 
 [[package]]
 name = "maxllm-config"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "regex",
  "serde",
@@ -1684,7 +1684,7 @@ dependencies = [
 
 [[package]]
 name = "maxllm-gateway"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "ahash 0.8.12",
  "arc-swap",
@@ -1719,7 +1719,7 @@ dependencies = [
 
 [[package]]
 name = "maxllm-plugin"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "ahash 0.8.12",
  "async-trait",
@@ -1745,7 +1745,7 @@ dependencies = [
 
 [[package]]
 name = "maxllm-translate"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "hmac",
  "serde",
@@ -2310,8 +2310,6 @@ dependencies = [
 [[package]]
 name = "pingora-proxy"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4e1e070a98a70d0d05f2fdcfb706237e06a043b2fbc9261e8772a3459cc2175e"
 dependencies = [
  "async-trait",
  "bytes",
