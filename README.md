@@ -339,7 +339,10 @@ A route with `auto_model = true` selects from a pool instead of its own
 declares further pools, each answering to its own sentinel name. Keep the
 rotation sets disjoint — e.g. cloud vendors under `auto` and home / on-prem
 GPUs under `auto_home`, so a request that asks for `auto` never lands on a
-machine at home (and vice versa):
+machine at home (and vice versa). Split by **where the model runs**, not by
+where the host sits: a LAN box that only proxies to a cloud-hosted model
+belongs to the cloud pool, while a GPU serving its own weights belongs to the
+home pool.
 
 ```toml
 [auto_model]              # sentinel "auto": cloud vendors
@@ -474,15 +477,18 @@ never replayed — that request may already have been executed and billed.
 
 ### Checking pool health
 
-`scripts/pool_health.py` probes every pool entry through its own
+`scripts/pool_health.py` probes every entry of every enabled pool (the default
+`[auto_model]` and each `[auto_models.<key>]`) through its own
 `/v1/responses/<provider>` route (no rotation, no failover, so each answer is
-attributable) and prints status, latency and the upstream's error message:
+attributable) and prints the pool, status, latency and the upstream's error
+message. `--pool` narrows it to one sentinel (or a comma list):
 
 ```bash
 python3 scripts/pool_health.py --config maxllm.toml --env-file maxllm.env
 # pool=25 healthy=12 failed=13 elapsed=32.7s
-# ok   200   1463ms one_api_volc_1   deepseek-v4-flash   text='ok'
-# BAD  403    102ms one_api_zhipu_1  glm-5.3-flash       {"code": "model_access_denied", ...}
+# ok   200   1463ms auto          one_api_volc_1      deepseek-v4-flash  text='ok'
+# BAD  403    102ms auto          one_api_zhipu_1     glm-5.3-flash      {"code": "model_access_denied", ...}
+python3 scripts/pool_health.py --config maxllm.toml --pool auto_home --env-file maxllm.env
 ```
 
 It exits non-zero when any member fails, so it can gate a deploy.
