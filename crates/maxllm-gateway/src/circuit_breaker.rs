@@ -269,7 +269,7 @@ impl CircuitBreaker {
     pub fn release_probe(&self) {
         let _ = self
             .pending_probes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1));
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1));
     }
 
     /// Reclaim a probe slot that has been held for longer than two fail
