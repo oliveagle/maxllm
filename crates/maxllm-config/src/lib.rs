@@ -60,6 +60,11 @@ pub struct Config {
     /// Model cost overrides (supplement built-in costs).
     #[serde(default)]
     pub model_costs: HashMap<String, ModelCostConfig>,
+    /// Cost accounting switches. `enabled = false` keeps `cost_usd` at 0
+    /// (budgets become advisory) and `warn_on_missing = false` silences the
+    /// per-request "no cost entry" warning for models outside the table.
+    #[serde(default)]
+    pub costs: CostsConfig,
     /// Guardrail definitions (content-level guardrails).
     #[serde(default)]
     pub guardrails: Vec<GuardrailConfig>,
@@ -127,6 +132,23 @@ impl Config {
     }
 }
 
+/// How a pool entry is paid for. Selection is tiered by this: the rotation
+/// only reaches a `metered` (pay-per-token) entry once every `subscription`
+/// entry of the pool is unavailable, so a prepaid plan is never left idle
+/// while a per-token key is being billed.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BillingMode {
+    /// Prepaid plan / membership (Coding Plan, Code membership, monthly
+    /// subscription). The default: an entry without `billing` is assumed to
+    /// be prepaid, which keeps older configs on the preferred tier.
+    #[default]
+    Subscription,
+    /// Pay per token against a balance. Always ranked after every
+    /// subscription entry.
+    Metered,
+}
+
 /// One entry of the auto-rotation pool.
 #[derive(Debug, Deserialize, Clone)]
 pub struct AutoPoolEntry {
@@ -135,6 +157,9 @@ pub struct AutoPoolEntry {
     /// Model name forwarded to that provider (rewritten into the request
     /// body, so the upstream sees its own model rather than the sentinel).
     pub model: String,
+    /// Billing model of this entry. Defaults to `subscription`.
+    #[serde(default)]
+    pub billing: BillingMode,
 }
 
 fn default_auto_model_name() -> String {
@@ -198,6 +223,30 @@ pub struct RecordingConfig {
 pub struct ModelCostConfig {
     pub input_per_1m: f64,
     pub output_per_1m: f64,
+}
+
+/// Global cost-accounting switches.
+#[derive(Debug, Deserialize, Clone)]
+pub struct CostsConfig {
+    /// Compute `cost_usd` at all. When false every request books 0 and the
+    /// "no cost entry" warning is suppressed.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Warn (once per request) when a model is not in the price table.
+    /// A deployment whose price table is known to be incomplete should set
+    /// this false; the `maxllm_usage_missing_total` metric still flags
+    /// responses that carry no usage at all.
+    #[serde(default = "default_true")]
+    pub warn_on_missing: bool,
+}
+
+impl Default for CostsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            warn_on_missing: true,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -550,6 +599,14 @@ pub struct MetricsConfig {
     #[serde(default)]
     pub enabled: bool,
     pub listen: Option<SocketAddr>,
+    /// Serve `/metrics` to non-loopback clients.
+    ///
+    /// The exposition carries per-provider traffic, quota and cost figures, so
+    /// it is loopback-only by default: the OTel collector scrapes it locally.
+    /// Turn this on only when the scraper lives on another host and the
+    /// listener is already behind a firewall.
+    #[serde(default)]
+    pub allow_remote: bool,
 }
 
 /// Guardrail configuration — content-level inspection with provider integration.
@@ -1169,6 +1226,51 @@ pool = [{{ provider = "openai", model = "local-model" }}]
         let err = Config::parse(&toml).unwrap_err();
         assert!(
             err.to_string().contains("declared twice"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_auto_pool_entry_billing_defaults_to_subscription() {
+        let toml = format!(
+            r#"{PROVIDER_TOML}
+[auto_model]
+pool = [{{ provider = "openai", model = "gpt-4o" }}]
+"#
+        );
+        let config = Config::parse(&toml).unwrap();
+        let pool = &config.auto_model.as_ref().unwrap().pool;
+        assert_eq!(pool[0].billing, BillingMode::Subscription);
+    }
+
+    #[test]
+    fn test_auto_pool_entry_billing_parses_metered() {
+        let toml = format!(
+            r#"{PROVIDER_TOML}
+[auto_model]
+pool = [
+  {{ provider = "openai", model = "gpt-4o" }},
+  {{ provider = "openai", model = "deepseek", billing = "metered" }},
+]
+"#
+        );
+        let config = Config::parse(&toml).unwrap();
+        let pool = &config.auto_model.as_ref().unwrap().pool;
+        assert_eq!(pool[0].billing, BillingMode::Subscription);
+        assert_eq!(pool[1].billing, BillingMode::Metered);
+    }
+
+    #[test]
+    fn test_auto_pool_entry_billing_rejects_an_unknown_value() {
+        let toml = format!(
+            r#"{PROVIDER_TOML}
+[auto_model]
+pool = [{{ provider = "openai", model = "gpt-4o", billing = "prepaid" }}]
+"#
+        );
+        let err = Config::parse(&toml).unwrap_err();
+        assert!(
+            err.to_string().contains("billing"),
             "unexpected error: {err}"
         );
     }

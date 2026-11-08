@@ -51,7 +51,24 @@ pub struct CircuitBreaker {
     state_transitions: AtomicU64,
     /// Force-opens caused by HTTP 429 (quota exhaustion).
     quota_opens: AtomicU64,
+    /// Start of the current stream-health window (ms epoch; 0 = none yet).
+    stream_window_start_ms: AtomicU64,
+    /// Streams whose completeness was determined inside the window.
+    stream_judged: AtomicU32,
+    /// The truncated subset of `stream_judged` inside the window.
+    stream_bad: AtomicU32,
+    /// Force-opens caused by a bad stream-truncation ratio.
+    stream_opens: AtomicU64,
 }
+
+/// How long a stream-health sample window lasts before it restarts.
+const STREAM_WINDOW_MS: u64 = 60_000;
+/// Truncations needed inside a window before the ratio may demote a provider.
+/// Below this the sample is too small to distinguish a flake from a bad
+/// provider, and one unlucky request must not move production traffic.
+const STREAM_MIN_BAD: u32 = 4;
+/// Truncation ratio that demotes a provider for its normal fail timeout.
+const STREAM_BAD_RATIO: f64 = 0.25;
 
 impl CircuitBreaker {
     pub fn new(max_fails: u32, fail_timeout_secs: u64) -> Self {
@@ -79,6 +96,10 @@ impl CircuitBreaker {
             force_open_until_ms: AtomicU64::new(0),
             state_transitions: AtomicU64::new(0),
             quota_opens: AtomicU64::new(0),
+            stream_window_start_ms: AtomicU64::new(0),
+            stream_judged: AtomicU32::new(0),
+            stream_bad: AtomicU32::new(0),
+            stream_opens: AtomicU64::new(0),
         }
     }
 
@@ -240,6 +261,64 @@ impl CircuitBreaker {
 
     /// Record a success. Resets failure count; while half-open, counts toward
     /// closing the circuit.
+    /// Feed one judged stream outcome into the provider's stream-health window.
+    ///
+    /// A provider that answers `200` and then drops the body mid-stream is
+    /// invisible to the plain failure counter: the status was a success, so
+    /// `record_success` resets the streak and the provider keeps every byte of
+    /// the traffic. A *consecutive*-failure breaker cannot catch it either —
+    /// for a provider that truncates ~40% of its streams independently, three
+    /// failures in a row is a ~6% event, so the circuit would essentially
+    /// never trip.
+    ///
+    /// This measures the *ratio* over a short window instead. Once enough
+    /// truncations have accumulated and they exceed [`STREAM_BAD_RATIO`], the
+    /// circuit is force-opened for the breaker's normal fail timeout. Routing
+    /// skips open circuits, so the route's traffic moves to the next fallback
+    /// provider; the provider then gets a probe window to prove itself again.
+    pub fn record_stream_outcome(&self, truncated: bool) {
+        let now = now_ms();
+        let window_start = self.stream_window_start_ms.load(Ordering::Relaxed);
+        if window_start == 0 || now.saturating_sub(window_start) >= STREAM_WINDOW_MS {
+            // Racy under concurrency, which is harmless: the loser of the race
+            // just restarts the sample, it never miscounts a truncation.
+            if self
+                .stream_window_start_ms
+                .compare_exchange(window_start, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                self.stream_judged.store(0, Ordering::Relaxed);
+                self.stream_bad.store(0, Ordering::Relaxed);
+            }
+        }
+        self.stream_judged.fetch_add(1, Ordering::Relaxed);
+        if !truncated {
+            return;
+        }
+        let bad = self.stream_bad.fetch_add(1, Ordering::Relaxed) + 1;
+        let judged = self.stream_judged.load(Ordering::Relaxed);
+        if bad < STREAM_MIN_BAD || (bad as f64) / (judged.max(1) as f64) < STREAM_BAD_RATIO {
+            return;
+        }
+        self.force_open_until_ms
+            .store(now + self.fail_timeout_ms, Ordering::Relaxed);
+        self.state.store(STATE_OPEN, Ordering::Relaxed);
+        self.failures.store(self.max_fails, Ordering::Relaxed);
+        self.last_failure_at.store(now, Ordering::Relaxed);
+        self.state_transitions.fetch_add(1, Ordering::Relaxed);
+        self.stream_opens.fetch_add(1, Ordering::Relaxed);
+        // Start a fresh window: after the cool-down the provider must earn its
+        // place back on new samples, not on the ones that demoted it.
+        self.stream_judged.store(0, Ordering::Relaxed);
+        self.stream_bad.store(0, Ordering::Relaxed);
+        self.stream_window_start_ms.store(now, Ordering::Relaxed);
+    }
+
+    /// Force-opens caused by a bad stream-truncation ratio.
+    pub fn stream_opens(&self) -> u64 {
+        self.stream_opens.load(Ordering::Relaxed)
+    }
+
     pub fn record_success(&self) {
         match self.state.load(Ordering::Relaxed) {
             STATE_HALF_OPEN => {
@@ -279,6 +358,43 @@ impl CircuitBreaker {
             return STATE_OPEN;
         }
         self.state.load(Ordering::Relaxed)
+    }
+
+    /// The state the next routing decision would see, without driving the
+    /// state machine (a metrics scrape must not consume a half-open probe
+    /// slot). `state()` alone is a lazy snapshot: a breaker whose fail window
+    /// elapsed still reads OPEN until some request calls `is_open()`.
+    pub fn effective_state(&self) -> u8 {
+        let now = now_ms();
+        let force_until = self.force_open_until_ms.load(Ordering::Relaxed);
+        if force_until != 0 {
+            return if now < force_until {
+                STATE_OPEN
+            } else {
+                STATE_CLOSED
+            };
+        }
+        let last = self.last_failure_at.load(Ordering::Relaxed);
+        let window_elapsed = now.saturating_sub(last) >= self.fail_timeout_ms;
+        match self.state.load(Ordering::Relaxed) {
+            STATE_CLOSED => {
+                if self.failures.load(Ordering::Relaxed) < self.max_fails {
+                    STATE_CLOSED
+                } else if window_elapsed {
+                    STATE_HALF_OPEN
+                } else {
+                    STATE_OPEN
+                }
+            }
+            STATE_OPEN => {
+                if window_elapsed {
+                    STATE_HALF_OPEN
+                } else {
+                    STATE_OPEN
+                }
+            }
+            other => other,
+        }
     }
 
     pub fn state_transitions(&self) -> u64 {
@@ -488,5 +604,44 @@ mod tests {
         assert!(cb.is_open());
         cb.record_success();
         assert!(!cb.is_open());
+    }
+
+    /// A provider that truncates a large share of its streams must be demoted,
+    /// even though every one of those streams answered 200 (so the plain
+    /// failure counter never saw a failure).
+    #[test]
+    fn test_a_bad_stream_ratio_force_opens_the_circuit() {
+        let cb = CircuitBreaker::new(3, 60);
+        // 50% truncation: 4 good + 4 truncated. The ratio trips on the 8th
+        // sample (4/8 = 0.5 >= 0.25) but only after `STREAM_MIN_BAD`.
+        for _ in 0..4 {
+            cb.record_stream_outcome(false);
+        }
+        assert!(!cb.is_open(), "a healthy prefix must not demote");
+        for _ in 0..3 {
+            cb.record_stream_outcome(true);
+        }
+        assert!(
+            !cb.is_open(),
+            "{} truncations alone are not enough evidence",
+            STREAM_MIN_BAD - 1
+        );
+        cb.record_stream_outcome(true);
+        assert!(
+            cb.is_open(),
+            "4 truncations in 8 judged streams must demote"
+        );
+        assert_eq!(cb.stream_opens(), 1, "the demotion is counted once");
+    }
+
+    /// One truncation among many good streams is a flake, not a bad provider.
+    #[test]
+    fn test_a_single_truncation_does_not_demote() {
+        let cb = CircuitBreaker::new(3, 60);
+        for i in 0..50 {
+            cb.record_stream_outcome(i == 7);
+        }
+        assert!(!cb.is_open());
+        assert_eq!(cb.stream_opens(), 0);
     }
 }

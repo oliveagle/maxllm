@@ -74,6 +74,11 @@ pub struct CostCalculator {
     costs: Vec<ModelCost>,
     /// Exact-match index for O(1) lookup of non-glob patterns.
     exact: ahash::AHashMap<String, usize>,
+    /// Whether a missing price entry logs a warning. False for deployments
+    /// that know their table is partial (or have disabled cost accounting).
+    warn_on_missing: bool,
+    /// Whether to compute costs at all.
+    enabled: bool,
 }
 
 impl CostCalculator {
@@ -81,7 +86,22 @@ impl CostCalculator {
     pub fn new() -> Self {
         let costs = default_costs();
         let exact = Self::build_exact_index(&costs);
-        Self { costs, exact }
+        Self {
+            costs,
+            exact,
+            warn_on_missing: true,
+            enabled: true,
+        }
+    }
+
+    /// Silence the per-request warning for models outside the price table.
+    pub fn set_warn_on_missing(&mut self, enabled: bool) {
+        self.warn_on_missing = enabled;
+    }
+
+    /// Turn cost computation off entirely (every request books 0).
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
     }
 
     fn build_exact_index(costs: &[ModelCost]) -> ahash::AHashMap<String, usize> {
@@ -115,7 +135,12 @@ impl CostCalculator {
             })
             .collect();
         let exact = Self::build_exact_index(&costs);
-        Ok(Self { costs, exact })
+        Ok(Self {
+            costs,
+            exact,
+            warn_on_missing: true,
+            enabled: true,
+        })
     }
 
     /// Add or replace cost entries (useful for runtime updates).
@@ -131,6 +156,9 @@ impl CostCalculator {
     ///
     /// Returns `0.0` if no matching model cost is found.
     pub fn calculate_cost(&self, model: &str, tokens_in: u64, tokens_out: u64) -> f64 {
+        if !self.enabled {
+            return 0.0;
+        }
         match self.find_cost(model) {
             Some(mc) => {
                 let input = (tokens_in as f64 / 1_000_000.0) * mc.input_cost_per_1m;
@@ -138,7 +166,9 @@ impl CostCalculator {
                 input + output
             }
             None => {
-                tracing::warn!(model = %model, "no cost entry found, returning 0");
+                if self.warn_on_missing {
+                    tracing::warn!(model = %model, "no cost entry found, returning 0");
+                }
                 0.0
             }
         }
@@ -286,6 +316,84 @@ fn default_costs() -> Vec<ModelCost> {
             input_cost_per_1m: 2.00,
             output_cost_per_1m: 6.00,
         },
+        // ── Production channels ──────────────────────────────────────────
+        //
+        // List prices (USD per 1M tokens), not contract prices: the gateway
+        // ships them so a channel is never silently booked at 0. A deployment
+        // with a negotiated rate overrides the row in `[model_costs.<model>]`
+        // — the config entry replaces the built-in one because exact matches
+        // win over the entries above (and `add_cost` appends later entries,
+        // which `find_cost` checks first).
+        //
+        // DeepSeek V4 Flash / Flash (cache-miss list price, blended).
+        ModelCost {
+            model_pattern: "deepseek-v4-flash".into(),
+            input_cost_per_1m: 0.10,
+            output_cost_per_1m: 0.28,
+        },
+        ModelCost {
+            model_pattern: "deepseek-flash".into(),
+            input_cost_per_1m: 0.10,
+            output_cost_per_1m: 0.28,
+        },
+        // MiniMax M3.
+        ModelCost {
+            model_pattern: "MiniMax-M3".into(),
+            input_cost_per_1m: 0.30,
+            output_cost_per_1m: 1.20,
+        },
+        // Xiaomi MiMo V2.6 Flash.
+        ModelCost {
+            model_pattern: "mimo-v2.6-flash".into(),
+            input_cost_per_1m: 0.10,
+            output_cost_per_1m: 0.30,
+        },
+        // Zhipu GLM 5.3 Flash.
+        ModelCost {
+            model_pattern: "glm-5.3-flash".into(),
+            input_cost_per_1m: 0.02,
+            output_cost_per_1m: 0.08,
+        },
+        // ── Zero-marginal-cost channels ──────────────────────────────────
+        //
+        // Prepaid coding plans and self-hosted endpoints are not billed per
+        // token. An explicit 0/0 row keeps them out of the "no cost entry"
+        // warning and lets the upstream-reported cost (when present) win.
+        ModelCost {
+            model_pattern: "kimi-for-coding".into(),
+            input_cost_per_1m: 0.0,
+            output_cost_per_1m: 0.0,
+        },
+        ModelCost {
+            model_pattern: "deepseek-v4.1-flash:cloud".into(),
+            input_cost_per_1m: 0.0,
+            output_cost_per_1m: 0.0,
+        },
+        ModelCost {
+            model_pattern: "qwen3.8-27b*".into(),
+            input_cost_per_1m: 0.0,
+            output_cost_per_1m: 0.0,
+        },
+        ModelCost {
+            model_pattern: "qwen3-embedding-*".into(),
+            input_cost_per_1m: 0.0,
+            output_cost_per_1m: 0.0,
+        },
+        ModelCost {
+            model_pattern: "qwen3-reranker-*".into(),
+            input_cost_per_1m: 0.0,
+            output_cost_per_1m: 0.0,
+        },
+        ModelCost {
+            model_pattern: "minicpm*".into(),
+            input_cost_per_1m: 0.0,
+            output_cost_per_1m: 0.0,
+        },
+        ModelCost {
+            model_pattern: "humanizer-*".into(),
+            input_cost_per_1m: 0.0,
+            output_cost_per_1m: 0.0,
+        },
     ]
 }
 
@@ -323,6 +431,36 @@ mod tests {
         // Claude
         let cost = calc.calculate_cost("claude-opus-4-20250514", 1_000_000, 1_000_000);
         assert!((cost - 90.0).abs() < 0.01); // 15.00 + 75.00
+    }
+
+    #[test]
+    fn production_channels_have_a_price_or_an_explicit_zero() {
+        let calc = CostCalculator::new();
+        for model in [
+            "deepseek-v4-flash",
+            "deepseek-flash",
+            "MiniMax-M3",
+            "mimo-v2.6-flash",
+            "glm-5.3-flash",
+            "kimi-for-coding",
+            "deepseek-v4.1-flash:cloud",
+            "qwen3.8-27b-ct",
+            "minicpmv47-awq",
+            "humanizer-12b",
+        ] {
+            assert!(
+                calc.get_model_cost(model).is_some(),
+                "{model} must have an explicit cost row"
+            );
+        }
+        // A metered channel is billed, not silently zero.
+        let cost = calc.calculate_cost("deepseek-v4-flash", 1_000_000, 1_000_000);
+        assert!((cost - 0.38).abs() < 1e-9, "got {cost}");
+        // A subscription/self-hosted channel is explicitly free.
+        assert_eq!(
+            calc.calculate_cost("kimi-for-coding", 1_000_000, 1_000_000),
+            0.0
+        );
     }
 
     #[test]

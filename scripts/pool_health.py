@@ -86,6 +86,10 @@ def select_entries(pools: dict[str, list[dict]], wanted: str | None) -> list[dic
 def probe(base_url: str, key: str, entry: dict, timeout: float) -> dict:
     provider, model = entry["provider"], entry["model"]
     pool_name = entry.get("pool", "auto")
+    # Billing tier the gateway will rank this entry by: subscription entries
+    # are preferred, metered ones are only used once every subscription entry
+    # of the pool is unavailable.
+    tier = entry.get("billing", "subscription")
     body = json.dumps({
         "model": model,
         "input": PROBE_PROMPT,
@@ -95,7 +99,13 @@ def probe(base_url: str, key: str, entry: dict, timeout: float) -> dict:
         f"{base_url}/v1/responses/{provider}",
         data=body,
         method="POST",
-        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+            # The gateway excludes probe traffic from metrics, request logs
+            # and breaker accounting.
+            "X-MaxLLM-Probe": "1",
+        },
     )
     started = time.time()
     try:
@@ -124,8 +134,9 @@ def probe(base_url: str, key: str, entry: dict, timeout: float) -> dict:
             detail = f"text={text.strip()[:60]!r}"
     except ValueError:
         pass
-    return {"pool": pool_name, "provider": provider, "model": model,
-            "status": status, "ms": elapsed_ms, "detail": detail}
+    return {"pool": pool_name, "tier": tier, "provider": provider,
+            "model": model, "status": status, "ms": elapsed_ms,
+            "detail": detail}
 
 
 def main() -> int:
@@ -159,7 +170,7 @@ def main() -> int:
     for row in rows:
         flag = "ok " if row["status"] == 200 else "BAD"
         print(f"{flag} {row['status']:>4} {row['ms']:>6}ms {row['pool']:<10} "
-              f"{row['provider']:<38} {row['model']:<28} {row['detail']}")
+              f"{row['tier']:<12} {row['provider']:<38} {row['model']:<28} {row['detail']}")
     return 0 if len(healthy) == len(rows) else 1
 
 

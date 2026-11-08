@@ -4303,6 +4303,135 @@ auto_model = true
     assert_eq!(b_sent["model"], "model-b");
 }
 
+/// A streaming request on an auto route must keep the native Responses
+/// passthrough and its usage ledger. Regression: the auto rewrite makes the
+/// body non-verbatim, which used to bypass the `keep_request_content_length`
+/// branch that parses `stream`. Consequently `ctx.is_streaming` stayed false,
+/// no stream translator was installed, `extract_stream_usage` never ran, and
+/// every `/v1/responses/auto` response booked 0 tokens while also emitting
+/// SSE under `Content-Type: application/json`.
+#[tokio::test]
+async fn test_auto_responses_streaming_records_usage_and_content_type() {
+    let mock = MockServer::start().await;
+
+    let sse = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_auto\",\"object\":\"response\",\"status\":\"in_progress\"}}\n\n",
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_auto\",\"output_index\":0,\"content_index\":0,\"delta\":\"hi\"}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_auto\",\"object\":\"response\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":85,\"output_tokens\":17,\"total_tokens\":102}}}\n\n",
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/zen/go/v1/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(sse, "text/event-stream"),
+        )
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let config = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[metrics]
+enabled = true
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.mock_opencode]
+kind = "opencode"
+base_url = "{MOCK_URL}"
+upstream_path = "/zen/go/v1/chat/completions"
+api_key = "fake-key"
+
+[auto_model]
+enabled = true
+name = "auto"
+
+[[auto_model.pool]]
+provider = "mock_opencode"
+model = "deepseek-v4.1-flash"
+
+[[routes]]
+path = "/v1/responses/auto"
+provider = "mock_opencode"
+endpoint_type = "responses"
+auto_model = true
+"#;
+    let gw = TestGateway::start(config, &mock.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/responses/auto"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&json!({
+            "model": "auto",
+            "input": "hi",
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        content_type.starts_with("text/event-stream"),
+        "a streaming Responses request must be labelled as SSE, got {content_type:?}"
+    );
+
+    let text = resp.text().await.unwrap();
+    assert!(text.contains("event: response.completed"), "{text}");
+
+    // The upstream saw the entry's model, not the sentinel.
+    let requests = mock.received_requests().await.unwrap();
+    let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(sent["model"], "deepseek-v4.1-flash");
+    assert_eq!(sent["stream"], true);
+
+    // Usage from the native `response.completed` event must reach the ledger.
+    let metrics = c
+        .get(gw.url("/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let line = metrics
+        .lines()
+        .find(|l| l.starts_with("maxllm_tokens_in_total") && l.contains("deepseek-v4.1-flash"))
+        .unwrap_or_else(|| panic!("no tokens_in metric for the auto model:\n{metrics}"));
+    assert!(
+        line.trim_end().ends_with("85"),
+        "expected 85 input tokens, got: {line}"
+    );
+    let line = metrics
+        .lines()
+        .find(|l| l.starts_with("maxllm_tokens_out_total") && l.contains("deepseek-v4.1-flash"))
+        .unwrap_or_else(|| panic!("no tokens_out metric for the auto model:\n{metrics}"));
+    assert!(
+        line.trim_end().ends_with("17"),
+        "expected 17 output tokens, got: {line}"
+    );
+}
+
 /// A pool entry naming an unknown provider is dropped at startup, so a
 /// typo cannot silently shrink the pool into a single-provider route.
 #[tokio::test]
@@ -4459,6 +4588,197 @@ auto_model = true
         home_body["model"] != "model-cloud" && cloud_body["model"] != "model-home",
         "a request must never rotate over another pool's entries"
     );
+}
+
+/// Billing tiers: a `metered` (pay-per-token) entry is ranked after every
+/// `subscription` entry, regardless of where it sits in the pool. Declared
+/// first and with a healthy upstream, it must still see zero traffic while
+/// the prepaid entry can serve.
+#[tokio::test]
+async fn test_auto_pool_never_prefers_a_metered_entry() {
+    let sub = MockServer::start().await;
+    let paid = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from-sub")))
+        .expect(4)
+        .mount(&sub)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from-paid")))
+        .mount(&paid)
+        .await;
+
+    let config = r#"
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[providers.sub]
+kind = "openai"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+
+[providers.paid]
+kind = "openai"
+base_url = "{FALLBACK_URL}"
+api_key = "fake-key"
+
+[auto_model]
+enabled = true
+
+# The metered entry is declared first on purpose: selection must order by
+# billing tier, not by declaration order.
+[[auto_model.pool]]
+provider = "paid"
+model = "model-paid"
+billing = "metered"
+
+[[auto_model.pool]]
+provider = "sub"
+model = "model-sub"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "auto"
+auto_model = true
+"#;
+    let gw = TestGateway::start_with_fallback(config, &sub.uri(), &paid.uri()).await;
+    let c = client();
+
+    for _ in 0..4 {
+        let resp = c
+            .post(gw.url("/v1/chat/completions"))
+            .json(&chat_body("auto", "hi"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(
+            body["choices"][0]["message"]["content"], "from-sub",
+            "every call must be served by the subscription entry"
+        );
+    }
+
+    let paid_reqs = paid.received_requests().await.unwrap_or_default();
+    assert_eq!(
+        paid_reqs.len(),
+        0,
+        "a healthy subscription entry must keep the metered entry idle"
+    );
+    let sub_reqs = sub.received_requests().await.unwrap_or_default();
+    assert_eq!(sub_reqs.len(), 4);
+    let sent: Value = serde_json::from_slice(&sub_reqs[0].body).expect("json body");
+    assert_eq!(sent["model"], "model-sub");
+}
+
+/// Billing tiers: once every subscription entry is unavailable (circuit open
+/// after an upstream failure), the same request walks into the metered entry
+/// instead of failing. The metered selection counter records the downgrade.
+#[tokio::test]
+async fn test_auto_pool_falls_back_to_metered_only_after_subscriptions_fail() {
+    let subs = MockServer::start().await;
+    let paid = MockServer::start().await;
+
+    // Every subscription entry answers 500.
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500).set_body_json(json!({"error": "down"})))
+        .mount(&subs)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from-paid")))
+        .mount(&paid)
+        .await;
+
+    let config = r#"
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[metrics]
+enabled = true
+
+[providers.sub_a]
+kind = "openai"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+max_fails = 1
+
+[providers.sub_b]
+kind = "openai"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+max_fails = 1
+
+[providers.paid]
+kind = "openai"
+base_url = "{FALLBACK_URL}"
+api_key = "fake-key"
+
+[auto_model]
+enabled = true
+
+[[auto_model.pool]]
+provider = "sub_a"
+model = "model-sub-a"
+
+[[auto_model.pool]]
+provider = "sub_b"
+model = "model-sub-b"
+
+[[auto_model.pool]]
+provider = "paid"
+model = "model-paid"
+billing = "metered"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "auto"
+auto_model = true
+"#;
+    let gw = TestGateway::start_with_fallback(config, &subs.uri(), &paid.uri()).await;
+    let c = client();
+
+    // Both subscription entries answer 500, so the request has to walk past
+    // both of them and land on the metered entry.
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .json(&chat_body("auto", "hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "from-paid");
+
+    let sub_reqs = subs.received_requests().await.unwrap_or_default();
+    assert_eq!(
+        sub_reqs.len(),
+        2,
+        "both subscription entries must be tried before the metered one"
+    );
+    let paid_reqs = paid.received_requests().await.unwrap_or_default();
+    assert_eq!(paid_reqs.len(), 1, "the metered entry serves the request");
+    let sent: Value = serde_json::from_slice(&paid_reqs[0].body).expect("json body");
+    assert_eq!(sent["model"], "model-paid");
+
+    let metric = metric_sample(&gw, "maxllm_auto_pool_metered_selections_total").await;
+    assert_eq!(
+        metric,
+        Some(1.0),
+        "the downgrade must be observable in metrics"
+    );
+
+    // With both subscription circuits open, later requests go straight to
+    // the metered entry.
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .json(&chat_body("auto", "hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
 }
 
 /// A client that carries a named sentinel in the body only (its base URL still
@@ -6895,5 +7215,355 @@ async fn test_large_body_survives_a_connect_failure() {
         200,
         "the fallback must serve the request (body: {})",
         outcome.text().await.unwrap_or_default()
+    );
+}
+
+/// A native Responses stream whose upstream dies before `response.completed`
+/// must not be served as a clean 200: the client gets an explicit error event
+/// and the exchange is booked as truncated.
+#[tokio::test]
+async fn test_truncated_native_responses_stream_is_booked_as_truncated() {
+    let mock = MockServer::start().await;
+
+    // Deliberately stops after a delta — no `response.completed`.
+    let sse = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_cut\",\"object\":\"response\",\"status\":\"in_progress\"}}\n\n",
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_cut\",\"output_index\":0,\"content_index\":0,\"delta\":\"hal\"}\n\n",
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/zen/go/v1/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(sse, "text/event-stream"),
+        )
+        .mount(&mock)
+        .await;
+
+    let config = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[metrics]
+enabled = true
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.mock_opencode]
+kind = "opencode"
+base_url = "{MOCK_URL}"
+upstream_path = "/zen/go/v1/chat/completions"
+api_key = "fake-key"
+
+[[routes]]
+path = "/v1/responses/mock_opencode"
+provider = "mock_opencode"
+endpoint_type = "responses"
+"#;
+    let gw = TestGateway::start(config, &mock.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/responses/mock_opencode"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&json!({"model": "mock-model", "input": "hi", "stream": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let text = resp.text().await.unwrap();
+
+    assert!(
+        text.contains("event: error"),
+        "a truncated stream must end with an explicit error event:\n{text}"
+    );
+    assert!(
+        text.contains("gateway_stream_truncated"),
+        "the error event must name the cause:\n{text}"
+    );
+    assert!(
+        text.contains("\"delta\":\"hal\""),
+        "the partial answer the client already received must be preserved:\n{text}"
+    );
+
+    let metrics = c
+        .get(gw.url("/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let truncated = metrics
+        .lines()
+        .find(|l| l.starts_with("maxllm_stream_truncated_total"))
+        .unwrap_or_else(|| panic!("truncation was not counted:\n{metrics}"));
+    assert!(
+        truncated.trim_end().ends_with(" 1"),
+        "expected exactly one truncation, got: {truncated}"
+    );
+    let before_first_byte: Vec<&str> = metrics
+        .lines()
+        .filter(|l| l.starts_with("maxllm_stream_truncated_before_first_byte_total"))
+        .collect();
+    assert!(
+        before_first_byte
+            .iter()
+            .all(|l| l.trim_end().ends_with(" 0")),
+        "a delta had already reached the client, so this must not be a \
+         before-first-byte truncation: {before_first_byte:?}"
+    );
+}
+
+/// The healthy counterpart: a stream that carries `response.completed` must
+/// never be flagged, or the truncation alert would fire on every good request.
+#[tokio::test]
+async fn test_complete_native_responses_stream_is_not_booked_as_truncated() {
+    let mock = MockServer::start().await;
+
+    let sse = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_ok\",\"object\":\"response\",\"status\":\"in_progress\"}}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_ok\",\"object\":\"response\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":12,\"output_tokens\":3,\"total_tokens\":15}}}\n\n",
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/zen/go/v1/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(sse, "text/event-stream"),
+        )
+        .mount(&mock)
+        .await;
+
+    let config = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[metrics]
+enabled = true
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.mock_opencode]
+kind = "opencode"
+base_url = "{MOCK_URL}"
+upstream_path = "/zen/go/v1/chat/completions"
+api_key = "fake-key"
+
+[[routes]]
+path = "/v1/responses/mock_opencode"
+provider = "mock_opencode"
+endpoint_type = "responses"
+"#;
+    let gw = TestGateway::start(config, &mock.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/responses/mock_opencode"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&json!({"model": "mock-model", "input": "hi", "stream": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let text = resp.text().await.unwrap();
+    assert!(text.contains("event: response.completed"), "{text}");
+    assert!(
+        !text.contains("gateway_stream_truncated"),
+        "a completed stream must not get a synthetic error event:\n{text}"
+    );
+
+    let metrics = c
+        .get(gw.url("/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let truncated_lines: Vec<&str> = metrics
+        .lines()
+        .filter(|l| l.starts_with("maxllm_stream_truncated_total"))
+        .collect();
+    assert!(
+        truncated_lines.iter().all(|l| l.trim_end().ends_with(" 0")),
+        "no truncation may be booked for a complete stream: {truncated_lines:?}"
+    );
+}
+
+/// A provider that keeps answering 200 and then dropping the body mid-stream
+/// must be demoted off the route: the plain failure counter never sees it,
+/// because every response status was a success.
+#[tokio::test]
+async fn test_a_truncating_provider_is_demoted_and_traffic_moves_to_the_fallback() {
+    let flaky = MockServer::start().await;
+    let good = MockServer::start().await;
+
+    let truncated = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\",\"object\":\"response\",\"status\":\"in_progress\"}}\n\n",
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"cut\"}\n\n",
+    );
+    Mock::given(method("POST"))
+        .and(path("/zen/go/v1/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(truncated, "text/event-stream"),
+        )
+        .mount(&flaky)
+        .await;
+
+    let healthy = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\",\"object\":\"response\",\"status\":\"in_progress\"}}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"object\":\"response\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":5,\"output_tokens\":2,\"total_tokens\":7}}}\n\n",
+    );
+    Mock::given(method("POST"))
+        .and(path("/zen/go/v1/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(healthy, "text/event-stream"),
+        )
+        .mount(&good)
+        .await;
+
+    let config = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[metrics]
+enabled = true
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.flaky]
+kind = "opencode"
+base_url = "{MOCK_URL}"
+upstream_path = "/zen/go/v1/chat/completions"
+responses_path = "/zen/go/v1/responses"
+native_responses = true
+api_key = "fake-key"
+max_fails = 3
+fail_timeout_secs = 60
+
+[providers.good]
+kind = "opencode"
+base_url = "{FALLBACK_URL}"
+upstream_path = "/zen/go/v1/chat/completions"
+responses_path = "/zen/go/v1/responses"
+native_responses = true
+api_key = "fake-key"
+
+[[routes]]
+path = "/v1/responses/flaky"
+provider = "flaky"
+fallback = ["good"]
+endpoint_type = "responses"
+strategy = "fallback"
+"#;
+    let gw = TestGateway::start_with_fallback(config, &flaky.uri(), &good.uri()).await;
+    let c = client();
+
+    async fn ask(c: &Client, gw: &TestGateway) -> String {
+        c.post(gw.url("/v1/responses/flaky"))
+            .header("Authorization", "Bearer test-key-123")
+            .json(&json!({"model": "m", "input": "hi", "stream": true}))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap()
+    }
+
+    // Four truncations is the demotion threshold; the ratio is 100% here, so
+    // the circuit must be open by the time the last one is logged.
+    for _ in 0..4 {
+        let body = ask(&c, &gw).await;
+        assert!(
+            body.contains("gateway_stream_truncated"),
+            "the flaky provider is still primary, so its streams are truncated:\n{body}"
+        );
+    }
+
+    // The demotion is booked asynchronously by the logging hook — wait for it.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let metrics = c
+            .get(gw.url("/metrics"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        if metrics
+            .lines()
+            .any(|l| l.starts_with("maxllm_circuit_breaker_stream_opens_total"))
+        {
+            assert!(
+                metrics
+                    .lines()
+                    .filter(|l| l.starts_with("maxllm_circuit_breaker_stream_opens_total"))
+                    .all(|l| l.trim_end().ends_with(" 1")),
+                "the demotion must be counted exactly once:\n{metrics}"
+            );
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the flaky provider was never demoted"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // The next request must skip the open circuit and land on the fallback.
+    let body = ask(&c, &gw).await;
+    assert!(
+        body.contains("event: response.completed"),
+        "traffic must have moved to the healthy provider:\n{body}"
+    );
+    assert!(
+        !body.contains("gateway_stream_truncated"),
+        "the healthy fallback must serve a complete stream:\n{body}"
+    );
+
+    let flaky_hits = flaky.received_requests().await.unwrap_or_default().len();
+    let good_hits = good.received_requests().await.unwrap_or_default().len();
+    assert_eq!(flaky_hits, 4, "the flaky provider must stop at 4 attempts");
+    assert!(
+        good_hits >= 1,
+        "the fallback must serve the demoted traffic"
     );
 }

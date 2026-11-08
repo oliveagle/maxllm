@@ -19,7 +19,7 @@ use crate::session_sticky::SessionStore;
 use ahash::AHashMap;
 use async_trait::async_trait;
 use bytes::Bytes;
-use maxllm_config::{Config, EndpointType, ProviderKind, RouteConfig};
+use maxllm_config::{BillingMode, Config, EndpointType, ProviderKind, RouteConfig};
 use maxllm_plugin::builtin::auto_compaction::{
     apply_llm_compaction, compact_messages, CompactionParams, CompactionResult,
 };
@@ -255,6 +255,7 @@ pub struct HotState {
     /// also has to opt in with `session_sticky = true`.
     pub session_sticky_enabled: bool,
     pub metrics_enabled: bool,
+    pub metrics_allow_remote: bool,
     pub global_chain: PluginChain,
     pub route_chains: Vec<PluginChain>,
     pub model_aliases: HashMap<String, String>,
@@ -319,6 +320,35 @@ impl HotState {
 pub struct AutoPoolEntry {
     pub provider: String,
     pub model: String,
+    /// Billing model: subscription entries always outrank metered ones.
+    pub billing: BillingMode,
+}
+
+impl AutoPoolState {
+    /// The pool entries a request may use, in billing-priority order.
+    ///
+    /// `usable` is the caller's per-request predicate (provider exists, its
+    /// circuit is closed, it was not already tried, …). The tier is resolved
+    /// against the *whole* pool: as long as one subscription entry is usable,
+    /// only subscription entries are returned, so round-robin and failover
+    /// can never reach a metered (pay-per-token) entry before every prepaid
+    /// entry is exhausted. Only when no subscription entry is usable does the
+    /// returned list fall back to the remaining (metered) entries.
+    fn usable_entries<F>(&self, usable: F) -> Vec<&AutoPoolEntry>
+    where
+        F: Fn(&AutoPoolEntry) -> bool,
+    {
+        let subscription: Vec<&AutoPoolEntry> = self
+            .entries
+            .iter()
+            .filter(|e| e.billing == BillingMode::Subscription)
+            .filter(|e| usable(e))
+            .collect();
+        if !subscription.is_empty() {
+            return subscription;
+        }
+        self.entries.iter().filter(|e| usable(e)).collect()
+    }
 }
 
 /// The main AI gateway — implements Pingora's ProxyHttp trait.
@@ -555,6 +585,8 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
 
     // Initialize cost calculator with config overrides
     let mut cost_calculator = maxllm_admin::CostCalculator::new();
+    cost_calculator.set_warn_on_missing(config.costs.warn_on_missing);
+    cost_calculator.set_enabled(config.costs.enabled);
     for (model, cost_conf) in &config.model_costs {
         cost_calculator.add_cost(maxllm_admin::ModelCost {
             model_pattern: model.clone(),
@@ -588,6 +620,7 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
                 entries.push(AutoPoolEntry {
                     provider: entry.provider.clone(),
                     model: entry.model.clone(),
+                    billing: entry.billing,
                 });
             } else {
                 warn!(
@@ -601,7 +634,17 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
             warn!(pool = %name, "auto pool has no usable entries — pool disabled");
             continue;
         }
-        info!(pool = %name, entries = entries.len(), "Auto pool ready");
+        let metered = entries
+            .iter()
+            .filter(|e| e.billing == BillingMode::Metered)
+            .count();
+        info!(
+            pool = %name,
+            entries = entries.len(),
+            subscription = entries.len() - metered,
+            metered,
+            "Auto pool ready (subscription tier first, metered only as last resort)"
+        );
         auto_pools.push(AutoPoolState { name, entries });
     }
 
@@ -686,6 +729,7 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
             .unwrap_or(false),
         routes: config.routes.clone(),
         metrics_enabled: config.metrics.enabled,
+        metrics_allow_remote: config.metrics.allow_remote,
         global_chain,
         route_chains,
         model_aliases: config.model_aliases.clone(),
@@ -903,6 +947,32 @@ impl AiGateway {
         hot.routes.iter().position(|r| path.starts_with(&r.path))
     }
 
+    /// The first path segment after `/v1/responses/` when it names neither a
+    /// configured provider nor an auto pool. `None` means the route is valid.
+    ///
+    /// The segment is empty for the bare route, `responses` for a client that
+    /// appends the endpoint to a `/v1/responses` base URL, and a provider or
+    /// pool name for the per-provider routes. Anything else is a typo or a
+    /// retired name and must not be served by the generic pool under a 200.
+    fn unknown_responses_subroute<'a>(
+        hot: &HotState,
+        route: &RouteConfig,
+        path: &'a str,
+    ) -> Option<&'a str> {
+        if route.path != "/v1/responses" {
+            return None;
+        }
+        let rest = path.strip_prefix("/v1/responses/")?;
+        let segment = rest.split('/').next().unwrap_or_default();
+        if segment.is_empty() || segment == "responses" {
+            return None;
+        }
+        if hot.providers.contains_key(segment) || hot.pool_named(segment).is_some() {
+            return None;
+        }
+        Some(segment)
+    }
+
     /// The provider's blended USD price per 1M tokens — the ranking key of
     /// the cost-based strategy.
     ///
@@ -931,34 +1001,41 @@ impl AiGateway {
         route: &RouteConfig,
         ctx: &mut RequestCtx,
     ) -> Option<Arc<ProviderState>> {
-        // 1. Session-sticky: a session pinned to a pool provider keeps
-        //    using it (a different key loses upstream context), unless
-        //    that provider's circuit is open.
+        // Billing tiers first: `usable_entries` returns the healthy
+        // subscription entries whenever at least one exists, and only falls
+        // back to the metered entries once every subscription entry is
+        // unavailable (circuit open). Everything below — session-sticky and
+        // round-robin — walks that single tier, so a pay-per-token provider
+        // is never picked while a prepaid plan can still serve.
+        let healthy = pool.usable_entries(|e| {
+            hot.providers
+                .get(&e.provider)
+                .map(|p| !p.circuit_breaker.is_open())
+                .unwrap_or(false)
+        });
+        if healthy.is_empty() {
+            return None;
+        }
+        let metered_tier = healthy.iter().all(|e| e.billing == BillingMode::Metered);
+
+        // 1. Session-sticky within the preferred tier: a session pinned to a
+        //    pool provider keeps using it (a different key loses upstream
+        //    context). A pin on the metered tier is not honoured once a
+        //    subscription entry has recovered — the prepaid tier wins and
+        //    the session re-pins on the next successful response.
+        let mut chosen: Option<&AutoPoolEntry> = None;
         if route.session_sticky && hot.session_sticky_enabled {
             if let Some(session_id) = ctx.session_id.clone() {
                 match self.sessions.get(&session_id) {
                     Some(pinned_name) => {
-                        if let Some(entry) = pool.entry_for(&pinned_name) {
-                            if let Some(provider) = hot.providers.get(&entry.provider) {
-                                if !provider.circuit_breaker.is_open() {
-                                    METRICS.session_affinity_hits_total.inc();
-                                    ctx.provider_name = entry.provider.clone();
-                                    ctx.auto_target =
-                                        Some((entry.provider.clone(), entry.model.clone()));
-                                    ctx.model = entry.model.clone();
-                                    ctx.plugin_ctx.model = entry.model.clone();
-                                    ctx.native_responses = ctx.endpoint_type
-                                        == EndpointType::Responses
-                                        && provider.native_responses
-                                        && provider.responses_path.is_some();
-                                    return Some(Arc::clone(provider));
-                                }
-                            }
+                        chosen = healthy.iter().copied().find(|e| e.provider == pinned_name);
+                        if chosen.is_some() {
+                            METRICS.session_affinity_hits_total.inc();
                         }
-                        // Pinned provider unavailable (open circuit or no
-                        // longer in the pool) — fall through to
-                        // round-robin; the session re-pins on the next
-                        // successful response.
+                        // Pinned provider unavailable (open circuit, no
+                        // longer in the pool, or only in a lower billing
+                        // tier) — fall through to round-robin; the session
+                        // re-pins on the next successful response.
                     }
                     None => {
                         METRICS.session_affinity_misses_total.inc();
@@ -966,22 +1043,18 @@ impl AiGateway {
                 }
             }
         }
-        // 2. Round-robin over the healthy pool entries.
-        let healthy: Vec<&AutoPoolEntry> = pool
-            .entries
-            .iter()
-            .filter(|e| {
-                hot.providers
-                    .get(&e.provider)
-                    .map(|p| !p.circuit_breaker.is_open())
-                    .unwrap_or(false)
-            })
-            .collect();
-        if healthy.is_empty() {
-            return None;
+        // 2. Round-robin over the healthy entries of the preferred tier.
+        let entry = match chosen {
+            Some(entry) => entry,
+            None => {
+                let idx =
+                    AUTO_POOL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as usize;
+                healthy[idx % healthy.len()]
+            }
+        };
+        if metered_tier {
+            METRICS.auto_pool_metered_selections_total.inc();
         }
-        let idx = AUTO_POOL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as usize;
-        let entry = healthy[idx % healthy.len()];
         let provider = Arc::clone(hot.providers.get(&entry.provider)?);
         ctx.provider_name = entry.provider.clone();
         ctx.auto_target = Some((entry.provider.clone(), entry.model.clone()));
@@ -1541,6 +1614,11 @@ impl AiGateway {
             .entry_for(&ctx.provider_name)
             .map(|e| (e.provider.clone(), e.model.clone()))
         else {
+            warn!(
+                provider = %ctx.provider_name,
+                pool = %sentinel,
+                "body names an auto pool, but the selected provider is not one of its members; the sentinel will reach the upstream"
+            );
             return Ok(());
         };
         if let Some(obj) = parsed.as_object_mut() {
@@ -1682,15 +1760,78 @@ impl ProxyHttp for AiGateway {
     ) -> pingora::Result<bool> {
         let path = session.req_header().uri.path();
 
-        // Health check endpoint — fast path, no allocations, no metrics overhead
+        // Health check endpoint. The body carries enough state for an
+        // operator (or a monitor) to see which pools are starving and which
+        // providers are circuit-open without scraping Prometheus.
         if path == "/health" || path == "/healthz" {
-            static HEALTH_BODY: &[u8] = br#"{"status":"ok"}"#;
+            let hot = self.hot.load();
+            let providers_total = hot.providers.len();
+            let mut providers_healthy = 0usize;
+            let mut open_providers: Vec<&str> = Vec::new();
+            for (name, provider) in hot.providers.iter() {
+                if provider.circuit_breaker.effective_state() == 0 {
+                    providers_healthy += 1;
+                } else {
+                    open_providers.push(name.as_str());
+                }
+            }
+            let mut pools = serde_json::Map::new();
+            let mut degraded = providers_total > 0 && providers_healthy == 0;
+            for pool in &hot.auto_pools {
+                let total = pool.entries.len();
+                let healthy = pool
+                    .entries
+                    .iter()
+                    .filter(|entry| {
+                        hot.providers
+                            .get(&entry.provider)
+                            .map(|p| p.circuit_breaker.effective_state() == 0)
+                            .unwrap_or(false)
+                    })
+                    .count();
+                if total > 0 && healthy == 0 {
+                    degraded = true;
+                }
+                pools.insert(
+                    pool.name.clone(),
+                    serde_json::json!({"healthy": healthy, "total": total}),
+                );
+            }
+            open_providers.sort_unstable();
+            let body = serde_json::to_vec(&serde_json::json!({
+                "status": if degraded { "degraded" } else { "ok" },
+                "version": env!("CARGO_PKG_VERSION"),
+                "providers": {
+                    "healthy": providers_healthy,
+                    "total": providers_total,
+                },
+                "pools": pools,
+                "open_providers": open_providers,
+            }))
+            .unwrap_or_else(|_| br#"{"status":"degraded"}"#.to_vec());
+            let content_len = body.len().to_string();
             let mut resp = ResponseHeader::build(200, Some(2))?;
             resp.insert_header("Content-Type", "application/json")?;
-            resp.insert_header("Content-Length", "15")?;
+            resp.insert_header("Content-Length", &content_len)?;
             session.write_response_header(Box::new(resp), false).await?;
             session
-                .write_response_body(Some(Bytes::from_static(HEALTH_BODY)), true)
+                .write_response_body(Some(Bytes::from(body)), true)
+                .await?;
+            ctx.skip_logging = true;
+            return Ok(true);
+        }
+
+        // Version endpoint — a GET that used to fall through to the POST-only
+        // API guard and answer 405.
+        if path == "/version" {
+            let body = format!(r#"{{"version":"{}"}}"#, env!("CARGO_PKG_VERSION")).into_bytes();
+            let content_len = body.len().to_string();
+            let mut resp = ResponseHeader::build(200, Some(2))?;
+            resp.insert_header("Content-Type", "application/json")?;
+            resp.insert_header("Content-Length", &content_len)?;
+            session.write_response_header(Box::new(resp), false).await?;
+            session
+                .write_response_body(Some(Bytes::from(body)), true)
                 .await?;
             ctx.skip_logging = true;
             return Ok(true);
@@ -1717,6 +1858,31 @@ impl ProxyHttp for AiGateway {
         // gauge, and the exposition must not include the scrape itself —
         // otherwise the gauge could never read 0 while it is being scraped.
         if path == "/metrics" && hot.metrics_enabled {
+            // The exposition names every provider, model, key and price in the
+            // deployment, so it is served to loopback scrapers only unless the
+            // operator opts in. Nothing below the route layer is reached here,
+            // so this check is the whole authorisation story for the endpoint.
+            let client_ip = session
+                .client_addr()
+                .and_then(|addr| addr.as_inet().map(|sock| sock.ip()));
+            if !metrics_visible_to(hot.metrics_allow_remote, client_ip) {
+                return Self::send_error_response(
+                    session,
+                    403,
+                    "metrics is loopback-only; set [metrics] allow_remote = true to expose it",
+                )
+                .await;
+            }
+            // The breaker gauge is otherwise only written on transitions, so
+            // a provider whose fail window elapsed kept reading OPEN until a
+            // request happened to touch it. Evaluate the effective state at
+            // scrape time (read-only: no probe slot is consumed).
+            for (name, provider) in hot.providers.iter() {
+                METRICS
+                    .circuit_breaker_state
+                    .with_label_values(&[name])
+                    .set(provider.circuit_breaker.effective_state() as i64);
+            }
             // The in-flight gauge is derived from the counter the
             // least-connections router reads, so it can never drift.
             for (provider, count) in crate::provider_stats::inflight_counts() {
@@ -1919,6 +2085,25 @@ impl ProxyHttp for AiGateway {
         let route = &hot.routes[route_index];
         ctx.endpoint_type = route.endpoint_type;
 
+        // `/v1/responses` is a prefix route on purpose: a client points its
+        // base URL at `/v1/responses/<provider-or-pool>` and appends
+        // `/responses`. The same prefix match silently swallowed retired
+        // provider names (`/v1/responses/one_api_*`) and served them from the
+        // generic pool. Reject a segment that names neither a provider nor a
+        // pool, and say which names are valid.
+        if let Some(segment) = Self::unknown_responses_subroute(&hot, route, &path) {
+            METRICS.active_requests.dec();
+            ctx.skip_logging = true;
+            return Self::send_error_response(
+                session,
+                404,
+                &format!(
+                    "unknown provider or pool '{segment}' in {path}; use /v1/responses/<provider>, /v1/responses/auto or /v1/responses/auto_home"
+                ),
+            )
+            .await;
+        }
+
         // For passthrough, extract the path suffix after the route prefix
         if route.endpoint_type == EndpointType::Passthrough {
             let suffix = &path[route.path.len()..];
@@ -1950,6 +2135,9 @@ impl ProxyHttp for AiGateway {
         // Capture the request identity for the recorder and session-sticky.
         ctx.request_method = session.req_header().method.to_string();
         ctx.request_path = path.clone();
+        // A synthetic health probe is served normally but kept out of every
+        // production signal: metrics, request logs and breaker accounting.
+        ctx.probe_request = session.req_header().headers.get("x-maxllm-probe").is_some();
 
         // Session-sticky: capture the session identity from the request
         // headers. codex-cli sends `session-id`, Claude Code sends
@@ -2633,6 +2821,16 @@ impl ProxyHttp for AiGateway {
                     if let Ok(mut v) =
                         serde_json::from_slice::<serde_json::Value>(&ctx.request_body_buf)
                     {
+                        // The auto route is not verbatim (the model field is
+                        // rewritten, so the body travels chunked), which means
+                        // the `keep_request_content_length` branch above never
+                        // parses `stream`. Parse it here: without it
+                        // `ctx.is_streaming` stays false, no stream translator
+                        // is installed, and `extract_stream_usage` never runs
+                        // — every auto-pool streaming request loses its usage.
+                        if let Some(stream) = v.get("stream").and_then(|s| s.as_bool()) {
+                            ctx.is_streaming = stream;
+                        }
                         if let Some(obj) = v.as_object_mut() {
                             obj.insert(
                                 "model".into(),
@@ -3041,15 +3239,26 @@ impl ProxyHttp for AiGateway {
                             ctx.is_streaming = true;
                             match ctx.stream_translator.lock() {
                                 Ok(mut guard) => {
-                                    let inner = provider.translator.streaming_translator();
-                                    if ctx.endpoint_type == EndpointType::Responses
-                                        && !ctx.native_responses
-                                    {
+                                    // A native Responses upstream already emits
+                                    // the Responses SSE contract. Copying it
+                                    // verbatim also lets `extract_stream_usage`
+                                    // read the usage embedded in the final
+                                    // `response.completed` event; wrapping it in
+                                    // the provider's chat translator would
+                                    // corrupt the event stream.
+                                    if ctx.native_responses {
                                         *guard = Some(Box::new(
-                                            maxllm_translate::responses::ResponsesStreamTranslator::new(inner),
+                                            maxllm_translate::NativePassthroughStream,
                                         ));
                                     } else {
-                                        *guard = Some(inner);
+                                        let inner = provider.translator.streaming_translator();
+                                        if ctx.endpoint_type == EndpointType::Responses {
+                                            *guard = Some(Box::new(
+                                                maxllm_translate::responses::ResponsesStreamTranslator::new(inner),
+                                            ));
+                                        } else {
+                                            *guard = Some(inner);
+                                        }
                                     }
                                 }
                                 Err(e) => {
@@ -3183,7 +3392,10 @@ impl ProxyHttp for AiGateway {
             }
         }
 
-        if (quota_open || server_error || success) && !quota_resolved_by_header {
+        if (quota_open || server_error || success)
+            && !quota_resolved_by_header
+            && !ctx.probe_request
+        {
             let hot = self.hot.load();
             if let Some(p) = hot.providers.get(&ctx.provider_name) {
                 if quota_open {
@@ -3443,6 +3655,12 @@ impl ProxyHttp for AiGateway {
     ) -> pingora::Result<Option<std::time::Duration>> {
         let hot = self.hot.load();
 
+        // The client is about to receive real bytes; a later upstream failure
+        // can no longer be hidden behind a failover.
+        if body.as_ref().is_some_and(|b| !b.is_empty()) {
+            ctx.client_body_written = true;
+        }
+
         // ── Pending rate-limit decision (429 whose headers did not pin the
         // reset instant) ──────────────────────────────────────────────────
         //
@@ -3523,8 +3741,13 @@ impl ProxyHttp for AiGateway {
             }
 
             // Apply the decision to the circuit breaker, then fail over.
+            // A health probe must not move a production breaker.
             let hot = self.hot.load();
-            if let Some(p) = hot.providers.get(&provider_name) {
+            if let Some(p) = hot
+                .providers
+                .get(&provider_name)
+                .filter(|_| !ctx.probe_request)
+            {
                 match &decision {
                     crate::rate_limit::RateLimitDecision::QuotaUntil {
                         reset_at_ms,
@@ -3825,8 +4048,9 @@ impl ProxyHttp for AiGateway {
                             }
                         };
                         if let Some(ref t) = translated {
-                            extract_stream_usage(t, ctx, end_of_stream);
-                            *body = Some(t.clone());
+                            let mut translated = t.clone();
+                            observe_stream_chunk(&mut translated, ctx, end_of_stream);
+                            *body = Some(translated);
                         }
                     }
                 } else {
@@ -4002,8 +4226,9 @@ impl ProxyHttp for AiGateway {
                         }
                     };
                     if let Some(ref t) = translated {
-                        extract_stream_usage(t, ctx, end_of_stream);
-                        *body = Some(t.clone());
+                        let mut translated = t.clone();
+                        observe_stream_chunk(&mut translated, ctx, end_of_stream);
+                        *body = Some(translated);
                     }
                 }
             } else {
@@ -4212,8 +4437,9 @@ impl ProxyHttp for AiGateway {
                         }
                     };
                     if let Some(ref t) = translated {
-                        extract_stream_usage(t, ctx, end_of_stream);
-                        *body = Some(t.clone());
+                        let mut translated = t.clone();
+                        observe_stream_chunk(&mut translated, ctx, end_of_stream);
+                        *body = Some(translated);
                     }
                 }
             }
@@ -4450,7 +4676,24 @@ impl ProxyHttp for AiGateway {
         e.retry
             .decide_reuse(client_reused && !session.as_ref().retry_buffer_truncated());
 
-        if ctx.upstream_responded || e.esource() != &pingora::ErrorSource::Upstream {
+        if ctx.upstream_responded {
+            // Response headers already reached the client, so this attempt
+            // cannot be replayed. It is still not a success: a streaming body
+            // that dies mid-flight must be booked as truncated, not as a
+            // clean 200 with a partial answer.
+            // A terminal event already told the client the answer was
+            // complete; an error raised while the connection is torn down
+            // afterwards must not rewrite that success as a truncation.
+            if ctx.is_streaming
+                && !ctx.stream_terminal_seen
+                && tracks_stream_terminal(ctx.endpoint_type)
+                && e.esource() == &pingora::ErrorSource::Upstream
+            {
+                mark_stream_truncated(ctx);
+            }
+            return e;
+        }
+        if e.esource() != &pingora::ErrorSource::Upstream {
             return e;
         }
         if !body_is_replayable(session, ctx) {
@@ -4570,6 +4813,15 @@ impl ProxyHttp for AiGateway {
             crate::provider_stats::release(&ctx.provider_name);
         }
 
+        if ctx.probe_request {
+            info!(
+                provider = %ctx.provider_name,
+                status = ctx.upstream_status,
+                "health probe completed (excluded from metrics and request logs)"
+            );
+            return;
+        }
+
         let duration = ctx.request_start.elapsed();
 
         // Record metrics
@@ -4610,6 +4862,72 @@ impl ProxyHttp for AiGateway {
         }
 
         let hot = self.hot.load();
+
+        let truncated = ctx
+            .stream_truncated
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        // Stream health. A 200 whose body was cut mid-stream never reaches the
+        // plain failure counter (`record_success` resets the streak, since the
+        // status *was* a success), so a provider that truncates a large share
+        // of its streams would keep every byte of traffic and every byte of
+        // the complaint. Feed the ratio window instead; when it trips, the
+        // circuit opens and routing walks to the next fallback provider.
+        let judged_stream = ctx.is_streaming
+            && ctx.upstream_status == 200
+            && tracks_stream_terminal(ctx.endpoint_type)
+            && (ctx.stream_terminal_seen || truncated);
+        if judged_stream {
+            METRICS
+                .streams_judged_total
+                .with_label_values(&[&ctx.provider_name])
+                .inc();
+            if let Some(p) = hot.providers.get(&ctx.provider_name) {
+                let before = p.circuit_breaker.stream_opens();
+                p.circuit_breaker.record_stream_outcome(truncated);
+                let after = p.circuit_breaker.stream_opens();
+                if after > before {
+                    METRICS
+                        .circuit_breaker_stream_opens_total
+                        .with_label_values(&[&ctx.provider_name])
+                        .inc_by(after - before);
+                    METRICS
+                        .circuit_breaker_state
+                        .with_label_values(&[&ctx.provider_name])
+                        .set(p.circuit_breaker.state() as i64);
+                    METRICS
+                        .circuit_breaker_transitions_total
+                        .with_label_values(&[&ctx.provider_name])
+                        .set(p.circuit_breaker.state_transitions() as i64);
+                    // Demoting a provider is a routing change, so keep it
+                    // across a restart like any other open circuit.
+                    self.persist_circuit_breaker(&ctx.provider_name, &p.circuit_breaker);
+                    self.unpin_session(ctx);
+                    warn!(
+                        provider = %ctx.provider_name,
+                        "stream truncation ratio exceeded the demotion threshold — \
+                         circuit force-opened so the route fails over"
+                    );
+                }
+            }
+        }
+
+        let truncation_error = truncated.then(|| {
+            "stream truncated: upstream ended the body before a terminal event".to_string()
+        });
+        // A 2xx/3xx that reported no tokens at all would be booked as a free
+        // request; surface the gap instead of letting it hide in a zero row.
+        if !truncated
+            && ctx.upstream_status != 0
+            && ctx.upstream_status < 400
+            && ctx.tokens_in == 0
+            && ctx.tokens_out == 0
+        {
+            METRICS
+                .usage_missing_total
+                .with_label_values(&[&ctx.provider_name, &ctx.model])
+                .inc();
+        }
 
         // Calculate cost (skip when no tokens to avoid unnecessary lookups).
         // When the price table has no entry for the model, fall back to the
@@ -4671,6 +4989,7 @@ impl ProxyHttp for AiGateway {
             cost_usd = format!("{:.6}", cost),
             latency_ms = latency_ms,
             fallback = ctx.fallback_used,
+            truncated,
             "request completed"
         );
 
@@ -4691,7 +5010,9 @@ impl ProxyHttp for AiGateway {
                 route_path: ctx.plugin_ctx.route_path.clone(),
                 endpoint_type: format!("{:?}", ctx.endpoint_type),
                 fallback_used: ctx.fallback_used,
-                error: e.map(|err| err.to_string()),
+                error: e
+                    .map(|err| err.to_string())
+                    .or_else(|| truncation_error.clone()),
             };
             if let Err(err) = admin_api.record_log(log) {
                 warn!(error = %err, "Failed to record request log");
@@ -4704,7 +5025,7 @@ impl ProxyHttp for AiGateway {
             ctx,
             Some(ctx.upstream_status),
             Some(latency_ms),
-            e.map(|err| err.to_string()),
+            e.map(|err| err.to_string()).or(truncation_error),
             ctx.upstream_body.clone(),
         );
     }
@@ -4756,17 +5077,23 @@ impl AiGateway {
             // `select_provider` (session-sticky, then round-robin), so this
             // walk only has to move forward to the next healthy entry.
             if route.auto_model {
-                return pool
-                    .entries
-                    .iter()
-                    .filter(|e| e.provider != ctx.provider_name)
-                    .filter(|e| !ctx.attempted_providers.contains(&e.provider))
-                    .find_map(|e| {
-                        hot.providers
+                let next = pool.usable_entries(|e| {
+                    e.provider != ctx.provider_name
+                        && !ctx.attempted_providers.contains(&e.provider)
+                        && hot
+                            .providers
                             .get(&e.provider)
-                            .filter(|p| !p.circuit_breaker.is_open())
-                            .map(|p| (e.provider.clone(), Arc::clone(p)))
-                    });
+                            .map(|p| !p.circuit_breaker.is_open())
+                            .unwrap_or(false)
+                });
+                let entry = next.first()?;
+                if entry.billing == BillingMode::Metered {
+                    METRICS.auto_pool_metered_selections_total.inc();
+                }
+                return hot
+                    .providers
+                    .get(&entry.provider)
+                    .map(|p| (entry.provider.clone(), Arc::clone(p)));
             }
             // Sentinel carried by a request on a non-auto route: the pool is
             // entered mid-request, so no `select_provider` slot ever rotated
@@ -4776,41 +5103,43 @@ impl AiGateway {
             //
             // Session binding first: a conversation that already landed on a
             // pool provider keeps it, so the upstream keeps its context.
+            // Tier-aware: only entries of the preferred billing tier are
+            // candidates, so the walk never reaches a metered entry while a
+            // subscription entry is still untried and healthy.
+            let healthy: Vec<&AutoPoolEntry> = pool.usable_entries(|e| {
+                e.provider != ctx.provider_name
+                    && !ctx.attempted_providers.contains(&e.provider)
+                    && hot
+                        .providers
+                        .get(&e.provider)
+                        .map(|p| !p.circuit_breaker.is_open())
+                        .unwrap_or(false)
+            });
+            let metered_tier = healthy.iter().all(|e| e.billing == BillingMode::Metered);
             if let Some(session_id) = ctx.session_id.as_deref() {
                 if let Some(pinned) = self.sessions.get(session_id) {
-                    let usable = pinned != ctx.provider_name
-                        && !ctx.attempted_providers.contains(&pinned)
-                        && pool.entry_for(&pinned).is_some();
-                    if usable {
-                        if let Some(pair) = hot
-                            .providers
-                            .get(&pinned)
-                            .filter(|p| !p.circuit_breaker.is_open())
-                            .map(|p| (pinned.clone(), Arc::clone(p)))
-                        {
+                    // Sticky only inside the preferred tier: a pin on the
+                    // metered tier is abandoned as soon as a subscription
+                    // entry can serve again.
+                    if let Some(entry) = healthy.iter().copied().find(|e| e.provider == pinned) {
+                        if let Some(pair) = hot.providers.get(&entry.provider) {
                             METRICS.session_affinity_hits_total.inc();
-                            return Some(pair);
+                            if metered_tier {
+                                METRICS.auto_pool_metered_selections_total.inc();
+                            }
+                            return Some((entry.provider.clone(), Arc::clone(pair)));
                         }
                     }
                 }
             }
-            let healthy: Vec<&AutoPoolEntry> = pool
-                .entries
-                .iter()
-                .filter(|e| e.provider != ctx.provider_name)
-                .filter(|e| !ctx.attempted_providers.contains(&e.provider))
-                .filter(|e| {
-                    hot.providers
-                        .get(&e.provider)
-                        .map(|p| !p.circuit_breaker.is_open())
-                        .unwrap_or(false)
-                })
-                .collect();
             if healthy.is_empty() {
                 return None;
             }
             let idx = AUTO_POOL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as usize;
             let entry = healthy[idx % healthy.len()];
+            if metered_tier {
+                METRICS.auto_pool_metered_selections_total.inc();
+            }
             return hot
                 .providers
                 .get(&entry.provider)
@@ -4834,6 +5163,9 @@ impl AiGateway {
     /// update the breaker metrics and persist the new state, so the fallback
     /// chain stops using a provider that cannot be reached.
     fn record_provider_connect_failure(&self, ctx: &RequestCtx) {
+        if ctx.probe_request {
+            return;
+        }
         let hot = self.hot.load();
         let Some(p) = hot.providers.get(&ctx.provider_name) else {
             return;
@@ -5330,6 +5662,16 @@ fn looks_like_responses_sse(data: &[u8]) -> bool {
 /// The body sent when an upstream chat SSE stream cannot be converted into
 /// Responses events. Raw provider bytes are never forwarded to a Responses
 /// client, so an explicit error is sent instead.
+/// Whether this client may read `/metrics`.
+///
+/// Loopback is always allowed — that is the local OTel collector. Everything
+/// else needs `[metrics] allow_remote = true`. An unknown peer address (no
+/// socket, e.g. a unix socket transport) is treated as remote: the endpoint
+/// names every provider, model, key and price, so the safe default is to deny.
+fn metrics_visible_to(allow_remote: bool, client: Option<std::net::IpAddr>) -> bool {
+    allow_remote || client.is_some_and(|ip| ip.is_loopback())
+}
+
 fn early_sse_failure_body() -> String {
     serde_json::json!({
         "error": {
@@ -5339,6 +5681,106 @@ fn early_sse_failure_body() -> String {
         }
     })
     .to_string()
+}
+
+/// Protocol markers that prove a stream reached its defined end. A stream
+/// that ends without one of these was cut off mid-flight (the upstream died,
+/// the proxy hop dropped, …) even though the HTTP status was 200.
+const STREAM_TERMINAL_MARKERS: &[&[u8]] = &[
+    b"[DONE]",
+    b"response.completed",
+    b"response.incomplete",
+    b"response.failed",
+    b"event: error",
+];
+
+/// How much of the already-scanned stream is kept to bridge a terminal marker
+/// that an upstream chunk boundary cut in half (`[DO` + `NE]`).
+const STREAM_SCAN_TAIL: usize = 32;
+
+/// Whether the gateway knows this endpoint's stream grammar well enough to
+/// judge a body as complete or truncated.
+///
+/// Only the OpenAI-compatible dialects are judged. `Native` and `Passthrough`
+/// speak a provider-specific SSE grammar the gateway does not parse (Anthropic
+/// ends on `message_stop`, Gemini on `finishReason`, …), so treating a missing
+/// OpenAI marker as truncation there would flag every healthy stream.
+fn tracks_stream_terminal(endpoint: EndpointType) -> bool {
+    matches!(
+        endpoint,
+        EndpointType::ChatCompletions | EndpointType::Completions | EndpointType::Responses
+    )
+}
+
+fn stream_carries_terminal(bytes: &[u8]) -> bool {
+    STREAM_TERMINAL_MARKERS
+        .iter()
+        .any(|marker| find_bytes(bytes, marker, 0).is_some())
+}
+
+/// Mark this exchange as truncated (idempotent) and bump the counters once.
+fn mark_stream_truncated(ctx: &RequestCtx) -> bool {
+    if ctx
+        .stream_truncated
+        .swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        return false;
+    }
+    METRICS
+        .stream_truncated_total
+        .with_label_values(&[&ctx.provider_name])
+        .inc();
+    if !ctx.client_body_written {
+        METRICS
+            .stream_truncated_before_first_byte_total
+            .with_label_values(&[&ctx.provider_name])
+            .inc();
+    }
+    warn!(
+        provider = %ctx.provider_name,
+        model = %ctx.model,
+        client_body_written = ctx.client_body_written,
+        "upstream stream ended before a terminal event — the 200 is recorded as truncated"
+    );
+    true
+}
+
+/// Observe one translated stream chunk: remember the terminal event, extract
+/// usage, and — on the final chunk of a stream that never carried a terminal —
+/// append an explicit error event so the client is not left with a silent
+/// half-answer.
+fn observe_stream_chunk(out: &mut Bytes, ctx: &mut RequestCtx, end_of_stream: bool) {
+    if tracks_stream_terminal(ctx.endpoint_type) {
+        // Scan the previous chunk's tail together with this chunk: an SSE
+        // chunk boundary may fall anywhere, including inside the marker, and a
+        // missed marker would silently downgrade a healthy stream to truncated.
+        let mut window = Vec::with_capacity(ctx.stream_scan_tail.len() + out.len());
+        window.extend_from_slice(&ctx.stream_scan_tail);
+        window.extend_from_slice(out);
+        if !ctx.stream_terminal_seen && stream_carries_terminal(&window) {
+            ctx.stream_terminal_seen = true;
+        }
+        let keep = window.len().saturating_sub(STREAM_SCAN_TAIL);
+        ctx.stream_scan_tail.clear();
+        ctx.stream_scan_tail.extend_from_slice(&window[keep..]);
+    }
+    extract_stream_usage(out, ctx, end_of_stream);
+    if !end_of_stream || ctx.stream_terminal_seen || !tracks_stream_terminal(ctx.endpoint_type) {
+        return;
+    }
+    mark_stream_truncated(ctx);
+    let event: &[u8] = if ctx.endpoint_type == EndpointType::Responses {
+        b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"gateway_stream_truncated\",\"message\":\"upstream stream ended before response.completed; output is incomplete\",\"code\":\"stream_truncated\"}}\n\n"
+    } else {
+        b"data: {\"error\":{\"type\":\"gateway_stream_truncated\",\"message\":\"upstream stream ended before [DONE]; output is incomplete\",\"code\":\"stream_truncated\"}}\n\ndata: [DONE]\n\n"
+    };
+    let mut buf = out.to_vec();
+    if !buf.ends_with(b"\n") {
+        buf.push(b'\n');
+    }
+    buf.push(b'\n');
+    buf.extend_from_slice(event);
+    *out = Bytes::from(buf);
 }
 
 /// Extract token usage from a streaming SSE chunk. OpenAI chat streams carry
@@ -6339,5 +6781,161 @@ api_key = "sk-test"
     fn test_empty_auth_section_installs_no_plugin() {
         let state = hot_state(&format!("{BASE}\n[auth]\n"));
         assert!(state.global_chain.is_empty(), "no keys, no auth plugin");
+    }
+}
+
+#[cfg(test)]
+mod stream_truncation_tests {
+    use super::*;
+
+    fn responses_ctx() -> RequestCtx {
+        let mut ctx = RequestCtx::new();
+        ctx.endpoint_type = EndpointType::Responses;
+        ctx.is_streaming = true;
+        ctx
+    }
+
+    #[test]
+    fn terminal_marker_is_recognised_inside_one_chunk() {
+        assert!(stream_carries_terminal(
+            b"event: response.completed\ndata: {}\n\n"
+        ));
+        assert!(stream_carries_terminal(b"data: [DONE]\n\n"));
+        assert!(!stream_carries_terminal(
+            b"event: response.output_text.delta\ndata: {}\n\n"
+        ));
+    }
+
+    /// An SSE chunk boundary may fall inside the marker. Scanning each chunk in
+    /// isolation would miss `[DO` + `NE]` and book a healthy stream as
+    /// truncated, so the detector keeps a tail window across chunks.
+    #[test]
+    fn terminal_marker_split_across_two_chunks_is_still_detected() {
+        let mut ctx = responses_ctx();
+        let mut first = Bytes::from_static(b"data: {\"delta\":\"hi\"}\n\ndata: [DO");
+        observe_stream_chunk(&mut first, &mut ctx, false);
+        assert!(!ctx.stream_terminal_seen, "half a marker is not a marker");
+
+        let mut second = Bytes::from_static(b"NE]\n\n");
+        observe_stream_chunk(&mut second, &mut ctx, true);
+        assert!(
+            ctx.stream_terminal_seen,
+            "the marker spans the boundary and must be found"
+        );
+        assert!(
+            !ctx.stream_truncated
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "a completed stream must never be booked as truncated"
+        );
+        assert_eq!(second.as_ref(), b"NE]\n\n", "no error event is appended");
+    }
+
+    /// A stream that stops before its terminal event must be booked as
+    /// truncated and must not leave the client with a silent half-answer.
+    #[test]
+    fn truncated_stream_is_flagged_and_gets_an_error_event() {
+        let mut ctx = responses_ctx();
+        let mut chunk = Bytes::from_static(b"event: response.output_text.delta\ndata: {}\n\n");
+        observe_stream_chunk(&mut chunk, &mut ctx, true);
+
+        assert!(ctx
+            .stream_truncated
+            .load(std::sync::atomic::Ordering::Relaxed));
+        let text = String::from_utf8_lossy(&chunk).to_string();
+        assert!(text.contains("event: error"), "{text}");
+        assert!(text.contains("gateway_stream_truncated"), "{text}");
+        // The original payload survives — the error is appended, not swapped in.
+        assert!(
+            text.starts_with("event: response.output_text.delta"),
+            "{text}"
+        );
+    }
+
+    /// Chat-completions streams terminate on `[DONE]`; the error event uses the
+    /// chat dialect (no `event:` line, and a trailing `[DONE]` so clients stop).
+    #[test]
+    fn truncated_chat_stream_gets_a_chat_dialect_error_event() {
+        let mut ctx = RequestCtx::new();
+        ctx.endpoint_type = EndpointType::ChatCompletions;
+        ctx.is_streaming = true;
+        let mut chunk = Bytes::from_static(b"data: {\"choices\":[{\"delta\":{}}]}\n\n");
+        observe_stream_chunk(&mut chunk, &mut ctx, true);
+
+        assert!(ctx
+            .stream_truncated
+            .load(std::sync::atomic::Ordering::Relaxed));
+        let text = String::from_utf8_lossy(&chunk).to_string();
+        assert!(text.contains("gateway_stream_truncated"), "{text}");
+        assert!(text.trim_end().ends_with("[DONE]"), "{text}");
+    }
+
+    /// `Native` and `Passthrough` speak provider-specific grammars the gateway
+    /// does not parse (Anthropic ends on `message_stop`, Gemini on
+    /// `finishReason`). Judging them by an OpenAI marker would flag every
+    /// healthy stream as truncated.
+    #[test]
+    fn unknown_stream_grammars_are_never_judged() {
+        for endpoint in [EndpointType::Native, EndpointType::Passthrough] {
+            let mut ctx = RequestCtx::new();
+            ctx.endpoint_type = endpoint;
+            ctx.is_streaming = true;
+            let mut chunk = Bytes::from_static(b"event: message_stop\ndata: {}\n\n");
+            observe_stream_chunk(&mut chunk, &mut ctx, true);
+            assert!(
+                !ctx.stream_truncated
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                "{endpoint:?} streams must not be judged by the OpenAI marker set"
+            );
+            assert_eq!(chunk.as_ref(), b"event: message_stop\ndata: {}\n\n");
+        }
+    }
+
+    /// Truncation is sticky and counted once, however many paths notice it.
+    #[test]
+    fn truncation_is_counted_once() {
+        let ctx = responses_ctx();
+        assert!(
+            mark_stream_truncated(&ctx),
+            "first call books the truncation"
+        );
+        assert!(
+            !mark_stream_truncated(&ctx),
+            "later calls are no-ops, not double counts"
+        );
+    }
+}
+
+#[cfg(test)]
+mod metrics_visibility_tests {
+    use super::metrics_visible_to;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    /// The local OTel collector is the intended scraper, so loopback is always
+    /// served — without it the whole observability path breaks.
+    #[test]
+    fn loopback_may_always_scrape() {
+        for ip in [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ] {
+            assert!(metrics_visible_to(false, Some(ip)), "{ip} is loopback");
+            assert!(metrics_visible_to(true, Some(ip)));
+        }
+    }
+
+    /// The exposition names every provider, model, key and price, so a remote
+    /// client is refused unless the operator opted in.
+    #[test]
+    fn remote_clients_are_refused_by_default() {
+        let remote = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9));
+        assert!(!metrics_visible_to(false, Some(remote)));
+        assert!(metrics_visible_to(true, Some(remote)));
+    }
+
+    /// An unknown peer (no socket address) is not evidence of locality.
+    #[test]
+    fn an_unknown_peer_is_treated_as_remote() {
+        assert!(!metrics_visible_to(false, None));
+        assert!(metrics_visible_to(true, None));
     }
 }

@@ -173,6 +173,24 @@ pub struct RequestCtx {
     /// Set once `replay_body` has been re-injected: the chunks that follow are
     /// the replay buffer's truncated prefix and are dropped.
     pub replay_injected: bool,
+    /// Whether the translated stream already carried its protocol terminal
+    /// event (`response.completed` / `[DONE]`). A stream that ends without one
+    /// was cut off upstream; the gateway appends an error event and books the
+    /// exchange as truncated instead of a clean 200.
+    pub stream_terminal_seen: bool,
+    /// Sticky truncation flag, shared with the stream-translator wrapper so
+    /// the `logging` hook can see it after the body filter has returned.
+    pub stream_truncated: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Tail of the stream bytes already inspected for a terminal marker, so a
+    /// marker split across two upstream chunks is still recognised.
+    pub stream_scan_tail: Vec<u8>,
+    /// Whether at least one non-empty response body chunk was handed back to
+    /// pingora (i.e. the client already received stream data).
+    pub client_body_written: bool,
+    /// A synthetic health probe (`X-MaxLLM-Probe: 1`). It is served normally
+    /// but excluded from metrics, request logs and circuit-breaker accounting,
+    /// so a monitor cannot poison the production signals it measures.
+    pub probe_request: bool,
 }
 
 impl RequestCtx {
@@ -230,6 +248,11 @@ impl RequestCtx {
             upstream_responded: false,
             replay_body: None,
             replay_injected: false,
+            stream_terminal_seen: false,
+            stream_scan_tail: Vec::new(),
+            stream_truncated: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            client_body_written: false,
+            probe_request: false,
         }
     }
 }

@@ -23,6 +23,10 @@ pub struct GatewayMetrics {
     pub request_duration_seconds: HistogramVec,
     pub active_requests: IntGauge,
     pub fallbacks_total: IntCounterVec,
+    /// Auto-pool selections that had to leave the subscription tier because
+    /// every subscription entry was unavailable (circuit open) — i.e. requests
+    /// that fell back to a pay-per-token provider.
+    pub auto_pool_metered_selections_total: IntCounter,
     /// Session-sticky affinity cache hit/miss counters.
     pub session_affinity_hits_total: IntCounter,
     pub session_affinity_misses_total: IntCounter,
@@ -34,6 +38,26 @@ pub struct GatewayMetrics {
     pub circuit_breaker_transitions_total: IntGaugeVec,
     /// Force-opens caused by HTTP 429 (quota exhaustion) per provider.
     pub circuit_breaker_quota_opens_total: IntCounterVec,
+    /// Streaming responses whose upstream ended the body before the protocol
+    /// terminal event (`response.completed` / `[DONE]`). The gateway appends
+    /// an explicit error event and records the exchange as truncated instead
+    /// of counting the 200 as a success.
+    pub stream_truncated_total: IntCounterVec,
+    /// The subset of `stream_truncated_total` where not a single response
+    /// body byte had been handed to the client yet. These are the only
+    /// truncations a future provider could still have rescued, so the gap
+    /// between the two counters quantifies the unrecoverable class.
+    pub stream_truncated_before_first_byte_total: IntCounterVec,
+    /// Responses that reached a successful status but carried no token usage
+    /// (the ledger would book them as free). Labelled by provider + model.
+    pub usage_missing_total: IntCounterVec,
+    /// Streaming responses whose completeness the gateway could determine
+    /// (the protocol terminal event was seen, or its absence proved a
+    /// truncation). `stream_truncated_total / streams_judged_total` is the
+    /// provider's live truncation ratio.
+    pub streams_judged_total: IntCounterVec,
+    /// Circuit force-opens caused by an excessive stream-truncation ratio.
+    pub circuit_breaker_stream_opens_total: IntCounterVec,
     /// Failovers caused by an upstream HTTP error (the request is retried on
     /// the next provider of the route's fallback chain).
     pub http_failovers_total: IntCounterVec,
@@ -99,6 +123,16 @@ impl GatewayMetrics {
         .expect("metric");
         registry
             .register(Box::new(fallbacks_total.clone()))
+            .expect("register");
+
+        let auto_pool_metered_selections_total = IntCounter::new(
+            "maxllm_auto_pool_metered_selections_total",
+            "Auto-pool selections that fell back to the metered (pay-per-token) tier \
+             because every subscription entry was unavailable",
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(auto_pool_metered_selections_total.clone()))
             .expect("register");
 
         let session_affinity_hits_total = IntCounter::new(
@@ -173,6 +207,66 @@ impl GatewayMetrics {
             .register(Box::new(circuit_breaker_quota_opens_total.clone()))
             .expect("register");
 
+        let stream_truncated_total = IntCounterVec::new(
+            Opts::new(
+                "maxllm_stream_truncated_total",
+                "Streaming responses truncated before the protocol terminal event",
+            ),
+            &["provider"],
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(stream_truncated_total.clone()))
+            .expect("register");
+
+        let stream_truncated_before_first_byte_total = IntCounterVec::new(
+            Opts::new(
+                "maxllm_stream_truncated_before_first_byte_total",
+                "Streaming responses truncated before the first body byte reached the client",
+            ),
+            &["provider"],
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(stream_truncated_before_first_byte_total.clone()))
+            .expect("register");
+
+        let usage_missing_total = IntCounterVec::new(
+            Opts::new(
+                "maxllm_usage_missing_total",
+                "Successful responses that carried no token usage",
+            ),
+            &["provider", "model"],
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(usage_missing_total.clone()))
+            .expect("register");
+
+        let streams_judged_total = IntCounterVec::new(
+            Opts::new(
+                "maxllm_streams_judged_total",
+                "Streaming responses whose completeness the gateway could determine",
+            ),
+            &["provider"],
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(streams_judged_total.clone()))
+            .expect("register");
+
+        let circuit_breaker_stream_opens_total = IntCounterVec::new(
+            Opts::new(
+                "maxllm_circuit_breaker_stream_opens_total",
+                "Circuit force-opens caused by an excessive stream-truncation ratio",
+            ),
+            &["provider"],
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(circuit_breaker_stream_opens_total.clone()))
+            .expect("register");
+
         let http_failovers_total = IntCounterVec::new(
             Opts::new(
                 "maxllm_http_failovers_total",
@@ -217,6 +311,12 @@ impl GatewayMetrics {
             request_duration_seconds,
             active_requests,
             fallbacks_total,
+            stream_truncated_total,
+            stream_truncated_before_first_byte_total,
+            usage_missing_total,
+            streams_judged_total,
+            circuit_breaker_stream_opens_total,
+            auto_pool_metered_selections_total,
             session_affinity_hits_total,
             session_affinity_misses_total,
             session_affinity_evictions_total,

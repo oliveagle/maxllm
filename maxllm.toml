@@ -19,6 +19,16 @@ threads = 4
 [metrics]
 enabled = true
 
+# --- Cost accounting ---
+# `enabled = false` books every request at 0 (budgets become advisory) and
+# `warn_on_missing = false` silences the per-request "no cost entry" warning
+# for a model outside the table. The built-in table already covers the
+# production cloud channels and gives self-hosted / prepaid-plan models an
+# explicit 0/0 row; override any of them below with the contract price.
+[costs]
+enabled = true
+warn_on_missing = false
+
 # --- Model Aliases ---
 # Map requested model names to actual model names.
 [model_aliases]
@@ -32,6 +42,8 @@ enabled = true
 db_path = "maxllm.db"
 
 # --- Model Cost Overrides (supplement built-in costs) ---
+# USD per 1M tokens. An exact key replaces the built-in row; a key with `*`
+# or `?` is a glob checked after exact matches.
 # [model_costs."custom-model"]
 # input_per_1m = 1.00
 # output_per_1m = 3.00

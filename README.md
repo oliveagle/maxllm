@@ -383,6 +383,40 @@ goes upstream, so the upstream never sees the sentinel. Failover re-selects
 within the pool (skipping attempted / open-circuit entries), and DNS
 resolution failures share the connect-failure path (breaker + switch).
 
+#### Billing tiers — subscription before metered
+
+A pool entry declares how it is paid for with `billing`:
+
+```toml
+[auto_model]
+enabled = true
+
+[[auto_model.pool]]
+provider = "volc_1"        # prepaid plan (subscription is the default)
+model = "deepseek-v4-flash"
+
+[[auto_model.pool]]
+provider = "deepseek"      # pay-per-token balance
+model = "deepseek-flash"
+billing = "metered"
+```
+
+`billing` accepts `subscription` (the default, so older configs are
+unchanged) and `metered`. Selection is **tiered, not ordered**: while at
+least one subscription entry is usable (provider present, circuit closed, not
+already tried in this request), the pool rotates only over the subscription
+entries. A metered entry is reached only once every subscription entry is
+unavailable — regardless of where it sits in the pool — and the failover walk
+follows the same rule, so one request cannot downgrade to a pay-per-token key
+while a prepaid plan can still serve. Session-sticky is tier-scoped too: a
+session pinned to a metered entry is moved back to the subscription tier as
+soon as any subscription entry can serve again (the upstream context is lost
+once, which is the price of the policy).
+
+`GET /metrics` exposes `maxllm_auto_pool_metered_selections_total` — pool
+selections that had to leave the subscription tier. It should only move while
+the prepaid plans are genuinely down.
+
 ```toml
 [auto_model]
 enabled = true
@@ -491,7 +525,36 @@ python3 scripts/pool_health.py --config maxllm.toml --env-file maxllm.env
 python3 scripts/pool_health.py --config maxllm.toml --pool auto_home --env-file maxllm.env
 ```
 
-It exits non-zero when any member fails, so it can gate a deploy.
+It exits non-zero when any member fails, so it can gate a deploy. Every probe
+carries `X-MaxLLM-Probe: 1`, so a scheduled probe does not pollute the metrics
+or request log it is meant to explain.
+
+Running it on a schedule turns "a member died three hours ago" into "a member
+died five minutes ago" — a systemd timer is enough:
+
+```ini
+# maxllm-pool-health.service  (Type=oneshot, SuccessExitStatus=0 1)
+ExecStart=/usr/bin/python3 pool_health.py --config maxllm.toml --env-file maxllm.env
+
+# maxllm-pool-health.timer
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+```
+
+### Log rotation and recordings retention
+
+`scripts/rotate_logs.py` rotates the append-only service logs
+(`maxllm.log`, `maxllm.err`) by size and prunes old
+`recordings/*.jsonl`. The unit writes them with systemd's `append:` target,
+which opens the file once with `O_APPEND`; that makes plain truncation safe —
+every write continues at the current end of file, so the writer never leaves a
+sparse hole and the gateway needs no signal or restart.
+
+```bash
+python3 scripts/rotate_logs.py --dir logs --recordings-dir recordings \
+    --max-bytes 20971520 --recordings-days 14
+```
 
 ## OpenCode (opencode.ai "zen") conversion
 
@@ -734,7 +797,40 @@ fail_timeout_secs = 60
 
 Prometheus metrics: `maxllm_circuit_breaker_state{provider}` (0=closed,
 1=open, 2=half-open), `maxllm_circuit_breaker_transitions_total{provider}`,
-`maxllm_circuit_breaker_quota_opens_total{provider}` (429 force-opens).
+`maxllm_circuit_breaker_quota_opens_total{provider}` (429 force-opens),
+`maxllm_circuit_breaker_stream_opens_total{provider}` (truncation demotions).
+
+#### Stream truncation demotes a provider
+
+A provider that answers `200` and then drops the body mid-stream is invisible
+to the plain failure counter: the status was a success, so `record_success`
+resets the streak and the provider keeps every byte of the traffic. A
+*consecutive*-failure breaker cannot catch it either — for a provider that
+truncates ~40% of its streams independently, three failures in a row is a ~6%
+event, so the circuit would essentially never trip.
+
+The breaker therefore also measures the truncation **ratio** over a one-minute
+window. Once at least 4 judged streams in the window were truncated *and* they
+are at least 25% of them, the circuit is force-opened for the provider's
+`fail_timeout_secs`. Routing skips open circuits, so the route's traffic moves
+to the next fallback provider; after the cool-down the provider gets a probe
+window to prove itself again. This is counted once per demotion
+(`stream_opens`) and reported by the `maxllm-stream-demotions` alert.
+
+Consequences worth knowing:
+
+- Truncation is only judged on dialects the gateway actually parses —
+  `chat/completions`, `completions` and the Responses contract. `native` and
+  `passthrough` routes speak provider-specific SSE grammars (Anthropic ends on
+  `message_stop`, Gemini on `finishReason`), so they are never demoted for a
+  missing OpenAI marker.
+- A terminal marker split across two upstream chunks is still recognised: the
+  detector keeps a tail window across chunk boundaries, so a healthy stream is
+  never booked as truncated because of a TCP read boundary.
+- On a route with a single provider, demoting it makes that route answer `503`
+  until the fail window elapses. That is deliberate (a broken stream is worse
+  than a fast failure) but it is the reason to keep a second provider in every
+  fallback chain.
 
 ### Request-level failover (HTTP errors)
 
@@ -1124,6 +1220,12 @@ Available at `GET /metrics` when enabled:
 | `circuit_breaker_state` | provider | Gauge |
 | `circuit_breaker_transitions_total` | provider | Gauge |
 | `circuit_breaker_quota_opens_total` | provider | Counter |
+| `circuit_breaker_stream_opens_total` | provider | Counter |
+| `stream_truncated_total` | provider | Counter |
+| `stream_truncated_before_first_byte_total` | provider | Counter |
+| `streams_judged_total` | provider | Counter |
+| `usage_missing_total` | provider, model | Counter |
+| `auto_pool_metered_selections_total` | &mdash; | Counter |
 | `provider_inflight_requests` | provider | Gauge |
 
 `requests_total` counts each request that reached a provider, once, with the
@@ -1131,6 +1233,41 @@ provider that served it (after any failover), the model and the upstream
 status; the status is `0` when the provider never answered (a connect or DNS
 failure). `active_requests` counts application requests in flight — the
 `/metrics` scrape itself is not counted, so the gauge reads 0 when idle.
+
+`streams_judged_total` counts streaming responses whose completeness the
+gateway could determine (the protocol terminal event was seen, or its absence
+proved a truncation); `stream_truncated_total / streams_judged_total` is a
+provider's live truncation ratio. `usage_missing_total` counts 2xx responses
+that carried no token usage — each one is a request the ledger would otherwise
+book as free.
+
+The exposition names every provider, model, key and price in the deployment,
+so `/metrics` is **loopback-only** by default (that is where the OTel collector
+scrapes it). Set `[metrics] allow_remote = true` to expose it to another host —
+and put it behind a firewall when you do:
+
+```toml
+[metrics]
+enabled = true
+allow_remote = false   # default; loopback scrapers always work
+```
+
+### Health and version
+
+| Endpoint | Body |
+|----------|------|
+| `GET /health`, `/healthz` | `{"status":"ok\|degraded","version","providers":{"healthy","total"},"pools":{"<name>":{"healthy","total"}},"open_providers":[...]}` |
+| `GET /version` | `{"version":"x.y.z"}` |
+
+`status` is `degraded` when every provider — or every member of some pool — is
+circuit-open. `open_providers` and the pool tallies are computed from the
+breaker's *effective* state, so a provider whose fail window has elapsed reads
+healthy without waiting for a request to touch it.
+
+Send `X-MaxLLM-Probe: 1` on synthetic health traffic (the bundled
+`scripts/pool_health.py` does): the request is served normally but excluded
+from metrics, request logs and circuit-breaker accounting, so a monitor cannot
+poison the signals it measures.
 
 ### Response Headers
 
