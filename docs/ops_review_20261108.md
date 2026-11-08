@@ -431,7 +431,8 @@ pool_health 接 timer（5 min）；probe 显式传 `--provider kimi`；探针请
 
 ### 7.2 修复（2026-11-08 18:5x CST）：异构 fallback 链的模型名改写 + 诚实 503
 
-两个在 §7.1 复核中暴露的旁路缺陷，一起修（commit `038ff0a`，已上线验证）：
+两个在 §7.1 复核中暴露的旁路缺陷，一起修（commit `aa79acd`，已上线验证）；
+同日晚些时候补上了 404 分支（commit `0569de3`，见 C）：
 
 **A. §828 设计缺口：模型名改写（真缺陷）**
 
@@ -464,6 +465,33 @@ pool_health 接 timer（5 min）；probe 显式传 `--provider kimi`；探针请
   `no provider available: kimi=circuit open (quota force-open) — every candidate of route '/v1/responses/kimi' is rejecting traffic`。
 - 验证：线上 `/v1/responses/{zhipu_1,volc_t_1}` → 503 点名 + 原因；`pool_health` 最新一轮 4 家
   配额 503 全部自解释，11 家 502 如实暴露。
+
+**C. 404「模型不存在」分支（真缺陷，同日补充）**
+
+- 现象：A 的改写只覆盖 `400 | 422`。实测 vLLM / miniCPM 上游对未知模型不答 400，而是 **404**：
+  `{"error":{"message":"The model deepseek-v4.1-flash:cloud does not exist. Valid aliases: minicpmv47-awq."}}`。
+  而 404 在 `should_failover_status` 里是硬编码的"可 failover"，于是请求直接换 provider / 耗尽链路，
+  改写永不触发 —— 两条本地 GPU 的 Responses 契约（`olefedora_gpu0_minicpmv47`、
+  `coding_home_olefedora_gpu0`）从此整条 404。
+- 难点：404 本身不区分"模型不存在"与"端点缺失"（两者同为 404），不能无脑改写。
+- 修法（延迟决策，复用 429 的 pending 形状）：
+  1. header 阶段 `status == 404` 且**改写确实可行**（`model_rewrite_target` 的闸门全过）时置
+     `pending_model_404`，把决策推到 body 完整之后 —— pingora 此时尚未向客户端写出任何字节，
+     重试对客户端不可见；
+  2. `body_reports_unknown_model()` 判定 body 是否在说模型：强特征（`unknown model`、
+     `model not found`、`model does not exist`、`does not exist. valid aliases`、`invalid model` …）
+     直接命中；弱特征（`does not exist`、`not found`、`不存在`）必须同时提到 model/模型 ——
+     `404 page not found` 这类端点缺失不会误判；
+  3. 命中 → 走与 400/422 **完全相同**的三道闸，并在同一 provider 原地改写重试
+     （`begin_model_rewrite` 统一两处的状态复位）；不命中 → 按普通 404 换链，**模型名原样**带给下游；
+  4. 每 provider 至多一次（复用 `model_rewritten_providers`）：二次 404 原样返回客户端，不会 ping-pong。
+- 顺带收敛：429 延迟决策与 404 共用的换链尾部合并为 `fail_over_from_body_filter`
+  （回放上限 / failover 预算 / 审计事件 / `switch_to_fallback` / 指标一处实现），行为不变。
+- 验证（线上）：两条 Responses 契约发该名 → **修复前 404，修复后 200**
+  （响应体 `"model":"minicpmv47-awq"`）；发拼错的名字 → 仍 404 且不改写；
+  `maxllm_model_rewrite_retries_total{provider}` 各 +1；journal 0 error。
+- 测试：4 条单测钉 body 分类器（vLLM 别名体 / one-api 体 / 端点 404 / 弱特征需提到 model）；
+  3 条集成测试钉 404 改写成功、非模型 404 换链且模型名不变、二次 404 只改写一次后返回客户端。
 
 ---
 
@@ -599,6 +627,7 @@ EOF
 | P0-3 价格表复核 | ✅ 已核对（未改价） | `minimax`/`MiniMax-M3` 6 小时 1 290 请求、119.2M in / 0.51M out 记 $36.379，与内置 $0.30/M + $1.20/M 复算值 $36.377 一致，也与厂商公开价一致；**该数字是全 list 价 ⇒ 是上限**（缓存折价见下一行） | 反推单价 $0.3051/M 与配置单价吻合，排除重复计费/单位错位 |
 | P1 熔断器探针槽泄漏（旁路发现） | ✅ 已修 | `is_open()` 兼作状态机驱动，而**过滤**路径对每个候选都调用它 ⇒ 被"看过却没选中"的 provider 各占一个 probe 槽且永不释放（`pending_probes` 不落盘）⇒ 永久 503。修法：纯读 `allows_traffic()` 走所有过滤；`is_open()` 只在选中的 provider 上调用一次；幂等钳零 `release_probe()` + `logging()` 终态归还 + 2×`fail_timeout` 兜底回收；`Closed→HalfOpen` 改 CAS | 线上 `pool_health.py` BAD 503 **16/25 → 4/25**（仅剩 4 家配额强制开闸）；`ollama_local` 定向 503 → 200 并关闭熔断；3 条新回归测试；unit 162→165、integration 124(+4 ignored) 全绿 |
 | §828 异构 fallback 链的模型名 | ✅ 已修 | 400/422 `unknown model` 且该名属于本部署某 provider 时，同一 provider 带 `model_override` 重试一次：body 的 `model` 改写为该 provider 的 `default_model`；`model_override.is_some()` 并入 `is_auto_route` 使改写后的 body 走 chunked（native Responses 直传分支不改 body 的坑）；三道闸 = 先试“还持有该名”的 provider、拼错名不改写、每 provider 至多一次；新指标 `maxllm_model_rewrite_retries_total{provider}` | 线上 `/v1/responses/minimax`、`/v1/responses/deepseek` 发 `deepseek-v4.1-flash:cloud`：修复前 400 unknown model → 修复后 200（分别改写为 `MiniMax-M3`/`deepseek-flash`）；5 条新回归测试（含 native Responses 路径） |
+| §828 404「模型不存在」分支 | ✅ 已修 | vLLM / miniCPM 对未知模型答 **404**（`The model X does not exist. Valid aliases: …`），旧改写只认 400/422 ⇒ 整条路由 404。改为延迟到 body 判定：`pending_model_404` + `body_reports_unknown_model()`（强/弱特征分级，端点 404 不误判）→ 命中走与 400/422 相同的三道闸 + 原地改写重试，不命中走普通 failover 且模型名不变；与 429 共用 `fail_over_from_body_filter` | 线上 `/v1/responses/{olefedora_gpu0_minicpmv47,coding_home_olefedora_gpu0}` 发 `deepseek-v4.1-flash:cloud`：修复前 404 → 修复后 200（`"model":"minicpmv47-awq"`）；拼错名仍 404；指标各 +1；4 单测 + 3 集成测试 |
 | 503 谎报 “All providers are unavailable” | ✅ 已修 | `select_provider` 空结果改用 `unavailable_reason()`：逐候选点名 + breaker 状态（配额 force-open / 开闸 / 半开探针在飞 / 未配置）+ 路由路径 | 线上 `/v1/responses/{zhipu_1,volc_t_1}` → 503 `no provider available: zhipu_1=circuit open (quota force-open) — every candidate of route '/v1/responses/zhipu_1' is rejecting traffic`；`pool_health` 一轮 4 家配额 503 全部自解释 |
 
 ### 仍未做（需拍板或有前置）
