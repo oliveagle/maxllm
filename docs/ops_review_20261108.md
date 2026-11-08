@@ -1319,6 +1319,62 @@ sha256 `787844f3f5205ea7ba9f7f92b654d078f9441d87040421251240d009d2efe738`；备�
 `xiaomi` 走 `/v1/responses`（非 auto 路由），generic 候选路径不查 `pin_is_slow`，
 本修复不影响它的钉住行为。
 
+### 14.12 修复 C 复测（2026-11-09 06:35 CST，部署后 50 min）
+
+**门禁 + CI**：本地 `fmt` / `test`（admin 63 + gateway unit 185 + gateway integration
+139 passed / 4 ignored + translate 242 + doc-tests 1，0 failed）/ `clippy -D warnings`
+全绿；CI 手动触发 run **`42528882208`** 七项全绿（Format / Check / Clippy / Test /
+Responses policy / Ops scripts / Build Release），已补记进 §14.11。
+回归测试 `cohort_readmits_a_provider_whose_evidence_aged_out`（`f274c7c`）钉住
+「证据过期 → 重新进入 cohort」，且断言档位中位数掉下来之后**更慢的样本反而被排除**
+（过滤器变严不是变松）。
+
+**命中率**（NAS，`cache_hit.py --since 2026-11-08T21:45:00Z` = 修复 C 部署时刻）：
+
+| provider | reqs | tokens_in | 命中率 | 判定 |
+|---|---:|---:|---:|---|
+| opencode_go_2 | 440 | 58.6 M | **97.50%** | ✅ |
+| volc_t_1 | 192 | 28.8 M | **97.38%** | ✅ |
+| volc_1 | 172 | 22.9 M | **97.02%** | ✅（22:03Z 起配额熔断，见下） |
+| xiaomi | 134 | 20.4 M | **98.03%** | ✅ |
+| ollama_local | 78 | 9.7 M | **95.53%** | ✅ |
+| minimax | 1 | 183 | 69.95% | ⚠️ 冷首发，分母无意义 |
+| **合计** | **1 017** | **140.3 M** | **97.34%** | |
+
+30 分钟滚动窗口（22:05Z→22:35Z）：`go_2 98.08 / volc_t_1 97.27 / xiaomi 97.61 /
+ollama_local 96.63`，合计 **97.55%** —— 有实质流量的 provider **全部 >95%**。
+
+**修复 C 生效的直接证据**：
+
+- `minimax` 在修复前最后一次出流量是 `19:07:37Z`（被永久封禁），修复 C 部署后
+  **`22:25:04Z` 重新被选中并成功服务**（`MiniMax-M3`，1979 ms），封禁不再是终局；
+- `auto_pool_slow_skips_total` 自重启起只累到 `xiaomi=6 / ollama_local=1`，
+  **没有 `minimax` / `opencode_go_1`** —— 两家不再是"被 cohort 踢出去"的状态；
+- `session_affinity_hits=1010 / misses=1 / evictions=0 / size=115`，按
+  `(session, route_path, model)` 复核 `hop = 0`：sticky 没有乒乓，缓存没有被网关自己打散。
+
+**两盏残余红灯的真实状态（不是回归，是分母还没长出来）**：
+
+- `minimax` 只有 1 发 / 183 token，69.95% 是一次全前缀冷 prefill 的瞬时值；
+  要过 95% 需要 §14.11 说的 ≈10–15 M 热 token；
+- `opencode_go_1` 部署后 **0 流量**：它和 `go_2` 同池，session 全被 affinity 钉在
+  `go_2` 上（1 010 : 1），只有**新 session** 才会轮转到它，43 min 只出现了 1 个。
+  它的 71.89% 是 2 发 / 301 k token 的历史冻结值。
+- **不人为喂流量**：冷 miss 只会把数字拉低，等客户端自然回归（§14.11 诚实边界）。
+
+**同期两个非缓存观察**（记录，不改）：
+
+- `volc_1` 在 `22:03:48Z` 后进入配额熔断（`circuit_breaker_state=1`）—— 与 §12.4
+  同源的真配额耗尽，不是误熔断；30 分钟面板里它自然掉出（无流量），全窗口仍 97.02%。
+- `ollama_local` 全窗 95.53% 的主要拖累是两条**全新上下文冷首发**
+  （`tokens_in` 145 303 / 131 536、`cached=0`，合计 277 k miss ≈ 该家 miss 的 3/4），
+  加上 4 发 37/38 token 的健康探针；30 分钟窗口内它是 96.63%。
+
+**三节点一致性仍是唯一硬阻塞**：NAS / Fedora = `787844f3…2efe738`（含 A+B+C），
+VPS 停在 `23056546…166461`（2026-11-08 21:40 部署），本会话无 ssh 凭据
+（dotvault 无该机条目、无 `id_rsa`、root / oliveagle 均被拒）→ 待有凭据的会话跑
+`ops/machines/vm_tecent_cloud_01/maxllm/deploy.sh`，状态已写进该节点 README 文首。
+
 
 ---
 
