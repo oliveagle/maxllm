@@ -615,6 +615,52 @@ provider，测完两条快线后，钉该 session 的下一次请求必须落到
 
 ---
 
+## 11. open_design 入 auto 池（2026-11-08 20:3x–20:4x CST，纯配置）
+
+**背景**：当天新接的三个 provider 里，`open_design`（`amr-link.open-design.ai`）实测 200，
+且用户确认是**订阅制**（预付额度，边际成本 0）；`cmd` 在 Go 计划下恒 403；`cmd_cli` 是本机
+CLI 桥接。三者都不在 `auto` 池里，`auto` 池仍是 11 条。
+
+**入池条件（function calling 是硬门槛）**：池子要跑 codex 的工具调用，所以 provider 必须
+真能出 `function_call`。实测：
+
+- `POST /v1/responses/open-design` 带 `tools` → 返回 `function_call`（`get_weather`）✅
+- `POST /v1/responses/cli_cmd` 带 `tools` → 上游回 `"tools":[]`，模型明说
+  「I don't have a `get_weather` tool」，**没有 function calling** ❌
+
+**落地（NAS `maxllm.toml`，纯配置、无新版本）**：池尾追加
+
+```toml
+[[auto_model.pool]]
+provider = "open_design"
+model = "deepseek-v4.1-flash"
+```
+
+`billing` 留空 = 订阅层（`AutoPoolEntry.billing` 的 default 是 `BillingMode::Subscription`），
+因此排在 metered 的 `deepseek` **之前**；`cost_usd=0.000000` 是订阅制的正常表现，不是漏配价格。
+
+流程（照既有部署口径）：备份 `maxllm.toml.bak-20261108-203923-open-design-pool` → 在 `:3799`
+用改过 `listen` / `db_path` 的副本空跑（providers=33 / routes=70 /
+`pool=auto entries=12 subscription=11 metered=1`、auto_home 14 条不变、池路由实测命中
+`X-MaxLLM-Provider: open_design`）→ `os.replace` **同目录**原子替换（跨文件系统的
+`os.replace` 会 EXDEV，所以先 stage 到目标目录再替换）→ 文件 watcher 热加载，日志
+`Config reloaded successfully`。
+
+**线上验证**：热加载后 14 发 `/v1/responses/auto` 探针 → open_design 命中 4 次，其余落在
+volc_1 / minimax / ollama_local；`maxllm_auto_pool_metered_selections_total` 仍为 **0**
+（没掉进 metered 层）。新 provider 没有测量值 → 进快队（`auto_pool_fast_cohort` 对无测量
+entry 保留），所以它立刻拿到轮转份额；等第一批 EWMA 回来后由 §10 的过滤器决定去留。
+
+**`cmd_cli` 暂不入池**：除了没有 function calling，还有两个代价——每次调用 ~24 963 input
+token、每次起一个 CLI 进程，厂商称持续代理订阅违反 TOS。关键在于**网关侧目前没有
+「provider 不支持 function calling ⇒ 不参与带 tools 的请求」这类过滤开关**：
+`AutoPoolState::usable_entries` 的 `usable` 谓词只看熔断器状态
+（`gateway.rs::select_from_auto_pool`），不看请求是否带 `tools`。硬入池会让 codex 的工具
+调用**静默失效**——模型直接给文字答案、不再调工具，agent 循环看起来「正常结束」但什么都没干。
+要入池得先加这个能力开关（provider 级 `supports_tools` + 池选路按请求特征过滤）。
+
+---
+
 ## 附录 A：复现与口径
 
 ```sh
