@@ -6076,6 +6076,77 @@ provider = "member"
     );
 }
 
+/// A provider that speaks the Responses contract natively used to keep the
+/// client's exact bytes (Content-Length framing), so the sentinel could never
+/// be rewritten: every `{"model": "auto"}` on a plain route cost a 404 from the
+/// first provider and a failover. On the production gateway 1,931 failed
+/// upstream attempts carried `model: "auto"` for exactly this reason.
+///
+/// The body must be framed chunked in that case — the same framing the auto
+/// route already uses for these providers — so request_body_filter can resolve
+/// the sentinel to the pool entry's model.
+#[tokio::test]
+async fn test_body_sentinel_is_rewritten_for_a_native_responses_provider() {
+    let member = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from-member")))
+        .expect(1)
+        .mount(&member)
+        .await;
+
+    let config = r#"
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[providers.member]
+kind = "openai"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+# The upstream already speaks the Responses contract, so the body would be
+# forwarded byte-for-byte — unless it has to be rewritten.
+native_responses = true
+
+[auto_model]
+enabled = true
+name = "auto"
+
+[[auto_model.pool]]
+provider = "member"
+model = "model-member"
+
+# Not an auto route: the sentinel arrives in the body, after the provider was
+# picked. It is a pool member, so the body must be rewritten for it.
+[[routes]]
+path = "/v1/responses"
+endpoint_type = "responses"
+provider = "member"
+"#;
+    let gw = TestGateway::start(config, &member.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/responses"))
+        .json(&json!({"model": "auto", "input": "hi"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "the pool member serves the request directly (body: {})",
+        resp.text().await.unwrap_or_default()
+    );
+
+    let reqs = member.received_requests().await.unwrap_or_default();
+    assert_eq!(reqs.len(), 1, "one call, no wasted 404 hop");
+    let sent: Value = serde_json::from_slice(&reqs[0].body).expect("json body");
+    assert_eq!(
+        sent["model"], "model-member",
+        "the sentinel must never reach a native-Responses upstream"
+    );
+}
+
 /// The same sentinel on a route that *does* declare `auto_model = true` keeps
 /// its old behaviour: the pool is used from the first attempt, with no wasted
 /// call to the route's `provider` sentinel.

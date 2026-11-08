@@ -3148,11 +3148,27 @@ impl ProxyHttp for AiGateway {
             // other body the gateway rewrites.
             let repairs_native_body =
                 is_native_responses && provider.translator.repairs_native_responses_body();
+            // The provider was picked before the body was read, so a pool
+            // sentinel (`{"model": "auto"}`) can only be seen later, in
+            // request_body_filter. A body kept byte-verbatim cannot be
+            // rewritten there (changing its length would truncate it), and the
+            // literal sentinel reaches the upstream — which answers 404/400 and
+            // costs a failover plus the conversation's prompt cache on every
+            // turn. When the provider serves an auto pool, frame the body
+            // chunked like the auto route already does, so the sentinel can be
+            // resolved to this entry's model.
+            let provider_serves_a_pool = hot
+                .auto_pools
+                .iter()
+                .any(|pool| pool.entry_for(&ctx.provider_name).is_some());
+            let may_carry_pool_sentinel =
+                ctx.endpoint_type == EndpointType::Responses && provider_serves_a_pool;
             // A Responses body rewritten into chat completions has an
             // unpredictable size (the chat form can be larger than the
             // Responses form), so it travels chunked instead of keeping the
             // original Content-Length — which would truncate a larger body.
             let verbatim = !is_auto_route
+                && !may_carry_pool_sentinel
                 && ((is_native_responses && !repairs_native_body)
                     || (openai_style && !is_responses_to_chat));
 
