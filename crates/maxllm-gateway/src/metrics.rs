@@ -28,9 +28,10 @@ pub struct GatewayMetrics {
     /// that fell back to a pay-per-token provider.
     pub auto_pool_metered_selections_total: IntCounter,
     /// Auto-pool entries the latency filter skipped, per provider. A high
-    /// count means the provider's EWMA latency is far above the tier median
-    /// (see `[auto_model].prefer_fast`); it stays available as a failover and
-    /// is re-measured on the exploration rotations.
+    /// count means the provider's recent whole-exchange median is far above
+    /// the tier median (see `[auto_model].prefer_fast`); it stays available
+    /// as a failover and is re-measured once its evidence expires or an
+    /// exploration rotation reaches it.
     pub auto_pool_slow_skips_total: IntCounterVec,
     /// Session-sticky affinity cache hit/miss counters.
     pub session_affinity_hits_total: IntCounter,
@@ -176,8 +177,8 @@ impl GatewayMetrics {
         let auto_pool_slow_skips_total = IntCounterVec::new(
             Opts::new(
                 "maxllm_auto_pool_slow_skips_total",
-                "Auto-pool entries skipped by the latency filter (their EWMA latency \
-                 is far above the tier median), per provider",
+                "Auto-pool entries skipped by the latency filter (their recent \
+                 whole-exchange median is far above the tier median), per provider",
             ),
             &["provider"],
         )

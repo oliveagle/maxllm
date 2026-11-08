@@ -429,6 +429,17 @@ fn openai_response(content: &str) -> Value {
     })
 }
 
+/// Same body as [`openai_response`], but the prompt side reports a cache hit.
+///
+/// Routing now grades a provider on its *warm* exchanges: a reply that never
+/// reports `cached_tokens` is a cold prefill, and cold prefill is exactly the
+/// measurement that used to get a provider banned for being slow once.
+fn openai_response_warm(content: &str) -> Value {
+    let mut body = openai_response(content);
+    body["usage"]["prompt_tokens_details"] = json!({"cached_tokens": 10});
+    body
+}
+
 // ---------------------------------------------------------------------------
 // Health & routing tests
 // ---------------------------------------------------------------------------
@@ -5756,10 +5767,11 @@ session_sticky = true
 
 /// The rotation cohort and the sticky pin are judged by *two different* rules.
 ///
-/// Once a provider's whole-exchange EWMA is above the rotation ceiling it is
-/// filtered out of the round-robin, so a three-provider tier with one slow
-/// entry deterministically excludes it (sorted measurements [fast, fast, slow]
-/// put the median on a fast entry) and no *new* session lands on it.
+/// Once a provider's recent whole-exchange median is above the rotation
+/// ceiling it is filtered out of the round-robin, so a three-provider tier
+/// with one slow entry deterministically excludes it (sorted measurements
+/// [fast, fast, slow] put the median on a fast entry) and no *new* session
+/// lands on it.
 ///
 /// A session already pinned to it is a different question: at 6s it is above
 /// the cohort ceiling but below the pin escape's absolute 10s floor, so it
@@ -5775,13 +5787,13 @@ async fn test_auto_pool_keeps_a_warm_pin_that_is_only_above_the_cohort() {
     Mock::given(method("POST"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_json(openai_response("from-slow"))
+                .set_body_json(openai_response_warm("from-slow"))
                 .set_delay(Duration::from_secs(6)),
         )
         .mount(&slow)
         .await;
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from-fast")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response_warm("from-fast")))
         .mount(&fast)
         .await;
 
@@ -5923,13 +5935,13 @@ async fn test_auto_pool_escapes_a_pin_that_is_slow_enough() {
     Mock::given(method("POST"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_json(openai_response("from-slow"))
+                .set_body_json(openai_response_warm("from-slow"))
                 .set_delay(Duration::from_millis(10_500)),
         )
         .mount(&slow)
         .await;
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from-fast")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response_warm("from-fast")))
         .mount(&fast)
         .await;
 

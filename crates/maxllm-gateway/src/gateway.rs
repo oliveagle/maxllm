@@ -860,11 +860,17 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
 /// Round-robin counter for the auto pool (shared across auto routes).
 static AUTO_POOL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Auto-pool fast-cohort tuning. An entry whose EWMA latency exceeds the
-/// tier's median by more than [`AUTO_POOL_COHORT_MEDIAN_MULTIPLIER`]× — clamped
-/// into the absolute `[floor, cap]` band — is skipped by the rotation; it stays
-/// available as a failover/last-resort target (it is never circuit-opened by
-/// this filter).
+/// Auto-pool fast-cohort tuning. An entry whose recent whole-exchange median
+/// exceeds the tier's median by more than
+/// [`AUTO_POOL_COHORT_MEDIAN_MULTIPLIER`]× — clamped into the absolute
+/// `[floor, cap]` band — is skipped by the rotation; it stays available as a
+/// failover/last-resort target (it is never circuit-opened by this filter).
+///
+/// The estimate behind this filter expires (see `provider_stats::
+/// TOTAL_LATENCY_WINDOW`): a provider dropped here stops being measured, so a
+/// verdict that outlived its evidence would be a ban with no way back — and a
+/// provider with no traffic can never rebuild the upstream prompt cache that
+/// makes its next request cheap.
 ///
 /// The multiplier is deliberately tight (1.5×): the rotation is where a request
 /// with *no* upstream cache to lose lands, so it should go to the fast half of
@@ -896,8 +902,9 @@ const AUTO_POOL_PIN_ESCAPE_FLOOR_MS: f64 = 10_000.0;
 /// and can rejoin the fast cohort.
 const AUTO_POOL_EXPLORE_EVERY: u64 = 50;
 
-/// The median whole-exchange EWMA (time-to-last-byte, not TTFB) of `healthy`,
-/// or `None` when nothing in the tier has been measured yet.
+/// The median of the recent whole-exchange samples (time-to-last-byte, not
+/// TTFB) across `healthy`, or `None` when nothing in the tier has been
+/// measured inside the evidence window.
 fn auto_pool_cohort_median(healthy: &[&AutoPoolEntry]) -> Option<f64> {
     let mut measured: Vec<f64> = Vec::with_capacity(healthy.len());
     for e in healthy.iter() {
@@ -913,7 +920,7 @@ fn auto_pool_cohort_median(healthy: &[&AutoPoolEntry]) -> Option<f64> {
 }
 
 /// The rotation ceiling for a tier whose members have a median whole-exchange
-/// EWMA of `median` (ms): the multiplier, clamped into the absolute
+/// latency of `median` (ms): the multiplier, clamped into the absolute
 /// `[floor, cap]` band and never allowed below the median itself.
 fn auto_pool_cohort_ceiling(median: f64) -> f64 {
     (median * AUTO_POOL_COHORT_MEDIAN_MULTIPLIER)
@@ -930,11 +937,13 @@ fn auto_pool_pin_escapable(pinned_ms: f64, median: f64) -> bool {
 }
 
 /// The low-latency cohort of `healthy` for one rotation: every entry whose
-/// whole-exchange EWMA is within [`auto_pool_cohort_ceiling`] of the tier's
-/// median, plus every entry that has no measurement yet (it has not been
-/// proven slow, and the rotation is what produces its first measurement). When
-/// nothing has been measured — a freshly-started gateway — the whole tier is
-/// returned, so the first requests behave exactly like plain round-robin.
+/// whole-exchange median is within [`auto_pool_cohort_ceiling`] of the tier's
+/// median, plus every entry that has no *current* measurement — never
+/// measured, or measured so long ago that the evidence expired (it has not
+/// been proven slow, and the rotation is what produces the next measurement).
+/// When nothing has been measured — a freshly-started gateway, or a tier that
+/// has all gone quiet — the whole tier is returned, so the first requests
+/// behave exactly like plain round-robin.
 fn auto_pool_fast_cohort<'a>(healthy: &[&'a AutoPoolEntry]) -> Vec<&'a AutoPoolEntry> {
     let Some(median) = auto_pool_cohort_median(healthy) else {
         // Nothing has been measured — a freshly-started gateway: the whole
@@ -5994,8 +6003,19 @@ impl ProxyHttp for AiGateway {
         // duration (time-to-last-byte). Successes only: the cohort must rank
         // by how long a client actually waits, and a failed exchange is not a
         // latency sample. TTFB keeps feeding the route latency strategy.
+        //
+        // `warm` marks the requests the upstream answered from its prompt
+        // cache: a turn that had to re-read most of its input is dominated by
+        // a prefix prefill that the next turn will not repeat, and it is that
+        // prefill — not the provider — that makes the first request of every
+        // conversation slow.
         if ctx.upstream_status < 400 && !ctx.provider_name.is_empty() {
-            crate::provider_stats::record_total_latency(&ctx.provider_name, latency_ms as f64);
+            let warm = ctx.cached_tokens_in.saturating_mul(2) >= ctx.tokens_in;
+            crate::provider_stats::record_total_latency(
+                &ctx.provider_name,
+                latency_ms as f64,
+                warm,
+            );
         }
 
         info!(
@@ -8373,10 +8393,10 @@ mod auto_pool_latency_tests {
         // fast-a/b ~1-2s, mid-c ~6s, slow-d ~30s: the median is ~6s, the
         // ceiling is min(max(6*1.5, 5s), max(10s, 6s)) = 9s, so only slow-d
         // is excluded.
-        crate::provider_stats::record_total_latency("cohort-a", 1000.0);
-        crate::provider_stats::record_total_latency("cohort-b", 2000.0);
-        crate::provider_stats::record_total_latency("cohort-c", 6000.0);
-        crate::provider_stats::record_total_latency("cohort-d", 30000.0);
+        crate::provider_stats::record_total_latency("cohort-a", 1000.0, true);
+        crate::provider_stats::record_total_latency("cohort-b", 2000.0, true);
+        crate::provider_stats::record_total_latency("cohort-c", 6000.0, true);
+        crate::provider_stats::record_total_latency("cohort-d", 30000.0, true);
         let pool = pool_with_names(
             true,
             &["cohort-a", "cohort-b", "cohort-c", "cohort-d", "cohort-e"],
@@ -8415,10 +8435,10 @@ mod auto_pool_latency_tests {
         // A uniformly-fast cluster (all < 5s) must not be cut in half by the
         // absolute floor: ceiling = min(max(median*1.5, 5s), max(10s, median))
         // >= 5s covers all.
-        crate::provider_stats::record_total_latency("cluster-a", 900.0);
-        crate::provider_stats::record_total_latency("cluster-b", 1100.0);
-        crate::provider_stats::record_total_latency("cluster-c", 1300.0);
-        crate::provider_stats::record_total_latency("cluster-d", 1700.0);
+        crate::provider_stats::record_total_latency("cluster-a", 900.0, true);
+        crate::provider_stats::record_total_latency("cluster-b", 1100.0, true);
+        crate::provider_stats::record_total_latency("cluster-c", 1300.0, true);
+        crate::provider_stats::record_total_latency("cluster-d", 1700.0, true);
         let pool = pool_with_names(
             true,
             &[
@@ -8493,10 +8513,10 @@ mod auto_pool_latency_tests {
 
     #[test]
     fn rotation_counts_the_skipped_provider() {
-        crate::provider_stats::record_total_latency("skip-a", 1000.0);
-        crate::provider_stats::record_total_latency("skip-b", 2000.0);
-        crate::provider_stats::record_total_latency("skip-c", 6000.0);
-        crate::provider_stats::record_total_latency("skip-d", 30000.0);
+        crate::provider_stats::record_total_latency("skip-a", 1000.0, true);
+        crate::provider_stats::record_total_latency("skip-b", 2000.0, true);
+        crate::provider_stats::record_total_latency("skip-c", 6000.0, true);
+        crate::provider_stats::record_total_latency("skip-d", 30000.0, true);
         let pool = pool_with_names(true, &["skip-a", "skip-b", "skip-c", "skip-d", "skip-e"]);
         let healthy: Vec<&AutoPoolEntry> = pool.entries.iter().collect();
         let before = METRICS
