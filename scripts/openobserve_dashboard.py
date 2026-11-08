@@ -57,6 +57,16 @@ PANELS: list[tuple[str, str, str, str, str]] = [
         "The class a future first-byte failover could still rescue: the upstream died before the client saw any body byte.",
     ),
     (
+        "Client aborts/s by provider",
+        "sum by (provider) (rate(maxllm_client_aborted_total[5m]))",
+        "maxllm_client_aborted_total",
+        "reqps",
+        "Callers walking away mid-body (Ctrl-C, a client timeout, a model switch)."
+        " Not a provider fault - read it next to the truncation panels, never as"
+        " one: on 2026-11-08 the two were conflated and 816 aborts were reported as"
+        " 11.2% silent truncation when only one real truncation existed.",
+    ),
+    (
         "Recording redactions / 10m",
         "sum(increase(maxllm_recording_redactions_total[10m]))",
         "maxllm_recording_redactions_total",
