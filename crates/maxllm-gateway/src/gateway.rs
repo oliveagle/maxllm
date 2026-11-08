@@ -4015,15 +4015,20 @@ impl ProxyHttp for AiGateway {
         //
         // A 429 (quota exhausted) force-opens the provider until its cooldown
         // ends: retrying a quota-exhausted channel is wasted work, and the
-        // upstream usually says when it resets (Retry-After). Any other
-        // server error counts against `max_fails`. Successes reset the
-        // half-open probe and re-pin the session to this provider.
+        // upstream usually says when it resets (Retry-After). A 402 is the
+        // same kind of wall (the account has no balance) and gets its own
+        // force-open — without it, an out-of-credit provider stays "healthy"
+        // in the breaker and every rotation pays an extra upstream round trip
+        // before the failover chain finds someone else. Any other server error
+        // counts against `max_fails`. Successes reset the half-open probe and
+        // re-pin the session to this provider.
         let retry_after = upstream_response
             .headers
             .get("retry-after")
             .and_then(|v| v.to_str().ok())
             .and_then(parse_retry_after_secs);
         let quota_open = status == 429;
+        let payment_required = status == 402;
         let server_error = (500..=599).contains(&status);
         let success = (200..=299).contains(&status);
 
@@ -4093,13 +4098,33 @@ impl ProxyHttp for AiGateway {
             }
         }
 
-        if (quota_open || server_error || success)
+        if (quota_open || payment_required || server_error || success)
             && !quota_resolved_by_header
             && !ctx.probe_request
         {
             let hot = self.hot.load();
             if let Some(p) = hot.providers.get(&ctx.provider_name) {
-                if quota_open {
+                if payment_required {
+                    // Account balance, not a transient fault: pin the open
+                    // circuit to a deadline instead of counting misses, so the
+                    // provider leaves the rotation at once and returns on its
+                    // own after the cooldown (or the next config reload, if the
+                    // balance is topped up earlier).
+                    let until = crate::rate_limit::now_ms()
+                        + crate::circuit_breaker::PAYMENT_REQUIRED_COOLDOWN_MS;
+                    p.circuit_breaker.record_quota_until(until);
+                    METRICS
+                        .circuit_breaker_quota_opens_total
+                        .with_label_values(&[&ctx.provider_name])
+                        .inc();
+                    // An out-of-credit provider must not keep the session pinned.
+                    self.unpin_session(ctx);
+                    info!(
+                        provider = %ctx.provider_name,
+                        cooldown_ms = crate::circuit_breaker::PAYMENT_REQUIRED_COOLDOWN_MS,
+                        "402 payment required — force-opened until the balance is topped up"
+                    );
+                } else if quota_open {
                     p.circuit_breaker.record_http_failure(429, retry_after);
                     METRICS
                         .circuit_breaker_quota_opens_total

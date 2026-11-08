@@ -4867,6 +4867,83 @@ async fn test_429_retry_after_header_fails_over_immediately() {
     assert_eq!(state, Some(1.0));
 }
 
+/// A `402 Payment Required` means the upstream account has no balance: the
+/// provider will answer 402 to every request until it is topped up. Before
+/// the fix the gateway booked such an answer as *nothing* (402 is neither a
+/// 5xx nor a 429), so the breaker kept calling the provider healthy and every
+/// rotation paid one extra upstream round trip before the fallback chain took
+/// over. A 402 must force-open the circuit for a cooldown instead.
+#[tokio::test]
+async fn test_402_payment_required_force_opens_the_provider() {
+    let primary = MockServer::start().await;
+    let fallback = MockServer::start().await;
+
+    // Exactly one upstream call: the second request must not reach the
+    // out-of-credit provider again.
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(402).set_body_json(json!({
+            "error": {
+                "code": "insufficient_balance",
+                "message": "Insufficient wallet balance. Please top up your wallet before retrying.",
+                "type": "insufficient_balance"
+            }
+        })))
+        .expect(1)
+        .mount(&primary)
+        .await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from fallback")))
+        .expect(2)
+        .mount(&fallback)
+        .await;
+
+    let gw =
+        TestGateway::start_with_fallback(HTTP_FAILOVER_CONFIG, &primary.uri(), &fallback.uri())
+            .await;
+    let c = client();
+
+    for _ in 0..2 {
+        let resp = c
+            .post(gw.url("/v1/chat/completions"))
+            .header("Authorization", "Bearer test-key-123")
+            .json(&chat_body("deepseek-v4.1-flash", "hi"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers().get("X-MaxLLM-Provider").unwrap(), "fallback");
+    }
+
+    // The 402 is booked as a force-open, not as a plain miss.
+    let quota_opens = metric_sample(
+        &gw,
+        "maxllm_circuit_breaker_quota_opens_total{provider=\"primary\"}",
+    )
+    .await;
+    assert_eq!(quota_opens, Some(1.0));
+    let state = metric_sample(&gw, "maxllm_circuit_breaker_state{provider=\"primary\"}").await;
+    assert_eq!(state, Some(1.0));
+
+    // ... and the provider is reported as open by /health.
+    let health: Value = c
+        .get(gw.url("/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let open = health["open_providers"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        open.iter().any(|v| v == "primary"),
+        "the out-of-credit provider must be reported as open: {health}"
+    );
+}
+
 #[tokio::test]
 async fn test_429_laya_classifies_inconclusive_text() {
     let primary = MockServer::start().await;

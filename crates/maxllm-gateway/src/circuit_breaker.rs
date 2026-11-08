@@ -16,6 +16,18 @@ pub const STATE_CLOSED: u8 = 0;
 pub const STATE_OPEN: u8 = 1;
 pub const STATE_HALF_OPEN: u8 = 2;
 
+/// How long an upstream that answered `402 Payment Required` is kept out of
+/// rotation.
+///
+/// A 402 is an account-level wall (no balance), not a transient fault, so it
+/// does not belong in the `max_fails` counter: the provider must not be
+/// retried on the next pick, yet it must come back on its own once the
+/// balance is topped up. Ten minutes bounds the wasted calls to one per
+/// provider per ten minutes — the previous behaviour, where a 402 was booked
+/// as nothing at all, paid one extra upstream round trip on *every*
+/// rotation — while a top-up is picked up well inside a working session.
+pub const PAYMENT_REQUIRED_COOLDOWN_MS: u64 = 10 * 60 * 1000;
+
 /// Lock-free circuit breaker using atomic counters.
 ///
 /// Three states (mirroring litellm_lb_go's breaker):
@@ -31,6 +43,13 @@ pub const STATE_HALF_OPEN: u8 = 2;
 /// regardless of the failure count. That mirrors litellm_lb_go's
 /// `ForceOpenUntil(quotaResetTime)` — a per-quota exhausted channel is known to
 /// be unavailable until the reset, so retrying it is wasted work.
+///
+/// A `402 Payment Required` from an upstream is the same kind of wall for a
+/// different reason: the account has no balance left, so the provider will
+/// answer 402 to *every* request until someone tops it up. It is force-opened
+/// for [`PAYMENT_REQUIRED_COOLDOWN_MS`] — long enough that a rotation does not
+/// pay an extra round trip on every pick, short enough that a top-up is
+/// noticed within minutes.
 pub struct CircuitBreaker {
     failures: AtomicU32,
     /// Consecutive successes while probing in half-open.
