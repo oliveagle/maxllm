@@ -1165,13 +1165,29 @@ impl AiGateway {
         let healthy = pool.usable_entries(|e| {
             hot.providers
                 .get(&e.provider)
-                .map(|p| !p.circuit_breaker.is_open())
+                // Pure read: inspecting a pool entry must not consume its
+                // half-open probe slot. The old `is_open()` did exactly that,
+                // so the entries the round-robin *looked at* but never picked
+                // were left permanently half-open and answered 503.
+                .map(|p| p.circuit_breaker.allows_traffic())
                 .unwrap_or(false)
         });
         if healthy.is_empty() {
             return None;
         }
         let metered_tier = healthy.iter().all(|e| e.billing == BillingMode::Metered);
+
+        // Admission: the entry the request is actually sent to is the one
+        // that drives the breaker and reserves the single half-open probe
+        // slot. An entry whose slot is already occupied by another in-flight
+        // probe is skipped, so `half_open_max` still bounds concurrent
+        // probes per provider.
+        let admits = |e: &AutoPoolEntry| -> bool {
+            hot.providers
+                .get(&e.provider)
+                .map(|p| !p.circuit_breaker.is_open())
+                .unwrap_or(false)
+        };
 
         // 1. Session-sticky within the preferred tier: a session pinned to a
         //    pool provider keeps using it (a different key loses upstream
@@ -1183,12 +1199,16 @@ impl AiGateway {
             if let Some(session_id) = ctx.session_id.clone() {
                 match self.sessions.get(&session_id) {
                     Some(pinned_name) => {
-                        chosen = healthy.iter().copied().find(|e| e.provider == pinned_name);
+                        chosen = healthy
+                            .iter()
+                            .copied()
+                            .find(|e| e.provider == pinned_name && admits(e));
                         // Pinned provider unavailable (open circuit, no
-                        // longer in the pool, or only in a lower billing
-                        // tier) — fall through to round-robin; the session
-                        // re-pins on the next successful response. A pin that
-                        // cannot be honoured is a miss, not a hit.
+                        // longer in the pool, only in a lower billing tier,
+                        // or its probe slot is busy) — fall through to
+                        // round-robin; the session re-pins on the next
+                        // successful response. A pin that cannot be honoured
+                        // is a miss, not a hit.
                         if chosen.is_some() {
                             METRICS.session_affinity_hits_total.inc();
                         } else {
@@ -1207,7 +1227,9 @@ impl AiGateway {
             None => {
                 let idx =
                     AUTO_POOL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as usize;
-                healthy[idx % healthy.len()]
+                (0..healthy.len())
+                    .map(|i| healthy[(idx + i) % healthy.len()])
+                    .find(|e| admits(e))?
             }
         };
         if metered_tier {
@@ -3695,7 +3717,9 @@ impl ProxyHttp for AiGateway {
         // upstream would answer the same way again. A connect failure fails
         // over too (`fail_to_connect`) — the provider is unreachable, not
         // flaky.
-        if (500..=599).contains(&status) && !provider.circuit_breaker.is_open() {
+        // Pure read: the outcome was just booked; deciding whether to retry
+        // the same provider must not reserve (and strand) a probe slot.
+        if (500..=599).contains(&status) && provider.circuit_breaker.allows_traffic() {
             let (num_retries, backoff_ms) = same_provider_retries(&hot.routes, ctx.route_index);
             if ctx.provider_retry_count < num_retries {
                 ctx.provider_retry_count += 1;
@@ -5076,9 +5100,16 @@ impl ProxyHttp for AiGateway {
         }
 
         // The request is done — it no longer counts towards the provider's
-        // in-flight load.
+        // in-flight load, and it gives back the half-open probe slot it may
+        // have reserved. The release is idempotent and clamped at zero, so
+        // it is safe on paths that never booked a breaker outcome (a health
+        // probe, a 4xx that fails over, a client that hung up mid-stream).
         if !ctx.provider_name.is_empty() {
             crate::provider_stats::release(&ctx.provider_name);
+            let hot = self.hot.load();
+            if let Some(p) = hot.providers.get(&ctx.provider_name) {
+                p.circuit_breaker.release_probe();
+            }
         }
 
         // A session that never reached the router has no route, no provider,
@@ -5377,6 +5408,17 @@ impl AiGateway {
         let hot = self.hot.load();
         let route = hot.routes.get(ctx.route_index?)?;
 
+        // Admission for the entry that is actually switched to. The walks
+        // below only *inspect* candidates (`allows_traffic`); the one that
+        // becomes the next provider reserves its half-open probe slot here,
+        // and no other entry's slot is touched.
+        let admit = |provider: &str| -> bool {
+            hot.providers
+                .get(provider)
+                .map(|p| !p.circuit_breaker.is_open())
+                .unwrap_or(false)
+        };
+
         // Auto pool: walk the entries of the pool this request rotates over
         // (still skipping attempted and open-circuit entries) rather than the
         // route's fallback chain.
@@ -5398,10 +5440,10 @@ impl AiGateway {
                         && hot
                             .providers
                             .get(&e.provider)
-                            .map(|p| !p.circuit_breaker.is_open())
+                            .map(|p| p.circuit_breaker.allows_traffic())
                             .unwrap_or(false)
                 });
-                let entry = next.first()?;
+                let entry = next.into_iter().find(|e| admit(&e.provider))?;
                 if entry.billing == BillingMode::Metered {
                     METRICS.auto_pool_metered_selections_total.inc();
                 }
@@ -5427,7 +5469,7 @@ impl AiGateway {
                     && hot
                         .providers
                         .get(&e.provider)
-                        .map(|p| !p.circuit_breaker.is_open())
+                        .map(|p| p.circuit_breaker.allows_traffic())
                         .unwrap_or(false)
             });
             let metered_tier = healthy.iter().all(|e| e.billing == BillingMode::Metered);
@@ -5452,7 +5494,9 @@ impl AiGateway {
                 return None;
             }
             let idx = AUTO_POOL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as usize;
-            let entry = healthy[idx % healthy.len()];
+            let entry = (0..healthy.len())
+                .map(|i| healthy[(idx + i) % healthy.len()])
+                .find(|e| admit(&e.provider))?;
             if metered_tier {
                 METRICS.auto_pool_metered_selections_total.inc();
             }

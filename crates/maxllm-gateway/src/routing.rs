@@ -40,37 +40,48 @@ impl ProviderSelector {
     }
 
     /// Select a provider from the candidate list.
+    ///
+    /// The candidate walk is a *read-only* inspection: `allows_traffic` never
+    /// advances a breaker's state machine nor reserves a half-open probe
+    /// slot, so the rejected candidates of a route stay untouched. Only the
+    /// provider that is actually selected drives the state machine — the
+    /// single `is_open()` admission below. If that provider's probe slot is
+    /// already occupied by a concurrent request (`half_open_max`), the next
+    /// healthy candidate is tried instead of reporting the whole route
+    /// unavailable.
     pub fn select<'a>(
         &self,
         candidates: &'a [ProviderTarget],
         _ctx: &mut RequestCtx,
     ) -> Option<&'a ProviderTarget> {
-        // Filter to healthy candidates (circuit breaker not open)
+        // Filter to healthy candidates (pure read — does not consume probe
+        // slots of the candidates it rejects).
         let healthy: Vec<&ProviderTarget> = candidates
             .iter()
-            .filter(|c| !c.state.circuit_breaker.is_open())
+            .filter(|c| c.state.circuit_breaker.allows_traffic())
             .collect();
 
         if healthy.is_empty() {
             return None;
         }
 
-        match self.strategy {
+        let chosen = match self.strategy {
             RoutingStrategy::Fallback => {
                 // Simple priority: try primary first, then fallbacks in order
-                healthy.into_iter().next()
+                healthy.first().copied()
             }
             RoutingStrategy::Weighted => self.weighted_select(&healthy),
             RoutingStrategy::RoundRobin => {
                 let idx = ROUND_ROBIN_COUNTER.fetch_add(1, Ordering::Relaxed) as usize;
-                Some(healthy[idx % healthy.len()])
+                healthy.get(idx % healthy.len()).copied()
             }
             RoutingStrategy::LeastConnections => {
                 // The healthy provider with the fewest requests currently
                 // routed to it. The counter is per provider and process-wide
                 // (see `provider_stats`), so it survives a config reload.
                 healthy
-                    .into_iter()
+                    .iter()
+                    .copied()
                     .min_by_key(|c| crate::provider_stats::inflight(&c.name))
             }
             RoutingStrategy::LatencyBased => {
@@ -84,12 +95,14 @@ impl ProviderSelector {
                     .filter_map(|c| crate::provider_stats::latency_ms(&c.name).map(|ms| (*c, ms)))
                     .collect();
                 if measured.is_empty() {
-                    return healthy.into_iter().next();
+                    healthy.first().copied()
+                } else {
+                    // Stable sort: equal latency keeps the candidate order,
+                    // so the primary still wins a tie.
+                    measured
+                        .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                    Some(measured[0].0)
                 }
-                // Stable sort: equal latency keeps the candidate order, so
-                // the primary still wins a tie.
-                measured.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-                Some(measured[0].0)
             }
             RoutingStrategy::CostBased => {
                 // The cheapest healthy provider, by blended USD price per 1M
@@ -101,14 +114,29 @@ impl ProviderSelector {
                     .filter_map(|c| c.cost_per_1m.map(|cost| (*c, cost)))
                     .collect();
                 if priced.is_empty() {
-                    return healthy.into_iter().next();
+                    healthy.first().copied()
+                } else {
+                    // Stable sort: equal price keeps the candidate order, so
+                    // the primary still wins a tie.
+                    priced
+                        .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                    Some(priced[0].0)
                 }
-                // Stable sort: equal price keeps the candidate order, so the
-                // primary still wins a tie.
-                priced.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-                Some(priced[0].0)
             }
+        };
+        let chosen = chosen?;
+
+        // Admission: this is the provider the request will actually use, so
+        // (and only so) drive the breaker and reserve the probe slot.
+        if !chosen.state.circuit_breaker.is_open() {
+            return Some(chosen);
         }
+        // The chosen candidate's probe slot is occupied by another request in
+        // flight: fall back to the next healthy candidate that admits.
+        healthy
+            .iter()
+            .copied()
+            .find(|c| !c.state.circuit_breaker.is_open())
     }
 
     fn weighted_select<'a>(&self, healthy: &[&'a ProviderTarget]) -> Option<&'a ProviderTarget> {
@@ -192,6 +220,80 @@ mod tests {
         let mut ctx = RequestCtx::new();
         let selected = selector.select(&candidates, &mut ctx).unwrap();
         assert_eq!(selected.name, "fallback");
+    }
+
+    /// A candidate whose breaker has a 1-second fail window, already tripped
+    /// `failures` times — half-open-eligible once that window elapses.
+    fn make_probe_target(name: &str, failures: u32) -> ProviderTarget {
+        let breaker = Arc::new(CircuitBreaker::new(1, 1));
+        for _ in 0..failures {
+            breaker.record_failure();
+        }
+        ProviderTarget {
+            name: name.to_string(),
+            state: Arc::new(ProviderState {
+                kind: maxllm_config::ProviderKind::OpenAI,
+                translator: Box::new(maxllm_translate::openai::OpenAITranslator),
+                circuit_breaker: breaker,
+                api_key: String::new(),
+                host: "localhost".to_string(),
+                port: 443,
+                tls: true,
+                sni: "localhost".to_string(),
+                region: None,
+                weight: 100,
+                tags: vec![],
+                default_model: None,
+                native_responses: false,
+                responses_path: None,
+                connect_timeout: std::time::Duration::from_secs(10),
+                total_connect_timeout: None,
+                utc_offset_minutes: 0,
+            }),
+            is_primary: false,
+            cost_per_1m: None,
+        }
+    }
+
+    /// Regression for the 2026-11-08 outage: selecting one provider out of a
+    /// healthy list must reserve the half-open probe slot of *that* provider
+    /// only. Every candidate the selector inspected and rejected has to stay
+    /// untouched — the old filter called `is_open()` on all of them, which
+    /// transitioned each one to half-open and reserved its only probe slot for
+    /// a request that never came.
+    #[test]
+    fn test_selection_only_reserves_the_chosen_providers_probe_slot() {
+        let candidates: Vec<ProviderTarget> = (0..3)
+            .map(|i| make_probe_target(&format!("probe-{i}"), 1))
+            .collect();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        let selector = ProviderSelector::new(RoutingStrategy::Fallback);
+        let mut ctx = RequestCtx::new();
+        let selected = selector.select(&candidates, &mut ctx).unwrap();
+        assert_eq!(selected.name, "probe-0");
+
+        // Only the selected provider entered half-open (the raw state, not
+        // the projected `effective_state`, which reports half-open for every
+        // eligible breaker).
+        assert_eq!(
+            candidates[0].state.circuit_breaker.state(),
+            crate::circuit_breaker::STATE_HALF_OPEN
+        );
+        for c in &candidates[1..] {
+            assert_eq!(
+                c.state.circuit_breaker.state(),
+                crate::circuit_breaker::STATE_CLOSED,
+                "an inspected-but-rejected candidate must not be transitioned"
+            );
+        }
+
+        // The chosen provider's probe slot is held by the request...
+        assert!(candidates[0].state.circuit_breaker.is_open());
+        // ...while the rejected candidates still admit a probe, i.e. the
+        // inspection never consumed their slots.
+        assert!(!candidates[1].state.circuit_breaker.is_open());
+        assert!(!candidates[2].state.circuit_breaker.is_open());
     }
 
     /// A candidate with an explicit blended price (cost-based ranking key).

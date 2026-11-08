@@ -386,6 +386,49 @@ Anthropic `cache_read_input_tokens`），落在 `ctx.cached_tokens_in`，暴露�
 pool_health 接 timer（5 min）；probe 显式传 `--provider kimi`；探针请求带
 `X-MaxLLM-Probe: 1` 并在指标中排除。
 
+### 7.1 修复（2026-11-08 18:1x CST）：熔断器"半开探针槽"泄漏 —— 13 个健康成员被永久 503
+
+**现象**：`pool_health.py` 报 25 个池成员里 16 个 `503 "All providers are unavailable
+(circuit breakers open)"`、耗时 0–1 ms（根本没碰上游），而同一时刻 `/health` 把它们
+全部列进 `half_open_providers`（语义是"等一次探测"）。其中包括 `ollama_local` ——
+本轮订正过的上游失败率 0.00% 的那家。
+
+**根因**：`CircuitBreaker::is_open()` 既是**判定**又是**状态机驱动**：fail window
+结束后第一次被调用时，它把 `Closed→HalfOpen` 并 `pending_probes += 1`，占掉该 provider
+唯一的探测槽。而所有**过滤**路径（`ProviderSelector::select` 的候选遍历、
+`AutoPoolState::usable_entries`、`switch_to_fallback` 的池/链遍历）都对**每个**候选调用
+`is_open()`，于是被"看过但没被选中"的 provider 各占一个槽、永不释放
+（`pending_probes` 只在 HALF_OPEN 的 `record_success` / `record_http_failure` 里
+`fetch_sub`，而且**不落盘**）。之后它对任何请求都读作"开闸"→ 503，直到重启。
+12 个本地 GPU 端点 + `ollama_local` 就是这样被自己的路由读操作打死的。
+
+**修法**（`crates/maxllm-gateway/src/{circuit_breaker,routing,gateway}.rs`）：
+
+1. 新增**纯读** `CircuitBreaker::allows_traffic()`（`effective_state() != STATE_OPEN`，
+   不写任何原子量），所有过滤/判定路径改用它；
+2. `is_open()` 只在**最终被选中的那个 provider** 上调用一次（`ProviderSelector::select`
+   末尾、`select_from_auto_pool` / `next_fallback_provider` 的选取处）作为"准入 + 占槽"；
+   槽被并发探测占用时顺延到下一个健康候选，而不是让整条路由 503；
+3. 新增幂等、钳零的 `release_probe()`；`record_success` / `record_http_failure` 用它归还，
+   `logging()` 在请求终态无条件归还（覆盖探针流量、4xx failover、客户端中途断开这些
+   "不记账"路径）；
+4. 新增兜底 `reap_stale_probe()`：槽被占超过 2×`fail_timeout`（下限 120 s）视为泄漏并
+   回收 —— 任何遗漏的释放路径最多阻塞 120 s，而不是永久；
+5. `Closed→HalfOpen` 改用 `compare_exchange`（与 `Open→HalfOpen` 一致）；429 / 配额
+   强制开闸 / 流截断降级 / `restore()` 都顺手清空探测槽。
+
+**验证**（线上部署 `e2c87f4e…`，`NRestarts=0`，journal 0 error/panic）：
+
+| 指标 | 修复前 | 修复后 |
+|---|---|---|
+| `pool_health.py` BAD 503 | 16 / 25 | **4 / 25**（全部是 `kimi`/`volc_2`/`volc_t_1`/`zhipu_1` 的配额强制开闸，正确） |
+| `ollama_local` 定向请求 | 503 circuit open（0 ms） | 200，随后 `record_success` 关闭熔断（`/health` 的半开名单 −1） |
+| 本地 GPU 死端点 | 503 circuit open（把真实故障掩盖成"熔断"） | 502 `Upstream ConnectionClosed`（如实暴露） |
+| 新增回归测试 | — | `test_inspection_does_not_consume_a_probe_slot`（25 次纯读不占槽）、`test_a_stale_probe_slot_is_reclaimed`、`test_selection_only_reserves_the_chosen_providers_probe_slot` |
+
+注意：`auto_home` 那 11 个成员 502 是**上游真的没在跑**（家里 GPU 服务未启动），
+不是本缺陷；修复只是让它们从"被误报成 503 熔断"变成"如实报 502"。
+
 ---
 
 ## 8. P2：小项
@@ -518,6 +561,7 @@ EOF
 | P0-3 缓存命中采集 | ✅ 已修（采集侧） | `ctx.cached_tokens_in` + `copy_cached_tokens()` 统一解析三种形态；`extract_usage` 与 `copy_usage_tokens` 合流（原来两份手抄，缓存字段只会在一条路径上被读到）；新增 `maxllm_cached_input_tokens_total{provider,model}`（`tokens_in_total` 的子集）+ 完成日志 `cached_in` | 单测 `test_cached_input_tokens_are_extracted_on_every_shape`（chat/Responses/Anthropic/无该字段）与 `test_buffered_and_streamed_usage_agree`；线上指标已出数（§3.1） |
 | P0-3 缓存折价计价 | ✅ 已修（计价侧） | 价格表新增可选 `cached_input_per_1m`（`[model_costs."…"]` 每行，`#[serde(default)]` 省略即保持现状）；`CostCalculator` 新增 `cache_rates`（exact 优先、glob 兜底）+ `set_cache_rate()` / `cache_rate_for()` + `calculate_cost_with_cache(model, in, out, cached)`（cached 钳制到 in，接口不破坏：旧 `calculate_cost()` 内部转调、cached=0）；内置 `MiniMax-M3 → $0.05`；`gateway` 按配置 `set_cache_rate` 并用 `ctx.cached_tokens_in` 计价 | 3 条单测钉住折价/钳制/glob 覆盖；线上 minimax 单请求记账从 ~$0.055 降到 ~$0.010 量级（99.5% input 按 $0.05 计）；**未配置 `cached_input_per_1m` 的模型一律按 list 计**，刻意为之（渠道缓存价未知时不低估） |
 | P0-3 价格表复核 | ✅ 已核对（未改价） | `minimax`/`MiniMax-M3` 6 小时 1 290 请求、119.2M in / 0.51M out 记 $36.379，与内置 $0.30/M + $1.20/M 复算值 $36.377 一致，也与厂商公开价一致；**该数字是全 list 价 ⇒ 是上限**（缓存折价见下一行） | 反推单价 $0.3051/M 与配置单价吻合，排除重复计费/单位错位 |
+| P1 熔断器探针槽泄漏（旁路发现） | ✅ 已修 | `is_open()` 兼作状态机驱动，而**过滤**路径对每个候选都调用它 ⇒ 被"看过却没选中"的 provider 各占一个 probe 槽且永不释放（`pending_probes` 不落盘）⇒ 永久 503。修法：纯读 `allows_traffic()` 走所有过滤；`is_open()` 只在选中的 provider 上调用一次；幂等钳零 `release_probe()` + `logging()` 终态归还 + 2×`fail_timeout` 兜底回收；`Closed→HalfOpen` 改 CAS | 线上 `pool_health.py` BAD 503 **16/25 → 4/25**（仅剩 4 家配额强制开闸）；`ollama_local` 定向 503 → 200 并关闭熔断；3 条新回归测试；unit 162→165、integration 124(+4 ignored) 全绿 |
 
 ### 仍未做（需拍板或有前置）
 

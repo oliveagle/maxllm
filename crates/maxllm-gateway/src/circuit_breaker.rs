@@ -37,6 +37,10 @@ pub struct CircuitBreaker {
     successes_half_open: AtomicU32,
     /// In-flight probes in half-open (bounds concurrent probing).
     pending_probes: AtomicU32,
+    /// When the most recent half-open probe slot was reserved (ms epoch;
+    /// 0 = none). Used only to reclaim a slot a request never released —
+    /// see `reap_stale_probe`.
+    last_probe_admit_ms: AtomicU64,
     last_failure_at: AtomicU64,
     max_fails: u32,
     fail_timeout_ms: u64,
@@ -104,6 +108,7 @@ impl CircuitBreaker {
             failures: AtomicU32::new(0),
             successes_half_open: AtomicU32::new(0),
             pending_probes: AtomicU32::new(0),
+            last_probe_admit_ms: AtomicU64::new(0),
             last_failure_at: AtomicU64::new(0),
             max_fails: max_fails.max(1),
             fail_timeout_ms: fail_timeout_secs * 1000,
@@ -121,13 +126,35 @@ impl CircuitBreaker {
         }
     }
 
-    /// Returns true if the circuit is open (provider should be skipped).
+    /// Pure read: would a routing decision consider this provider usable?
     ///
-    /// This doubles as the state machine driver: called from the routing path,
-    /// it advances Open→HalfOpen when the fail window elapses and HalfOpen→
-    /// Closed once enough probes succeeded. All transitions are atomic and
-    /// idempotent, so concurrent callers cannot corrupt the breaker.
+    /// This is the one predicate a *filter* may use — it inspects a candidate
+    /// without advancing its state machine and without reserving a half-open
+    /// probe slot. A route walks every candidate of a route (twenty-five for
+    /// the auto pool) and only ever picks one; the old `is_open()` was used
+    /// there, so each inspected provider transitioned Closed→HalfOpen and
+    /// consumed its single probe slot, and twelve pool entries ended up
+    /// permanently half-open answering `503 circuit breakers open` (the
+    /// 2026-11-08 pool-health probe saw 16 of 25 members in that state).
+    pub fn allows_traffic(&self) -> bool {
+        // Reclaim a probe slot a request never released before deciding.
+        self.reap_stale_probe();
+        self.effective_state() != STATE_OPEN
+    }
+
+    /// Reserve the one half-open probe slot for the provider that will
+    /// actually serve a request.
+    ///
+    /// Exactly one call per selected provider: it advances the state machine
+    /// (Closed→HalfOpen on the first request after the fail window elapses)
+    /// and bounds concurrent probes to `half_open_max`. Returns `true` when
+    /// the circuit is open and the request must go elsewhere; `false` when
+    /// the request may use this provider. Every admission is balanced by a
+    /// `release_probe()` when the request finishes.
     pub fn is_open(&self) -> bool {
+        // A leaked slot (a request that ended without releasing) must not
+        // keep this provider blocked forever.
+        self.reap_stale_probe();
         let now = now_ms();
 
         // Quota force-open takes precedence over everything.
@@ -141,6 +168,7 @@ impl CircuitBreaker {
             self.failures.store(0, Ordering::Relaxed);
             self.successes_half_open.store(0, Ordering::Relaxed);
             self.pending_probes.store(0, Ordering::Relaxed);
+            self.last_probe_admit_ms.store(0, Ordering::Relaxed);
             self.state.store(STATE_CLOSED, Ordering::Relaxed);
             return false;
         }
@@ -158,13 +186,25 @@ impl CircuitBreaker {
                     self.state_transitions.fetch_add(1, Ordering::Relaxed);
                     return true;
                 }
-                // Fail window elapsed → half-open. This caller becomes the
-                // first probe request and occupies one probe slot.
-                self.state.store(STATE_HALF_OPEN, Ordering::Relaxed);
-                self.successes_half_open.store(0, Ordering::Relaxed);
-                self.state_transitions.fetch_add(1, Ordering::Relaxed);
-                let admitted = self.pending_probes.fetch_add(1, Ordering::Relaxed);
-                admitted >= self.half_open_max
+                // Fail window elapsed → half-open. CAS so exactly one caller
+                // performs the transition; the winner becomes the first probe
+                // request and occupies one probe slot.
+                if self
+                    .state
+                    .compare_exchange(
+                        STATE_CLOSED,
+                        STATE_HALF_OPEN,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+                {
+                    self.successes_half_open.store(0, Ordering::Relaxed);
+                    self.state_transitions.fetch_add(1, Ordering::Relaxed);
+                }
+                // Re-evaluate as a half-open caller (the CAS may have been
+                // lost to a concurrent transition).
+                self.half_open_admission()
             }
             STATE_OPEN => {
                 let last = self.last_failure_at.load(Ordering::Relaxed);
@@ -185,8 +225,6 @@ impl CircuitBreaker {
                 {
                     self.successes_half_open.store(0, Ordering::Relaxed);
                     self.state_transitions.fetch_add(1, Ordering::Relaxed);
-                    let admitted = self.pending_probes.fetch_add(1, Ordering::Relaxed);
-                    return admitted >= self.half_open_max;
                 }
                 // Lost the CAS race — another thread already transitioned to
                 // half-open; evaluate as a half-open caller.
@@ -206,15 +244,56 @@ impl CircuitBreaker {
             self.failures.store(0, Ordering::Relaxed);
             self.successes_half_open.store(0, Ordering::Relaxed);
             self.pending_probes.store(0, Ordering::Relaxed);
+            self.last_probe_admit_ms.store(0, Ordering::Relaxed);
             self.state_transitions.fetch_add(1, Ordering::Relaxed);
             return false;
         }
         let admitted = self.pending_probes.fetch_add(1, Ordering::Relaxed);
+        if admitted == 0 {
+            // The first slot of a new probe window: remember when it was
+            // reserved so a request that never releases it can be reclaimed.
+            self.last_probe_admit_ms.store(now_ms(), Ordering::Relaxed);
+        }
         if admitted >= self.half_open_max {
             self.pending_probes.fetch_sub(1, Ordering::Relaxed);
             return true;
         }
         false
+    }
+
+    /// Give back one half-open probe slot, if any is held.
+    ///
+    /// Idempotent and clamped at zero: a late stream completion may release a
+    /// slot the staleness reaper already reclaimed, and an underflow would
+    /// wrap the counter to `u32::MAX` and permanently block the provider.
+    pub fn release_probe(&self) {
+        let _ = self
+            .pending_probes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1));
+    }
+
+    /// Reclaim a probe slot that has been held for longer than two fail
+    /// windows without ever being released.
+    ///
+    /// The routing path is not the only way a slot can leak: a health probe
+    /// deliberately books no breaker outcome, a client can hang up mid-stream,
+    /// and a 4xx that fails over never records anything. Without this a single
+    /// leaked slot left a provider half-open for ever, answering
+    /// `503 circuit breakers open` until the gateway restarted.
+    fn reap_stale_probe(&self) {
+        if self.pending_probes.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let since = self.last_probe_admit_ms.load(Ordering::Relaxed);
+        if since == 0 {
+            return; // a slot predating the timestamp bookkeeping
+        }
+        let stale_after = self.fail_timeout_ms.saturating_mul(2).max(120_000);
+        if now_ms().saturating_sub(since) <= stale_after {
+            return;
+        }
+        self.pending_probes.store(0, Ordering::Relaxed);
+        self.last_probe_admit_ms.store(0, Ordering::Relaxed);
     }
 
     /// Force-open the circuit until an absolute epoch-ms instant.
@@ -232,6 +311,10 @@ impl CircuitBreaker {
             .store(reset_at_ms, Ordering::Relaxed);
         self.state.store(STATE_OPEN, Ordering::Relaxed);
         self.failures.store(self.max_fails, Ordering::Relaxed);
+        // No probe can be in flight against an open circuit: the slot of the
+        // request that just hit the quota wall (if it held one) is returned.
+        self.pending_probes.store(0, Ordering::Relaxed);
+        self.last_probe_admit_ms.store(0, Ordering::Relaxed);
         self.quota_opens.fetch_add(1, Ordering::Relaxed);
         self.state_transitions.fetch_add(1, Ordering::Relaxed);
     }
@@ -256,6 +339,10 @@ impl CircuitBreaker {
             // force-open check path.
             self.state.store(STATE_OPEN, Ordering::Relaxed);
             self.failures.store(self.max_fails, Ordering::Relaxed);
+            // The probe that saw the 429 is finished; it must not keep
+            // holding the half-open slot while the circuit is force-open.
+            self.pending_probes.store(0, Ordering::Relaxed);
+            self.last_probe_admit_ms.store(0, Ordering::Relaxed);
             self.quota_opens.fetch_add(1, Ordering::Relaxed);
             self.state_transitions.fetch_add(1, Ordering::Relaxed);
             return;
@@ -263,8 +350,10 @@ impl CircuitBreaker {
 
         match self.state.load(Ordering::Relaxed) {
             STATE_HALF_OPEN => {
-                // A probe failed → back to open.
-                self.pending_probes.fetch_sub(1, Ordering::Relaxed);
+                // A probe failed → back to open. Hand the slot back before
+                // clearing the counter so a concurrent release cannot
+                // underflow it.
+                self.release_probe();
                 self.state.store(STATE_OPEN, Ordering::Relaxed);
                 self.failures.store(self.max_fails, Ordering::Relaxed);
                 self.last_failure_at.store(now, Ordering::Relaxed);
@@ -335,6 +424,9 @@ impl CircuitBreaker {
         self.state.store(STATE_OPEN, Ordering::Relaxed);
         self.failures.store(self.max_fails, Ordering::Relaxed);
         self.last_failure_at.store(now, Ordering::Relaxed);
+        // The circuit is now open, so no probe slot may stay reserved.
+        self.pending_probes.store(0, Ordering::Relaxed);
+        self.last_probe_admit_ms.store(0, Ordering::Relaxed);
         self.state_transitions.fetch_add(1, Ordering::Relaxed);
         self.stream_opens.fetch_add(1, Ordering::Relaxed);
         // Start a fresh window: after the cool-down the provider must earn its
@@ -360,13 +452,16 @@ impl CircuitBreaker {
     pub fn record_success(&self) {
         match self.state.load(Ordering::Relaxed) {
             STATE_HALF_OPEN => {
-                self.pending_probes.fetch_sub(1, Ordering::Relaxed);
+                // The probe finished: return its slot (clamped, because the
+                // staleness reaper may already have reclaimed it).
+                self.release_probe();
                 let successes = self.successes_half_open.fetch_add(1, Ordering::Relaxed) + 1;
                 if successes >= self.successes_to_close {
                     self.state.store(STATE_CLOSED, Ordering::Relaxed);
                     self.failures.store(0, Ordering::Relaxed);
                     self.successes_half_open.store(0, Ordering::Relaxed);
                     self.pending_probes.store(0, Ordering::Relaxed);
+                    self.last_probe_admit_ms.store(0, Ordering::Relaxed);
                     self.state_transitions.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -492,6 +587,7 @@ impl CircuitBreaker {
         self.successes_half_open
             .store(row.successes_half_open, Ordering::Relaxed);
         self.pending_probes.store(0, Ordering::Relaxed);
+        self.last_probe_admit_ms.store(0, Ordering::Relaxed);
         self.last_failure_at
             .store(row.last_failure_at, Ordering::Relaxed);
         self.state.store(row.state, Ordering::Relaxed);
@@ -642,6 +738,65 @@ mod tests {
         assert!(cb.is_open());
         cb.record_success();
         assert!(!cb.is_open());
+    }
+
+    /// Regression for the 2026-11-08 pool-health outage: merely *inspecting*
+    /// a provider must not consume its half-open probe slot.
+    ///
+    /// The routing path walks every candidate of a route / every entry of the
+    /// auto pool and only ever picks one. When the filter called `is_open()`,
+    /// each inspected provider transitioned Closed→HalfOpen and reserved its
+    /// single probe slot for a request that never came — sixteen of the
+    /// twenty-five pool members ended up permanently half-open and answered
+    /// `503 circuit breakers open` until the gateway was restarted.
+    #[test]
+    fn test_inspection_does_not_consume_a_probe_slot() {
+        let cb = CircuitBreaker::new(1, 1);
+        cb.record_failure();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        // The fail window has elapsed: the next request may probe.
+        assert_eq!(cb.effective_state(), STATE_HALF_OPEN);
+
+        // Twenty-five read-only inspections (one per pool member) must leave
+        // the slot free.
+        for _ in 0..25 {
+            assert!(cb.allows_traffic(), "half-open providers stay eligible");
+        }
+
+        // The provider is still admitted when the request actually picks it.
+        assert!(
+            !cb.is_open(),
+            "25 inspections must not have reserved the probe slot"
+        );
+        // Admitted → the single slot is occupied; a second probe is refused.
+        assert!(cb.is_open(), "half_open_max=1 must bound concurrent probes");
+        // Releasing the slot (what the request's terminal path does) frees it.
+        cb.release_probe();
+        assert!(!cb.is_open(), "a released slot must admit the next probe");
+    }
+
+    /// A request that ends without booking an outcome (client abort, a 4xx
+    /// that fails over, a health probe) must not leave its provider blocked
+    /// for ever: a slot held for longer than two fail windows is reclaimed.
+    #[test]
+    fn test_a_stale_probe_slot_is_reclaimed() {
+        let cb = CircuitBreaker::new(1, 1);
+        cb.record_failure();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        assert!(!cb.is_open(), "first probe admitted");
+        // Pretend the request that held the slot vanished: backdate the
+        // admission stamp beyond the staleness threshold (two fail windows,
+        // floored at 120 s).
+        cb.last_probe_admit_ms
+            .store(now_ms().saturating_sub(200_000), Ordering::Relaxed);
+        assert!(
+            cb.allows_traffic(),
+            "an expired slot must not keep the provider blocked"
+        );
+        assert!(
+            !cb.is_open(),
+            "the leaked slot must have been reclaimed, admitting a new probe"
+        );
     }
 
     /// A provider that truncates a large share of its streams must be demoted,
