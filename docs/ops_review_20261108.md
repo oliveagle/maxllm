@@ -1294,10 +1294,19 @@ minimax 在 19:07:37Z 打出最后一发、耗时 **88 903 ms** 后整条 sessio
 | 中位数而非 EWMA | 取窗口样本的中位数（偶数取靠上中间） | 单个 90 s 离群定不了 provider 的生死 |
 | 冷样本降级 | `warm = cached_tokens_in × 2 ≥ tokens_in`（命中 ≥50% 才算 warm）；窗口内有 warm 就只用 warm 中位数；没有 warm 且样本 `< 5` → `None`；≥5 才退化取全冷中位数 | 不拿「全前缀 prefill」判 provider；同时保证从不报 cache hit 的 provider 仍可测、pin 逃得掉 |
 
-**门禁**：`cargo fmt --check` / `cargo test`（gateway 63 + translate 184 + admin 139 +
-doc-tests，**0 failed**）/ `cargo clippy --all-targets -- -D warnings` 全绿。
+**门禁**：`cargo fmt --check` / `cargo test`（admin 63 + gateway unit 185 + gateway
+integration 139 passed / 4 ignored + translate 242 + doc-tests 1，**0 failed**）/
+`cargo clippy --all-targets -- -D warnings` 全绿。
 新增 5 个单测（中位数、单离群不动、证据过期、冷不压热、纯冷 5 发仍可测）+ 2 个集成测试
-改用 `openai_response_warm`（否则 mock 不报 `cached_tokens` → 全判冷 → 测不到行为）。
+改用 `openai_response_warm`（否则 mock 不报 `cached_tokens` → 全判冷 → 测不到行为）；
+再补 1 个回归测试 `cohort_readmits_a_provider_whose_evidence_aged_out`（`f274c7c`，
+证据过期后重新进入 cohort，同时断言档位中位数变严、慢样本仍被排除）。
+
+**CI**：push 不触发 Actions（仓库是手动 `workflow_dispatch`），已补跑
+`gh workflow run CI --ref main` → run **`42528882208`**（2026-11-09 22:10Z 触发），
+Format / Check / Clippy / Test / Responses policy / Ops scripts / Build Release **七项全绿**
+（Docker Build & Push 按条件跳过）；仅剩官方 runner 的 Node.js 20 弃用与 ubuntu-latest
+迁移预告两条 annotation，与本次改动无关。
 
 **双机部署（2026-11-09 05:45 / 05:47 CST）**：musl static-pie release，
 sha256 `787844f3f5205ea7ba9f7f92b654d078f9441d87040421251240d009d2efe738`；备份
