@@ -129,16 +129,21 @@ PANELS: list[tuple[str, str, str, str, str]] = [
         "Prompt cache hit rate by provider",
         "(sum by (provider) (increase(maxllm_cached_input_tokens_total[30m]))"
         " or (sum by (provider) (increase(maxllm_tokens_in_total[30m])) * 0))"
-        " / clamp_min(sum by (provider) (increase(maxllm_tokens_in_total[30m])), 1)",
+        " / clamp_min(sum by (provider) (increase(maxllm_tokens_in_total[30m])), 1)"
+        " and sum by (provider) (increase(maxllm_tokens_in_total[30m])) > 10000",
         "maxllm_cached_input_tokens_total",
         "percentunit",
         "Share of prompt tokens each upstream served from its prompt cache —"
         " the cache-utilisation number the gateway is tuned against (target:"
         " every provider above 95%). The `or ... * 0` arm keeps a provider"
-        " sitting at an absolute 0% on the chart: the cached-tokens counter"
+        " serving with an absolute 0% on the chart: the cached-tokens counter"
         " only gains a series once a request reports a non-zero cached count,"
         " so without it a cold provider would silently disappear instead of"
-        " reading as a failure.",
+        " reading as a failure. The trailing `and ... > 10000` floor removes"
+        " the opposite distortion — a provider with no meaningful traffic in"
+        " the window (idle, or a health probe sending a few dozen tokens) has"
+        " no rate to report, and rendering it as 0% reads as a broken cache"
+        " rather than as nothing to measure.",
     ),
     (
         "Breakers open",

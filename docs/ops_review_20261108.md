@@ -1153,6 +1153,9 @@ python3 cache_hit.py --since 2026-11-08T18:24:00Z   # 或 --last-minutes N
 
 `scripts/openobserve_dashboard.py --apply` → dashboard `7525075825075421184`：
 **21 → 22 panels**，新增 “Prompt cache hit rate by provider”（查询带 `or ... * 0` 零填充）。
+复测阶段给该查询补了一道 `and ... > 10000` 活动量下限：30 分钟窗口里没有实质流量的
+provider（空闲、或只有几十 token 的健康探针）本来就没有命中率可言，却会被 `or ... * 0`
+渲染成 0% 红条；下限把它们从图上摘掉，0% 只留给「在服务但一发都没命中」的真冷 provider。
 
 ### 14.8 双机部署（2026-11-09 02:23 / 02:24 CST）
 
