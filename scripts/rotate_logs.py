@@ -13,6 +13,12 @@ Recording files (``recordings/YYYY-MM-DDTHH.jsonl``) hold full request and
 response bodies, so they are also retained for a bounded number of days rather
 than forever.
 
+Dated binary backups written next to the server
+(``maxllm-server.bak-YYYYMMDD-<stamp>``) are pruned to the newest
+``--bin-keep``; a deploy that keeps its previous binary "just in case"
+otherwise leaves one 32 MB copy per deploy on the disk. Hand-named archives
+(``.bak-pre-auto``, ``.disabled-*``) are left alone.
+
 Usage::
 
     python3 scripts/rotate_logs.py --dir logs --recordings-dir recordings
@@ -24,6 +30,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import os
+import re
 import shutil
 import sys
 import time
@@ -88,6 +95,38 @@ def prune_recordings(directory: str, days: int, dry_run: bool) -> list[str]:
     return removed
 
 
+# Only dated deploy backups (``maxllm-server.bak-20261108-213916``) are
+# rotated. A hand-named archive (``.bak-pre-auto``, ``.bak-20261107-2201`` is
+# dated, ``.disabled-20261108``) is a deliberate keep and is never touched.
+DATED_BACKUP = re.compile(r"\.bak-\d{8}-")
+
+
+def prune_binary_backups(directory: str, keep: int, dry_run: bool) -> list[str]:
+    """Delete stale dated ``*.bak-YYYYMMDD-*`` binaries, keeping the newest `keep`."""
+    removed: list[str] = []
+    if keep < 0:
+        return removed
+    try:
+        names = [n for n in os.listdir(directory) if DATED_BACKUP.search(n)]
+    except FileNotFoundError:
+        return removed
+    stamped = []
+    for name in names:
+        path = os.path.join(directory, name)
+        try:
+            stamped.append((os.path.getmtime(path), path))
+        except OSError:
+            continue
+    stamped.sort(reverse=True)
+    for _, path in stamped[keep:]:
+        removed.append(path)
+        if dry_run:
+            print(f"would prune {path}")
+        else:
+            os.unlink(path)
+    return removed
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -98,6 +137,12 @@ def main() -> int:
     parser.add_argument("--keep", type=int, default=2, help="rotated generations to keep")
     parser.add_argument("--recordings-dir", default=None, help="prune recordings/*.jsonl here")
     parser.add_argument("--recordings-days", type=int, default=14)
+    parser.add_argument(
+        "--bin-dir",
+        default=None,
+        help="prune *.bak-* binaries here, keeping the newest --bin-keep",
+    )
+    parser.add_argument("--bin-keep", type=int, default=5)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -112,10 +157,15 @@ def main() -> int:
     if args.recordings_dir:
         pruned = prune_recordings(args.recordings_dir, args.recordings_days, args.dry_run)
 
+    pruned_bins = []
+    if args.bin_dir:
+        pruned_bins = prune_binary_backups(args.bin_dir, args.bin_keep, args.dry_run)
+
     stamp = dt.datetime.now().astimezone().isoformat(timespec="seconds")
     verb = "would rotate" if args.dry_run else "rotated"
     print(
-        f"{stamp} {verb} {len(rotated)} log(s), pruned {len(pruned)} recording file(s)",
+        f"{stamp} {verb} {len(rotated)} log(s), pruned {len(pruned)} recording file(s), "
+        f"pruned {len(pruned_bins)} binary backup(s)",
         file=sys.stderr,
     )
     return 0

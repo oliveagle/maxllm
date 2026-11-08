@@ -936,7 +936,22 @@ OPENOBSERVE_ENDPOINT=<...> OPENOBSERVE_AUTH=<...> \
 覆盖了「选中 provider 是池成员」的主路；剩余「选中 provider 不在池里」分支现在会 WARN
 点名 provider/pool。不改写显式模型语义，因为该分支已无实际流量。
 
-### 13.5 仍未做（不变）
+### 13.5 二进制备份堆叠（本轮顺手清掉）
+
+部署习惯是 `cp -p maxllm-server maxllm-server.bak-<stamp>-<label>` 再换新的。一天下了
+NAS 上堆到 **39 个 32 MB 的 `.bak-*`**（`~/opt/maxllm/bin` 657 MB，根分区 78%），
+本机 5 个。已给 `rotate_logs.py` 加 `--bin-dir` / `--bin-keep`（默认留最新 5 个），
+只轮转**带日期戳**的部署备份（`.bak-YYYYMMDD-*`）；手工命名的归档
+（`.bak-pre-auto` / `.bak-pre-v020` / `.bak-pre-v032`）和 `.disabled-*` 一律不碰。
+NAS 上实测清掉 31 个（657 MB → 156 MB），并把 `--bin-dir bin --bin-keep 5` 写进
+`maxllm-logrotate.service` 的 ExecStart；本机 oleFedora01 原先**根本没有**这个 timer，
+本轮补建了同样的 service+timer（每日 00:00 + 开机 10 min，`Persistent=true`）。
+两个脚本（`rotate_logs.py` / `redact_recordings.py`）此前零测试，本轮补了
+`scripts/tests/test_ops_scripts.py`（11 个用例：O_APPEND 语义下的 copy-then-truncate、
+按龄清 recordings、按 mtime 留最新 N 个备份且不碰归档、脱敏键/value 哨兵/PII 可选/
+未改动分片不动 mtime），并作为 CI 的 `Ops scripts` job 接线。
+
+### 13.6 仍未做（不变）
 
 `open_design` 是否移出 auto 池、是否发版（bump 0.3.11 或补打 `v0.3.10` tag）、
 告警 webhook 换真实出口、VPS 0.3.8 → 0.3.10 升级 —— 四项都需要用户拍板或凭据。
