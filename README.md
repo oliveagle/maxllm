@@ -56,7 +56,7 @@ A high-performance AI gateway built on [Pingora](https://github.com/cloudflare/p
 
 ## Features
 
-- **16 LLM providers** &mdash; OpenAI, Anthropic, Gemini, Azure, Bedrock, Groq, Together, Fireworks, Mistral, xAI, DeepSeek, Ollama, Cohere, DeepInfra, OpenCode, Command Code, and any OpenAI-compatible endpoint
+- **17 LLM providers** &mdash; OpenAI, Anthropic, Gemini, Azure, Bedrock, Groq, Together, Fireworks, Mistral, xAI, DeepSeek, Ollama, Cohere, DeepInfra, OpenCode, Command Code, OpenDesign, and any OpenAI-compatible endpoint
 - **Three input modes** &mdash; OpenAI-format with translation, native provider format (Anthropic Messages API, Gemini, etc.), or raw pass-through
 - **Streaming support** &mdash; SSE streaming with real-time format translation (Anthropic SSE, Gemini SSE, Cohere SSE &rarr; OpenAI SSE)
 - **Smart routing** &mdash; Fallback chains, weighted load balancing, round-robin, least-connections, with per-provider circuit breakers
@@ -238,6 +238,7 @@ curl http://localhost:8080/passthrough/openai/v1/embeddings \
 | Cohere | `cohere` | Full translation | Bearer token |
 | OpenCode (opencode.ai "zen") | `opencode` | OpenAI-compatible + strict schema | Bearer token |
 | Command Code (commandcode.ai) | `commandcode` | OpenAI-compatible + native Responses + Anthropic Messages | Bearer token |
+| OpenDesign (open-design.ai) | `open_design` | OpenAI-compatible + native Responses | Bearer token |
 | Custom | `openai_compat` | OpenAI-compatible | Configurable |
 
 > **AWS Bedrock** authenticates with AWS Signature V4. Credentials are read
@@ -677,6 +678,84 @@ endpoint_type = "responses"
 The full vendor catalogue (ids, context lengths and the endpoints each model
 is served on) is published at `GET https://api.commandcode.ai/provider/v1/models`
 — the gateway advertises only the models a deployment actually configures.
+
+## OpenDesign (open-design.ai) provider
+
+`kind = "open_design"` proxies the OpenDesign **AMR link** — the
+OpenAI-compatible endpoint the design workspace's cloud runtime reaches its
+model vendors through. One `sk-amr-…` key, one credit balance, the models the
+account's plan carries:
+
+| Upstream path | Contract | Serves |
+|---------------|----------|--------|
+| `/v1/responses` | OpenAI Responses | every chat model (native, streaming) |
+| `/v1/chat/completions` | OpenAI Chat Completions | every chat model |
+| `/v1/models` | OpenAI model list | the account's catalogue |
+
+**The gateway speaks the link natively — no CLI is involved.** Nothing is
+shelled out to: the `od` / `vela` binaries are never spawned, the link's
+protocol is implemented in Rust
+(`crates/maxllm-translate/src/open_design.rs`), and the workspace's own
+account management stays where it belongs (the OpenDesign app).
+
+What the gateway does with it:
+
+* **Responses first** — the link serves the Responses contract natively
+  (verified 2026-11-08 against the live endpoint: `POST /v1/responses`
+  answers a Responses object, and `stream: true` emits the `response.*` SSE
+  event family), so `kind = "open_design"` defaults to
+  `native_responses = true` and `/v1/responses` requests are forwarded
+  byte-for-byte to `/v1/responses`. `store`, `previous_response_id`,
+  `include`, `reasoning.effort` and `text.verbosity` all survive the forward.
+* **`tool_choice: "any"` is rewritten** — the link rejects the non-standard
+  value with HTTP 400 `upstream_error` (codex-cli sends it), so the gateway
+  rewrites it to `"required"`, the OpenAI value with the same meaning.
+  `"auto"`, `"none"` and `"required"` are forwarded untouched.
+* **Bearer auth** — every route authenticates with
+  `Authorization: Bearer <OPEN_DESIGN_API_KEY>`.
+* **The link's extensions survive** — the assistant message carries
+  `reasoning_details[]` (the OpenRouter shape) and the usage block carries
+  `prompt_tokens_details.cached_read_tokens` /
+  `completion_tokens_details.reasoning_tokens`. Both are passed through
+  verbatim; the gateway's own accounting reads the standard token fields.
+* **Unknown models fail over** — the link answers HTTP 404
+  `{"error":{"code":"model_not_found"}}`, which the gateway already treats as
+  a failover trigger, so a request for a model the account does not carry
+  walks the fallback chain instead of failing outright.
+* **Cost** — the link draws down a prepaid credit balance and reports no
+  per-request USD cost, so `deepseek-v4.1-flash` is booked at 0 (like the
+  other prepaid channels). Override it in
+  `[model_costs."deepseek-v4.1-flash"]` if you want the credit draw booked.
+
+```toml
+[providers.open_design]
+kind = "open_design"
+base_url = "https://amr-link.open-design.ai/v1"
+api_key = "${OPEN_DESIGN_API_KEY}"
+default_model = "deepseek-v4.1-flash"
+# native_responses defaults to true for kind = "open_design"
+# The gateway connects to the base_url's origin and routes to the link's own
+# paths (/v1/chat/completions, /v1/responses, /v1/models).
+
+[[routes]]
+path = "/v1/open-design"
+provider = "open_design"
+timeout_secs = 120
+plugins = ["rate_limiter", "cors"]
+
+# Per-provider path: declare it BEFORE any generic "/v1/responses" route
+# (route matching is prefix based, first match wins).
+[[routes]]
+path = "/v1/responses/open-design"
+provider = "open_design"
+endpoint_type = "responses"
+```
+
+The account's catalogue (which models it carries, their context limits and
+their credit tier) is published at `GET /v1/models` on the link. The gateway
+advertises the chat models OpenDesign's own runtime prefers —
+`deepseek-v4.1-flash`, `deepseek-v4-flash`, `deepseek-v4-pro` — and the
+`default_model` a deployment configures.
 
 ### Native Responses: required whenever the upstream serves it
 
@@ -1581,6 +1660,7 @@ OPTIONS:
 | `OPENAI_API_KEY` | OpenAI API key |
 | `ANTHROPIC_API_KEY` | Anthropic API key |
 | `GEMINI_API_KEY` | Google Gemini API key |
+| `OPEN_DESIGN_API_KEY` | OpenDesign AMR link key (`sk-amr-…`) |
 | `MAXLLM_MASTER_KEY` | Admin API master key |
 
 > **Note:** Always unset `HTTPS_PROXY` / `HTTP_PROXY` before running &mdash; Pingora routes through them and it breaks TLS to upstream providers.

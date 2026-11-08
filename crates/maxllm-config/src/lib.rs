@@ -464,6 +464,13 @@ pub enum ProviderKind {
     /// route that serves its Claude models).
     #[serde(rename = "commandcode")]
     CommandCode,
+    /// OpenDesign (open-design.ai) — the "AMR link" endpoint of the design
+    /// workspace. It speaks the OpenAI Chat Completions contract on
+    /// `/v1/chat/completions` and the OpenAI Responses contract natively on
+    /// `/v1/responses`; the link is authenticated with an `sk-amr-…` bearer
+    /// token.
+    #[serde(rename = "open_design")]
+    OpenDesign,
 }
 
 #[derive(Debug, Deserialize, Clone)]

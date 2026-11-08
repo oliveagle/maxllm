@@ -17,6 +17,7 @@ pub mod commandcode;
 pub mod formats;
 pub mod gemini;
 pub mod gemini_stream;
+pub mod open_design;
 pub mod openai;
 pub mod openai_compat;
 pub mod opencode;

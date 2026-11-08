@@ -149,6 +149,18 @@ fn well_known_models(kind: ProviderKind) -> &'static [&'static str] {
         // `GET https://api.commandcode.ai/provider/v1/models` — add a name
         // here when a deployment actually wants it advertised.
         ProviderKind::CommandCode => &["deepseek/deepseek-v4.1-flash"],
+        // The OpenDesign AMR link serves an account-specific catalogue
+        // (`GET /v1/models` on the live endpoint returned exactly one
+        // enabled model for the probed key: `deepseek-v4.1-flash`, marked
+        // `default: true`). The ids below are the chat models OpenDesign's
+        // own runtime prefers, in the order it ranks them
+        // (`PREFERRED_AMR_CHAT_MODEL_ORDER` in the open-design repo); a
+        // deployment pins the one its account carries with `default_model`.
+        ProviderKind::OpenDesign => &[
+            "deepseek-v4.1-flash",
+            "deepseek-v4-flash",
+            "deepseek-v4-pro",
+        ],
     }
 }
 
@@ -174,6 +186,9 @@ fn provider_owned_by(kind: ProviderKind) -> &'static str {
         // Matches the `owned_by` field commandcode.ai publishes in its own
         // model list.
         ProviderKind::CommandCode => "command-code",
+        // The OpenDesign AMR link publishes `owned_by: "vela"` in its own
+        // model list; maxllm names the provider it talks to.
+        ProviderKind::OpenDesign => "open-design",
     }
 }
 
@@ -416,6 +431,14 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
                     .as_deref()
                     .unwrap_or(maxllm_translate::commandcode::DEFAULT_CHAT_PATH),
             ),
+            // The OpenDesign link serves its Chat Completions route at
+            // /v1/chat/completions; the default is needed out here as well,
+            // because the native Responses path is derived from it.
+            ProviderKind::OpenDesign => Some(
+                conf.upstream_path
+                    .as_deref()
+                    .unwrap_or(maxllm_translate::open_design::DEFAULT_CHAT_PATH),
+            ),
             _ => conf.upstream_path.as_deref(),
         };
 
@@ -497,6 +520,17 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
                         .to_string(),
                 ))
             }
+            ProviderKind::OpenDesign => {
+                // The OpenDesign AMR link is OpenAI-compatible with one
+                // repair (tool_choice: "any" is rejected upstream) and
+                // serves the Responses contract natively.
+                Box::new(maxllm_translate::open_design::OpenDesignTranslator::new(
+                    name.clone(),
+                    effective_chat_path
+                        .unwrap_or(maxllm_translate::open_design::DEFAULT_CHAT_PATH)
+                        .to_string(),
+                ))
+            }
         };
 
         let url: url::Url = conf.base_url.parse().map_err(|e: url::ParseError| {
@@ -522,6 +556,11 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
                     effective_chat_path.unwrap_or(maxllm_translate::commandcode::DEFAULT_CHAT_PATH),
                 ) == maxllm_translate::commandcode::CommandCodeWire::ChatCompletions
             }
+            // The OpenDesign AMR link serves the Responses contract on
+            // /v1/responses (verified 2026-11-08 against the live endpoint:
+            // the route answers 200 with a Responses object and streams the
+            // response.* event family).
+            ProviderKind::OpenDesign => true,
             _ => false,
         });
         let responses_path = if native_responses {

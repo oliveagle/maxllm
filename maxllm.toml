@@ -261,6 +261,25 @@ default_model = "deepseek/deepseek-v4.1-flash"
 # api_key = "${CMD_API_KEY}"
 # default_model = "claude-sonnet-5-5"
 
+# OpenDesign (open-design.ai) — the design workspace's "AMR link" endpoint.
+# The workspace's cloud runtime reaches the model vendors through this
+# OpenAI-compatible link, authenticated with an `sk-amr-…` key:
+#   /v1/responses        — OpenAI Responses contract (native, streaming)
+#   /v1/chat/completions — OpenAI Chat Completions contract
+#   /v1/models           — the account's model catalogue
+# The Responses route is the default for kind = "open_design": /v1/responses
+# requests are forwarded to /v1/responses byte-for-byte.
+# The gateway speaks the link's protocol natively — no `od` / `vela` CLI is
+# spawned and no command is shelled out to.
+# The gateway connects to the base_url's origin and routes to the link's own
+# paths (/v1/chat/completions, /v1/responses, /v1/models); the `/v1` in the
+# base_url is the link's published API prefix.
+[providers.open_design]
+kind = "open_design"
+base_url = "https://amr-link.open-design.ai/v1"
+api_key = "${OPEN_DESIGN_API_KEY}"
+default_model = "deepseek-v4.1-flash"
+
 # --- Routes ---
 
 [[routes]]
@@ -293,6 +312,15 @@ plugins = ["rate_limiter", "cors"]
 [[routes]]
 path = "/v1/gemini"
 provider = "gemini"
+timeout_secs = 120
+plugins = ["rate_limiter", "cors"]
+
+# OpenDesign AMR link — the account's models behind one key. The gateway
+# speaks the link's protocol natively (OpenAI Chat Completions + the OpenAI
+# Responses contract).
+[[routes]]
+path = "/v1/open-design"
+provider = "open_design"
 timeout_secs = 120
 plugins = ["rate_limiter", "cors"]
 
@@ -329,6 +357,15 @@ plugins = []
 # [[routes]]
 # path = "/v1/responses/cmd"
 # provider = "cmd"
+# endpoint_type = "responses"
+# timeout_secs = 120
+# plugins = ["rate_limiter", "cors"]
+
+# The OpenDesign AMR link speaks the Responses contract natively too, so this
+# route forwards the body byte-for-byte to /v1/responses.
+# [[routes]]
+# path = "/v1/responses/open-design"
+# provider = "open_design"
 # endpoint_type = "responses"
 # timeout_secs = 120
 # plugins = ["rate_limiter", "cors"]

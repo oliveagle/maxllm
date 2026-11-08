@@ -7807,6 +7807,207 @@ async fn test_commandcode_native_messages_rewrites_the_path() {
     assert_eq!(requests[0].url.path(), "/provider/v1/messages");
 }
 
+const OPEN_DESIGN_CONFIG: &str = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[metrics]
+enabled = true
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.open_design]
+kind = "open_design"
+base_url = "{MOCK_URL}"
+api_key = "sk-amr-secret"
+default_model = "deepseek-v4.1-flash"
+
+[[routes]]
+path = "/v1/responses"
+provider = "open_design"
+endpoint_type = "responses"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "open_design"
+"#;
+
+#[tokio::test]
+async fn test_open_design_native_responses_passthrough() {
+    let mock = MockServer::start().await;
+
+    // The OpenDesign AMR link serves the Responses contract on
+    // /v1/responses. The request must land there byte-for-byte, with the
+    // link's bearer token.
+    let upstream_body = json!({
+        "id": "resp_od",
+        "object": "response",
+        "status": "completed",
+        "model": "deepseek-v4.1-flash",
+        "output": [{
+            "id": "msg_od",
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "hi"}]
+        }],
+        "usage": {"input_tokens": 11, "output_tokens": 5, "total_tokens": 16}
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .and(header("Authorization", "Bearer sk-amr-secret"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(upstream_body.clone()))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let gw = TestGateway::start(OPEN_DESIGN_CONFIG, &mock.uri()).await;
+    let c = client();
+
+    let request_body = json!({
+        "model": "deepseek-v4.1-flash",
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+        "stream": false,
+        "previous_response_id": "resp_prev"
+    });
+
+    let resp = c
+        .post(gw.url("/v1/responses"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&request_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["object"], "response");
+    assert_eq!(body["id"], "resp_od");
+    assert_eq!(body["output"][0]["content"][0]["text"], "hi");
+
+    // Byte-for-byte passthrough to the link's own Responses route.
+    let requests = mock.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].url.path(), "/v1/responses");
+    assert_eq!(requests[0].body, serde_json::to_vec(&request_body).unwrap());
+    let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert!(
+        sent.get("messages").is_none(),
+        "no chat translation happened"
+    );
+}
+
+#[tokio::test]
+async fn test_open_design_chat_completions_use_the_link_path() {
+    let mock = MockServer::start().await;
+
+    let upstream_body = json!({
+        "id": "chatcmpl_od",
+        "object": "chat.completion",
+        "model": "deepseek-v4.1-flash",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "hi",
+                "reasoning_details": [{
+                    "index": 0,
+                    "type": "reasoning.summary",
+                    "summary": "thinking"
+                }]
+            },
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("Authorization", "Bearer sk-amr-secret"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(upstream_body.clone()))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let gw = TestGateway::start(OPEN_DESIGN_CONFIG, &mock.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&chat_body("deepseek-v4.1-flash", "hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "hi");
+    // The link's reasoning_details array reaches the client untouched.
+    assert_eq!(
+        body["choices"][0]["message"]["reasoning_details"][0]["summary"],
+        "thinking"
+    );
+
+    let requests = mock.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(sent["model"], "deepseek-v4.1-flash");
+}
+
+#[tokio::test]
+async fn test_open_design_rewrites_tool_choice_any() {
+    let mock = MockServer::start().await;
+
+    // The link rejects the non-standard `tool_choice: "any"` with HTTP 400
+    // `upstream_error`; the gateway rewrites it to "required".
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl_od",
+            "object": "chat.completion",
+            "model": "deepseek-v4.1-flash",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "hi"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let gw = TestGateway::start(OPEN_DESIGN_CONFIG, &mock.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&json!({
+            "model": "deepseek-v4.1-flash",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tool_choice": "any"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let requests = mock.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(sent["tool_choice"], "required");
+}
+
 #[tokio::test]
 async fn test_commandcode_upstream_script_ua_replaced() {
     let mock = MockServer::start().await;

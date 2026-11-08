@@ -80,7 +80,7 @@ maxllm/
   crates/
     maxllm-config/        # TOML config parsing, env var expansion, validation
     maxllm-plugin/        # Plugin trait, chain executor, 14 built-in plugins
-    maxllm-translate/     # Provider translation (OpenAI <-> 16 providers)
+    maxllm-translate/     # Provider translation (OpenAI <-> 17 providers)
     maxllm-admin/         # Virtual keys, teams, cost tracking, budget enforcement, admin API
     maxllm-gateway/       # Main binary: Pingora ProxyHttp implementation + routing
 ```
@@ -95,7 +95,7 @@ maxllm/
 - **Lock-free circuit breaker**: Uses AtomicU32/AtomicU64 for per-provider failure tracking. No mutexes in the hot path.
 - **StreamTranslator wrapped in Mutex**: Pingora requires `CTX: Send + Sync`. The `StreamTranslator` trait object is `Send` but not `Sync`, so it's wrapped in `Mutex<Option<Box<dyn StreamTranslator>>>`.
 
-## Supported Providers (16)
+## Supported Providers (17)
 
 | Provider | Kind | Format | Auth |
 |----------|------|--------|------|
@@ -115,6 +115,7 @@ maxllm/
 | Cohere | `cohere` | Full translation | Bearer token |
 | OpenCode (zen) | `opencode` | OpenAI-compatible + strict schema | Bearer token |
 | Command Code | `commandcode` | OpenAI-compatible + native Responses + Anthropic Messages | Bearer token |
+| OpenDesign | `open_design` | OpenAI-compatible + native Responses | Bearer token |
 | Custom | `openai_compat` | OpenAI-compatible | Configurable |
 
 ## Plugin System
@@ -209,6 +210,7 @@ Built-in cost map for 10+ model families (gpt-4o, claude-sonnet, gemini-flash, e
 | Bedrock | OpenAI -> Anthropic (reuses Anthropic translator) | Anthropic -> OpenAI | Anthropic SSE -> OpenAI SSE |
 | OpenAI-compat | Passthrough | Passthrough | Passthrough |
 | Command Code | Passthrough (chat route) or OpenAI -> Anthropic (messages route) | Passthrough or Anthropic -> OpenAI | Passthrough or Anthropic SSE -> OpenAI SSE |
+| OpenDesign | Passthrough (chat route, `tool_choice: "any"` -> `"required"`) | Passthrough | Passthrough |
 
 ## Responses Contract Policy (MUST)
 
@@ -263,10 +265,11 @@ the full contract, is cheaper, and removes a whole class of translation bugs.
 
 ### Kinds that are native by default
 
-`opencode` and `commandcode` default to `native_responses = true` — their
-upstreams serve the Responses contract on their own route
-(`/zen/go/v1/responses` and `/provider/v1/responses` respectively), so the
-default is native and translation is the exception. A `commandcode` provider
+`opencode`, `commandcode` and `open_design` default to
+`native_responses = true` — their upstreams serve the Responses contract on
+their own route (`/zen/go/v1/responses`, `/provider/v1/responses` and
+`/v1/responses` respectively), so the default is native and translation is
+the exception. A `commandcode` provider
 entry whose `upstream_path` points at the Anthropic Messages route
 (`/provider/v1/messages` — the only route that serves the vendor's Claude
 models) has no Responses sibling and is therefore translated by design; the
@@ -322,12 +325,13 @@ Benchmarked on macOS (Apple Silicon), 4 Pingora worker threads:
 
 ## Test Coverage
 
-140 tests across 5 crates:
-- `maxllm-admin`: 35 tests (keys, teams, costs, budget, API)
-- `maxllm-translate`: 51 tests (all provider translators + streaming)
-- `maxllm-plugin`: 41 tests (all 10 plugins)
-- `maxllm-config`: 5 tests (parsing, validation, env vars)
-- `maxllm-gateway`: 7 tests (circuit breaker, routing) + 1 doc-test
+793 tests across 6 crates:
+- `maxllm-admin`: 51 tests (keys, teams, costs, budget, API)
+- `maxllm-translate`: 236 tests (all provider translators + streaming)
+- `maxllm-plugin`: 193 tests (all 14 plugins + the plugin contract)
+- `maxllm-config`: 32 tests (parsing, validation, env vars)
+- `maxllm-gateway`: 280 tests (159 unit + 121 mock integration; 4 live tests are gated behind `#[ignore]`) + 1 doc-test
+- `maxllm-cli`: 1 test
 
 ## Development Notes
 

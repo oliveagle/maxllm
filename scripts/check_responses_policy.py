@@ -25,6 +25,7 @@ import re
 import sys
 import tomllib
 import urllib.error
+import urllib.parse
 import urllib.request
 
 # Kinds whose upstream speaks a wire protocol other than OpenAI's, so there is
@@ -75,14 +76,16 @@ DEFAULT_RESPONSES_PATH = "/v1/responses"
 # Kinds whose default upstream path is not the OpenAI one. commandcode.ai
 # namespaces every route under `/provider`, so its defaults are
 # `/provider/v1/chat/completions` and `/provider/v1/responses`
-# (crates/maxllm-translate/src/commandcode.rs).
+# (crates/maxllm-translate/src/commandcode.rs). The OpenDesign AMR link
+# serves the standard OpenAI paths under its own `/v1` prefix, so it needs
+# no entry here.
 KIND_DEFAULT_CHAT_PATH = {"commandcode": "/provider/v1/chat/completions"}
 KIND_DEFAULT_RESPONSES_PATH = {"commandcode": "/provider/v1/responses"}
 
-# Kinds that default to native Responses. `opencode` and `commandcode` both
-# serve the Responses contract on their own route; every other kind is
-# translated unless the config says otherwise.
-NATIVE_BY_DEFAULT_KINDS = {"opencode", "commandcode"}
+# Kinds that default to native Responses. `opencode`, `commandcode` and
+# `open_design` all serve the Responses contract on their own route; every
+# other kind is translated unless the config says otherwise.
+NATIVE_BY_DEFAULT_KINDS = {"opencode", "commandcode", "open_design"}
 
 # Kinds whose native Responses route is not the OpenAI `/v1/responses` shape and
 # therefore must name `responses_path` explicitly.
@@ -114,6 +117,22 @@ def classify(conf: dict, kind: str) -> tuple[str, str]:
         return "NATIVE", path
     return "TRANSLATED", "no Responses endpoint configured: /v1/responses is " \
                          "rewritten into /chat/completions"
+
+
+def upstream_origin(base_url: str) -> str:
+    """The origin the gateway actually talks to.
+
+    The gateway takes scheme/host/port from `base_url` and ignores its path
+    (the provider's own route lives in `upstream_path` / `responses_path`),
+    so a base_url that carries a path prefix must not be concatenated with
+    the provider path: the OpenDesign link's
+    "https://amr-link.open-design.ai/v1" plus "/v1/responses" would probe
+    "/v1/v1/responses" and report a false "route absent".
+    """
+    parts = urllib.parse.urlsplit(base_url)
+    if not parts.scheme or not parts.netloc:
+        return base_url.rstrip("/")
+    return f"{parts.scheme}://{parts.netloc}"
 
 
 def probe(url: str, model: str | None, api_key: str | None, timeout: float) -> str:
@@ -192,7 +211,7 @@ def main() -> int:
             violations += 1
         row = {"provider": name, "kind": kind, "verdict": verdict, "detail": detail}
         if verdict in {"NATIVE", "WARN"} and args.live:
-            base = conf.get("base_url", "").rstrip("/")
+            base = upstream_origin(conf.get("base_url", ""))
             row["probe"] = probe(f"{base}{detail}", conf.get("default_model"),
                                  expand_env(conf.get("api_key")), args.timeout)
             if row["probe"].startswith("404"):

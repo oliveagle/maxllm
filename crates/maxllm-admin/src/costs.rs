@@ -396,6 +396,17 @@ fn default_costs() -> Vec<ModelCost> {
             input_cost_per_1m: 0.0,
             output_cost_per_1m: 0.0,
         },
+        // DeepSeek V4.1 Flash behind a prepaid plan — the OpenDesign AMR
+        // link (the design workspace's credit balance) and the opencode.ai
+        // zen plan. Neither reports a per-request USD cost, and both are
+        // covered by a prepaid allowance, so the marginal token price is
+        // zero. A deployment that wants the credit draw booked overrides
+        // the row in `[model_costs."deepseek-v4.1-flash"]`.
+        ModelCost {
+            model_pattern: "deepseek-v4.1-flash".into(),
+            input_cost_per_1m: 0.0,
+            output_cost_per_1m: 0.0,
+        },
         ModelCost {
             model_pattern: "qwen3.8-27b*".into(),
             input_cost_per_1m: 0.0,
@@ -471,6 +482,7 @@ mod tests {
             "glm-5.3-flash",
             "kimi-for-coding",
             "deepseek-v4.1-flash:cloud",
+            "deepseek-v4.1-flash",
             "qwen3.8-27b-ct",
             "minicpmv47-awq",
             "humanizer-12b",
@@ -486,6 +498,11 @@ mod tests {
         // A subscription/self-hosted channel is explicitly free.
         assert_eq!(
             calc.calculate_cost("kimi-for-coding", 1_000_000, 1_000_000),
+            0.0
+        );
+        // The OpenDesign AMR link draws down a prepaid credit balance.
+        assert_eq!(
+            calc.calculate_cost("deepseek-v4.1-flash", 1_000_000, 1_000_000),
             0.0
         );
     }

@@ -578,7 +578,7 @@ Client Response (translated: OpenAI format / native: provider format / passthrou
 
 ### 1. Trait-Based Abstraction
 - `Plugin` -- Pluggable middleware (14 built-in plugins in `maxllm-plugin`)
-- `ProviderTranslator` -- Format translation (8 translators covering the 16 provider kinds)
+- `ProviderTranslator` -- Format translation (10 translator implementations covering the 18 provider kinds)
 - `StreamTranslator` -- Streaming response handling
 - `AdminStore` -- Persistence abstraction (swap InMemory for Postgres/SQLite)
 
@@ -600,10 +600,10 @@ Client Response (translated: OpenAI format / native: provider format / passthrou
 
 ### 5. Canonical Format Translation
 - All clients speak OpenAI format
-- Gateway translates to/from the 17 provider kinds transparently
+- Gateway translates to/from the 18 provider kinds transparently
   (openai, anthropic, gemini, azure_openai, bedrock, groq, together,
   fireworks, deepinfra, mistral, xai, deepseek, ollama, cohere,
-  openai_compat, opencode, commandcode)
+  openai_compat, opencode, commandcode, open_design)
 - Streaming translation handles SSE chunk-by-chunk
 
 ---
@@ -652,7 +652,7 @@ Client Response (translated: OpenAI format / native: provider format / passthrou
 - Validates request translation (headers, path, body format)
 - Tests response translation back to OpenAI format
 
-**Test Categories (97 tests: 93 mock-based, 4 live gated with `#[ignore]`):**
+**Test Categories (125 tests: 121 mock-based, 4 live gated with `#[ignore]`):**
 
 | Category | Count | Description |
 |----------|-------|-------------|
@@ -664,6 +664,7 @@ Client Response (translated: OpenAI format / native: provider format / passthrou
 | Native & passthrough | 6 | Responses passthrough (streaming/non-streaming), function-tool flattening, large-body usage, chat→native fallback |
 | OpenCode (zen) | 16 | session header injection/affinity, body normalisation, error envelopes, UA handling, models list, streaming usage |
 | Command Code | 10 | vendor path defaults, native Responses, Anthropic Messages wire + translation, bearer auth, models list |
+| OpenDesign | 3 | native Responses passthrough, link chat path, `tool_choice: "any"` rewrite |
 | Headers & metrics | 6 | X-Request-Id, X-MaxLLM-Provider, CORS, request/token/active/inflight metrics |
 | Bedrock SigV4 | 3 | signed request + model routing, error forwarding, streaming translation |
 | Routing strategies | 6 | latency, cost, least-connections, auto-model rotation (+session affinity, pool filtering) |
