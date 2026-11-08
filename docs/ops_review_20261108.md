@@ -142,11 +142,12 @@ response body is complete"`）。
    客户端断开天然不进入。代码在 `error_while_proxy()` 里用 `e.esource() == ErrorSource::Upstream`
    守着 `mark_stream_truncated()`，**客户端断开不会触发流截断降级** —— 否则任何一次 Ctrl-C 都能把
    健康 provider 熔断。线上 311 judged / 0 truncated / 0 次降级印证。
-4. **真正缺的是口径分离**：`Downstream ConnectionClosed` 仍按 `200 + error` 记账，会污染任何
-   "error 非空 = 失败"的成功率；`usage_missing_total` 也只在 `tokens_in==0 && tokens_out==0` 时
-   触发（这类行通常已带 tokens_in，线上至今仅 1 次），口径上仍应显式排除。建议新增
-   `maxllm_client_aborted_total{provider}`，并给 `request_logs.status` 一个独立取值；它是
-   **客户端行为指标**，不进熔断、不进失败率告警。
+4. **口径分离已落地**：新增 `maxllm_client_aborted_total{provider}` —— `Downstream` 错误且
+   尚未见到终止事件时 +1（`stream_terminal_seen` 守着"客户端恰好在终态事件发出的瞬间挂断"
+   的竞态，那笔交换已经完成，不算放弃），这类请求不再进 `usage_missing_total`（token 本来
+   就不会再来，算"provider 没报 usage"是找错人），也不进熔断/失败率。线上以主动断开的
+   客户端验证：`client_aborted_total{provider="ollama_local"} 1`，且 `stream_truncated_total`
+   与 `streams_judged_total` 均未被它影响。
 
 ---
 
@@ -293,7 +294,7 @@ pool_health 接 timer（5 min）；probe 显式传 `--provider kimi`；探针请
 | P1 | 路由精确匹配 + rename 状态迁移 + 清僵尸行（§5） | 代码 | 1 天 |
 | P1 | body 哨兵精确匹配池名（§6） | 代码 | 0.5 天 |
 | P2 | health 池摘要 / probe 排除 / 轮转 / 脱敏（§7–8） | 混合 | 0.5 天 |
-| P1 | `client_aborted_total{provider}` + `request_logs.status` 独立取值，把客户端放弃从成功率口径里摘出去（§1.1） | 代码 | 0.5 天 |
+| ~~P1~~ | ~~`client_aborted_total` + 把客户端放弃从成功率口径里摘出去（§1.1）~~ **✅ 已做**（见附录 B） | 代码 | — |
 
 > **§1.1 订正后的两处降级**：`/v1/responses` primary 换 provider 不再是可靠性问题（ollama 端点
 > 上游失败率 0.00%，全仓最低）；"首字节前 failover" 收益只有 0.25%，**不做**。真正要补的是
@@ -362,6 +363,7 @@ curl -s http://<gateway>:3795/v1/responses/auto \
 |---|---|---|---|
 | P0-1 截断按 200 计成功 | ✅ 已修（暴露）+ ⏳ 未做（failover） | 新增 `maxllm_stream_truncated_total{provider}`、`maxllm_stream_truncated_before_first_byte_total{provider}`、`maxllm_streams_judged_total{provider}`；SSE 缺终止事件时补 `event: error`（Responses）或 `error`+`[DONE]`（chat）；`request_logs.error` 与日志 `truncated` 字段同步记账 | 线上 `/metrics` 已出现 `streams_judged_total`，无截断时 `stream_truncated_total` 不出现；集成测试 `test_truncated_native_responses_stream_is_booked_as_truncated` 断言 200 被记截断且客户端收到 error 事件 |
 | P0-1 口径订正（本轮） | ✅ 已订正 | `Downstream ConnectionClosed` 被误读为上游截断；实测 816/817 是客户端断开、真截断仅 1 条。代码侧已核实：`error_while_proxy()` 只用 `ErrorSource::Upstream` 触发 `mark_stream_truncated()`，客户端断开不会误触流截断降级 | 复现实验（读到首字节后 1s 断开 ⇒ 逐字节相同 error）；全量重算 4 天 9 010 条 200；线上 311 judged / 0 truncated |
+| P0-1 客户端放弃独立计数 | ✅ 已修 | 新增 `maxllm_client_aborted_total{provider}`：`ErrorSource::Downstream` 且 `!stream_terminal_seen` 时 +1（一次交换只记一次），并从 `usage_missing_total` 中排除；`/health` 把"半开（等探测）"从 `open_providers` 拆到 `half_open_providers`——原先 12 个只是等探测的本地 GPU 被报成 circuit-open | 集成测试 `test_client_abort_is_counted_apart_from_truncation`（裸 socket 上游开流不回包 + 客户端 socket 断开 ⇒ 恰好 1 次放弃、无截断计数）；`test_health_endpoint` 断言两张表在全新配置下为空；线上实测 `open_providers` 5 个（kimi + 4 个配额熔断）、`half_open_providers` 12 个、主动断开后 `client_aborted_total=1`；README 的 metrics 表已补 |
 | P0-2 auto 池流式丢 usage | ✅ 已修 | auto 改写 body 时补解析 `stream`（原逻辑只在 `keep_request_content_length` 分支解析，auto 非 verbatim 走不到）；native Responses 流优先 `NativePassthroughStream`，不再套 chat translator（套了会破坏事件流并吃掉 usage） | 线上 `/v1/responses/auto` 实测 `Content-Type: text/event-stream` 且 `tokens_in/out` 入库；audit 前 2178/2200 零 usage，部署后新请求全部带 token |
 | P0-3 成本表为空 | ✅ 已修 | 内置价表补生产渠道（deepseek-v4-flash / MiniMax-M3 / mimo-v2.6-flash / glm-5.3-flash），订阅制与本地模型显式 0/0；新增 `[costs] enabled / warn_on_missing` | 线上 `cost_usd` 已非 0（minimax 单请求 0.020459）；`production_channels_have_a_price_or_an_explicit_zero` 单测防漏配 |
 | P1-4 只采不看 | ✅ 已修 | collector 拆三个 exporter：logs 按 `stream-name` 落 `maxllm_recordings` / `maxllm_logs`（OpenObserve 的 OTLP **metrics** 是按指标名分流的，`stream-name` 对 metrics 无效，已在配置里注明）；新增 dashboard + 告警，定义收敛到 `scripts/openobserve_alerts.py`（7 条，可重放）；dashboard 面板收敛到 `scripts/openobserve_dashboard.py`（幂等补面板，PUT 后回读校验——OpenObserve 的 update 接口接受 `{"v8": …}` 信封会 200 但静默丢掉 tabs，必须发裸 v8 + `?hash=`） | 三路数据实测有量：`maxllm_recordings` 49 条 / `maxllm_logs` 21 条 / `maxllm_requests_total` 5 分钟 286 样本；7 条告警 `enabled=true`；dashboard 7→11 面板（新增按 provider 截断率/截断速率、首字节前截断、脱敏计数） |

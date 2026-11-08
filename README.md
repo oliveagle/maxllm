@@ -1328,6 +1328,7 @@ Available at `GET /metrics` when enabled:
 | `stream_truncated_total` | provider | Counter |
 | `stream_truncated_before_first_byte_total` | provider | Counter |
 | `streams_judged_total` | provider | Counter |
+| `client_aborted_total` | provider | Counter |
 | `usage_missing_total` | provider, model | Counter |
 | `recording_redactions_total` | &mdash; | Counter |
 | `auto_pool_metered_selections_total` | &mdash; | Counter |
@@ -1338,6 +1339,16 @@ provider that served it (after any failover), the model and the upstream
 status; the status is `0` when the provider never answered (a connect or DNS
 failure). `active_requests` counts application requests in flight — the
 `/metrics` scrape itself is not counted, so the gauge reads 0 when idle.
+
+`client_aborted_total` counts the responses the **client** abandoned, i.e. it
+closed the connection while the gateway was still writing the body (pingora
+labels those `Downstream ConnectionClosed … Prematurely before response body is
+complete`). Keep them out of a provider's failure rate: they are the caller
+giving up, and on this fleet they are ~2-5% of all 200s at baseline and 9% over
+the four days of the 2026-11-08 audit, against exactly one genuine upstream
+truncation (`Upstream ConnectionClosed … without the termination chunk`). Only
+the `Upstream` shape is a truncation; mixing the two is how the audit concluded
+11.2% of all 200s were silently cut. See `docs/ops_review_20261108.md` §1.1.
 
 `streams_judged_total` counts streaming responses whose completeness the
 gateway could determine (the protocol terminal event was seen, or its absence
@@ -1361,7 +1372,7 @@ allow_remote = false   # default; loopback scrapers always work
 
 | Endpoint | Body |
 |----------|------|
-| `GET /health`, `/healthz` | `{"status":"ok\|degraded","version","providers":{"healthy","total"},"pools":{"<name>":{"healthy","total"}},"open_providers":[...]}` |
+| `GET /health`, `/healthz` | `{"status":"ok\|degraded","version","providers":{"healthy","total"},"pools":{"<name>":{"healthy","total"}},"open_providers":[...],"half_open_providers":[...]}` |
 | `GET /version` | `{"version":"x.y.z"}` |
 
 `status` is `degraded` when every provider — or every member of some pool — is
