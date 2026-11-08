@@ -1194,6 +1194,32 @@ impl AiGateway {
     /// appends the endpoint to a `/v1/responses` base URL, and a provider or
     /// pool name for the per-provider routes. Anything else is a typo or a
     /// retired name and must not be served by the generic pool under a 200.
+    /// The provider named by `/v1/responses/<provider>` when no explicit
+    /// `[[routes]]` entry matched that path and the segment is a real provider.
+    ///
+    /// Such a path falls into the pooled `/v1/responses` route by prefix match
+    /// (`match_route` takes the first prefix match in config order), because
+    /// only providers that happen to have a duplicate `[[routes]]` entry pin
+    /// correctly. Honouring the name here is what makes the documented
+    /// `/v1/responses/<provider>` contract true for every provider, instead of
+    /// silently answering with whichever provider the pool selected.
+    ///
+    /// Pools are not pinned here: `auto` / `auto_home` have their own routes,
+    /// which match before the pooled one.
+    fn responses_subroute_pin(hot: &HotState, route: &RouteConfig, path: &str) -> Option<String> {
+        if route.path != "/v1/responses" {
+            return None;
+        }
+        let rest = path.strip_prefix("/v1/responses/")?;
+        let segment = rest.split('/').next().unwrap_or_default();
+        if segment.is_empty() || segment == "responses" {
+            return None;
+        }
+        hot.providers
+            .contains_key(segment)
+            .then(|| segment.to_string())
+    }
+
     fn unknown_responses_subroute<'a>(
         hot: &HotState,
         route: &RouteConfig,
@@ -1298,7 +1324,8 @@ impl AiGateway {
         //    one lost prompt cache is cheaper than every turn waiting on a
         //    provider whose typical answer takes tens of seconds.
         let mut chosen: Option<&AutoPoolEntry> = None;
-        if route.session_sticky && hot.session_sticky_enabled {
+        if ctx.path_pinned_provider.is_none() && route.session_sticky && hot.session_sticky_enabled
+        {
             if let Some(session_id) = ctx.session_id.clone() {
                 match self.sessions.get(&session_id) {
                     Some(pinned_name) => {
@@ -1369,37 +1396,54 @@ impl AiGateway {
         // route's provider and the failover walks into the pool — see
         // `switch_to_fallback` for the replay that makes that safe for a
         // ~100 KB agent request.
-        if let Some(pool) = hot.request_pool(route, ctx) {
-            let pool_name = pool.name.clone();
-            ctx.auto_pool = Some(pool_name);
-            if let Some(provider) = self.select_from_auto_pool(hot, pool, route, ctx) {
-                return Some(provider);
+        // A path-pinned provider (`/v1/responses/<provider>` with no route of
+        // its own) is served by that provider alone: the caller named one
+        // provider, so neither a pool nor the pooled chain may stand in for
+        // it.
+        if ctx.path_pinned_provider.is_none() {
+            if let Some(pool) = hot.request_pool(route, ctx) {
+                let pool_name = pool.name.clone();
+                ctx.auto_pool = Some(pool_name);
+                if let Some(provider) = self.select_from_auto_pool(hot, pool, route, ctx) {
+                    return Some(provider);
+                }
+                // Every pool entry is unhealthy — fall through to the route's
+                // own selection so the request still has somewhere to go.
+                ctx.auto_pool = None;
             }
-            // Every pool entry is unhealthy — fall through to the route's own
-            // selection so the request still has somewhere to go.
-            ctx.auto_pool = None;
         }
 
         // Build list of all candidate providers for this route
         let mut candidates: Vec<ProviderTarget> = Vec::new();
 
-        if let Some(provider) = hot.providers.get(&route.provider) {
-            candidates.push(ProviderTarget {
-                name: route.provider.clone(),
-                cost_per_1m: Self::provider_cost(hot, provider),
-                state: Arc::clone(provider),
-                is_primary: true,
-            });
-        }
-
-        for fb_name in &route.fallback {
-            if let Some(provider) = hot.providers.get(fb_name) {
+        if let Some(pin) = ctx.path_pinned_provider.clone() {
+            if let Some(provider) = hot.providers.get(&pin) {
                 candidates.push(ProviderTarget {
-                    name: fb_name.clone(),
+                    name: pin,
                     cost_per_1m: Self::provider_cost(hot, provider),
                     state: Arc::clone(provider),
-                    is_primary: false,
+                    is_primary: true,
                 });
+            }
+        } else {
+            if let Some(provider) = hot.providers.get(&route.provider) {
+                candidates.push(ProviderTarget {
+                    name: route.provider.clone(),
+                    cost_per_1m: Self::provider_cost(hot, provider),
+                    state: Arc::clone(provider),
+                    is_primary: true,
+                });
+            }
+
+            for fb_name in &route.fallback {
+                if let Some(provider) = hot.providers.get(fb_name) {
+                    candidates.push(ProviderTarget {
+                        name: fb_name.clone(),
+                        cost_per_1m: Self::provider_cost(hot, provider),
+                        state: Arc::clone(provider),
+                        is_primary: false,
+                    });
+                }
             }
         }
 
@@ -1500,6 +1544,12 @@ impl AiGateway {
         let Some(route) = ctx.route_index.and_then(|i| hot.routes.get(i)) else {
             return false;
         };
+        if ctx.path_pinned_provider.is_some() {
+            // The pinned provider is the only candidate: no other provider can
+            // serve the model, so the name may be rewritten to the pinned
+            // provider's default (exactly as on a single-provider route).
+            return true;
+        }
         !std::iter::once(&route.provider)
             .chain(route.fallback.iter())
             .filter(|name| name.as_str() != ctx.provider_name)
@@ -1639,7 +1689,9 @@ impl AiGateway {
     /// unavailable" while each entry was merely circuit-open on its own).
     fn unavailable_reason(&self, hot: &HotState, route: &RouteConfig, ctx: &RequestCtx) -> String {
         let mut names: Vec<&str> = Vec::new();
-        if let Some(pool) = hot.request_pool(route, ctx) {
+        if let Some(pin) = ctx.path_pinned_provider.as_deref() {
+            names.push(pin);
+        } else if let Some(pool) = hot.request_pool(route, ctx) {
             names.extend(pool.entries.iter().map(|e| e.provider.as_str()));
         } else {
             names.push(&route.provider);
@@ -1673,10 +1725,13 @@ impl AiGateway {
                 }
             }
         }
+        let scope = match ctx.path_pinned_provider.as_deref() {
+            Some(pin) => format!("the provider '{pin}' named by the request path"),
+            None => format!("every candidate of route '{}'", route.path),
+        };
         format!(
-            "no provider available: {} — every candidate of route '{}' is rejecting traffic",
-            parts.join(", "),
-            route.path
+            "no provider available: {} — {scope} is rejecting traffic",
+            parts.join(", ")
         )
     }
 
@@ -2666,6 +2721,14 @@ impl ProxyHttp for AiGateway {
                 ),
             )
             .await;
+        }
+
+        // The segment named a real provider but no explicit route matched it,
+        // so the request is sitting on the pooled `/v1/responses` route. Pin
+        // it: the caller asked for that provider, not for the pool.
+        if let Some(pin) = Self::responses_subroute_pin(&hot, route, &path) {
+            ctx.plugin_ctx.route_path = format!("/v1/responses/{pin}");
+            ctx.path_pinned_provider = Some(pin);
         }
 
         // For passthrough, extract the path suffix after the route prefix
@@ -5835,6 +5898,12 @@ impl AiGateway {
     /// circuits), so the walk is strictly forward through the chain.
     /// Returns its name and state.
     fn next_fallback_provider(&self, ctx: &RequestCtx) -> Option<(String, Arc<ProviderState>)> {
+        // A path-pinned provider is served alone: the caller named it, so a
+        // failure is reported to the caller instead of being papered over by
+        // another provider's answer.
+        if ctx.path_pinned_provider.is_some() {
+            return None;
+        }
         let hot = self.hot.load();
         let route = hot.routes.get(ctx.route_index?)?;
 

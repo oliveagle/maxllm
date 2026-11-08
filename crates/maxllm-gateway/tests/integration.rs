@@ -9319,3 +9319,199 @@ async fn aborted_fast_path_probe_leaves_no_request_log() {
         "an aborted fast-path probe must not push the gauge negative:\n{metrics}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// `/v1/responses/<provider>` pins the named provider (2026-11-08)
+// ---------------------------------------------------------------------------
+
+/// A pooled `/v1/responses` route plus a provider that is *only* reachable
+/// by naming it in the path.
+///
+/// `side_channel` deliberately has no `[[routes]]` entry of its own: it is
+/// the case that used to be served by the pool, because the pooled route
+/// matched the path by prefix and the name in the path was validated and then
+/// ignored.
+const PATH_PINNED_PROVIDER_CONFIG: &str = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[metrics]
+enabled = true
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.pool_head]
+kind = "openai"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+native_responses = true
+responses_path = "/v1/responses"
+
+[providers.pool_tail]
+kind = "openai"
+base_url = "{FALLBACK_URL}"
+api_key = "fake-key"
+native_responses = true
+responses_path = "/v1/responses"
+
+[providers.side_channel]
+kind = "openai"
+base_url = "{SIDE_URL}"
+api_key = "fake-key"
+native_responses = true
+responses_path = "/v1/responses"
+
+[[routes]]
+path = "/v1/responses"
+provider = "pool_head"
+fallback = ["pool_tail"]
+strategy = "fallback"
+endpoint_type = "responses"
+"#;
+
+fn responses_body(text: &str) -> Value {
+    json!({
+        "id": "resp_test",
+        "object": "response",
+        "status": "completed",
+        "model": "deepseek-v4.1-flash",
+        "output": [{
+            "id": "msg_1", "type": "message", "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": text}]
+        }],
+        "usage": {"input_tokens": 5, "output_tokens": 2, "total_tokens": 7}
+    })
+}
+
+fn responses_request(text: &str) -> Value {
+    json!({
+        "model": "deepseek-v4.1-flash",
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": text}]}]
+    })
+}
+
+#[tokio::test]
+async fn test_responses_path_provider_name_pins_that_provider() {
+    let head = MockServer::start().await;
+    let tail = MockServer::start().await;
+    let side = MockServer::start().await;
+
+    // The pool must not be used at all for a pinned path.
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(responses_body("from head")))
+        .expect(0)
+        .mount(&head)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(responses_body("from tail")))
+        .expect(0)
+        .mount(&tail)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(responses_body("from side")))
+        .expect(1)
+        .mount(&side)
+        .await;
+
+    let config = PATH_PINNED_PROVIDER_CONFIG.replace("{SIDE_URL}", &side.uri());
+    let gw = TestGateway::start_with_fallback(&config, &head.uri(), &tail.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/responses/side_channel"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&responses_request("hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["output"][0]["content"][0]["text"], "from side",
+        "the provider named in the path must serve the request, not the pool"
+    );
+}
+
+#[tokio::test]
+async fn test_responses_path_provider_name_does_not_fall_back_to_the_pool() {
+    let head = MockServer::start().await;
+    let tail = MockServer::start().await;
+    let side = MockServer::start().await;
+
+    // The pinned provider fails; the pool must stay untouched.
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(responses_body("from head")))
+        .expect(0)
+        .mount(&head)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(responses_body("from tail")))
+        .expect(0)
+        .mount(&tail)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(500).set_body_json(json!({"error": "down"})))
+        .expect(1)
+        .mount(&side)
+        .await;
+
+    let config = PATH_PINNED_PROVIDER_CONFIG.replace("{SIDE_URL}", &side.uri());
+    let gw = TestGateway::start_with_fallback(&config, &head.uri(), &tail.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/responses/side_channel"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&responses_request("hi"))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        !resp.status().is_success(),
+        "a pinned provider that fails must not be papered over by the pool: {}",
+        resp.status()
+    );
+}
+
+#[tokio::test]
+async fn test_responses_path_unknown_provider_is_rejected() {
+    let head = MockServer::start().await;
+    let side = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(responses_body("from head")))
+        .expect(0)
+        .mount(&head)
+        .await;
+
+    let config = PATH_PINNED_PROVIDER_CONFIG.replace("{SIDE_URL}", &side.uri());
+    let gw = TestGateway::start_with_fallback(&config, &head.uri(), &head.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/responses/no_such_provider"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&responses_request("hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let body: Value = resp.json().await.unwrap();
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("unknown provider or pool 'no_such_provider'"),
+        "the 404 must name the unknown segment: {body}"
+    );
+}

@@ -234,6 +234,17 @@ pub struct RequestCtx {
     /// but excluded from metrics, request logs and circuit-breaker accounting,
     /// so a monitor cannot poison the production signals it measures.
     pub probe_request: bool,
+    /// The provider named by the request path itself
+    /// (`/v1/responses/<provider>`), when that provider has no `[[routes]]`
+    /// entry of its own.
+    ///
+    /// `/v1/responses` is a prefix route, so such a path lands on the pooled
+    /// route by prefix match. The name used to be validated and then ignored,
+    /// and the request was served by whichever provider the pool picked — a
+    /// caller that named one provider got another one, after the whole
+    /// fallback chain had been walked. A pinned request is served by that
+    /// provider alone.
+    pub path_pinned_provider: Option<String>,
 }
 
 impl RequestCtx {
@@ -303,6 +314,7 @@ impl RequestCtx {
             client_aborted: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             client_body_written: false,
             probe_request: false,
+            path_pinned_provider: None,
         }
     }
 }
