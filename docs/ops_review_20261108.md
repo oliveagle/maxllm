@@ -1,6 +1,6 @@
 # MaxLLM 网关运行审计（2026-11-08）
 
-> 范围：NAS 生产实例 v0.3.8，`/v1/responses` 家族路由 + auto/auto_home 双池。
+> 范围：NAS 生产实例（审计起于 v0.3.8，收口于 v0.3.10），`/v1/responses` 家族路由 + auto/auto_home 双池。
 > 数据快照：2026-11-08 13:30 CST（recordings 覆盖 11-04 04:00Z – 11-08 05:30Z）。
 > 数据源：网关 access log（4 天，10.5k+ 行）、recording JSONL（6.5k 条 client_response）、
 > Prometheus `/metrics`、SQLite `maxllm.db`、OpenTelemetry collector → OpenObserve
@@ -21,6 +21,7 @@
 | 8 | breaker 指标是惰性快照，4 个 provider 长期显示 open 但实际已过 fail window | `is_open()` 在下次请求时才 lazy half-open，gauge 直接读原子 state | P2 |
 | 9 | `maxllm.err` 长期未轮转，且错误文案把 sentinel 当 provider | 23 行、全部停留在 11-04；`route '/v1/responses/auto' references unknown provider 'auto'` | P2 |
 | 10 | 自检探针流量计入生产指标 | 本机 loopback 探针命中已删除路由，产生 429/404/400 并写入 request_logs | P2 |
+| 11 | **`/v1/responses/<provider>` 只校验不钉住**（2026-11-08 晚发现并修复）：路径里的 provider 段被丢弃，请求按池路由走，最终由**别的** provider 作答，`route_path` 还记成 `/v1/responses` | 修复前 `/v1/responses/open_design` 实际由 `opencode_go_1` 作答；见 §12.1 | P1（已修 `ebcfa9f`） |
 
 **正常项**（不用改）：session 亲和命中 3,488 / miss 22（size 8）；97.6% 的客户端请求
 以 200 结束；failover 链在 429/404 上工作正常；auto/auto_home 双池互不越界；OTel
@@ -546,7 +547,7 @@ pool_health 接 timer（5 min）；probe 显式传 `--provider kimi`；探针请
 | breaker gauge 语义 | `state=1` 是惰性快照；4 个 provider fail window 已过仍显示 open | gauge 输出 effective state，或加 `last_failure_at`/`force_open_until` 标签 |
 | `maxllm.err` | 23 行、全部停留在 11-04，无轮转 | logrotate（按大小/天），并修掉 `unknown provider 'auto'` 的误导文案（sentinel 不是 provider） |
 | 请求体落盘 | recordings 里 451 条 client_request + 388 条 client_response 存了完整 body | 脱敏（API key / 个人信息）或只存 hash + 长度；明确保留期 |
-| `/metrics` 暴露 | 0.0.0.0:3795 无鉴权 | 绑定内网/加 bearer，或由 collector 走 localhost（当前已是 localhost 抓取，可直接收口） |
+| `/metrics` 暴露 | **✅ 已收口**：0.3.9 起远程抓取一律 `403 metrics is loopback-only`（loopback 抓取不受影响，collector 本来就走 localhost）；两台节点均已实测 | — |
 | `cmd` provider 403（2026-11-08 19:5x CST） | 直连上游 `api.commandcode.ai/provider/v1/{responses,chat/completions}` 均 403 `{"code":"upgrade_required","message":"Your Go plan doesn't include API access. Upgrade to Provider or higher"}` —— 是**订阅档位问题，不是网关 bug**（网关正确透传 403 JSON）。Go 档位能用的通道是 `cmd_cli`（CLI 桥，`maxllm-commandcode.service`） | 升级 Provider 档，或把 `/v1/responses/cmd` 路由指向 `cmd_cli`；`cmd` 的 403 由上游计费决定，网关侧无需改 |
 | 大 prompt | p50 96k tokens、p90 200k（`request_logs.tokens_in`）；原写"≥128k 截断率 38.5%"用的是被误分类的客户端放弃行，按 `Upstream` 口径重算**没有证据**（§1.1） | 无证据支持预检；若要做，动机应是**上游成本/额度**（长 prompt 每次都是全额输入计费）而不是截断 |
 
@@ -612,6 +613,7 @@ provider，测完两条快线后，钉该 session 的下一次请求必须落到
   （`01a1ba19-…`）发 `session-id` 请求 → 由 `minimax` 服务，affinity miss +1，
   绑定重写为 `minimax`（`updated_at` 刷新）。
 - 预期收益：按 24h 对照（排除 xiaomi）auto 池 >30s 占比 ~9.7% → ~6.8%。
+- **部署范围**：NAS 节点先上线；2026-11-08 21:5x CST 本机节点（第二台）也升级到同一 0.3.10 构建，两台一致（见 §12.5）。
 
 ---
 
@@ -651,6 +653,8 @@ volc_1 / minimax / ollama_local；`maxllm_auto_pool_metered_selections_total` �
 （没掉进 metered 层）。新 provider 没有测量值 → 进快队（`auto_pool_fast_cohort` 对无测量
 entry 保留），所以它立刻拿到轮转份额；等第一批 EWMA 回来后由 §10 的过滤器决定去留。
 
+> **注（2026-11-08 晚）**：`cmd_cli` 整条桥接已在 0.3.10 下线（厂商 TOS + 没有 function calling），见附录 C；下面这段保留为当时的判断依据。
+
 **`cmd_cli` 暂不入池**：除了没有 function calling，还有两个代价——每次调用 ~24 963 input
 token、每次起一个 CLI 进程，厂商称持续代理订阅违反 TOS。关键在于**网关侧目前没有
 「provider 不支持 function calling ⇒ 不参与带 tools 的请求」这类过滤开关**：
@@ -658,6 +662,145 @@ token、每次起一个 CLI 进程，厂商称持续代理订阅违反 TOS。关
 （`gateway.rs::select_from_auto_pool`），不看请求是否带 `tools`。硬入池会让 codex 的工具
 调用**静默失效**——模型直接给文字答案、不再调工具，agent 循环看起来「正常结束」但什么都没干。
 要入池得先加这个能力开关（provider 级 `supports_tools` + 池选路按请求特征过滤）。
+
+---
+
+## 12. 收口轮（2026-11-08 21:0x–22:1x CST）：一个真 bug、一个被忽略的 402、两次"不是 bug"的订正
+
+这一轮把上一版遗留的三个疑点全部用数据结掉，其中 `/v1/responses/<provider>` 不钉住是**真 bug**（已修），
+`402` 被当成"没发生"是**成本 bug**（已修），`Downstream` 记账与 `volc_1` 熔断则是**结论正确、不用改**。
+
+### 12.1 `/v1/responses/<provider>` 只校验不钉住（真 bug，commit `ebcfa9f`）
+
+**现象**（修复前线上实测）：
+
+```
+POST /v1/responses/open_design      ← 下划线；配置里的路由是 /v1/responses/open-design
+```
+
+这条路径落进 `[[routes]] path = "/v1/responses"` 的**前缀匹配**。`unknown_responses_subroute()`
+只确认「`open_design` 是个已知 provider」，然后**把这一段丢掉**，请求继续按池路由走：
+`ollama_local`(404) → `minimax`(400) → `xiaomi`(400) → `kimi`(429) → 最终由 `opencode_go_1` 作答。
+即**路径点名的 provider 与实际作答的 provider 完全不同**，`request_logs.route_path` 还记成
+`/v1/responses` —— 审计里看起来就是一次普通的池请求。任何拼写近似（下划线/连字符）都会静默降级成池路由。
+
+**修复**（`crates/maxllm-gateway/src/`）：
+
+| 位置 | 改动 |
+|---|---|
+| `ctx.rs` | 新增 `path_pinned_provider: Option<String>` |
+| `gateway.rs::responses_subroute_pin()` | 紧邻 `unknown_responses_subroute()`：解析出 provider 段就设 pin，并把 `plugin_ctx.route_path` 改写成 `/v1/responses/<provider>` |
+| `select_provider` | 有 pin 时**跳过 auto 池**，候选只放 pin 那一个，session-sticky 不参与 |
+| `next_fallback_provider` | 有 pin 直接返回 `None` —— 失败就如实回报，不拿别家答案顶替 |
+| `unavailable_reason` | pin 失败时点名 "the provider '<x>' named by the request path" |
+| `no_later_candidate_carries_model` | pin 视为单 provider 路由（保留既有的 model 改写路径） |
+
+**测试**：3 条集成测试（pin 生效且池零请求 / pin 失败不外溢 / 未知段仍 404），workspace 834 全绿；
+`cargo fmt --check` + `clippy --workspace --all-targets -- -D warnings` 干净。
+
+**修复后线上验证**：
+
+```
+POST /v1/responses/open_design        → 402 (2.1s)，日志 provider=open_design
+                                        route_path=/v1/responses/open_design fallback_used=0
+POST /v1/responses/volc_1             → 仍是诚实的 503（quota force-open 中）
+POST /v1/responses/no_such_provider   → 仍是 404
+POST /v1/responses                    → 池路由行为不变
+```
+
+### 12.2 `402 Payment Required` 被当成"什么都没发生"（成本 bug，commit `33a7599`）
+
+**背景**：`open_design` 现在稳定返回 `402 {"code":"insufficient_balance"}`（钱包没钱，上游真去查了
+余额，所以耗时 0.4–2.1s 而不是立刻回）。**402 既不是 5xx 也不是 429**，落不进任何记账分支 ⇒
+熔断器永远认为它健康 ⇒ 每一轮选路都白付一次上游往返，然后才 failover 到别家。§11 把它加进
+`auto` 池之后，这笔浪费变成**主流量路径上的固定开销**。
+
+**修复**：
+
+- `circuit_breaker.rs` 新增 `PAYMENT_REQUIRED_COOLDOWN_MS = 10 min` 与其文档（402 是账户级墙，
+  不是瞬时故障：不进 `max_fails`，但必须立刻退出轮转，且余额充上后能自己回来）；
+- `gateway.rs::upstream_response_filter` 新增 `payment_required = status == 402`，记账块条件扩为
+  `(quota_open || payment_required || server_error || success)`，最前面加 `if payment_required`
+  分支：`record_quota_until(now + 10min)` + `circuit_breaker_quota_opens_total` +1 + `unpin_session`
+  + `info!`。10 分钟后 `is_open()` 自己清掉 force-open 并回 closed，届时充过值的 provider 会被
+  下一次请求探活（不需要重启/重载配置）。
+
+**测试**：`test_402_payment_required_force_opens_the_provider` —— 主 provider 回 402、fallback 回
+200，**两次**客户端请求都必须 200 且主 provider 只收到 **1** 次上游调用；同时断言
+`quota_opens=1`、`circuit_breaker_state=1`、`/health.open_providers` 含该 provider。
+把 `let payment_required = status == 402;` 临时改成 `false` 重跑，该测试在 `quota_opens` 断言处变红
+（`None != Some(1.0)`）—— 回归有保护。workspace 835 全绿。
+
+**线上验证**（两台都打出来了）：
+
+```
+13:57:27Z INFO 402 payment required — force-opened until the balance is topped up
+        provider=open_design cooldown_ms=600000        (NAS)
+13:58:39Z INFO 402 payment required — force-opened until the balance is topped up
+        provider=open_design cooldown_ms=600000        (本机节点)
+/health.open_providers = ["open_design", "volc_t_1"]，auto 池 healthy 12 → 10/12
+maxllm_circuit_breaker_quota_opens_total{provider="open_design"} 1
+```
+
+**仍未做**：余额没充之前，`open_design` 留在 `auto` 池里只是"每 10 分钟白打一次"，不再每轮白打。
+是否**移出池**是成本/配置决策，等用户拍板（§12.6）。
+
+### 12.3 `Downstream ConnectionClosed` 三臂实验：记账分类是对的，**不改**
+
+上一版 §1.1 已把这条错误订正为"客户端断开"，但留了一个猜测："native Responses 直传结束得太突然，
+客户端还没来得及读完 ⇒ 被误记"。三臂实验（NAS 本机对 0.3.10 打流式请求，逐个观察）：
+
+| 客户端行为 | 网关表现 | `client_aborted_total` |
+|---|---|---|
+| 读到 `response.completed` 后继续 drain | 保持 keep-alive 2s 后正常 EOF | 不增 |
+| 读到 `response.completed` 后**立刻** close | 不产生任何 `Downstream` 行、不增计数 | 不增 |
+| 读到首条 `delta` 后立刻 close（mid-stream） | `error=Downstream ConnectionClosed…`、`tokens_in=tokens_out=0`、`status=200` | **+1** |
+
+⇒ 那个"结束太突然被误记"的猜测**不成立**：终态事件是分界点，见到终态再挂断一分不记；只有真正
+中途放弃才记。分类正确且公平，**这条链路不再改**。
+
+顺带把"为什么 volc_1 的 Downstream 比例特别高"钉住了 —— 与会话自身的数据一致：本会话经网关打了
+**326 次 volc_1，其中 175 次 Downstream（53.7%）**；同一 `client_ip` 下 `minimax` 1682 次只 1 次、
+`opencode_go_2` 212 次 0 次。volc_1 按小时 09h 30/76 → 10h 29/61 → 11h 46/85 → 12h 70/119
+单调上升。机制就是 native Responses 直传 + 客户端完成即挂断（pingora `read_body_or_idle()` 报
+`Downstream`）。**归因是客户端行为，不该进失败率**；`ollama_local`（20/619）与 `open_design`
+（41/152）偏高同理，是"长回答被 agent 循环主动掐断"，不是提供方故障。
+
+### 12.4 `volc_1` 熔断核实：**是真配额耗尽，不是误熔断**
+
+一度怀疑 `learned_pattern` 把普通 429 误判成"周额度"。核实结论是否定的：
+
+- `circuit_breaker_state`：`volc_1` `quota_opens=2`，`force_open_until=1794153600000`
+  = **2026-11-09 00:00 +0800**（周额度重置点）；
+- 日志铁证：`2026-11-08T12:50:11.408979Z 429 quota force-opened until the resolved reset instant
+  provider=volc_1 reset_at_ms=1794153600000 source=learned_pattern`，紧接
+  `retrying on the fallback provider status=429 provider=minimax failed_provider=volc_1`；
+- `rate_limit_patterns` 里确有该 learned 指纹（"已超过每周用量上限"模板）。
+
+⇒ 上游确实说"本周额度用完"，重置时刻也是它自己给的。**不动它**，等 00:00 自动恢复（§12.6 有
+恢复观察项）。同一时刻同为配额耗尽：`volc_2` / `volc_t_1`（到 11-09 00:00）、`zhipu_1`（到 11-10 22:58）。
+
+### 12.5 部署状态
+
+| 节点 | 二进制 sha256（前 12） | 版本 | 状态 |
+|---|---|---|---|
+| NAS 节点 | `c2375971da30` | 0.3.10 | active，`NRestarts=0`（2026-11-08 21:56:30 CST 起） |
+| 本机节点 | `c2375971da30` | 0.3.10 | active，`NRestarts=0`（2026-11-08 21:57:29 CST 起） |
+
+两台跑的是**同一个** musl 静态二进制（含 `ebcfa9f` + `33a7599`）。上一版为 `10ed814c6c28`（含
+`ebcfa9f`，不含 402 修复）。镜像版本号仍是 0.3.10 —— 本轮不再单独 bump（`--version` 不能区分这两个
+构建，用 sha256 认）。
+
+**对外入口 VPS 仍是 0.3.8**，且是对外流量的主上游，尚未升级（需要 root 凭据，见 §12.6）。
+
+### 12.6 本轮之后仍未做
+
+| 项 | 状态 | 说明 |
+|---|---|---|
+| `open_design` 是否留在 `auto` 池 | **待用户拍板** | 402（余额为零）期间每 10 分钟仍白打一次；留在池里等用户充值，或移出池 |
+| `volc_1` 恢复观察 | 待 00:00 | 确认 `quota_opens` 不再增长、`/health` 里 `volc_1` 消失 |
+| 推送 `main` | **待用户确认** | 本地领先 origin（`481f9a7` / `0badb54` / `ebcfa9f` / `33a7599`）；push 后发版要 `gh workflow run CI --ref <tag>`（push 事件不触发 Actions） |
+| VPS 升级 0.3.8 → 0.3.10 | **阻塞** | 需 root 私钥/密码；拿到后跑 `ops/machines/<vps>/maxllm/deploy.sh`（SOURCE=NAS） |
 
 ---
 
