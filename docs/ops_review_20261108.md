@@ -572,6 +572,49 @@ pool_health 接 timer（5 min）；probe 显式传 `--provider kimi`；探针请
 
 ---
 
+## 10. 优化：auto 池 latency-aware 轮转（2026-11-08 19:5x–20:2x CST）
+
+**问题**：auto 池按「计费分档 + 轮转」选 provider，同档内是纯 round-robin。
+`xiaomi`（`mimo-v2.6-flash`，订阅制）因此拿到 ~1/7 的交互流量，但它的**整段
+响应耗时**是同级最慢的：近 24h 200 响应里 p50 23.0s / p90 92.5s / p99 279.5s /
+max 459.9s，而 minimax p50 3.2s、volc_1 4.4s、deepseek 2.2s。24h 内 auto 池
+10 151 次请求中 9.7% 超过 30s，其中 **35.8% 的慢请求落在只占 8.6% 流量的
+`xiaomi` 上**；27 条 300s 客户端超时也全部在它身上。
+
+**关键订正**：xiaomi 的**首字延迟并不慢**（ttft p50 2.4s），慢的是**生成时长**
+（整段响应 p50 23s）。所以路由信号必须用「整段响应 EWMA」，不能用 TTFB
+（`provider_stats::latency_ms` 是 TTFB，喂的是 `LatencyBased` 路由策略）。
+
+**实现**（commit `71b8a1f` + `19e7b69`）：
+- `provider_stats` 新增 `record_total_latency` / `total_latency_ms`：整段
+  交换耗时（请求开始→客户端最后字节）的 EWMA，成功请求才记账。
+- auto 池轮转按「快队」（fast cohort）挑：同一计费档内，只保留**整段 EWMA
+  ≤ max(档内中位数 × 2.5, 5s)** 的 entry；无测量值的 entry 保留（还没被证明慢，
+  且轮转本身才会产生第一次测量）；全部无测量值时退回全档（刚启动=纯轮转）。
+- 每 50 次轮转做一次 exploration，走全档，让恢复/新加的 provider 重新被测量。
+- **sticky 钉住也走同一个过滤器**：session 钉在慢 provider 上时，钉不被 honour
+  （记一次 affinity miss），请求落到快 provider 并**重新钉住**——和「钉在熔断 /
+  低计费档 / 探针槽满」的处理一致。否则一个会话会被永久拖在慢 provider 上。
+- 新指标 `maxllm_auto_pool_slow_skips_total{provider}`；
+  配置开关 `[auto_model].prefer_fast`（默认 `true`，设 `false` 回到纯轮转）。
+  **线上 maxllm.toml 未改动**（默认即开）。
+
+**测试**：8 条单测（中位数/5s 地板、同质簇不误杀、全新无测量、exploration、
+跳过计数、整段 EWMA）+ 1 条集成测试（3 provider，慢 mock 延迟 6s：会钉住慢
+provider，测完两条快线后，钉该 session 的下一次请求必须落到快 provider，
+慢 mock 只收到最开始 1 次请求）。`cargo fmt --check` / `clippy -D warnings` /
+`cargo test --workspace`（unit 178 / integration 133）全绿。
+
+**线上验证**（二进制 `0130293504…`，NRestarts=0）：
+- 24+20 次 `/v1/responses/auto` 探针全 200，`xiaomi` 一次都没被选中；
+  `maxllm_auto_pool_slow_skips_total{provider="xiaomi"}=23` 且只此一个 provider。
+- 定向验证 session 重钉：一个 DB 里钉在 `xiaomi` 的会话
+  （`01a1ba19-…`）发 `session-id` 请求 → 由 `minimax` 服务，affinity miss +1，
+  绑定重写为 `minimax`（`updated_at` 刷新）。
+- 预期收益：按 24h 对照（排除 xiaomi）auto 池 >30s 占比 ~9.7% → ~6.8%。
+
+---
+
 ## 附录 A：复现与口径
 
 ```sh
@@ -675,6 +718,8 @@ EOF
 | §828 404「模型不存在」分支 | ✅ 已修 | vLLM / miniCPM 对未知模型答 **404**（`The model X does not exist. Valid aliases: …`），旧改写只认 400/422 ⇒ 整条路由 404。改为延迟到 body 判定：`pending_model_404` + `body_reports_unknown_model()`（强/弱特征分级，端点 404 不误判）→ 命中走与 400/422 相同的三道闸 + 原地改写重试，不命中走普通 failover 且模型名不变；与 429 共用 `fail_over_from_body_filter` | 线上 `/v1/responses/{olefedora_gpu0_minicpmv47,coding_home_olefedora_gpu0}` 发 `deepseek-v4.1-flash:cloud`：修复前 404 → 修复后 200（`"model":"minicpmv47-awq"`）；拼错名仍 404；指标各 +1；4 单测 + 3 集成测试 |
 | 503 谎报 “All providers are unavailable” | ✅ 已修 | `select_provider` 空结果改用 `unavailable_reason()`：逐候选点名 + breaker 状态（配额 force-open / 开闸 / 半开探针在飞 / 未配置）+ 路由路径 | 线上 `/v1/responses/{zhipu_1,volc_t_1}` → 503 `no provider available: zhipu_1=circuit open (quota force-open) — every candidate of route '/v1/responses/zhipu_1' is rejecting traffic`；`pool_health` 一轮 4 家配额 503 全部自解释 |
 | §1.2 4xx/5xx 误记为 `stream truncated` | ✅ 已修 | 只有 2xx..399 的流才谈得上"截断"：native Responses 流式分支加 `upstream_status < 400` 守卫（4xx 走缓冲/规范化错误体路径）；`mark_stream_truncated()` 入口对 ≥400 直接 return false（计数器唯一记账点）；`observe_stream_chunk()` 对 ≥400 提前返回（不再往 JSON 错误体追加 SSE 事件）；`logging()` 的 `truncated` 限定 `status < 400`（日志/指标双保险） | 线上 deepseek 流式 4xx（`temperature:9`→400、`max_output_tokens:-1`→422）：body 从"JSON+追加的 gateway_stream_truncated 事件"变纯 JSON；`request_logs.error` 不再写 "stream truncated"；`maxllm_stream_truncated_total{deepseek}` 对 4xx 不再记账；正常 200 流 10039B 完整收尾无回归；新单测 1 条，unit 7/7 + integration 132/132 + fmt/clippy 全绿 |
+
+| auto 池 latency-aware 轮转 | ✅ 已修（优化） | 整段响应 EWMA（非 TTFB）+ 档内中位数 ×2.5（5s 地板）快队 + 每 50 次 exploration；sticky 钉也走同一过滤器（钉慢 provider 不 honour、重新钉到快 provider）；新指标 `auto_pool_slow_skips_total`；开关 `[auto_model].prefer_fast`（默认 true） | 线上 44 次 auto 探针全 200、xiaomi 0 次入选、skip 计数 23 只落 xiaomi；DB 钉在 xiaomi 的会话 `01a1ba19-…` 发请求 → minimax 服务 + affinity miss +1 + 绑定重写 minimax；单测 8 + 集成 1，workspace 全绿（见 §10） |
 
 ### 仍未做（需拍板或有前置）
 
