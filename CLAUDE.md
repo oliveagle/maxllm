@@ -75,7 +75,7 @@ Client receives response
 
 ```
 maxllm/
-  Cargo.toml              # Workspace root (5 crates)
+  Cargo.toml              # Workspace root (6 crates)
   maxllm.toml             # Gateway configuration
   crates/
     maxllm-config/        # TOML config parsing, env var expansion, validation
@@ -83,6 +83,7 @@ maxllm/
     maxllm-translate/     # Provider translation (OpenAI <-> 17 providers)
     maxllm-admin/         # Virtual keys, teams, cost tracking, budget enforcement, admin API
     maxllm-gateway/       # Main binary: Pingora ProxyHttp implementation + routing
+    maxllm-commandcode/   # Sidecar binary: OpenAI Responses / Chat Completions bridge in front of the `cmd` CLI
 ```
 
 **Dependency flow:** `maxllm-gateway` depends on all four crates. `maxllm-plugin` and `maxllm-translate` are independent of each other. `maxllm-config` and `maxllm-admin` have no internal dependencies.
@@ -117,6 +118,39 @@ maxllm/
 | Command Code | `commandcode` | OpenAI-compatible + native Responses + Anthropic Messages | Bearer token |
 | OpenDesign | `open_design` | OpenAI-compatible + native Responses | Bearer token |
 | Custom | `openai_compat` | OpenAI-compatible | Configurable |
+
+### Command Code CLI bridge (`maxllm-commandcode`)
+
+`kind = "commandcode"` talks to the vendor's **Provider API**
+(`/provider/v1/*`), which needs the paid Provider plan — on the Go plan every
+call answers `403 upgrade_required`.
+
+`crates/maxllm-commandcode/` is a standalone sidecar binary that bridges the
+vendor's own client instead: it runs `cmd -p <prompt> --output-format json`
+(the CLI's documented non-interactive mode) and translates the NDJSON event
+stream into an OpenAI contract — **the Responses contract natively**
+(`POST /v1/responses`, the `response.*` SSE family) and Chat Completions
+(`POST /v1/chat/completions`).
+
+In `maxllm.toml` it is an `openai_compat` provider with
+`native_responses = true` and `responses_path = "/v1/responses"`, so the
+gateway forwards a client's Responses body byte-for-byte:
+
+```toml
+[providers.cmd_cli]
+kind = "openai_compat"
+base_url = "http://127.0.0.1:3801"
+upstream_path = "/v1/chat/completions"
+responses_path = "/v1/responses"
+native_responses = true
+default_model = "commandcode-cli/deepseek-v4.1-flash"
+```
+
+The served model id is deliberately **not** the CLI's own id: the CLI plan is
+a flat subscription, and an id that matches a per-token price entry would be
+booked as metered. See `crates/maxllm-commandcode/README.md` for the flags,
+the contract and the known limits (no function calling, ~24k input tokens per
+request, the CLI agent's own tools).
 
 ## Plugin System
 
