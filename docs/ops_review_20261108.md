@@ -258,6 +258,7 @@ curl -s http://<gateway>:3795/v1/responses/auto \
 | P2 日志未轮转 | ✅ 已修 | `scripts/rotate_logs.py` + systemd timer：按大小轮转 `maxllm.log`/`maxllm.err`（O_APPEND 下可安全截断），并保留 14 天 recordings | 线上 timer 已 enable 并手动跑通 |
 | P2 探针污染指标 | ✅ 已修 | probe 请求跳过 metrics / request_logs / breaker 记账 | 见 P1-7 |
 | P2 `/metrics` 无鉴权 | ✅ 已修 | 默认仅 loopback 可读，`[metrics] allow_remote = true` 才放开 | 3 条单测覆盖 loopback / 远程 / 未知 peer |
+| P2 recordings 落盘脱敏 | ✅ 已修 | recorder 落盘前两层脱敏：①凭据键（`authorization`/`api_key`/`token`/`password`/`cookie`… 按归一化名精确匹配，`max_tokens` 等计数不受影响）整值替换 `[REDACTED]`；②自由文本里的高置信密钥形状（`Bearer …`/`sk-…`/`AKIA…`/`ghp_…`/`xox?-…`/`AIza…`/JWT/`api_key=…`）；`redact_pii` 另清邮箱/手机号/身份证。命中条目标 `redacted: true` 并计 `maxllm_recording_redactions_total`。历史分片用 `scripts/redact_recordings.py` 原地重写（同规则、原子替换、`--dry-run`） | 8 条 recorder 单测（键/嵌套/数组/自由文本/PII/可关闭/落盘断言）+ 脚本合成数据自测；线上历史分片已重写 |
 | 新增（审计未列） | ✅ | **流截断率自动降级**：某 provider 在一分钟窗口内截断数 ≥4 且占比 ≥25% 时强制开闸 `fail_timeout`，路由自动走到 fallback 下一家（`maxllm_circuit_breaker_stream_opens_total` + `maxllm-stream-demotions` 告警） | 集成测试 `test_a_truncating_provider_is_demoted_and_traffic_moves_to_the_fallback`：4 次截断后第 5 个请求由健康 fallback 服务 |
 
 ### 仍未做（需拍板或有前置）
@@ -266,6 +267,5 @@ curl -s http://<gateway>:3795/v1/responses/auto \
 |---|---|---|
 | `/v1/responses` primary 从 ollama 端点换掉 | 属成本/配额口径决策 | 新增的流截断率降级已让它在持续截断时**自动**被降级；若希望彻底不经手，改 `provider` 或让客户端走 `/v1/responses/auto` |
 | 首字节前的截断 failover | 需要"先缓冲首包再决定"的改写，影响交互延迟 | 先用 `stream_truncated_before_first_byte_total` 量化收益再决定 |
-| recordings 落盘脱敏 | 目前存完整 body | 已加 14 天保留；脱敏需要字段级规则（prompt/response 内容） |
 | 超大 prompt 预检 | ≥128k 输入截断率显著更高 | 可先用 `maxllm_stream_truncated_total` × 请求 token 直方图确认 |
 | 告警真实出口 | `maxllm-http-sink` 仍是占位 URL（httpbin） | `scripts/openobserve_alerts.py --destination-url <webhook>` 一条命令替换 |

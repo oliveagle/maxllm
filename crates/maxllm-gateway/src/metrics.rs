@@ -67,6 +67,10 @@ pub struct GatewayMetrics {
     /// Requests currently in flight per provider — the live view of the
     /// least-connections routing decision.
     pub provider_inflight_requests: IntGaugeVec,
+    /// Recorded bodies (or error strings) whose content the recorder scrubbed
+    /// before writing. Non-zero means clients are pasting credentials or
+    /// personal data through the gateway; the bytes never reach the log store.
+    pub recording_redactions_total: IntCounter,
 }
 
 impl GatewayMetrics {
@@ -303,6 +307,15 @@ impl GatewayMetrics {
             .register(Box::new(provider_inflight_requests.clone()))
             .expect("register");
 
+        let recording_redactions_total = IntCounter::new(
+            "maxllm_recording_redactions_total",
+            "Recorded bodies/errors scrubbed by the recorder redactor",
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(recording_redactions_total.clone()))
+            .expect("register");
+
         Self {
             registry,
             requests_total,
@@ -327,6 +340,7 @@ impl GatewayMetrics {
             http_failovers_total,
             provider_retries_total,
             provider_inflight_requests,
+            recording_redactions_total,
         }
     }
 

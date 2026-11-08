@@ -1036,7 +1036,36 @@ dir = "./recordings"
 max_body_bytes = 8192
 max_file_bytes = 67108864
 retention_hours = 168
+redact = true      # scrub credentials before writing (default true)
+redact_pii = true  # also scrub e-mail / phone / resident ID (default true)
 ```
+
+Bodies are **redacted before they reach disk**. Two layers:
+
+- *Key-based*: a JSON key that conventionally carries a credential
+  (`authorization`, `api_key`, `x-api-key`, `access_token`, `client_secret`,
+  `password`, `cookie`, …) has its value replaced whole with `[REDACTED]`.
+  Keys are matched as normalised names, so token *counts* (`max_tokens`,
+  `prompt_tokens`) are never touched.
+- *Shape-based*: high-confidence secret shapes are scrubbed inside ordinary
+  strings, because a key pasted into a prompt lands in `input`/`messages`, not
+  in a metadata field — `Bearer …`, `sk-…`/`rk-…`, `AKIA…`, `ghp_…`, `xox?-…`,
+  `AIza…`, JWTs, and inline `api_key=…`/`token: …`.
+
+With `redact_pii` on, e-mail addresses, mainland-China mobile numbers and
+18-digit resident IDs are replaced with `[EMAIL]`/`[PHONE]`/`[ID]`. Any entry
+whose body was scrubbed carries `redacted: true`, and
+`maxllm_recording_redactions_total` counts them — non-zero means clients are
+pasting credentials through the gateway. This is a scrubbing layer, not a
+guarantee: a novel credential format in free text can still slip through, so
+keep the retention window short and treat the shard directory as sensitive.
+
+Shards written before redaction existed can be scrubbed in place with the same
+rules: `python3 scripts/redact_recordings.py --dir recordings` (add
+`--dry-run` to report only, `--no-pii` to keep personal data). The script
+replaces shards atomically, which orphans the append-only fd of a *running*
+gateway, so run it with the service stopped — or pass `--live` to skip the
+shard the gateway currently holds open.
 
 The `client_request` event carries the original client body (captured before
 any translation rewrites it) and `client_response` carries the upstream body —

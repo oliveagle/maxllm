@@ -217,6 +217,21 @@ pub struct RecordingConfig {
     /// Delete recording shards older than this many hours.
     #[serde(default = "default_recording_retention_hours")]
     pub retention_hours: u64,
+    /// Scrub credentials out of recorded bodies before they hit disk.
+    ///
+    /// Applies to both the JSON keys that conventionally carry credentials
+    /// (`authorization`, `api_key`, `token`, …) and high-confidence secret
+    /// shapes inside ordinary strings (`sk-…`, `Bearer …`, `AKIA…`, JWTs).
+    /// On by default: recordings are shipped to a log store, so an unredacted
+    /// body is an exfiltration path for any key a client pastes into a prompt.
+    #[serde(default = "default_true")]
+    pub redact: bool,
+    /// Also scrub obvious personal data — e-mail addresses, mainland China
+    /// mobile numbers and 18-digit resident IDs — from recorded bodies.
+    /// On by default; turn off only on a deployment whose audit trail must
+    /// preserve the exact prompt text.
+    #[serde(default = "default_true")]
+    pub redact_pii: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1086,6 +1101,13 @@ mod mutation_tests {
         assert_eq!(default_recording_max_body_bytes(), 8192);
         assert_eq!(default_recording_max_file_bytes(), 64 * 1024 * 1024);
         assert_eq!(default_recording_retention_hours(), 168);
+        // Redaction is a safety default, not an opt-in: a `[recording]` block
+        // written before the switch existed must still scrub bodies.
+        assert!(default_true());
+        let cfg: RecordingConfig =
+            toml::from_str("enabled = true\ndir = \"/tmp/rec\"\n").expect("recording config");
+        assert!(cfg.redact);
+        assert!(cfg.redact_pii);
     }
 
     #[test]

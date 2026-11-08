@@ -1703,6 +1703,7 @@ dependencies = [
  "pingora-limits",
  "portpicker",
  "prometheus",
+ "regex",
  "reqwest",
  "serde_json",
  "sha2",
