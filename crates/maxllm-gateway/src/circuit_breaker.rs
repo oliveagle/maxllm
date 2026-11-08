@@ -57,6 +57,11 @@ pub struct CircuitBreaker {
     stream_judged: AtomicU32,
     /// The truncated subset of `stream_judged` inside the window.
     stream_bad: AtomicU32,
+    /// Consecutive stream-demotions with no clean window in between. Drives
+    /// the hold escalation: a provider that keeps truncating after its
+    /// cool-down is put away for longer each time instead of flapping back
+    /// into rotation every `fail_timeout`.
+    stream_demotion_streak: AtomicU32,
     /// Force-opens caused by a bad stream-truncation ratio.
     stream_opens: AtomicU64,
 }
@@ -69,6 +74,18 @@ const STREAM_WINDOW_MS: u64 = 60_000;
 const STREAM_MIN_BAD: u32 = 4;
 /// Truncation ratio that demotes a provider for its normal fail timeout.
 const STREAM_BAD_RATIO: f64 = 0.25;
+
+/// Hold applied for the 1st, 2nd, 3rd and 4th+ consecutive stream-demotion,
+/// clamped from below by the provider's own `fail_timeout`.
+///
+/// A provider that truncates a *systematic* share of its streams (the ollama
+/// endpoint sat at ~34% for a day) is demoted at the normal 60 s timeout,
+/// comes back, truncates four more answers in the first minute, and is
+/// demoted again — a flap that costs the client a broken answer every cycle
+/// and never actually takes the provider out of service. Escalating the hold
+/// keeps it out for as long as the evidence says it is broken; a clean window
+/// of real traffic resets the ladder.
+const STREAM_DEMOTION_HOLD_SECS: [u64; 4] = [60, 300, 900, 1800];
 
 impl CircuitBreaker {
     pub fn new(max_fails: u32, fail_timeout_secs: u64) -> Self {
@@ -99,6 +116,7 @@ impl CircuitBreaker {
             stream_window_start_ms: AtomicU64::new(0),
             stream_judged: AtomicU32::new(0),
             stream_bad: AtomicU32::new(0),
+            stream_demotion_streak: AtomicU32::new(0),
             stream_opens: AtomicU64::new(0),
         }
     }
@@ -273,9 +291,12 @@ impl CircuitBreaker {
     ///
     /// This measures the *ratio* over a short window instead. Once enough
     /// truncations have accumulated and they exceed [`STREAM_BAD_RATIO`], the
-    /// circuit is force-opened for the breaker's normal fail timeout. Routing
-    /// skips open circuits, so the route's traffic moves to the next fallback
-    /// provider; the provider then gets a probe window to prove itself again.
+    /// circuit is force-opened. Routing skips open circuits, so the route's
+    /// traffic moves to the next fallback provider; the provider then gets a
+    /// probe window to prove itself again. Consecutive demotions without a
+    /// clean window in between escalate the hold
+    /// ([`STREAM_DEMOTION_HOLD_SECS`]) so a systematically broken provider does
+    /// not flap back into rotation every minute.
     pub fn record_stream_outcome(&self, truncated: bool) {
         let now = now_ms();
         let window_start = self.stream_window_start_ms.load(Ordering::Relaxed);
@@ -287,6 +308,14 @@ impl CircuitBreaker {
                 .compare_exchange(window_start, now, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
             {
+                // A window that carried real stream traffic and no truncation
+                // is proof the provider recovered: drop the escalation so a
+                // later relapse starts again at the short hold.
+                let judged = self.stream_judged.load(Ordering::Relaxed);
+                let bad = self.stream_bad.load(Ordering::Relaxed);
+                if judged >= STREAM_MIN_BAD && bad == 0 {
+                    self.stream_demotion_streak.store(0, Ordering::Relaxed);
+                }
                 self.stream_judged.store(0, Ordering::Relaxed);
                 self.stream_bad.store(0, Ordering::Relaxed);
             }
@@ -300,8 +329,9 @@ impl CircuitBreaker {
         if bad < STREAM_MIN_BAD || (bad as f64) / (judged.max(1) as f64) < STREAM_BAD_RATIO {
             return;
         }
+        let streak = self.stream_demotion_streak.fetch_add(1, Ordering::Relaxed) + 1;
         self.force_open_until_ms
-            .store(now + self.fail_timeout_ms, Ordering::Relaxed);
+            .store(now + self.demotion_hold_ms(streak), Ordering::Relaxed);
         self.state.store(STATE_OPEN, Ordering::Relaxed);
         self.failures.store(self.max_fails, Ordering::Relaxed);
         self.last_failure_at.store(now, Ordering::Relaxed);
@@ -317,6 +347,14 @@ impl CircuitBreaker {
     /// Force-opens caused by a bad stream-truncation ratio.
     pub fn stream_opens(&self) -> u64 {
         self.stream_opens.load(Ordering::Relaxed)
+    }
+
+    /// Hold for the `streak`-th consecutive stream-demotion.
+    fn demotion_hold_ms(&self, streak: u32) -> u64 {
+        let step = usize::try_from(streak.saturating_sub(1))
+            .unwrap_or(usize::MAX)
+            .min(STREAM_DEMOTION_HOLD_SECS.len() - 1);
+        (STREAM_DEMOTION_HOLD_SECS[step] * 1000).max(self.fail_timeout_ms)
     }
 
     pub fn record_success(&self) {
@@ -632,6 +670,63 @@ mod tests {
             "4 truncations in 8 judged streams must demote"
         );
         assert_eq!(cb.stream_opens(), 1, "the demotion is counted once");
+    }
+
+    fn hold_secs(cb: &CircuitBreaker) -> u64 {
+        (cb.force_open_until_ms
+            .load(Ordering::Relaxed)
+            .saturating_sub(now_ms())
+            + 500)
+            / 1000
+    }
+
+    /// A provider that keeps truncating after its cool-down must be put away
+    /// for longer each time instead of flapping back in every 60 seconds.
+    #[test]
+    fn test_repeated_stream_demotions_escalate_the_hold() {
+        let cb = CircuitBreaker::new(3, 60);
+        let mut holds = Vec::new();
+        for expected_opens in 1..=4u64 {
+            for _ in 0..STREAM_MIN_BAD {
+                cb.record_stream_outcome(true);
+            }
+            assert_eq!(cb.stream_opens(), expected_opens);
+            holds.push(hold_secs(&cb));
+            // Force the next burst to start from an empty window, exactly as
+            // it would after the hold expires and traffic returns.
+            cb.stream_window_start_ms.store(0, Ordering::Relaxed);
+            cb.stream_judged.store(0, Ordering::Relaxed);
+            cb.stream_bad.store(0, Ordering::Relaxed);
+        }
+        assert_eq!(holds, STREAM_DEMOTION_HOLD_SECS.to_vec());
+    }
+
+    /// Serving a clean window proves recovery: the ladder restarts at the
+    /// short hold instead of carrying the old escalation forever.
+    #[test]
+    fn test_a_clean_window_resets_the_demotion_hold() {
+        let cb = CircuitBreaker::new(3, 60);
+        for _ in 0..STREAM_MIN_BAD {
+            cb.record_stream_outcome(true);
+        }
+        assert_eq!(cb.stream_opens(), 1);
+        assert_eq!(hold_secs(&cb), STREAM_DEMOTION_HOLD_SECS[0]);
+
+        // A full window of real traffic with zero truncations.
+        for _ in 0..STREAM_MIN_BAD {
+            cb.record_stream_outcome(false);
+        }
+        // Roll the window: the roll observes judged=4, bad=0 and resets the
+        // streak. This sample opens the next window.
+        cb.stream_window_start_ms.store(0, Ordering::Relaxed);
+        cb.record_stream_outcome(false);
+
+        // Relapse: the hold is back to the first step.
+        for _ in 0..STREAM_MIN_BAD {
+            cb.record_stream_outcome(true);
+        }
+        assert_eq!(cb.stream_opens(), 2);
+        assert_eq!(hold_secs(&cb), STREAM_DEMOTION_HOLD_SECS[0]);
     }
 
     /// One truncation among many good streams is a flake, not a bad provider.

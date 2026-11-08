@@ -811,11 +811,21 @@ event, so the circuit would essentially never trip.
 
 The breaker therefore also measures the truncation **ratio** over a one-minute
 window. Once at least 4 judged streams in the window were truncated *and* they
-are at least 25% of them, the circuit is force-opened for the provider's
-`fail_timeout_secs`. Routing skips open circuits, so the route's traffic moves
-to the next fallback provider; after the cool-down the provider gets a probe
-window to prove itself again. This is counted once per demotion
-(`stream_opens`) and reported by the `maxllm-stream-demotions` alert.
+are at least 25% of them, the circuit is force-opened. Routing skips open
+circuits, so the route's traffic moves to the next fallback provider; after the
+cool-down the provider gets a probe window to prove itself again. This is
+counted once per demotion (`stream_opens`) and reported by the
+`maxllm-stream-demotions` alert.
+
+The hold **escalates**: consecutive demotions with no clean window in between
+are put away for 1 min, 5 min, 15 min, then 30 min (never shorter than the
+provider's own `fail_timeout_secs`). Without that, a systematically broken
+provider — the ollama endpoint truncated ~34% of its streams for a day — would
+be demoted, restored 60 s later, truncate four more answers in its first
+minute, and be demoted again: a flap that costs the client a broken answer per
+cycle and never really takes the provider out of service. A window that
+carries at least 4 judged streams with **zero** truncations is proof of
+recovery and resets the ladder to the first step.
 
 Consequences worth knowing:
 
@@ -1254,6 +1264,7 @@ Available at `GET /metrics` when enabled:
 | `stream_truncated_before_first_byte_total` | provider | Counter |
 | `streams_judged_total` | provider | Counter |
 | `usage_missing_total` | provider, model | Counter |
+| `recording_redactions_total` | &mdash; | Counter |
 | `auto_pool_metered_selections_total` | &mdash; | Counter |
 | `provider_inflight_requests` | provider | Gauge |
 

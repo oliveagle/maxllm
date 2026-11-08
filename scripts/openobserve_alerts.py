@@ -99,6 +99,18 @@ ALERTS: dict[str, tuple[str, str, float, int, int, str]] = {
         60,
         "maxllm_streams_judged_total",
     ),
+    # A client pasting a credential (or personal data) into a prompt is a
+    # security signal even though the recorder scrubbed it before disk: the
+    # key still travelled to a third-party model provider. Any single
+    # occurrence is worth a look, hence the zero threshold.
+    "maxllm-recording-redactions": (
+        "Recorded body scrubbed of credentials or personal data",
+        "sum(increase(maxllm_recording_redactions_total[10m]))",
+        0,
+        10,
+        60,
+        "maxllm_requests_total",
+    ),
     # A provider that truncates a large share of its streams is demoted off the
     # route; that is a deliberate routing change and should be reported.
     "maxllm-stream-demotions": (
