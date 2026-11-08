@@ -429,6 +429,42 @@ pool_health 接 timer（5 min）；probe 显式传 `--provider kimi`；探针请
 注意：`auto_home` 那 11 个成员 502 是**上游真的没在跑**（家里 GPU 服务未启动），
 不是本缺陷；修复只是让它们从"被误报成 503 熔断"变成"如实报 502"。
 
+### 7.2 修复（2026-11-08 18:5x CST）：异构 fallback 链的模型名改写 + 诚实 503
+
+两个在 §7.1 复核中暴露的旁路缺陷，一起修（commit `038ff0a`，已上线验证）：
+
+**A. §828 设计缺口：模型名改写（真缺陷）**
+
+- 现象：通用 `/v1/responses` 路由 primary=`ollama_local`（模型 `deepseek-v4.1-flash:cloud`），
+  fallback 链 10 家云渠道各持不同模型名。客户端把 primary 专属名原样发给链上每家：
+  volc/minimax/deepseek 等都不认，答 400 `unknown model`；`should_failover_status` 因
+  `default_model != ctx.model` 判为"可换"，于是整条链把 400 走完，**primary 一挂该模型名整条路由即死**。
+- 修法（**只在 400/422 且该名真的属于本部署某 provider 时**触发，retry 同一 provider 一次）：
+  1. `request_body_filter` 新增 `model_override` 通道：重试时把 body 的 `model` 字段改写为目标
+     provider 的 `default_model`，再走翻译/转发；
+  2. `upstream_request_filter` 把 `model_override.is_some()` 并入 `is_auto_route` ——
+     改写后的 body 体积会变，必须走 chunked，不能保留原 Content-Length 逐字节直传
+     （**踩坑**：native Responses 直传分支不改 body，第一版上线后 minimax/deepseek 仍收到原名，
+     靠 recordings 逐条核对才发现 retry 的 `ctx.model` 已对、body 没对）；
+  3. 三道闸：`no_later_candidate_carries_model`（还有一家声称持有该名的没试过 → 先 failover 不改写，
+     避免静默换模型）、`model_belongs_to_some_provider`（拼错的名字不改写，保持 400）、
+     `model_rewritten_providers`（每 provider 至多改写一次，防 ping-pong）。
+- 新指标 `maxllm_model_rewrite_retries_total{provider}`。
+- 验证（线上真实上游）：`/v1/responses/minimax` 与 `/v1/responses/deepseek` 发
+  `deepseek-v4.1-flash:cloud` → **修复前 400 unknown model，修复后 200**（各自改写为
+  `MiniMax-M3` / `deepseek-flash`）；`volc_1` 本就认该名，200 不变。
+- 5 条新回归测试（含 native Responses 路径 + 改写的"最后手段"闸门 + 拼错名保持 400）。
+
+**B. 诚实 503：不再谎报 "All providers are unavailable"**
+
+- 现象：`pool_health` 的 503 文案统一是 `All providers are unavailable (circuit breakers open)`，
+  而它探的是**钉死的单 provider 路由**（`/v1/responses/<provider>`）——一家配额 force-open，
+  文案却让运维去找路由 bug（§7.1 的 16/25 一度就是这样被误读的）。
+- 修法：`select_provider` 空结果时 `unavailable_reason()` 逐候选点名：
+  `no provider available: kimi=circuit open (quota force-open) — every candidate of route '/v1/responses/kimi' is rejecting traffic`。
+- 验证：线上 `/v1/responses/{zhipu_1,volc_t_1}` → 503 点名 + 原因；`pool_health` 最新一轮 4 家
+  配额 503 全部自解释，11 家 502 如实暴露。
+
 ---
 
 ## 8. P2：小项
@@ -562,6 +598,8 @@ EOF
 | P0-3 缓存折价计价 | ✅ 已修（计价侧） | 价格表新增可选 `cached_input_per_1m`（`[model_costs."…"]` 每行，`#[serde(default)]` 省略即保持现状）；`CostCalculator` 新增 `cache_rates`（exact 优先、glob 兜底）+ `set_cache_rate()` / `cache_rate_for()` + `calculate_cost_with_cache(model, in, out, cached)`（cached 钳制到 in，接口不破坏：旧 `calculate_cost()` 内部转调、cached=0）；内置 `MiniMax-M3 → $0.05`；`gateway` 按配置 `set_cache_rate` 并用 `ctx.cached_tokens_in` 计价 | 3 条单测钉住折价/钳制/glob 覆盖；线上 minimax 单请求记账从 ~$0.055 降到 ~$0.010 量级（99.5% input 按 $0.05 计）；**未配置 `cached_input_per_1m` 的模型一律按 list 计**，刻意为之（渠道缓存价未知时不低估） |
 | P0-3 价格表复核 | ✅ 已核对（未改价） | `minimax`/`MiniMax-M3` 6 小时 1 290 请求、119.2M in / 0.51M out 记 $36.379，与内置 $0.30/M + $1.20/M 复算值 $36.377 一致，也与厂商公开价一致；**该数字是全 list 价 ⇒ 是上限**（缓存折价见下一行） | 反推单价 $0.3051/M 与配置单价吻合，排除重复计费/单位错位 |
 | P1 熔断器探针槽泄漏（旁路发现） | ✅ 已修 | `is_open()` 兼作状态机驱动，而**过滤**路径对每个候选都调用它 ⇒ 被"看过却没选中"的 provider 各占一个 probe 槽且永不释放（`pending_probes` 不落盘）⇒ 永久 503。修法：纯读 `allows_traffic()` 走所有过滤；`is_open()` 只在选中的 provider 上调用一次；幂等钳零 `release_probe()` + `logging()` 终态归还 + 2×`fail_timeout` 兜底回收；`Closed→HalfOpen` 改 CAS | 线上 `pool_health.py` BAD 503 **16/25 → 4/25**（仅剩 4 家配额强制开闸）；`ollama_local` 定向 503 → 200 并关闭熔断；3 条新回归测试；unit 162→165、integration 124(+4 ignored) 全绿 |
+| §828 异构 fallback 链的模型名 | ✅ 已修 | 400/422 `unknown model` 且该名属于本部署某 provider 时，同一 provider 带 `model_override` 重试一次：body 的 `model` 改写为该 provider 的 `default_model`；`model_override.is_some()` 并入 `is_auto_route` 使改写后的 body 走 chunked（native Responses 直传分支不改 body 的坑）；三道闸 = 先试“还持有该名”的 provider、拼错名不改写、每 provider 至多一次；新指标 `maxllm_model_rewrite_retries_total{provider}` | 线上 `/v1/responses/minimax`、`/v1/responses/deepseek` 发 `deepseek-v4.1-flash:cloud`：修复前 400 unknown model → 修复后 200（分别改写为 `MiniMax-M3`/`deepseek-flash`）；5 条新回归测试（含 native Responses 路径） |
+| 503 谎报 “All providers are unavailable” | ✅ 已修 | `select_provider` 空结果改用 `unavailable_reason()`：逐候选点名 + breaker 状态（配额 force-open / 开闸 / 半开探针在飞 / 未配置）+ 路由路径 | 线上 `/v1/responses/{zhipu_1,volc_t_1}` → 503 `no provider available: zhipu_1=circuit open (quota force-open) — every candidate of route '/v1/responses/zhipu_1' is rejecting traffic`；`pool_health` 一轮 4 家配额 503 全部自解释 |
 
 ### 仍未做（需拍板或有前置）
 

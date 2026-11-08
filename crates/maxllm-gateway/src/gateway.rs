@@ -1380,6 +1380,111 @@ impl AiGateway {
         }
     }
 
+    /// Whether no untried candidate of the route declares itself as carrying
+    /// the requested model.
+    ///
+    /// A 400 "unknown model" has two possible cures, and the cheaper one is
+    /// handing the request to a provider that does carry the name. Only when
+    /// no such provider is left does it make sense to substitute the model
+    /// with the current provider's `default_model` — the name may simply
+    /// belong to the provider that just died (the pooled `/v1/responses`
+    /// primary's `deepseek-v4.1-flash:cloud`), which no fallback knows.
+    ///
+    /// A candidate with no `default_model` gives no signal and is treated as
+    /// possibly carrying the model, so a request is never rewritten while an
+    /// unexamined provider is still in the chain.
+    fn no_later_candidate_carries_model(&self, hot: &HotState, ctx: &RequestCtx) -> bool {
+        let Some(route) = ctx.route_index.and_then(|i| hot.routes.get(i)) else {
+            return false;
+        };
+        !std::iter::once(&route.provider)
+            .chain(route.fallback.iter())
+            .filter(|name| name.as_str() != ctx.provider_name)
+            .filter(|name| !ctx.attempted_providers.iter().any(|a| a == *name))
+            .any(|name| {
+                hot.providers.get(name).is_some_and(|p| {
+                    p.circuit_breaker.allows_traffic()
+                        && p.default_model.as_deref().is_none_or(|dm| dm == ctx.model)
+                })
+            })
+    }
+
+    /// Whether `ctx.model` is a name this deployment actually serves — the
+    /// `default_model` of some provider or the model of some pool entry.
+    ///
+    /// A 400 for a name no provider declares is a typo, or a model this
+    /// gateway does not offer at all; substituting the current provider's
+    /// default would silently answer with a different model. Only a name that
+    /// belongs to *another* provider of this deployment (the pooled
+    /// `/v1/responses` primary's `deepseek-v4.1-flash:cloud`) is worth
+    /// rewriting when that provider is the one that failed.
+    fn model_belongs_to_some_provider(hot: &HotState, ctx: &RequestCtx) -> bool {
+        if ctx.model.is_empty() {
+            return false;
+        }
+        hot.providers
+            .values()
+            .any(|p| p.default_model.as_deref() == Some(ctx.model.as_str()))
+            || hot
+                .auto_pools
+                .iter()
+                .flat_map(|pool| pool.entries.iter())
+                .any(|e| e.model == ctx.model)
+    }
+
+    /// Explain why routing produced no provider, naming every candidate and
+    /// its circuit state.
+    ///
+    /// The flat `503 "All providers are unavailable (circuit breakers open)"`
+    /// is actively misleading on a *pinned* single-provider route: the one
+    /// provider is circuit-open (often a quota force-open), and an operator
+    /// reading "all providers" starts hunting for a routing bug. Naming the
+    /// candidates and the reason turns the same answer into a diagnosis
+    /// (2026-11-08: `pool_health` reported 16/25 "All providers are
+    /// unavailable" while each entry was merely circuit-open on its own).
+    fn unavailable_reason(&self, hot: &HotState, route: &RouteConfig, ctx: &RequestCtx) -> String {
+        let mut names: Vec<&str> = Vec::new();
+        if let Some(pool) = hot.request_pool(route, ctx) {
+            names.extend(pool.entries.iter().map(|e| e.provider.as_str()));
+        } else {
+            names.push(&route.provider);
+            names.extend(route.fallback.iter().map(String::as_str));
+        }
+        if names.is_empty() {
+            return format!(
+                "no provider available: route '{}' has no candidates",
+                route.path
+            );
+        }
+        let mut parts: Vec<String> = Vec::new();
+        for name in names {
+            match hot.providers.get(name) {
+                None => parts.push(format!("{name}=not configured")),
+                Some(p) => {
+                    let cb = &p.circuit_breaker;
+                    if cb.is_force_open() {
+                        parts.push(format!("{name}=circuit open (quota force-open)"));
+                    } else {
+                        match cb.effective_state() {
+                            crate::circuit_breaker::STATE_OPEN => {
+                                parts.push(format!("{name}=circuit open"))
+                            }
+                            crate::circuit_breaker::STATE_HALF_OPEN => {
+                                parts.push(format!("{name}=half-open probe in flight"))
+                            }
+                            _ => parts.push(format!("{name}=available")),
+                        }
+                    }
+                }
+            }
+        }
+        format!(
+            "no provider available: {} — every candidate of route '{}' is rejecting traffic",
+            parts.join(", "),
+            route.path
+        )
+    }
+
     /// Resolve model aliases.
     fn resolve_model_alias(hot: &HotState, model: &str) -> String {
         hot.model_aliases
@@ -2385,7 +2490,7 @@ impl ProxyHttp for AiGateway {
                 return Self::send_error_response(
                     session,
                     503,
-                    "All providers are unavailable (circuit breakers open)",
+                    &self.unavailable_reason(&hot, route, ctx),
                 )
                 .await;
             }
@@ -2702,10 +2807,17 @@ impl ProxyHttp for AiGateway {
                 ctx.endpoint_type == EndpointType::Responses && !ctx.native_responses;
             let openai_style = provider.translator.name() == "openai"
                 || provider.translator.name() == "azure_openai";
-            // An auto route rewrites the request body's model field to the
-            // selected pool entry's model, so the body size changes and the
-            // request must travel chunked — never verbatim passthrough.
+            // A route that rewrites the request body's model field — the auto
+            // sentinel resolution, or a model substitution after a 400
+            // "unknown model" — changes the body's size, so the request must
+            // travel chunked: never verbatim passthrough. Without this the
+            // retry re-enters the `keep_request_content_length` branch, which
+            // forwards the body untouched and the substitution never reaches
+            // the upstream (2026-11-08: native-Responses providers answered
+            // the same 400 twice while `ctx.model` already showed the new
+            // name).
             let is_auto_route = ctx.auto_target.is_some()
+                || ctx.model_override.is_some()
                 || hot
                     .routes
                     .get(ctx.route_index.unwrap_or(usize::MAX))
@@ -3085,6 +3197,41 @@ impl ProxyHttp for AiGateway {
                         ctx.model = auto_model.clone();
                         Self::enforce_model_allowlist(session, ctx, &auto_model, None).await?;
                         ctx.plugin_ctx.model = auto_model.clone();
+                    }
+                }
+            } else if let Some(override_model) = ctx.model_override.take() {
+                // A retry after the previous attempt answered 400/422
+                // "unknown model": this provider does not carry the name the
+                // client sent (it belongs to another provider of the chain,
+                // e.g. the pool primary's `deepseek-v4.1-flash:cloud`).
+                // Rewrite the body to this provider's own default before the
+                // translation so every later step (responses→chat, guardrails,
+                // provider translator) sees the substituted name. The
+                // substitution only happens after the upstream said it does
+                // not know the original, so a provider that *would* have
+                // served it is never second-guessed.
+                if !ctx.request_body_buf.is_empty() {
+                    if let Ok(mut v) =
+                        serde_json::from_slice::<serde_json::Value>(&ctx.request_body_buf)
+                    {
+                        // A native Responses body is forwarded as-is, so the
+                        // model rewrite is the only pass that could read the
+                        // streaming flag on the retry.
+                        if let Some(stream) = v.get("stream").and_then(|s| s.as_bool()) {
+                            ctx.is_streaming = stream;
+                        }
+                        if let Some(obj) = v.as_object_mut() {
+                            obj.insert(
+                                "model".into(),
+                                serde_json::Value::String(override_model.clone()),
+                            );
+                        }
+                        if let Ok(bytes) = serde_json::to_vec(&v) {
+                            ctx.request_body_buf = bytes;
+                        }
+                        ctx.model = override_model.clone();
+                        Self::enforce_model_allowlist(session, ctx, &override_model, None).await?;
+                        ctx.plugin_ctx.model = override_model;
                     }
                 }
             } else if !ctx.keep_request_content_length {
@@ -3708,6 +3855,75 @@ impl ProxyHttp for AiGateway {
                 .push(format!("{}=toobig", ctx.provider_name));
             self.record_event(EVENT_PROVIDER_RESPONSE, ctx, Some(status), None, None, None);
             return Ok(());
+        }
+        // A provider that does not carry the requested model answers 400/422
+        // (one-api's `invalid params, unknown model`). When the name belongs
+        // to *another* provider of the route — the pooled `/v1/responses`
+        // primary serves `deepseek-v4.1-flash:cloud`, which no cloud fallback
+        // knows — a plain failover collects the same 400 from every entry and
+        // the route dies together with its primary. Rewrite the body's model
+        // to THIS provider's own default and retry it once before spending a
+        // provider of the chain. A second 400 after the rewrite is a genuine
+        // request fault and is returned to the client (at most one rewrite
+        // per provider, so the walk can never ping-pong).
+        //
+        // Only the plain fallback chain is rewritten: an auto pool already
+        // carries a per-entry model, which is authoritative for that entry.
+        if matches!(status, 400 | 422)
+            && ctx.auto_target.is_none()
+            && ctx.client_body.is_some()
+            && self.no_later_candidate_carries_model(&hot, ctx)
+            && Self::model_belongs_to_some_provider(&hot, ctx)
+        {
+            let rewrite_to = provider
+                .default_model
+                .as_deref()
+                .filter(|dm| !dm.is_empty() && *dm != ctx.model)
+                .map(str::to_string);
+            if let Some(rewrite_to) = rewrite_to {
+                if !ctx.model_rewritten_providers.contains(&ctx.provider_name) {
+                    let original_model = ctx.model.clone();
+                    ctx.model_rewritten_providers
+                        .push(ctx.provider_name.clone());
+                    ctx.model = rewrite_to.clone();
+                    ctx.plugin_ctx.model = rewrite_to.clone();
+                    ctx.model_override = Some(rewrite_to.clone());
+                    // Replay the whole client body: the translated copy of
+                    // the failed attempt carries the old model and cannot be
+                    // reused. Same state reset a failover performs, minus the
+                    // provider switch.
+                    ctx.body_translated = false;
+                    ctx.upstream_responded = false;
+                    ctx.request_body_buf.clear();
+                    ctx.replay_body = ctx.client_body.clone();
+                    ctx.replay_injected = false;
+                    ctx.keep_request_content_length = false;
+                    if let Ok(mut guard) = ctx.stream_translator.lock() {
+                        *guard = None;
+                    }
+                    METRICS
+                        .model_rewrite_retries_total
+                        .with_label_values(&[&ctx.provider_name])
+                        .inc();
+                    info!(
+                        status = %status,
+                        provider = %ctx.provider_name,
+                        from = %original_model,
+                        to = %rewrite_to,
+                        "upstream does not carry the requested model — rewriting to its own default and retrying it"
+                    );
+                    let mut e = pingora::Error::explain(
+                        pingora::ErrorType::HTTPStatus(status),
+                        format!(
+                            "provider '{}' does not carry model '{original_model}'; retrying it with '{}'",
+                            ctx.provider_name, rewrite_to
+                        ),
+                    );
+                    e.as_up();
+                    e.set_retry(true);
+                    return Err(e);
+                }
+            }
         }
         // A 5xx is a transient provider failure: when the route allows it
         // (`num_retries`), retry the SAME provider — spaced by

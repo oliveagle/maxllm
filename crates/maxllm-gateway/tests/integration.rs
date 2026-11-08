@@ -3676,6 +3676,448 @@ async fn test_400_for_carried_model_does_not_fail_over() {
     assert_eq!(fallback_reqs.len(), 0);
 }
 
+/// A heterogeneous fallback chain forwards one provider's model name to every
+/// entry. The pooled `/v1/responses` primary serves a provider-specific name
+/// (`deepseek-v4.1-flash:cloud`); when it dies, every cloud fallback answers
+/// 400 "unknown model", so a plain failover walked the whole chain and the
+/// route died together with its primary (docs/ops_review_20261108.md §828).
+///
+/// The provider that answers 400 and declares a different `default_model` must
+/// get one same-provider retry with its own model substituted; when that
+/// succeeds the client sees a 200 instead of the chain's last 400.
+#[tokio::test]
+async fn test_unknown_model_is_rewritten_to_the_fallback_default() {
+    let primary = MockServer::start().await;
+    let fallback = MockServer::start().await;
+
+    // The primary is simply down (the production shape: `ollama_local`
+    // unreachable). Its own default is the provider-specific name the client
+    // sends, so nothing about the request is wrong.
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500).set_body_json(json!({"error": "down"})))
+        .expect(1)
+        .mount(&primary)
+        .await;
+
+    // The fallback only knows its own default. The first attempt carries the
+    // primary's model name and is rejected; the rewritten retry must arrive
+    // with `fallback-model` and succeed.
+    Mock::given(method("POST"))
+        .respond_with(move |req: &wiremock::Request| {
+            let sent: Value = serde_json::from_slice(&req.body).expect("json body");
+            if sent["model"] == "fallback-model" {
+                ResponseTemplate::new(200).set_body_json(openai_response("from fallback"))
+            } else {
+                ResponseTemplate::new(400).set_body_json(json!({
+                    "error": {"message": format!(
+                        "invalid params, unknown model '{}'",
+                        sent["model"].as_str().unwrap_or_default()
+                    )}
+                }))
+            }
+        })
+        .mount(&fallback)
+        .await;
+
+    let config = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.primary]
+kind = "openai_compat"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+default_model = "primary-model:cloud"
+
+[providers.fallback]
+kind = "openai_compat"
+base_url = "{FALLBACK_URL}"
+api_key = "fake-key"
+default_model = "fallback-model"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "primary"
+fallback = ["fallback"]
+strategy = "fallback"
+max_failover_attempts = 4
+"#;
+    let gw = TestGateway::start_with_fallback(config, &primary.uri(), &fallback.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&chat_body("primary-model:cloud", "hi"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        200,
+        "the fallback must serve the rewritten retry instead of 400ing the whole route"
+    );
+    assert_eq!(resp.headers().get("X-MaxLLM-Provider").unwrap(), "fallback");
+
+    let fallback_reqs = fallback.received_requests().await.unwrap_or_default();
+    assert_eq!(
+        fallback_reqs.len(),
+        2,
+        "one rejected attempt, then the rewritten retry"
+    );
+    let first: Value = serde_json::from_slice(&fallback_reqs[0].body).expect("json body");
+    assert_eq!(
+        first["model"], "primary-model:cloud",
+        "the first attempt must carry the client's model name unchanged"
+    );
+    let second: Value = serde_json::from_slice(&fallback_reqs[1].body).expect("json body");
+    assert_eq!(
+        second["model"], "fallback-model",
+        "the retry must carry the fallback's own default model"
+    );
+}
+
+/// The rewrite is a fallback of last resort: while an untried provider still
+/// declares the requested model, the request must move to that provider
+/// instead of silently serving a different model from the current one.
+#[tokio::test]
+async fn test_unknown_model_prefers_a_provider_that_carries_the_name() {
+    let primary = MockServer::start().await;
+    let middle = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": {"message": "invalid params, unknown model 'wanted-model'"}
+        })))
+        .expect(1)
+        .mount(&primary)
+        .await;
+
+    // The middle provider declares the requested model as its default.
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from middle")))
+        .expect(1)
+        .mount(&middle)
+        .await;
+
+    let config = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.primary]
+kind = "openai_compat"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+default_model = "primary-model"
+
+[providers.middle]
+kind = "openai_compat"
+base_url = "{FALLBACK_URL}"
+api_key = "fake-key"
+default_model = "wanted-model"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "primary"
+fallback = ["middle"]
+strategy = "fallback"
+max_failover_attempts = 4
+"#;
+    let gw = TestGateway::start_with_fallback(config, &primary.uri(), &middle.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&chat_body("wanted-model", "hi"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers().get("X-MaxLLM-Provider").unwrap(), "middle");
+    let middle_reqs = middle.received_requests().await.unwrap_or_default();
+    assert_eq!(
+        middle_reqs.len(),
+        1,
+        "the carrying provider serves it first"
+    );
+    let sent: Value = serde_json::from_slice(&middle_reqs[0].body).expect("json body");
+    assert_eq!(
+        sent["model"], "wanted-model",
+        "the requested name must reach the provider that carries it"
+    );
+}
+
+/// The rewrite must reach the upstream on the **native Responses** path too.
+///
+/// A native Responses body normally travels verbatim, keeping the client's
+/// Content-Length; that branch forwards the bytes untouched. Substituting the
+/// model therefore has to switch the retry to chunked framing first, or the
+/// upstream sees the original name again and answers the same 400 (the live
+/// failure on 2026-11-08: `model_rewrite_retries_total` incremented, the
+/// retry's `ctx.model` was correct, and minimax still rejected the original
+/// name).
+#[tokio::test]
+async fn test_unknown_model_is_rewritten_on_the_native_responses_path() {
+    let upstream = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .respond_with(move |req: &wiremock::Request| {
+            let sent: Value = serde_json::from_slice(&req.body).expect("json body");
+            if sent["model"] == "native-model" {
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "id": "resp_1",
+                    "object": "response",
+                    "created_at": 1,
+                    "model": "native-model",
+                    "status": "completed",
+                    "output": [{
+                        "type": "message", "id": "msg_1", "role": "assistant",
+                        "status": "completed",
+                        "content": [{"type": "output_text", "text": "from native", "annotations": []}]
+                    }]
+                }))
+            } else {
+                ResponseTemplate::new(400).set_body_json(json!({
+                    "error": {"message": format!(
+                        "invalid params, unknown model '{}'",
+                        sent["model"].as_str().unwrap_or_default()
+                    )}
+                }))
+            }
+        })
+        .mount(&upstream)
+        .await;
+
+    let config = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+# Owns the model name the client sends; not on this route.
+[providers.owner]
+kind = "openai_compat"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+default_model = "primary-model:cloud"
+
+[providers.native]
+kind = "openai_compat"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+default_model = "native-model"
+native_responses = true
+responses_path = "/v1/responses"
+
+[[routes]]
+path = "/v1/responses/native"
+provider = "native"
+endpoint_type = "responses"
+strategy = "fallback"
+max_failover_attempts = 2
+"#;
+    let gw = TestGateway::start(config, &upstream.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/responses/native"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&json!({
+            "model": "primary-model:cloud",
+            "input": "hi",
+            "max_output_tokens": 16
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        200,
+        "the native-Responses retry must carry the provider's own model name"
+    );
+
+    let reqs = upstream.received_requests().await.unwrap_or_default();
+    assert_eq!(
+        reqs.len(),
+        2,
+        "one rejected attempt, then the rewritten retry"
+    );
+    let first: Value = serde_json::from_slice(&reqs[0].body).expect("json body");
+    assert_eq!(first["model"], "primary-model:cloud");
+    let second: Value = serde_json::from_slice(&reqs[1].body).expect("json body");
+    assert_eq!(
+        second["model"], "native-model",
+        "the retried native body must carry the substituted model"
+    );
+}
+
+/// A model name that belongs to no provider of this deployment (a typo, or a
+/// model the gateway does not offer) must stay a 400: the rewrite exists for
+/// names that belong to *another* provider of the same deployment, and must
+/// never silently answer a bogus name with the provider's default model.
+#[tokio::test]
+async fn test_unknown_model_of_no_provider_stays_a_400() {
+    let primary = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": {"message": "invalid params, unknown model 'gpt-4o'"}
+        })))
+        .mount(&primary)
+        .await;
+
+    let config = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.primary]
+kind = "openai_compat"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+default_model = "only-model"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "primary"
+strategy = "fallback"
+"#;
+    let gw = TestGateway::start(config, &primary.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&chat_body("gpt-4o", "hi"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        400,
+        "an unknown model name must not be substituted with the provider default"
+    );
+    let reqs = primary.received_requests().await.unwrap_or_default();
+    assert_eq!(
+        reqs.len(),
+        1,
+        "the provider must not be retried with a different model"
+    );
+}
+
+/// A 503 must name the candidate(s) and the reason instead of claiming that
+/// "all providers are unavailable" on a single-provider route.
+#[tokio::test]
+async fn test_503_names_the_provider_and_the_reason() {
+    let primary = MockServer::start().await;
+
+    // `max_fails = 1`: the first upstream 5xx opens the breaker, the next
+    // request is refused by the gateway before any upstream call.
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500).set_body_json(json!({"error": "down"})))
+        .mount(&primary)
+        .await;
+
+    let config = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.only]
+kind = "openai_compat"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+default_model = "only-model"
+max_fails = 1
+fail_timeout_secs = 60
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "only"
+strategy = "fallback"
+"#;
+    let gw = TestGateway::start(config, &primary.uri()).await;
+    let c = client();
+
+    let first = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&chat_body("only-model", "hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        first.status(),
+        500,
+        "the first attempt reaches the upstream"
+    );
+
+    let second = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&chat_body("only-model", "hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), 503, "the open breaker refuses the request");
+    let body: Value = second.json().await.unwrap();
+    let message = body["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("only=circuit open"),
+        "the 503 must name the provider and its state, got: {message}"
+    );
+    assert!(
+        message.contains("route '/v1/chat/completions'"),
+        "the 503 must name the route, got: {message}"
+    );
+}
+
 #[tokio::test]
 async fn test_all_providers_fail_returns_last_error() {
     let primary = MockServer::start().await;

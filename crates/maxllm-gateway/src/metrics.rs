@@ -71,6 +71,13 @@ pub struct GatewayMetrics {
     /// Same-provider retries after a transient upstream HTTP error (5xx),
     /// per provider and status. The route's `num_retries` bounds them.
     pub provider_retries_total: IntCounterVec,
+    /// Same-provider retries that rewrote the body's `model` to the
+    /// provider's own `default_model` after a 400/422 "unknown model".
+    ///
+    /// A heterogeneous fallback chain forwards one provider's model name to
+    /// every entry; without the rewrite the whole chain 400s and the route
+    /// dies with its primary (docs/ops_review_20261108.md §828).
+    pub model_rewrite_retries_total: IntCounterVec,
     /// Requests currently in flight per provider — the live view of the
     /// least-connections routing decision.
     pub provider_inflight_requests: IntGaugeVec,
@@ -324,6 +331,18 @@ impl GatewayMetrics {
             .register(Box::new(provider_retries_total.clone()))
             .expect("register");
 
+        let model_rewrite_retries_total = IntCounterVec::new(
+            Opts::new(
+                "maxllm_model_rewrite_retries_total",
+                "Same-provider retries after rewriting an unknown model name to the provider default",
+            ),
+            &["provider"],
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(model_rewrite_retries_total.clone()))
+            .expect("register");
+
         let provider_inflight_requests = IntGaugeVec::new(
             Opts::new(
                 "maxllm_provider_inflight_requests",
@@ -390,6 +409,7 @@ impl GatewayMetrics {
             circuit_breaker_quota_opens_total,
             http_failovers_total,
             provider_retries_total,
+            model_rewrite_retries_total,
             provider_inflight_requests,
             recording_redactions_total,
             cached_input_tokens_total,

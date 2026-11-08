@@ -157,6 +157,23 @@ pub struct RequestCtx {
     /// pool instead of the route's fallback chain, so a request never leaks
     /// from one pool into another. `None` means "no pool: use the route".
     pub auto_pool: Option<String>,
+    /// A model name the replayed request body must carry instead of the one
+    /// the client sent (and the one the failed attempt used).
+    ///
+    /// Set when a provider answers 400/422 because it does not carry the
+    /// requested model: the name may be another provider's model (the pool's
+    /// primary, e.g. `deepseek-v4.1-flash:cloud`), which no later provider of
+    /// the chain knows either, so a plain failover would collect the same 400
+    /// from every entry and the route would die with the primary. The retry
+    /// on the SAME provider rewrites the body to that provider's own
+    /// `default_model` before translation. Consumed by the next
+    /// `request_body_filter` pass.
+    pub model_override: Option<String>,
+    /// Providers already given the "rewrite the model to my default and try
+    /// again" retry for this request. Keeps the rewrite to one attempt per
+    /// provider: a second 400 after the rewrite is a genuine request fault
+    /// and is returned to the client instead of looping.
+    pub model_rewritten_providers: Vec<String>,
     /// One entry per failed upstream attempt, in order: `provider=status`,
     /// `provider=connect`, `provider=dns`. Appended to the error handed back
     /// to the client so a 502 names every provider that failed instead of
@@ -264,6 +281,8 @@ impl RequestCtx {
             rate_limit_headers: Vec::new(),
             auto_target: None,
             auto_pool: None,
+            model_override: None,
+            model_rewritten_providers: Vec::new(),
             attempt_trail: Vec::new(),
             upstream_responded: false,
             replay_body: None,
