@@ -74,6 +74,10 @@ pub struct CostCalculator {
     costs: Vec<ModelCost>,
     /// Exact-match index for O(1) lookup of non-glob patterns.
     exact: ahash::AHashMap<String, usize>,
+    /// Per-model prompt-cache (cache-hit) input rates, USD per 1M tokens,
+    /// keyed by the same patterns as `costs`. A model without an entry is
+    /// billed entirely at the list input rate (the pre-cache behaviour).
+    cache_rates: ahash::AHashMap<String, f64>,
     /// Whether a missing price entry logs a warning. False for deployments
     /// that know their table is partial (or have disabled cost accounting).
     warn_on_missing: bool,
@@ -89,6 +93,7 @@ impl CostCalculator {
         Self {
             costs,
             exact,
+            cache_rates: default_cache_rates(),
             warn_on_missing: true,
             enabled: true,
         }
@@ -138,8 +143,31 @@ impl CostCalculator {
         Ok(Self {
             costs,
             exact,
+            cache_rates: default_cache_rates(),
             warn_on_missing: true,
             enabled: true,
+        })
+    }
+
+    /// Set (or replace) the prompt-cache input rate for a model pattern.
+    pub fn set_cache_rate(&mut self, model_pattern: &str, rate_per_1m: f64) {
+        self.cache_rates
+            .insert(model_pattern.to_string(), rate_per_1m);
+    }
+
+    /// The prompt-cache input rate for a model: exact match first, then glob
+    /// patterns in insertion order. `None` means "bill cached input at the
+    /// list input price".
+    pub fn cache_rate_for(&self, model: &str) -> Option<f64> {
+        if let Some(&r) = self.cache_rates.get(model) {
+            return Some(r);
+        }
+        self.cache_rates.iter().find_map(|(pat, &rate)| {
+            if (pat.contains('*') || pat.contains('?')) && glob_match(pat, model) {
+                Some(rate)
+            } else {
+                None
+            }
         })
     }
 
@@ -156,14 +184,32 @@ impl CostCalculator {
     ///
     /// Returns `0.0` if no matching model cost is found.
     pub fn calculate_cost(&self, model: &str, tokens_in: u64, tokens_out: u64) -> f64 {
+        self.calculate_cost_with_cache(model, tokens_in, tokens_out, 0)
+    }
+
+    /// Calculate the cost when `cached_in` of the input tokens were served from
+    /// the vendor's prompt cache. Those are billed at the model's cache rate
+    /// (default: the list rate, i.e. no discount) and are never allowed to
+    /// exceed the input count.
+    pub fn calculate_cost_with_cache(
+        &self,
+        model: &str,
+        tokens_in: u64,
+        tokens_out: u64,
+        cached_in: u64,
+    ) -> f64 {
         if !self.enabled {
             return 0.0;
         }
         match self.find_cost(model) {
             Some(mc) => {
-                let input = (tokens_in as f64 / 1_000_000.0) * mc.input_cost_per_1m;
+                let cached = cached_in.min(tokens_in);
+                let fresh = tokens_in - cached;
+                let input = (fresh as f64 / 1_000_000.0) * mc.input_cost_per_1m;
+                let cached_input = (cached as f64 / 1_000_000.0)
+                    * self.cache_rate_for(model).unwrap_or(mc.input_cost_per_1m);
                 let output = (tokens_out as f64 / 1_000_000.0) * mc.output_cost_per_1m;
-                input + output
+                input + cached_input + output
             }
             None => {
                 if self.warn_on_missing {
@@ -208,6 +254,19 @@ impl Default for CostCalculator {
 // ---------------------------------------------------------------------------
 // Default pricing
 // ---------------------------------------------------------------------------
+
+/// Prompt-cache input rates for models whose vendor publishes a cache price
+/// and that this fleet actually uses. A rate here is a discount on the *list*
+/// input price, so it only appears when the number is public and the channel
+/// reports cache hits. MiniMax M3 is the fleet's biggest cost line and its
+/// traffic is ~99% cache hits (measured 2026-11-08): its cache-read rate is
+/// $0.05/1M against a $0.30/1M list price, so list-price booking overstated
+/// that line roughly sixfold.
+fn default_cache_rates() -> ahash::AHashMap<String, f64> {
+    let mut rates = ahash::AHashMap::new();
+    rates.insert("MiniMax-M3".into(), 0.05);
+    rates
+}
 
 fn default_costs() -> Vec<ModelCost> {
     vec![
@@ -543,6 +602,55 @@ output_cost_per_1m = 4.0
 
         let cost = calc.calculate_cost("my-model-v2", 1_000_000, 0);
         assert!((cost - 1.5).abs() < 0.01);
+    }
+
+    /// Cached input is billed at the cache rate, the rest at the list rate.
+    #[test]
+    fn cached_input_is_billed_at_the_cache_rate() {
+        let calc = CostCalculator::new();
+        // MiniMax-M3: $0.30/M in, $1.20/M out, $0.05/M cached in.
+        let cost = calc.calculate_cost_with_cache("MiniMax-M3", 1_000_000, 1_000_000, 900_000);
+        let expected = 100_000.0 / 1_000_000.0 * 0.30 // fresh input, list price
+            + 900_000.0 / 1_000_000.0 * 0.05 // cached input, cache rate
+            + 1.20; // output
+        assert!(
+            (cost - expected).abs() < 1e-9,
+            "got {cost}, want {expected}"
+        );
+        // Without the cached count the same request books list price for all
+        // of it — the behaviour every model without a cache rate keeps.
+        let plain = calc.calculate_cost("MiniMax-M3", 1_000_000, 1_000_000);
+        assert!((plain - (0.30 + 1.20)).abs() < 1e-9);
+    }
+
+    /// A provider that reports more cached tokens than input tokens (or a
+    /// parser underflow) must not produce a negative charge.
+    #[test]
+    fn cached_tokens_are_clamped_to_the_input_count() {
+        let calc = CostCalculator::new();
+        let cost = calc.calculate_cost_with_cache("MiniMax-M3", 1_000, 0, 5_000);
+        let expected = 1_000.0 / 1_000_000.0 * 0.05;
+        assert!(
+            (cost - expected).abs() < 1e-12,
+            "got {cost}, want {expected}"
+        );
+        assert!(cost >= 0.0);
+    }
+
+    /// Models with no published cache price keep billing cached input at list;
+    /// a per-deployment override can add one (glob patterns included).
+    #[test]
+    fn cache_rate_override_and_glob() {
+        let mut calc = CostCalculator::new();
+        assert_eq!(calc.cache_rate_for("deepseek-v4-flash"), None);
+        let list = calc.calculate_cost_with_cache("deepseek-v4-flash", 1_000_000, 0, 800_000);
+        assert!((list - 0.10).abs() < 1e-9, "no rate => list price: {list}");
+
+        calc.set_cache_rate("deepseek-*", 0.003);
+        assert_eq!(calc.cache_rate_for("deepseek-v4-flash"), Some(0.003));
+        let discounted = calc.calculate_cost_with_cache("deepseek-v4-flash", 1_000_000, 0, 800_000);
+        let expected = 200_000.0 / 1_000_000.0 * 0.10 + 800_000.0 / 1_000_000.0 * 0.003;
+        assert!((discounted - expected).abs() < 1e-9, "got {discounted}");
     }
 
     #[test]

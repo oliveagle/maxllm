@@ -238,6 +238,12 @@ pub struct RecordingConfig {
 pub struct ModelCostConfig {
     pub input_per_1m: f64,
     pub output_per_1m: f64,
+    /// USD per 1M input tokens served from the vendor's prompt cache. When
+    /// present, the cached part of the input is billed at this rate instead of
+    /// `input_per_1m`. Omit it to keep the current behaviour (everything at
+    /// list price) — e.g. when the channel's cache price is unknown.
+    #[serde(default)]
+    pub cached_input_per_1m: Option<f64>,
 }
 
 /// Global cost-accounting switches.

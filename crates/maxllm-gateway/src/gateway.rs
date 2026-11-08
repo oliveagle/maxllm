@@ -699,6 +699,10 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
             input_cost_per_1m: cost_conf.input_per_1m,
             output_cost_per_1m: cost_conf.output_per_1m,
         });
+        // Optional cache-hit rate: without it cached input bills at list price.
+        if let Some(rate) = cost_conf.cached_input_per_1m {
+            cost_calculator.set_cache_rate(model, rate);
+        }
     }
     let cost_calculator = Arc::new(cost_calculator);
 
@@ -5236,8 +5240,16 @@ impl ProxyHttp for AiGateway {
         // cost the upstream itself reported (e.g. opencode.ai's
         // `usage.opencode.allowance`) instead of recording 0.
         let mut cost = if ctx.tokens_in > 0 || ctx.tokens_out > 0 {
-            hot.cost_calculator
-                .calculate_cost(&ctx.model, ctx.tokens_in, ctx.tokens_out)
+            // Cached input bills at the model's cache rate, not the list rate:
+            // this fleet's traffic is ~99% prompt-cache hits, so quoting list
+            // price for every input token overbooks the biggest line roughly
+            // sixfold (MiniMax M3: $0.30 list vs $0.05 cache).
+            hot.cost_calculator.calculate_cost_with_cache(
+                &ctx.model,
+                ctx.tokens_in,
+                ctx.tokens_out,
+                ctx.cached_tokens_in,
+            )
         } else {
             0.0
         };

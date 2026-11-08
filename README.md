@@ -1449,9 +1449,16 @@ missing. The gateway reads all three shapes in the wild —
 `prompt_tokens_details.cached_tokens` (chat completions, MiniMax, one-api),
 `input_tokens_details.cached_tokens` (Responses) and
 `cache_read_input_tokens` (Anthropic) — and logs the count on the
-`request completed` line as `cached_in`. Cost is still booked at the list price
-for now (see `docs/ops_review_20261108.md` §3.1): measure the hit rate first,
-then set a cache rate per model.
+`request completed` line as `cached_in`. When a model's `[model_costs."…"]`
+row carries `cached_input_per_1m`, the cached part of the input bills at that
+rate and the rest at the list price; the cached count is clamped to the input
+count, so a provider that over-reports (or a parser that underflows) can never
+produce a negative charge. A model **without** `cached_input_per_1m` keeps
+billing all of its input at the list price — deliberately, so a channel whose
+cache price is unknown is never under-booked. On this fleet MiniMax M3 runs at
+~99% cache hits, so its rate is built in (`cached_input_per_1m = 0.05` against
+`input_per_1m = 0.30`), which cuts that line's booking roughly sixfold (see
+`docs/ops_review_20261108.md` §3.1).
 
 `unrouted_sessions_total` counts sessions that ended **before the router was
 reached** — the usual cause is a client that resets the connection between the

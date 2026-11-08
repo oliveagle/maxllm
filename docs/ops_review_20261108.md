@@ -282,14 +282,18 @@ RST 探测 → 断言 `request_logs` 为空、`active_requests==0`；再发一�
 没有单位错位。单价本身也与厂商公开价一致（M3 标准档 $0.30 / $1.20，prompt < 512k；
 超过 512k 翻倍）。
 
-**尚未建模的两点**（本轮未改，属于下一轮）：
-1. **prompt cache 未折价**。M3 支持自动 prompt 缓存，缓存命中的 input 在第三方渠道约
-   $0.05/M，而账本把**全部** input 都按 $0.30/M 记。命中的部分目前只被转发给客户端
-   （`crates/maxllm-translate/src/responses.rs:1075` 会读 `prompt_tokens_details.cached_tokens`
-   并写进 `input_tokens_details`），**没有进入 `copy_usage_tokens`/`extract_usage` 的成本路径**。
-   历史缓存命中率无法回算（流式响应体不落盘；少数落盘的 `minimax` usage 块里 7/8 有缓存、
-   合计 62% input 命中），所以 $36 应视为**上限**，真实账单可能低一个档。
-2. **>512k 分档翻倍**未实现（当前 6 小时均值 92k/请求，暂未触发）。
+**本轮已补齐**：
+1. **prompt cache 折价（已完成）**。M3 支持自动 prompt 缓存，缓存命中的 input 在第三方
+   渠道约 $0.05/M；实测命中率 99.5%+（下文 `cached_input_tokens_total` 对
+   `tokens_in_total`）。价格表新增可选的 `cached_input_per_1m`
+   （`[model_costs."…"]` 每行）：有值时按
+   `(tokens_in − cached) × list + cached × cache_rate + out × out_rate` 计价，`cached`
+   钳制到 `tokens_in`（防上游超报或解析下溢导致负费）。未配置该字段的模型维持现状：
+   全部按 list —— 这是**刻意**的，渠道缓存单价未知时宁可按 list 高记，也不低估账单。
+   `CostCalculator` 内置 `MiniMax-M3 → $0.05`（exact 优先、glob 兜底，配置可覆盖），
+   据此 minimax 单请求记账从 ~$0.055 降到 ~$0.010 量级（99.5% input 按 $0.05 计）。
+2. **>512k 分档翻倍**未实现（当前 6 小时均值 92k/请求，暂未触发）——仍是本轮遗留，
+   但账本已按真实缓存价记账，$36 不再是上限而是含缓存折价后的口径。
 
 **已做（采集半）**：`copy_usage_tokens`/`extract_usage` 现在解析三种缓存字段
 （`prompt_tokens_details.cached_tokens` / `input_tokens_details.cached_tokens` /
@@ -298,9 +302,11 @@ Anthropic `cache_read_input_tokens`），落在 `ctx.cached_tokens_in`，暴露�
 不是额外量），完成日志也带 `cached_in`。两条解析路径原来各抄一份，现在合流成
 `copy_usage_tokens`，单测钉住"三条形态 + 缓冲/流式同值"。
 
-**下一步**：拿到命中率之后再定单价 —— 给价格表加 `cached_input_per_1m`，按
-`(tokens_in - cached) × list + cached × cache_rate` 计价（未配置就维持现状：全按 list），
-这样在不知道渠道真实缓存单价时不会把账少记。
+**记账侧已上线**：`gateway` 的 `logging` 钩子改调
+`cost_calculator.calculate_cost_with_cache(…, ctx.cached_tokens_in)`，`build_hot_state`
+按配置逐模型 `set_cache_rate`；`calculate_cost()` 的旧签名保留（内部转调、cached=0），
+对外接口不变。单测：`cached_input_is_billed_at_the_cache_rate` /
+`cached_tokens_are_clamped_to_the_input_count` / `cache_rate_override_and_glob`。
 
 ---
 
@@ -496,7 +502,8 @@ EOF
 | P0-2 修复后实测 | ✅ 已核对 | 按 10 分钟切片复算 `request_logs`：03:00–04:09 UTC 285 个 200 全零 usage（只有 `one_api_*` 在服务）、04:10–06:19 40%、**06:20 UTC（14:23 CST 新二进制）起 208/208 = 100%**；当日 2 785 条零 usage 里 2 778 条无 error，几乎全在 06:20 之前 ⇒ 是 §2 的历史存量（§2.1） | 修复后窗口内仅剩的零 usage 行逐条带 `Downstream ConnectionClosed`（4/4 = 客户端放弃），不是提取缺口 |
 | P1-幽灵行 `provider="" status=0` | ✅ 已修 | 四个快路径把 `skip_logging` 挪到第一个 `await` 之前；`logging` 的 `active_requests.dec()` 改为只在 `active_request_counted` 时执行；新增 `is_unrouted_session()` 守卫（不写 `request_logs`、不算 `requests_total{status="0"}`，改记 `maxllm_unrouted_sessions_total`，客户端侧降 debug、内部侧保持 warn）；`request_path` 一进 `request_filter` 就落 ctx（§2.2） | 集成测试 `aborted_fast_path_probe_leaves_no_request_log` **修复前必失败**（4 条幽灵行）、修复后通过，且真实请求仍恰好 1 行；单元测试钉住判据；线上 13/13 探测复现、修复后 0 行、`active_requests` 恒 0 |
 | P0-3 缓存命中采集 | ✅ 已修（采集侧） | `ctx.cached_tokens_in` + `copy_cached_tokens()` 统一解析三种形态；`extract_usage` 与 `copy_usage_tokens` 合流（原来两份手抄，缓存字段只会在一条路径上被读到）；新增 `maxllm_cached_input_tokens_total{provider,model}`（`tokens_in_total` 的子集）+ 完成日志 `cached_in` | 单测 `test_cached_input_tokens_are_extracted_on_every_shape`（chat/Responses/Anthropic/无该字段）与 `test_buffered_and_streamed_usage_agree`；线上指标已出数（§3.1） |
-| P0-3 价格表复核 | ✅ 已核对（未改价） | `minimax`/`MiniMax-M3` 6 小时 1 290 请求、119.2M in / 0.51M out 记 $36.379，与内置 $0.30/M + $1.20/M 复算值 $36.377 一致，也与厂商公开价一致；**未建模** prompt cache 折价与 >512k 翻倍 ⇒ 该数字是上限（§3.1） | 反推单价 $0.3051/M 与配置单价吻合，排除重复计费/单位错位 |
+| P0-3 缓存折价计价 | ✅ 已修（计价侧） | 价格表新增可选 `cached_input_per_1m`（`[model_costs."…"]` 每行，`#[serde(default)]` 省略即保持现状）；`CostCalculator` 新增 `cache_rates`（exact 优先、glob 兜底）+ `set_cache_rate()` / `cache_rate_for()` + `calculate_cost_with_cache(model, in, out, cached)`（cached 钳制到 in，接口不破坏：旧 `calculate_cost()` 内部转调、cached=0）；内置 `MiniMax-M3 → $0.05`；`gateway` 按配置 `set_cache_rate` 并用 `ctx.cached_tokens_in` 计价 | 3 条单测钉住折价/钳制/glob 覆盖；线上 minimax 单请求记账从 ~$0.055 降到 ~$0.010 量级（99.5% input 按 $0.05 计）；**未配置 `cached_input_per_1m` 的模型一律按 list 计**，刻意为之（渠道缓存价未知时不低估） |
+| P0-3 价格表复核 | ✅ 已核对（未改价） | `minimax`/`MiniMax-M3` 6 小时 1 290 请求、119.2M in / 0.51M out 记 $36.379，与内置 $0.30/M + $1.20/M 复算值 $36.377 一致，也与厂商公开价一致；**该数字是全 list 价 ⇒ 是上限**（缓存折价见下一行） | 反推单价 $0.3051/M 与配置单价吻合，排除重复计费/单位错位 |
 
 ### 仍未做（需拍板或有前置）
 
