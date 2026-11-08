@@ -62,6 +62,34 @@ pub trait ProviderTranslator: Send + Sync {
 
     /// Provider-specific headers to set on the upstream request.
     fn upstream_headers(&self, api_key: &str) -> Vec<(String, String)>;
+
+    /// Provider-specific repairs applied to a **native Responses** request
+    /// body before it is forwarded upstream.
+    ///
+    /// A native Responses body already speaks the upstream's own contract,
+    /// so the default is the identity function: the body is forwarded as it
+    /// arrived. A provider whose upstream rejects part of the Responses
+    /// contract (e.g. the non-standard `tool_choice: "any"`) overrides this
+    /// to repair the body before it is sent.
+    ///
+    /// A repair may change the body's size, so the gateway forwards a
+    /// repaired body chunked instead of with the client's Content-Length —
+    /// see [`Self::repairs_native_responses_body`].
+    fn normalize_native_responses_request(&self, body: &[u8]) -> Vec<u8> {
+        body.to_vec()
+    }
+
+    /// Whether this provider repairs native Responses request bodies.
+    ///
+    /// The gateway must pick the request framing (Content-Length vs
+    /// chunked) before it has read the body, so it cannot learn about the
+    /// repair from the body itself: a provider that repairs the body
+    /// declares it here, and the gateway forwards that provider's native
+    /// Responses requests chunked — the repaired body no longer matches the
+    /// client's Content-Length.
+    fn repairs_native_responses_body(&self) -> bool {
+        false
+    }
 }
 
 /// Incremental SSE stream translator.

@@ -1692,6 +1692,20 @@ impl AiGateway {
 /// buffer for a non-final chunk keeps the body open while sending nothing;
 /// the accumulated bytes are forwarded as one piece at `end_of_stream`.
 impl AiGateway {
+    /// Apply the repairs a **native Responses** request body needs before it
+    /// is forwarded upstream.
+    ///
+    /// Two layers: the generic Responses normalisation (a chat-style nested
+    /// function tool -> the official flat shape) and the provider's own fixes
+    /// (the OpenDesign link answers HTTP 400 `upstream_error` for the
+    /// non-standard `tool_choice: "any"` that codex-cli sends).
+    fn normalize_native_responses_body(provider: &ProviderState, body: &[u8]) -> Vec<u8> {
+        let normalized = maxllm_translate::responses::normalize_responses_request(body);
+        provider
+            .translator
+            .normalize_native_responses_request(&normalized)
+    }
+
     /// Buffer one request body chunk, keeping the upstream body open until the
     /// whole body has been read.
     ///
@@ -2651,12 +2665,21 @@ impl ProxyHttp for AiGateway {
                     .get(ctx.route_index.unwrap_or(usize::MAX))
                     .map(|r| r.auto_model)
                     .unwrap_or(false);
+            // A provider whose upstream rejects part of the Responses
+            // contract repairs the body before forwarding it (the OpenDesign
+            // link answers 400 for the non-standard `tool_choice: "any"`).
+            // A repaired body is a different size, so it cannot keep the
+            // client's Content-Length framing — it travels chunked, like any
+            // other body the gateway rewrites.
+            let repairs_native_body =
+                is_native_responses && provider.translator.repairs_native_responses_body();
             // A Responses body rewritten into chat completions has an
             // unpredictable size (the chat form can be larger than the
             // Responses form), so it travels chunked instead of keeping the
             // original Content-Length — which would truncate a larger body.
-            let verbatim =
-                !is_auto_route && (is_native_responses || (openai_style && !is_responses_to_chat));
+            let verbatim = !is_auto_route
+                && ((is_native_responses && !repairs_native_body)
+                    || (openai_style && !is_responses_to_chat));
 
             let compaction_enabled = ctx
                 .plugin_ctx
@@ -2862,9 +2885,12 @@ impl ProxyHttp for AiGateway {
                             }
                         }
                     }
-                    let normalized = maxllm_translate::responses::normalize_responses_request(
-                        &ctx.request_body_buf,
-                    );
+                    let normalized = match hot.providers.get(&ctx.provider_name) {
+                        Some(p) => Self::normalize_native_responses_body(p, &ctx.request_body_buf),
+                        None => maxllm_translate::responses::normalize_responses_request(
+                            &ctx.request_body_buf,
+                        ),
+                    };
                     let mut out = normalized;
                     if let Some(original_cl) = ctx
                         .plugin_ctx
@@ -3159,6 +3185,17 @@ impl ProxyHttp for AiGateway {
                         ctx.plugin_ctx.model = resolved;
                     }
 
+                    // A native Responses body is forwarded as-is, so no
+                    // translation reports the streaming flag — read it here,
+                    // or the stream translator is never installed and the
+                    // usage embedded in the final `response.completed` event
+                    // is never accounted for.
+                    if ctx.native_responses {
+                        if let Some(stream) = parsed.get("stream").and_then(|v| v.as_bool()) {
+                            ctx.is_streaming = stream;
+                        }
+                    }
+
                     // Extract client-requested guardrails from request body
                     if let Some(guardrails) = parsed.get("guardrails").and_then(|g| g.as_array()) {
                         ctx.requested_guardrails = Some(
@@ -3392,10 +3429,15 @@ impl ProxyHttp for AiGateway {
                 // Translate request body (OpenAI → provider format).
                 //
                 // A native Responses body already speaks the upstream
-                // contract, so it is forwarded unchanged.
+                // contract, so it is forwarded unchanged — apart from the
+                // repairs the provider needs (nested function tools -> flat,
+                // the OpenDesign link's `tool_choice: "any"`).
                 let translated = if ctx.native_responses {
                     Ok(TranslatedRequest {
-                        body: std::mem::take(&mut ctx.request_body_buf),
+                        body: Self::normalize_native_responses_body(
+                            provider,
+                            &ctx.request_body_buf,
+                        ),
                         is_streaming: ctx.is_streaming,
                     })
                 } else {

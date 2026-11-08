@@ -213,6 +213,20 @@ impl ProviderTranslator for OpenDesignTranslator {
             ("Content-Type".to_string(), "application/json".to_string()),
         ]
     }
+
+    fn normalize_native_responses_request(&self, body: &[u8]) -> Vec<u8> {
+        // The link rejects the non-standard `tool_choice: "any"` on its
+        // Responses route too, so the same repair the chat path applies
+        // runs here: the body is rewritten to the OpenAI value with the
+        // same meaning ("required").
+        normalize_request(body)
+    }
+
+    fn repairs_native_responses_body(&self) -> bool {
+        // The repair grows the body ("any" -> "required"), so the gateway
+        // must not keep the client's Content-Length framing for it.
+        true
+    }
 }
 
 #[cfg(test)]
@@ -260,6 +274,45 @@ mod tests {
             .unwrap();
         let v: Value = serde_json::from_slice(&out.body).unwrap();
         assert_eq!(v["tool_choice"], "required");
+    }
+
+    #[test]
+    fn test_native_responses_request_rewrites_tool_choice_any() {
+        // The link rejects `tool_choice: "any"` on its Responses route too,
+        // so the native path applies the same repair as the chat path.
+        let body = json!({
+            "model": "deepseek-v4.1-flash",
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+            "tool_choice": "any",
+        });
+        let out =
+            translator().normalize_native_responses_request(&serde_json::to_vec(&body).unwrap());
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["tool_choice"], "required");
+        // Everything else survives untouched.
+        assert_eq!(v["model"], "deepseek-v4.1-flash");
+        assert_eq!(v["input"][0]["content"][0]["text"], "hi");
+    }
+
+    #[test]
+    fn test_native_responses_request_without_tool_choice_is_unchanged() {
+        let body = json!({
+            "model": "deepseek-v4.1-flash",
+            "input": "hi",
+        });
+        let raw = serde_json::to_vec(&body).unwrap();
+        let out = translator().normalize_native_responses_request(&raw);
+        assert_eq!(
+            out, raw,
+            "a body without tool_choice must be forwarded as-is"
+        );
+    }
+
+    #[test]
+    fn test_native_responses_body_is_declared_as_repaired() {
+        // The repair grows the body, so the gateway must not keep the
+        // client's Content-Length framing for it.
+        assert!(translator().repairs_native_responses_body());
     }
 
     #[test]

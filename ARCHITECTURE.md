@@ -652,7 +652,7 @@ Client Response (translated: OpenAI format / native: provider format / passthrou
 - Validates request translation (headers, path, body format)
 - Tests response translation back to OpenAI format
 
-**Test Categories (125 tests: 121 mock-based, 4 live gated with `#[ignore]`):**
+**Test Categories (127 tests: 123 mock-based, 4 live gated with `#[ignore]`):**
 
 | Category | Count | Description |
 |----------|-------|-------------|

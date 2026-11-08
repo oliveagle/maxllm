@@ -325,12 +325,12 @@ Benchmarked on macOS (Apple Silicon), 4 Pingora worker threads:
 
 ## Test Coverage
 
-793 tests across 6 crates:
+798 tests across 6 crates:
 - `maxllm-admin`: 51 tests (keys, teams, costs, budget, API)
-- `maxllm-translate`: 236 tests (all provider translators + streaming)
+- `maxllm-translate`: 239 tests (all provider translators + streaming)
 - `maxllm-plugin`: 193 tests (all 14 plugins + the plugin contract)
 - `maxllm-config`: 32 tests (parsing, validation, env vars)
-- `maxllm-gateway`: 280 tests (159 unit + 121 mock integration; 4 live tests are gated behind `#[ignore]`) + 1 doc-test
+- `maxllm-gateway`: 283 tests (159 unit + 124 mock integration; 4 live tests are gated behind `#[ignore]`) + 1 doc-test
 - `maxllm-cli`: 1 test
 
 ## Development Notes

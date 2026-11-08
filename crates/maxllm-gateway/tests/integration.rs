@@ -7906,6 +7906,134 @@ async fn test_open_design_native_responses_passthrough() {
 }
 
 #[tokio::test]
+async fn test_open_design_native_responses_rewrites_tool_choice_any() {
+    let mock = MockServer::start().await;
+
+    // The link rejects the non-standard `tool_choice: "any"` (sent by
+    // codex-cli) with HTTP 400 `upstream_error` — on its Responses route
+    // just like on chat. The native path must repair the body before it is
+    // forwarded, or every codex-cli tool call fails.
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(|req: &wiremock::Request| {
+            let sent: Value = serde_json::from_slice(&req.body).expect("json body");
+            assert_eq!(
+                sent["tool_choice"], "required",
+                "tool_choice \"any\" must be rewritten to \"required\": {sent}"
+            );
+            // The rest of the body survives the repair.
+            assert_eq!(sent["model"], "deepseek-v4.1-flash");
+            assert_eq!(
+                sent["input"],
+                json!([{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}])
+            );
+            ResponseTemplate::new(200).set_body_json(json!({
+                "id": "resp_od",
+                "object": "response",
+                "status": "completed",
+                "model": "deepseek-v4.1-flash",
+                "output": [{
+                    "id": "msg_od",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "hi"}]
+                }],
+                "usage": {"input_tokens": 11, "output_tokens": 5, "total_tokens": 16}
+            }))
+        })
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let gw = TestGateway::start(OPEN_DESIGN_CONFIG, &mock.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/responses"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&json!({
+            "model": "deepseek-v4.1-flash",
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+            "tool_choice": "any"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let requests = mock.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].url.path(), "/v1/responses");
+}
+
+#[tokio::test]
+async fn test_open_design_native_responses_streams_and_accounts_usage() {
+    let mock = MockServer::start().await;
+
+    // The OpenDesign link streams the Responses SSE event family. Its
+    // native route travels chunked (the gateway may repair the body, so it
+    // cannot keep the client's Content-Length) — the stream must still be
+    // copied verbatim and its usage accounted for.
+    let sse = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_s\",\"object\":\"response\",\"status\":\"in_progress\"}}\n\n",
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_s\",\"object\":\"response\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":11,\"output_tokens\":5}}}\n\n",
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(sse, "text/event-stream"),
+        )
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let gw = TestGateway::start(OPEN_DESIGN_CONFIG, &mock.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/responses"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&json!({
+            "model": "deepseek-v4.1-flash",
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let text = resp.text().await.unwrap();
+    assert!(text.contains("event: response.completed"), "{text}");
+    assert!(text.contains("response.output_text.delta"), "{text}");
+
+    // The usage embedded in the final event must be accounted for.
+    let metrics = c
+        .get(gw.url("/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let line = metrics
+        .lines()
+        .find(|l| l.starts_with("maxllm_tokens_in_total") && l.contains("deepseek-v4.1-flash"))
+        .unwrap_or_else(|| panic!("no tokens_in metric for the model:\n{metrics}"));
+    assert!(
+        line.trim_end().ends_with("11"),
+        "expected 11 input tokens, got: {line}"
+    );
+}
+
+#[tokio::test]
 async fn test_open_design_chat_completions_use_the_link_path() {
     let mock = MockServer::start().await;
 

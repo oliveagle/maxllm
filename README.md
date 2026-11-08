@@ -710,7 +710,13 @@ What the gateway does with it:
 * **`tool_choice: "any"` is rewritten** — the link rejects the non-standard
   value with HTTP 400 `upstream_error` (codex-cli sends it), so the gateway
   rewrites it to `"required"`, the OpenAI value with the same meaning.
-  `"auto"`, `"none"` and `"required"` are forwarded untouched.
+  `"auto"`, `"none"` and `"required"` are forwarded untouched. The rewrite
+  runs on **both** contracts — the chat path and the native Responses path —
+  because the link rejects `"any"` on `/v1/responses` too. Since the repaired
+  body no longer matches the client's `Content-Length`, the native Responses
+  requests for this provider travel chunked (the link accepts chunked
+  bodies); every other provider keeps the byte-for-byte `Content-Length`
+  framing.
 * **Bearer auth** — every route authenticates with
   `Authorization: Bearer <OPEN_DESIGN_API_KEY>`.
 * **The link's extensions survive** — the assistant message carries
