@@ -1375,6 +1375,72 @@ VPS 停在 `23056546…166461`（2026-11-08 21:40 部署），本会话无 ssh �
 （dotvault 无该机条目、无 `id_rsa`、root / oliveagle 均被拒）→ 待有凭据的会话跑
 `ops/machines/vm_tecent_cloud_01/maxllm/deploy.sh`，状态已写进该节点 README 文首。
 
+### 14.13 `/health` 两节点读数不一致的归因（2026-11-09 06:5x–07:0x CST）：不是 bug
+
+**现象**：同 sha（`787844f3`）同 `maxllm.toml` 的两台，`/health` 读数差一倍 —— Fedora
+`providers 31/32`、`auto 11/12`、`auto_home 14/14`；NAS `providers 17/32`、`auto 9/12`、
+`auto_home 3/14`，`half_open` 12 家全是 home 系。四步判定链，全部实测：
+
+1. **端点可达性两台一致 ⇒ 排除「NAS 网络不可达」**。14 个 http `base_url` 分别从两台
+   curl，结果逐条相同：`.20:11050` 404（活）、`.10:18195` 404（活）、`.4:11434` 200（活）、
+   `.10:11060` 活但 NAS 侧 4s 超时（慢而不死），其余 `.20:11051/52/53`、
+   `.10:10001/11023/11025/11050/11053`、`.20:11022/11023` 全部拒绝/空回复 ——
+   **14 个 home 端点里 11 个真死了**（GPU 服务没起，算力侧事实，不是网关问题）。
+2. **NAS 读数与端点现实逐条对齐 ⇒ NAS 是诚实的**。`auto_home` 14 家中恰好 3 家 closed
+   = `olefedora_gpu0_minicpmv47` + `coding_home_olefedora_gpu0`（都指活的 `.20:11050`）
+   + `humanizer_gpu3`（`.10:11060`）；half-open 12 = 11 家死的 auto_home 成员 +
+   `oleworkstation_rerank`（`.10:11025`，死）。breaker DB：这 12 家 `failures=3`、
+   `updated_at=2026-11-08T11:39:40Z` —— 当时一串 `/v1/responses/auto_home` 真实请求
+   （client `127.0.0.1`，11:39:41–57Z）经 failover 链把死候选各踩满 3 连败开闸、
+   最后落在活端点上（request_logs 只记成功者，中间连败只进 breaker），fail window 早已走完
+   → `effective_state()` 投影为 HALF_OPEN（下一次真实流量拿一次试探名额，成功即回 closed）。
+3. **Fedora 是「无罪推定」⇒ 流量历史不同，不是状态机分叉**。它的 `circuit_breaker_state`
+   只有 11 行、**home 系一行都没有**（重启后 request_logs 只有 `/v1/responses/auto` 与
+   `/v1/responses`，从没碰过 home provider）→ state 停在初始 CLOSED → 读作 healthy。
+   证据驱动熔断的固有语义：没证据不定罪，第一家真实流量失败会自己开闸自愈。
+4. **探针不进熔断是刻意设计，不动**。NAS 上 `maxllm-pool-health.timer` 每 5 min 发带
+   `X-MaxLLM-Probe: 1` 的最小请求（06:58 CST 一轮 `pool=26 healthy=10 failed=16`），
+   `gateway.rs:4714/6228` 把探针排除在熔断计量之外（`pool_health.py` 注释同款声明），
+   `SuccessExitStatus=0 1` 吞掉退出码。让探针推进熔断 = 一次探针抖动直接开关生产闸，
+   违背设计注释，**不改**；探针对开闸 provider 拿 503 `circuit open (quota force-open)`
+   进不了上游，也是同一条语义。
+
+**历史 bug 已修、不在现场**：11-08 的「过滤器逐候选调 `is_open()` 吃掉 probe 槽 → 16/25
+永久 half-open 503」（§14 附表 P1 行）已由纯读 `allows_traffic()` 修复（`79bb595`），
+`git merge-base --is-ancestor 79bb595 HEAD` = 是 ⇒ 含在 `787844f3` 部署里；现场 12 家
+half-open **全部**指向 curl 实测拒绝的端点，与该 bug 形态（活端点也 503）不同。
+
+**附带澄清 kimi（保留未动）**：`force_open_until=2026-11-08T22:51:12Z` 已过 → /health 把它
+数进 healthy，但 `quota-probe-kimi.jsonl` 07:01 CST 仍 429（7 天额度未恢复）→ 每个 cooldown
+周期试一次、429、再开闸（`quota_opens=94` 的循环）—— `QuotaUnknown → 默认冷却` 的设计节奏，
+不是状态机错；`maxllm.toml` 全程未改，kimi 在池。
+
+**结论**：`/health` 语义（half-open 单列、`providers.healthy` 只数 closed）保持 —— 把
+half-open 记为 healthy 会把 11 个真死端点洗成绿的；两台差异用「流量历史 + 探针不进熔断」
+解释完毕，**无代码改动、无需重部署**。真正待办是 ① 11 个 home 端点本身（算力侧）
+② 探针失败没有出口（`SuccessExitStatus=0 1` + webhook 仍是占位，§12.7 待办②）。
+
+### 14.14 缓存命中率续测（2026-11-09 07:02 CST）
+
+`cache_hit.py --since 2026-11-08T21:45:00Z`（修复 C 部署窗，1 919 请求 / 265.9 M input）：
+
+| provider | reqs | hit% |
+|---|---:|---:|
+| opencode_go_2 | 1 052 | **97.87%** |
+| volc_t_1 | 428 | **96.94%** |
+| xiaomi | 182 | **97.58%** |
+| volc_1 | 172 | **97.02%**（22:03Z 起配额熔断，08:47 CST 恢复待观察）|
+| ollama_local | 83 | **95.53%** |
+| minimax | 2 | 69.95%（冷首发，分母未长出）|
+| **合计** | **1 919** | **97.46%** |
+
+长窗（18:24Z 起，采样器每 10 min 写 `/tmp/cache_hit_series2.txt`，约 10:31 CST 收官）：
+`go_2 98.35 / volc_t_1 97.42 / volc_1 97.17 / xiaomi 96.79 / ollama_local 95.52 /
+minimax 93.18（128 发，从冷首发爬坡）/ go_1 71.89（2 发冻结）`，合计 **97.66%** ——
+有实质流量的 provider **全部 >95%**；minimax / go_1 两盏灯等自然流量把分母长出来，
+不人为喂（§14.11 诚实边界）。journal 自 05:45 部署起 `warning+` 0 条，
+`request_logs` 0 条 status≥400（§14.12 后持续）。
+
 
 ---
 
