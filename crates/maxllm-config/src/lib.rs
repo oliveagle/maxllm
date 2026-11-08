@@ -457,6 +457,13 @@ pub enum ProviderKind {
     /// validation (session header, tool_choice, tool call arguments).
     #[serde(rename = "opencode")]
     OpenCode,
+    /// commandcode.ai ("provider") — a multi-vendor gateway that speaks the
+    /// OpenAI Chat Completions contract on `/provider/v1/chat/completions`,
+    /// the OpenAI Responses contract on `/provider/v1/responses` and the
+    /// Anthropic Messages contract on `/provider/v1/messages` (the only
+    /// route that serves its Claude models).
+    #[serde(rename = "commandcode")]
+    CommandCode,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1005,6 +1012,31 @@ total_connect_timeout_secs = 60
         let p = &config.providers["opencode"];
         assert_eq!(p.connect_timeout_secs, Some(30));
         assert_eq!(p.total_connect_timeout_secs, Some(60));
+    }
+
+    #[test]
+    fn test_commandcode_kind_is_parsed() {
+        let toml = r#"
+[server]
+listen = "0.0.0.0:8080"
+
+[providers.cmd]
+kind = "commandcode"
+base_url = "https://api.commandcode.ai"
+api_key = "cmd-test"
+default_model = "deepseek/deepseek-v4.1-flash"
+"#;
+        let config = Config::parse(toml).unwrap();
+        let p = &config.providers["cmd"];
+        assert_eq!(p.kind, ProviderKind::CommandCode);
+        assert_eq!(p.base_url, "https://api.commandcode.ai");
+        assert_eq!(
+            p.default_model.as_deref(),
+            Some("deepseek/deepseek-v4.1-flash")
+        );
+        // The Responses route is native for this kind; the config may still
+        // override it.
+        assert_eq!(p.native_responses, None);
     }
 }
 

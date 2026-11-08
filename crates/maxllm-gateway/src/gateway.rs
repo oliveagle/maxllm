@@ -142,6 +142,13 @@ fn well_known_models(kind: ProviderKind) -> &'static [&'static str] {
             "glm-5.2",
             "kimi-k2.7-code",
         ],
+        // commandcode.ai serves ~96 models, but this deployment deliberately
+        // exposes one: `deepseek/deepseek-v4.1-flash` is the default model of
+        // every commandcode provider entry (and the one the auto pool may
+        // carry). The full catalogue lives upstream at
+        // `GET https://api.commandcode.ai/provider/v1/models` — add a name
+        // here when a deployment actually wants it advertised.
+        ProviderKind::CommandCode => &["deepseek/deepseek-v4.1-flash"],
     }
 }
 
@@ -164,20 +171,25 @@ fn provider_owned_by(kind: ProviderKind) -> &'static str {
         ProviderKind::Cohere => "cohere",
         ProviderKind::OpenaiCompat => "custom",
         ProviderKind::OpenCode => "opencode",
+        // Matches the `owned_by` field commandcode.ai publishes in its own
+        // model list.
+        ProviderKind::CommandCode => "command-code",
     }
 }
 
-/// User-Agent injected on upstream requests to opencode.ai. The upstream's
-/// Cloudflare edge bans script / HTTP-client fingerprints (HTTP 403 "error
-/// code: 1010", browser signature banned); `curl/8.5.0` is verified allowed.
-const OPENCODE_UPSTREAM_UA: &str = "curl/8.5.0";
+/// User-Agent injected on upstream requests to the vendors whose Cloudflare
+/// edge bans script / HTTP-client fingerprints (HTTP 403 "error code: 1010",
+/// browser signature banned): opencode.ai and commandcode.ai both do.
+/// `curl/8.5.0` is verified allowed by both.
+const SAFE_UPSTREAM_UA: &str = "curl/8.5.0";
 
-/// True when a User-Agent string is one opencode.ai's Cloudflare edge
-/// verifiably bans (HTTP 403 "error code: 1010"). Probing the live upstream
-/// shows the ban list is narrow: only `Python-urllib/*` (the default UA of
-/// Python's urllib) is blocked; curl, browsers and every other HTTP-client /
-/// SDK UA tested (OpenAI/Python, node-fetch, axios, python-requests, ...)
-/// are accepted, so they are never rewritten here.
+/// True when a User-Agent string is one the Cloudflare edge of opencode.ai
+/// and commandcode.ai verifiably bans (HTTP 403 "error code: 1010"). Probing
+/// the live upstreams shows the ban list is narrow: only `Python-urllib/*`
+/// (the default UA of Python's urllib) is blocked; curl, browsers and every
+/// other HTTP-client / SDK UA tested (OpenAI/Python, node-fetch, axios,
+/// python-requests, python-urllib3, ...) are accepted, so they are never
+/// rewritten here.
 ///
 /// The marker is `python-urllib/` — the real urllib UA always carries a
 /// version after the slash (`Python-urllib/3.11`). The urllib3 *package*
@@ -199,6 +211,20 @@ const DEFAULT_MAX_FAILOVER_ATTEMPTS: u32 = 6;
 
 /// Default backoff between two same-provider retries, in milliseconds.
 const DEFAULT_RETRY_BACKOFF_MS: u64 = 500;
+
+/// Resolve the upstream path of a native (provider-format) request.
+///
+/// Most providers serve the client's own path: Anthropic's `/v1/messages`,
+/// Gemini's `/v1beta/models/…:generateContent`. A vendor that publishes the
+/// Anthropic Messages contract under its own path is the exception —
+/// commandcode.ai serves it at `/provider/v1/messages`, so a client speaking
+/// the plain `/v1/messages` contract is rewritten onto the provider's path.
+fn native_upstream_path(client_path: &str, provider_path: &str) -> String {
+    if client_path.ends_with("/messages") && provider_path.ends_with("/messages") {
+        return provider_path.to_string();
+    }
+    client_path.to_string()
+}
 
 /// Derive the native Responses path from a chat completions path.
 /// `/zen/go/v1/chat/completions` → `/zen/go/v1/responses`.
@@ -380,6 +406,19 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
     let mut providers = AHashMap::new();
 
     for (name, conf) in &config.providers {
+        // The upstream path the translator will use. Most kinds keep their
+        // default inside the translator; commandcode.ai's default is needed
+        // out here as well, because the native Responses path is derived
+        // from it.
+        let effective_chat_path: Option<&str> = match conf.kind {
+            ProviderKind::CommandCode => Some(
+                conf.upstream_path
+                    .as_deref()
+                    .unwrap_or(maxllm_translate::commandcode::DEFAULT_CHAT_PATH),
+            ),
+            _ => conf.upstream_path.as_deref(),
+        };
+
         let translator: Box<dyn ProviderTranslator> = match conf.kind {
             ProviderKind::OpenAI => Box::new(maxllm_translate::openai::OpenAITranslator),
             ProviderKind::Anthropic => Box::new(maxllm_translate::anthropic::AnthropicTranslator),
@@ -444,6 +483,20 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
                     ),
                 )
             }
+            ProviderKind::CommandCode => {
+                // commandcode.ai namespaces every route under `/provider`.
+                // The default is the OpenAI Chat Completions route; a
+                // provider entry whose `upstream_path` points at
+                // `/provider/v1/messages` speaks the Anthropic Messages
+                // contract instead — the only route that serves the vendor's
+                // Claude models.
+                Box::new(maxllm_translate::commandcode::CommandCodeTranslator::new(
+                    name.clone(),
+                    effective_chat_path
+                        .unwrap_or(maxllm_translate::commandcode::DEFAULT_CHAT_PATH)
+                        .to_string(),
+                ))
+            }
         };
 
         let url: url::Url = conf.base_url.parse().map_err(|e: url::ParseError| {
@@ -457,19 +510,33 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
         // A provider may serve the Responses contract natively. The path is
         // derived from the chat path (`…/chat/completions` → `…/responses`)
         // unless the config names it explicitly.
-        let native_responses = conf
-            .native_responses
-            .unwrap_or(matches!(conf.kind, ProviderKind::OpenCode));
+        let native_responses = conf.native_responses.unwrap_or(match conf.kind {
+            ProviderKind::OpenCode => true,
+            // commandcode.ai serves the Responses contract natively on
+            // `/provider/v1/responses` (verified 2026-11-08: the route
+            // answers 401 without a key, so it exists). A commandcode entry
+            // that points at the Anthropic Messages route serves Claude
+            // models instead and has no Responses route of its own.
+            ProviderKind::CommandCode => {
+                maxllm_translate::commandcode::CommandCodeWire::from_path(
+                    effective_chat_path.unwrap_or(maxllm_translate::commandcode::DEFAULT_CHAT_PATH),
+                ) == maxllm_translate::commandcode::CommandCodeWire::ChatCompletions
+            }
+            _ => false,
+        });
         let responses_path = if native_responses {
             Some(
                 conf.responses_path
                     .clone()
-                    .or_else(|| {
-                        conf.upstream_path
-                            .as_deref()
-                            .and_then(derive_responses_path)
-                    })
-                    .unwrap_or_else(|| "/v1/responses".to_string()),
+                    .or_else(|| effective_chat_path.and_then(derive_responses_path))
+                    .unwrap_or_else(|| match conf.kind {
+                        // The vendor's Responses route is namespaced under
+                        // `/provider`, not the OpenAI default path.
+                        ProviderKind::CommandCode => {
+                            maxllm_translate::commandcode::DEFAULT_RESPONSES_PATH.to_string()
+                        }
+                        _ => "/v1/responses".to_string(),
+                    }),
             )
         } else {
             None
@@ -2381,7 +2448,7 @@ impl ProxyHttp for AiGateway {
                 if provider.kind == ProviderKind::Gemini {
                     format!("{}?key={}", original, provider.api_key)
                 } else {
-                    original
+                    native_upstream_path(&original, provider.translator.upstream_path())
                 }
             }
             EndpointType::Embeddings => {
@@ -2478,14 +2545,18 @@ impl ProxyHttp for AiGateway {
                 .insert_header(maxllm_translate::opencode::SESSION_HEADER, &session_id)?;
         }
 
-        // opencode.ai's Cloudflare edge bans requests whose User-Agent looks
-        // like a script / HTTP-client fingerprint (e.g. `Python-urllib/3.11`)
-        // with HTTP 403 "error code: 1010" (browser signature banned). Pingora
-        // forwards the client's User-Agent verbatim, so an SDK client would
-        // otherwise be banned outright. Inject a safe, generic UA unless the
-        // client already sent one that is not a known script fingerprint
-        // (curl / browser UAs are verified allowed by the upstream).
-        if provider.kind == ProviderKind::OpenCode {
+        // The Cloudflare edge of opencode.ai and commandcode.ai bans requests
+        // whose User-Agent looks like a script / HTTP-client fingerprint (e.g.
+        // `Python-urllib/3.11`) with HTTP 403 "error code: 1010" (browser
+        // signature banned). Pingora forwards the client's User-Agent
+        // verbatim, so an SDK client would otherwise be banned outright.
+        // Inject a safe, generic UA unless the client already sent one that
+        // is not a known script fingerprint (curl / browser UAs are verified
+        // allowed by both upstreams).
+        if matches!(
+            provider.kind,
+            ProviderKind::OpenCode | ProviderKind::CommandCode
+        ) {
             let ua = upstream_request
                 .headers
                 .get("User-Agent")
@@ -2496,7 +2567,7 @@ impl ProxyHttp for AiGateway {
                 Some(s) => is_script_like_user_agent(s),
             };
             if needs_injection {
-                upstream_request.insert_header("User-Agent", OPENCODE_UPSTREAM_UA)?;
+                upstream_request.insert_header("User-Agent", SAFE_UPSTREAM_UA)?;
             }
         }
 
@@ -6110,6 +6181,133 @@ api_key = "sk-test"
         let p = &state.providers["opencode"];
         assert_eq!(p.connect_timeout, Duration::from_secs(30));
         assert_eq!(p.total_connect_timeout, Some(Duration::from_secs(60)));
+    }
+}
+
+#[cfg(test)]
+mod commandcode_tests {
+    use super::*;
+    use maxllm_config::Config;
+
+    fn hot_state(toml: &str) -> HotState {
+        let config = Config::parse(toml).unwrap();
+        build_hot_state(&config).unwrap()
+    }
+
+    const BASE: &str = r#"
+[server]
+listen = "0.0.0.0:8080"
+
+[providers.cmd]
+kind = "commandcode"
+base_url = "https://api.commandcode.ai"
+api_key = "cmd-test"
+default_model = "deepseek/deepseek-v4.1-flash"
+"#;
+
+    #[test]
+    fn test_default_paths_are_the_vendor_routes() {
+        let state = hot_state(BASE);
+        let p = &state.providers["cmd"];
+        assert_eq!(
+            p.translator.upstream_path(),
+            "/provider/v1/chat/completions"
+        );
+        // The Responses route is the vendor's own, not the OpenAI default.
+        assert_eq!(p.responses_path.as_deref(), Some("/provider/v1/responses"));
+    }
+
+    #[test]
+    fn test_responses_is_native_by_default() {
+        let state = hot_state(BASE);
+        let p = &state.providers["cmd"];
+        assert!(
+            p.native_responses,
+            "commandcode.ai serves /provider/v1/responses — it must be native"
+        );
+    }
+
+    #[test]
+    fn test_native_responses_can_be_turned_off() {
+        let state = hot_state(&format!("{BASE}native_responses = false\n"));
+        let p = &state.providers["cmd"];
+        assert!(!p.native_responses);
+        assert_eq!(p.responses_path, None);
+    }
+
+    #[test]
+    fn test_explicit_upstream_path_drives_the_responses_path() {
+        let state = hot_state(&format!(
+            "{BASE}upstream_path = \"/provider/v1/chat/completions\"\n"
+        ));
+        let p = &state.providers["cmd"];
+        assert_eq!(p.responses_path.as_deref(), Some("/provider/v1/responses"));
+    }
+
+    #[test]
+    fn test_messages_route_is_not_native_responses() {
+        // A provider entry pointed at the Anthropic Messages route serves the
+        // vendor's Claude models; that route has no Responses sibling.
+        let state = hot_state(&format!(
+            "{BASE}upstream_path = \"/provider/v1/messages\"\n"
+        ));
+        let p = &state.providers["cmd"];
+        assert_eq!(p.translator.upstream_path(), "/provider/v1/messages");
+        assert!(!p.native_responses);
+        assert_eq!(p.responses_path, None);
+    }
+
+    #[test]
+    fn test_bearer_auth_is_injected() {
+        let state = hot_state(BASE);
+        let p = &state.providers["cmd"];
+        let headers = p.translator.upstream_headers(&p.api_key);
+        assert!(headers
+            .iter()
+            .any(|(k, v)| k == "Authorization" && v == "Bearer cmd-test"));
+    }
+
+    #[test]
+    fn test_models_list_advertises_only_the_default_model() {
+        let state = hot_state(BASE);
+        let body: serde_json::Value = serde_json::from_slice(&state.models_response).unwrap();
+        let ids: Vec<&str> = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m["id"].as_str())
+            .collect();
+        assert!(ids.contains(&"deepseek/deepseek-v4.1-flash"), "{ids:?}");
+        let owned: Vec<&str> = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["id"] == "deepseek/deepseek-v4.1-flash")
+            .filter_map(|m| m["owned_by"].as_str())
+            .collect();
+        assert_eq!(owned, vec!["command-code"]);
+    }
+
+    #[test]
+    fn test_native_messages_path_is_rewritten_onto_the_vendor_route() {
+        // A client that speaks the plain Anthropic Messages contract.
+        assert_eq!(
+            native_upstream_path("/v1/messages", "/provider/v1/messages"),
+            "/provider/v1/messages"
+        );
+        // An Anthropic provider serves the client's own path.
+        assert_eq!(
+            native_upstream_path("/v1/messages", "/v1/messages"),
+            "/v1/messages"
+        );
+        // Gemini's native path is not a Messages route.
+        assert_eq!(
+            native_upstream_path(
+                "/v1beta/models/gemini-2.5-flash:generateContent",
+                "/v1/messages"
+            ),
+            "/v1beta/models/gemini-2.5-flash:generateContent"
+        );
     }
 }
 

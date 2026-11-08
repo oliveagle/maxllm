@@ -56,7 +56,7 @@ A high-performance AI gateway built on [Pingora](https://github.com/cloudflare/p
 
 ## Features
 
-- **15 LLM providers** &mdash; OpenAI, Anthropic, Gemini, Azure, Bedrock, Groq, Together, Fireworks, Mistral, xAI, DeepSeek, Ollama, Cohere, DeepInfra, OpenCode, and any OpenAI-compatible endpoint
+- **16 LLM providers** &mdash; OpenAI, Anthropic, Gemini, Azure, Bedrock, Groq, Together, Fireworks, Mistral, xAI, DeepSeek, Ollama, Cohere, DeepInfra, OpenCode, Command Code, and any OpenAI-compatible endpoint
 - **Three input modes** &mdash; OpenAI-format with translation, native provider format (Anthropic Messages API, Gemini, etc.), or raw pass-through
 - **Streaming support** &mdash; SSE streaming with real-time format translation (Anthropic SSE, Gemini SSE, Cohere SSE &rarr; OpenAI SSE)
 - **Smart routing** &mdash; Fallback chains, weighted load balancing, round-robin, least-connections, with per-provider circuit breakers
@@ -237,6 +237,7 @@ curl http://localhost:8080/passthrough/openai/v1/embeddings \
 | Ollama | `ollama` | OpenAI-compatible | None (local) |
 | Cohere | `cohere` | Full translation | Bearer token |
 | OpenCode (opencode.ai "zen") | `opencode` | OpenAI-compatible + strict schema | Bearer token |
+| Command Code (commandcode.ai) | `commandcode` | OpenAI-compatible + native Responses + Anthropic Messages | Bearer token |
 | Custom | `openai_compat` | OpenAI-compatible | Configurable |
 
 > **AWS Bedrock** authenticates with AWS Signature V4. Credentials are read
@@ -600,6 +601,70 @@ default_model = "deepseek-v4.1-flash"
 connect_timeout_secs = 30
 total_connect_timeout_secs = 60
 ```
+
+## Command Code (commandcode.ai) provider
+
+`kind = "commandcode"` proxies `https://api.commandcode.ai` — one key and one
+credit balance for Claude, GPT, Gemini and the open models. The vendor
+namespaces every route under `/provider` and speaks three wire contracts:
+
+| Upstream path | Contract | Serves |
+|---------------|----------|--------|
+| `/provider/v1/responses` | OpenAI Responses | every non-Claude model that lists `/responses` |
+| `/provider/v1/chat/completions` | OpenAI Chat Completions | every non-Claude model |
+| `/provider/v1/messages` | Anthropic Messages | the Claude models **only** |
+
+What the gateway does with it:
+
+* **Responses first** — the upstream serves the Responses contract natively
+  (verified 2026-11-08: the route answers `401` without a key, so it exists),
+  so `kind = "commandcode"` defaults to `native_responses = true` and
+  `/v1/responses` requests are forwarded byte-for-byte to
+  `/provider/v1/responses`. The default model is `deepseek/deepseek-v4.1-flash`
+  — the one model this deployment advertises for the vendor.
+* **Bearer auth everywhere** — every route authenticates with
+  `Authorization: Bearer <CMD_API_KEY>`, including the Anthropic-shaped one
+  (commandcode.ai does *not* accept Anthropic's `x-api-key`).
+* **Claude models** — they are served on the Anthropic Messages route only.
+  Give them their own provider entry: the gateway then translates an
+  OpenAI-format request into the Anthropic Messages contract (and the answer
+  back), and a native `/v1/messages` request is forwarded to
+  `/provider/v1/messages` — the client can keep speaking the plain Anthropic
+  contract.
+* **Cost** — the Provider plan is pay-as-you-go at the underlying API rate, so
+  the price table carries the vendor's DeepSeek V4.1 Flash rate
+  (off-peak `$0.15` / `$0.60` per 1M tokens). Override it in
+  `[model_costs."deepseek/deepseek-v4.1-flash"]` if your contract differs.
+* **User-Agent** — the vendor's Cloudflare edge bans script fingerprints
+  (`Python-urllib/3.11` → HTTP 403 `error code: 1010`), exactly like
+  opencode.ai's. The gateway swaps a banned UA for `curl/8.5.0` on every
+  commandcode request; other client UAs are forwarded untouched.
+
+```toml
+[providers.cmd]
+kind = "commandcode"
+base_url = "https://api.commandcode.ai"
+api_key = "${CMD_API_KEY}"
+default_model = "deepseek/deepseek-v4.1-flash"
+# native_responses defaults to true for kind = "commandcode"
+
+# The Claude models, on the vendor's Anthropic Messages route.
+[providers.cmd_claude]
+kind = "commandcode"
+base_url = "https://api.commandcode.ai"
+upstream_path = "/provider/v1/messages"
+api_key = "${CMD_API_KEY}"
+default_model = "claude-sonnet-5-5"
+
+[[routes]]
+path = "/v1/responses"
+provider = "cmd"
+endpoint_type = "responses"
+```
+
+The full vendor catalogue (ids, context lengths and the endpoints each model
+is served on) is published at `GET https://api.commandcode.ai/provider/v1/models`
+— the gateway advertises only the models a deployment actually configures.
 
 ### Native Responses: required whenever the upstream serves it
 

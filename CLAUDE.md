@@ -80,7 +80,7 @@ maxllm/
   crates/
     maxllm-config/        # TOML config parsing, env var expansion, validation
     maxllm-plugin/        # Plugin trait, chain executor, 14 built-in plugins
-    maxllm-translate/     # Provider translation (OpenAI <-> 15 providers)
+    maxllm-translate/     # Provider translation (OpenAI <-> 16 providers)
     maxllm-admin/         # Virtual keys, teams, cost tracking, budget enforcement, admin API
     maxllm-gateway/       # Main binary: Pingora ProxyHttp implementation + routing
 ```
@@ -95,7 +95,7 @@ maxllm/
 - **Lock-free circuit breaker**: Uses AtomicU32/AtomicU64 for per-provider failure tracking. No mutexes in the hot path.
 - **StreamTranslator wrapped in Mutex**: Pingora requires `CTX: Send + Sync`. The `StreamTranslator` trait object is `Send` but not `Sync`, so it's wrapped in `Mutex<Option<Box<dyn StreamTranslator>>>`.
 
-## Supported Providers (15)
+## Supported Providers (16)
 
 | Provider | Kind | Format | Auth |
 |----------|------|--------|------|
@@ -113,6 +113,8 @@ maxllm/
 | DeepSeek | `deepseek` | OpenAI-compatible | Bearer token |
 | Ollama | `ollama` | OpenAI-compatible | None (local) |
 | Cohere | `cohere` | Full translation | Bearer token |
+| OpenCode (zen) | `opencode` | OpenAI-compatible + strict schema | Bearer token |
+| Command Code | `commandcode` | OpenAI-compatible + native Responses + Anthropic Messages | Bearer token |
 | Custom | `openai_compat` | OpenAI-compatible | Configurable |
 
 ## Plugin System
@@ -206,6 +208,7 @@ Built-in cost map for 10+ model families (gpt-4o, claude-sonnet, gemini-flash, e
 | Azure OpenAI | Passthrough (deployment URL + api-key header) | Passthrough | Passthrough |
 | Bedrock | OpenAI -> Anthropic (reuses Anthropic translator) | Anthropic -> OpenAI | Anthropic SSE -> OpenAI SSE |
 | OpenAI-compat | Passthrough | Passthrough | Passthrough |
+| Command Code | Passthrough (chat route) or OpenAI -> Anthropic (messages route) | Passthrough or Anthropic -> OpenAI | Passthrough or Anthropic SSE -> OpenAI SSE |
 
 ## Responses Contract Policy (MUST)
 
@@ -256,7 +259,18 @@ the full contract, is cheaper, and removes a whole class of translation bugs.
 5. **Gate it.** `python3 scripts/check_responses_policy.py --config <toml>`
    (`make policy`; a CI job runs it on `maxllm.toml`) fails on any
    `openai`-shaped provider (including `openai_compat`, `deepseek`, `ollama`,
-   `opencode`) left on translation without an exemption.
+   `opencode`, `commandcode`) left on translation without an exemption.
+
+### Kinds that are native by default
+
+`opencode` and `commandcode` default to `native_responses = true` — their
+upstreams serve the Responses contract on their own route
+(`/zen/go/v1/responses` and `/provider/v1/responses` respectively), so the
+default is native and translation is the exception. A `commandcode` provider
+entry whose `upstream_path` points at the Anthropic Messages route
+(`/provider/v1/messages` — the only route that serves the vendor's Claude
+models) has no Responses sibling and is therefore translated by design; the
+policy script recognises that shape and reports it `BY-KIND`.
    `--live` additionally posts a minimal Responses body to every native route
    and reports `404` as a hard failure (wrong `responses_path` — fix the path,
    do not disable native), `--only <substring>` narrows the run.

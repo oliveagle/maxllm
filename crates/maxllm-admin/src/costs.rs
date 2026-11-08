@@ -354,6 +354,33 @@ fn default_costs() -> Vec<ModelCost> {
             input_cost_per_1m: 0.02,
             output_cost_per_1m: 0.08,
         },
+        // ── commandcode.ai (Provider plan) ───────────────────────────────
+        //
+        // Pay-as-you-go at the underlying API rate (no markup), so these are
+        // real money and must be booked. The vendor's DeepSeek V4.1 Flash
+        // rate is time-banded: the row below is the off-peak rate (17h/day);
+        // the peak rate is $0.30 / $1.20 (01-04 and 06-10 UTC, Mon-Fri).
+        // A deployment that wants the peak rate booked overrides the row in
+        // `[model_costs."deepseek/deepseek-v4.1-flash"]`.
+        //
+        // The model ids are namespaced by the vendor (`deepseek/…`,
+        // `google/…`, `xai/…`), so they never collide with the un-namespaced
+        // ids of the direct channels above.
+        ModelCost {
+            model_pattern: "deepseek/deepseek-v4.1-flash".into(),
+            input_cost_per_1m: 0.15,
+            output_cost_per_1m: 0.60,
+        },
+        ModelCost {
+            model_pattern: "deepseek/deepseek-v4.1-flash-fast".into(),
+            input_cost_per_1m: 0.16,
+            output_cost_per_1m: 0.58,
+        },
+        ModelCost {
+            model_pattern: "deepseek/deepseek-v4.1-flash-ultrafast".into(),
+            input_cost_per_1m: 2.40,
+            output_cost_per_1m: 9.60,
+        },
         // ── Zero-marginal-cost channels ──────────────────────────────────
         //
         // Prepaid coding plans and self-hosted endpoints are not billed per

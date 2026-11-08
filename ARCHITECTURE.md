@@ -600,10 +600,10 @@ Client Response (translated: OpenAI format / native: provider format / passthrou
 
 ### 5. Canonical Format Translation
 - All clients speak OpenAI format
-- Gateway translates to/from the 16 provider kinds transparently
+- Gateway translates to/from the 17 provider kinds transparently
   (openai, anthropic, gemini, azure_openai, bedrock, groq, together,
   fireworks, deepinfra, mistral, xai, deepseek, ollama, cohere,
-  openai_compat, opencode)
+  openai_compat, opencode, commandcode)
 - Streaming translation handles SSE chunk-by-chunk
 
 ---
@@ -663,6 +663,7 @@ Client Response (translated: OpenAI format / native: provider format / passthrou
 | Responses API | 7 | chat-only translation (the fallback path: native `native_responses` forwarding is the norm), tool-choice nesting, images, SSE, error/mid-stream failure surfacing |
 | Native & passthrough | 6 | Responses passthrough (streaming/non-streaming), function-tool flattening, large-body usage, chat→native fallback |
 | OpenCode (zen) | 16 | session header injection/affinity, body normalisation, error envelopes, UA handling, models list, streaming usage |
+| Command Code | 10 | vendor path defaults, native Responses, Anthropic Messages wire + translation, bearer auth, models list |
 | Headers & metrics | 6 | X-Request-Id, X-MaxLLM-Provider, CORS, request/token/active/inflight metrics |
 | Bedrock SigV4 | 3 | signed request + model routing, error forwarding, streaming translation |
 | Routing strategies | 6 | latency, cost, least-connections, auto-model rotation (+session affinity, pool filtering) |

@@ -80,7 +80,7 @@ fn normalize_model(model: &str) -> String {
     model.to_string()
 }
 
-fn openai_to_anthropic_request(
+pub(crate) fn openai_to_anthropic_request(
     req: &OpenAIChatRequest,
 ) -> Result<AnthropicRequest, TranslateError> {
     let mut system: Option<Value> = None;
@@ -197,7 +197,7 @@ fn openai_to_anthropic_request(
     })
 }
 
-fn anthropic_to_openai_response(resp: &AnthropicResponse) -> OpenAIChatResponse {
+pub(crate) fn anthropic_to_openai_response(resp: &AnthropicResponse) -> OpenAIChatResponse {
     let mut text_parts: Vec<String> = Vec::new();
     let mut tool_calls: Vec<OpenAIToolCall> = Vec::new();
 

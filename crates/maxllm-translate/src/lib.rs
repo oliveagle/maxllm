@@ -13,6 +13,7 @@ pub mod azure_openai;
 pub mod bedrock;
 pub mod cohere;
 pub mod cohere_stream;
+pub mod commandcode;
 pub mod formats;
 pub mod gemini;
 pub mod gemini_stream;
@@ -109,6 +110,17 @@ pub fn extract_native_content(kind: &str, body: &serde_json::Value) -> String {
         "anthropic" => extract_anthropic_content(body),
         "gemini" => extract_gemini_content(body),
         "cohere" => extract_cohere_content(body),
+        // commandcode.ai speaks two contracts on one vendor: the OpenAI
+        // Chat Completions shape and the Anthropic Messages shape (the route
+        // that serves its Claude models). The body decides which one this
+        // is: an Anthropic Messages body has "messages" and no "input".
+        "commandcode" => {
+            if body.get("messages").is_some() && body.get("input").is_none() {
+                extract_anthropic_content(body)
+            } else {
+                extract_openai_content(body)
+            }
+        }
         // OpenAI-format and compatible providers
         _ => extract_openai_content(body),
     }

@@ -72,6 +72,18 @@ def is_non_chat(name: str, conf: dict) -> bool:
 # derivable `upstream_path` is configured (crates/maxllm-gateway/src/gateway.rs).
 DEFAULT_RESPONSES_PATH = "/v1/responses"
 
+# Kinds whose default upstream path is not the OpenAI one. commandcode.ai
+# namespaces every route under `/provider`, so its defaults are
+# `/provider/v1/chat/completions` and `/provider/v1/responses`
+# (crates/maxllm-translate/src/commandcode.rs).
+KIND_DEFAULT_CHAT_PATH = {"commandcode": "/provider/v1/chat/completions"}
+KIND_DEFAULT_RESPONSES_PATH = {"commandcode": "/provider/v1/responses"}
+
+# Kinds that default to native Responses. `opencode` and `commandcode` both
+# serve the Responses contract on their own route; every other kind is
+# translated unless the config says otherwise.
+NATIVE_BY_DEFAULT_KINDS = {"opencode", "commandcode"}
+
 # Kinds whose native Responses route is not the OpenAI `/v1/responses` shape and
 # therefore must name `responses_path` explicitly.
 PATH_MUST_BE_EXPLICIT = {"azure_openai": "/openai/responses?api-version=<api_version>"}
@@ -81,17 +93,18 @@ def derive_responses_path(conf: dict) -> str:
     explicit = conf.get("responses_path")
     if explicit:
         return explicit
-    upstream = conf.get("upstream_path")
+    kind = conf.get("kind", "openai_compat")
+    upstream = conf.get("upstream_path") or KIND_DEFAULT_CHAT_PATH.get(kind)
     if upstream and upstream.endswith("/chat/completions"):
         return upstream[: -len("/chat/completions")] + "/responses"
-    return DEFAULT_RESPONSES_PATH
+    return KIND_DEFAULT_RESPONSES_PATH.get(kind, DEFAULT_RESPONSES_PATH)
 
 
 def classify(conf: dict, kind: str) -> tuple[str, str]:
     """Return (verdict, detail) for one provider."""
     native = conf.get("native_responses")
     if native is None:
-        native = kind == "opencode"  # documented default in maxllm-gateway
+        native = kind in NATIVE_BY_DEFAULT_KINDS  # documented default in maxllm-gateway
     if native:
         path = derive_responses_path(conf)
         if kind in PATH_MUST_BE_EXPLICIT and not conf.get("responses_path"):
@@ -155,6 +168,15 @@ def main() -> int:
         if kind in NON_RESPONSES_KINDS:
             rows.append({"provider": name, "kind": kind, "verdict": "BY-KIND",
                          "detail": f"{kind} upstream has no Responses route; translation is the contract"})
+            continue
+        if kind == "commandcode" and str(conf.get("upstream_path", "")).endswith("/messages"):
+            # A commandcode entry pointed at the Anthropic Messages route
+            # serves the vendor's Claude models: that route has no Responses
+            # sibling, so the Responses contract is translated into Messages
+            # by design.
+            rows.append({"provider": name, "kind": kind, "verdict": "BY-KIND",
+                         "detail": "commandcode.ai Anthropic Messages route (upstream_path ends in "
+                                   "/messages) has no Responses sibling; translation is the contract"})
             continue
         if is_non_chat(name, conf):
             rows.append({"provider": name, "kind": kind, "verdict": "NON-CHAT",

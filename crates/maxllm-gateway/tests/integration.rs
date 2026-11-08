@@ -7567,3 +7567,261 @@ strategy = "fallback"
         "the fallback must serve the demoted traffic"
     );
 }
+
+// ---------------------------------------------------------------------------
+// commandcode.ai ("provider") — native Responses, vendor paths, Messages wire
+// ---------------------------------------------------------------------------
+
+const COMMANDCODE_CONFIG: &str = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[metrics]
+enabled = true
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.cmd]
+kind = "commandcode"
+base_url = "{MOCK_URL}"
+api_key = "cmd-secret"
+default_model = "deepseek/deepseek-v4.1-flash"
+
+[[routes]]
+path = "/v1/responses"
+provider = "cmd"
+endpoint_type = "responses"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "cmd"
+"#;
+
+const COMMANDCODE_MESSAGES_CONFIG: &str = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[metrics]
+enabled = true
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.cmd_claude]
+kind = "commandcode"
+base_url = "{MOCK_URL}"
+upstream_path = "/provider/v1/messages"
+api_key = "cmd-secret"
+default_model = "claude-sonnet-5-5"
+
+[[routes]]
+path = "/v1/messages"
+provider = "cmd_claude"
+endpoint_type = "native"
+"#;
+
+#[tokio::test]
+async fn test_commandcode_native_responses_passthrough() {
+    let mock = MockServer::start().await;
+
+    // commandcode.ai serves the Responses contract on /provider/v1/responses.
+    // The request must land there byte-for-byte, authenticated with the
+    // vendor's bearer token.
+    let upstream_body = json!({
+        "id": "resp_cmd",
+        "object": "response",
+        "status": "completed",
+        "model": "deepseek/deepseek-v4.1-flash",
+        "output": [{
+            "id": "msg_cmd",
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "hi"}]
+        }],
+        "usage": {"input_tokens": 11, "output_tokens": 5, "total_tokens": 16}
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/provider/v1/responses"))
+        .and(header("Authorization", "Bearer cmd-secret"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(upstream_body.clone()))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let gw = TestGateway::start(COMMANDCODE_CONFIG, &mock.uri()).await;
+    let c = client();
+
+    let request_body = json!({
+        "model": "deepseek/deepseek-v4.1-flash",
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+        "stream": false,
+        "previous_response_id": "resp_prev"
+    });
+
+    let resp = c
+        .post(gw.url("/v1/responses"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&request_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["object"], "response");
+    assert_eq!(body["id"], "resp_cmd");
+    assert_eq!(body["output"][0]["content"][0]["text"], "hi");
+
+    // Byte-for-byte passthrough to the vendor's Responses route.
+    let requests = mock.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].body, serde_json::to_vec(&request_body).unwrap());
+    let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert!(
+        sent.get("messages").is_none(),
+        "no chat translation happened"
+    );
+}
+
+#[tokio::test]
+async fn test_commandcode_chat_completions_use_the_vendor_path() {
+    let mock = MockServer::start().await;
+
+    let upstream_body = json!({
+        "id": "chatcmpl_cmd",
+        "object": "chat.completion",
+        "model": "deepseek/deepseek-v4.1-flash",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "hi"},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/provider/v1/chat/completions"))
+        .and(header("Authorization", "Bearer cmd-secret"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(upstream_body.clone()))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let gw = TestGateway::start(COMMANDCODE_CONFIG, &mock.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&chat_body("deepseek/deepseek-v4.1-flash", "hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "hi");
+
+    let requests = mock.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(sent["model"], "deepseek/deepseek-v4.1-flash");
+}
+
+#[tokio::test]
+async fn test_commandcode_native_messages_rewrites_the_path() {
+    let mock = MockServer::start().await;
+
+    // The vendor publishes the Anthropic Messages contract at
+    // /provider/v1/messages. A client that speaks the plain /v1/messages
+    // contract must still reach it.
+    let upstream_body = json!({
+        "id": "msg_cmd",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-sonnet-5-5",
+        "content": [{"type": "text", "text": "hi"}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 3, "output_tokens": 2}
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/provider/v1/messages"))
+        .and(header("Authorization", "Bearer cmd-secret"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(upstream_body.clone()))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let gw = TestGateway::start(COMMANDCODE_MESSAGES_CONFIG, &mock.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/messages"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&json!({
+            "model": "claude-sonnet-5-5",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // A native route returns the provider's own format untouched.
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["type"], "message");
+    assert_eq!(body["content"][0]["text"], "hi");
+
+    let requests = mock.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].url.path(), "/provider/v1/messages");
+}
+
+#[tokio::test]
+async fn test_commandcode_upstream_script_ua_replaced() {
+    let mock = MockServer::start().await;
+
+    // commandcode.ai's Cloudflare edge bans script fingerprints
+    // (`Python-urllib/3.11` -> HTTP 403 "error code: 1010"), the same
+    // fingerprint opencode.ai bans. The gateway must swap it for the safe UA.
+    Mock::given(method("POST"))
+        .and(path("/provider/v1/chat/completions"))
+        .and(header("User-Agent", "curl/8.5.0"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"id":"c1","object":"chat.completion","choices":[]})),
+        )
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let gw = TestGateway::start(COMMANDCODE_CONFIG, &mock.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .header("User-Agent", "Python-urllib/3.11")
+        .json(&chat_body("deepseek/deepseek-v4.1-flash", "hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+}
