@@ -1274,23 +1274,41 @@ impl AiGateway {
                 .unwrap_or(false)
         };
 
+        // The latency filter is computed once and reused: a sticky pin has to
+        // respect the same cohort as the round-robin, otherwise a session
+        // pinned to a provider that has since become an order of magnitude
+        // slower would keep waiting on it forever.
+        let fast_cohort: Option<Vec<&AutoPoolEntry>> = if pool.prefer_fast {
+            Some(auto_pool_fast_cohort(&healthy))
+        } else {
+            None
+        };
+        let in_fast_cohort = |name: &str| -> bool {
+            fast_cohort
+                .as_ref()
+                .is_none_or(|c| c.iter().any(|e| e.provider == name))
+        };
+
         // 1. Session-sticky within the preferred tier: a session pinned to a
         //    pool provider keeps using it (a different key loses upstream
         //    context). A pin on the metered tier is not honoured once a
         //    subscription entry has recovered — the prepaid tier wins and
-        //    the session re-pins on the next successful response.
+        //    the session re-pins on the next successful response. A pin on a
+        //    provider the latency filter skipped is abandoned the same way:
+        //    one lost prompt cache is cheaper than every turn waiting on a
+        //    provider whose typical answer takes tens of seconds.
         let mut chosen: Option<&AutoPoolEntry> = None;
         if route.session_sticky && hot.session_sticky_enabled {
             if let Some(session_id) = ctx.session_id.clone() {
                 match self.sessions.get(&session_id) {
                     Some(pinned_name) => {
-                        chosen = healthy
-                            .iter()
-                            .copied()
-                            .find(|e| e.provider == pinned_name && admits(e));
+                        chosen = healthy.iter().copied().find(|e| {
+                            e.provider == pinned_name && admits(e) && in_fast_cohort(&e.provider)
+                        });
                         // Pinned provider unavailable (open circuit, no
                         // longer in the pool, only in a lower billing tier,
-                        // or its probe slot is busy) — fall through to
+                        // its probe slot is busy, or its latency is far
+                        // above the tier median) — fall through to
                         // round-robin; the session re-pins on the next
                         // successful response. A pin that cannot be honoured
                         // is a miss, not a hit.
