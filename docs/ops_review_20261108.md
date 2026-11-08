@@ -11,7 +11,7 @@
 
 | # | 结论 | 证据 | 严重度 |
 |---|------|------|--------|
-| 1 | 上游流被截断仍按 HTTP 200 计成功，监控完全看不见 | 6,409 个 200 里 720 个（11.2%）带 transport error；其中 679 个是 ollama 端点 `Prematurely before response body is complete` | P0 |
+| 1 | ~~上游流被截断仍按 200 计成功~~ **（已订正，见 §1.1）**：真正的问题是"200 + error 非空" 把两类完全不同的东西记成了同一件事 | 799 条 200 带 error，其中 **798 条是客户端断开**（`ErrorSource::Downstream`），**只有 1 条是上游截断**（`… without the termination chunk`）。客户端断开里 638 条集中在 11-07 12–18Z 事故窗口、一台工作站；27 条是 300s 客户端超时；窗口外仅 0.4%–5% | P0（口径） |
 | 2 | auto 池路由的**流式**请求全部丢失 usage，token/成本账本对主流量不可用 | `/v1/responses/auto` 4,257 个响应里 4,208 个（98.9%）tokens=0；全站 65.9% 的 200 响应零 usage；`spend_logs` 表 0 行 | P0 |
 | 3 | 成本表为空，`cost_usd` 恒为 0，成本告警/预算失效 | 配置无 `[cost*]` 段；6,535 条完成日志 cost=0（仅 42 条非 0）；2,186 条 `no cost entry found` WARN（占全部 WARN 的 76%） | P0 |
 | 4 | 监控链路"只采不看"：无 maxllm 看板、无告警；日志全部灌进 `default` 流 | OpenObserve 20 条指标流均在更新，但 0 条 alert、2 个 dashboard 均与 maxllm 无关；collector 单 exporter 写死 `stream-name: default` | P1 |
@@ -29,6 +29,9 @@
 ---
 
 ## 1. P0-1：流被截断，但按 200 计成功
+
+> ⚠️ **本节结论已订正**：这 720 条里 798 条是**客户端断开**而不是上游截断，实测只有 1 条真截断。
+> 原判据（`error` 非空）不可用；保留原文是为了留下订正轨迹，**以 §1.1 为准**。
 
 **现象**：`client_response` 记录里带 `error` 字段的有 837 条，其中 **720 条 status=200**。
 
@@ -63,6 +66,76 @@
 client_response: n=1904  /v1/responses/responses  200=1818  transport_error=767 (40.3%)
 client_response: n=4257  /v1/responses/auto/...    200=4252  transport_error=31  (0.7%)
 ```
+
+### 1.1 订正（2026-11-08 15:5x）：`Downstream ConnectionClosed` 是**客户端断开**，不是上游截断
+
+§1 把 679 条 `Downstream ConnectionClosed … Prematurely before response body is complete`
+读成了"上游先回 200 再立刻断开"。这个读法是错的。本轮用三步钉死了它的真实含义：
+
+**① 错误语义**：pingora 的 `ErrorSource` 只有三种取值 —— `Upstream`（远端服务器）、
+`Downstream`（远端客户端）、`Internal`。`Downstream ConnectionClosed … Prematurely before
+response body is complete` 产生于 `pingora-core-0.8.0/src/protocols/http/v1/server.rs:938-952`
+的 `read_body_or_idle()`：网关边写响应体边 poll 客户端套接字，**客户端先挂断**才会走到这里。
+
+**② 消息里的 `Peer: addr: 10.126.126.4:11434` 是干扰项**：那是 `error_while_proxy()` 给
+*每一个*代理错误挂的上下文
+
+```rust
+e = e.more_context(format!("Peer: {}", peer));
+```
+
+它打印的是上游 `HttpPeer`，与"哪一端先断开"无关 —— 上一轮正是被这一行误导成
+"地址是上游 ⇒ 断的是上游"。
+
+**③ 复现验证**：对一个流式请求读到首字节后 1 秒主动关闭客户端，网关落盘的是**逐字节相同**的一行
+（`status_code=200`、`ttft_ms=598`、`duration_ms=1664`、
+`error="Downstream ConnectionClosed context: Peer: addr: 10.126.126.4:11434 … Prematurely before
+response body is complete"`）。
+
+**重分类（4 天 recordings，8 797 条 200 响应）**
+
+| 类别 | 条数 | 判据 |
+|---|---|---|
+| 200 且 `error` 非空 | 799 | |
+| ├ `Downstream ConnectionClosed`（**客户端断开**） | **798** | `ErrorSource::Downstream` |
+| └ `Upstream ConnectionClosed … without the termination chunk, read 503 855 bytes`（**上游截断**） | **1** | `ErrorSource::Upstream` |
+
+798 条客户端断开里 **796 条已经有 `ttft_ms`**（响应头 + 首包字节都已送达客户端），只有 2 条在
+首字节前断开。它们由三个互不相干的群体组成，不是一种现象：
+
+| 群体 | 条数 | 特征 | 读法 |
+|---|---|---|---|
+| 11-07 12Z–18Z 事故窗口内本网段一台工作站 | 638 | 逐小时放弃率 46.6% / 61.5% / 36.5% / 40.0% / 27.5% / 8.4%；放弃时刻中位 3s 内、相邻两条间隔中位 5.6s | 同一小时该端点上另有 315 条**完整成功**（tokens_out 100% 非零、ttft p50 1.22s）⇒ 上游健康，是客户端在反复取消/重来 |
+| 另一台工作站打 `xiaomi/mimo-v2.6-flash` | 27 | 时长全部 301.5–305.7s ≈ ttft(1.5–5.7s) + **300s** | 客户端 300s 请求超时；模型确实慢，但与网关无关 |
+| 其余零散 | 133 | volc_1 36 / xiaomi 43 / minimax 3 / deepseek 2 … | agent 循环里的中断、切模型、重试，属正常行为 |
+
+窗口外放弃率只有 0.4%–5%（今天 07Z 是 20/1016 = 2.0%）。
+
+**因此 §1 的下列结论撤回或改写**
+
+| 原文 | 订正 |
+|---|---|
+| "6 409 个 200 里 720 个（11.2%）带 transport error = 静默截断" | 只有 **1** 条是上游截断；798 条是客户端断开 |
+| "ollama 端点整体截断率 34.3%，是截断率最高的一家，建议把 primary 换掉" | **反了**。按 `request_logs` 全量口径，`ollama_local` 的上游失败率 **0.00%**、`one_api_ollama_local` **0.11%**，是全仓最低档；真正高的是 `opencode_go_2` 7.65%、`opencode_go_1` 2.58%、`ada` 2.50%。34.3% 是"客户端放弃率"，且集中在 11-07 12–18Z 窗口 |
+| "上游先回 200 再立刻断开，典型的超大 prompt / 上下文上限行为" | 不成立：被放弃请求的 ttft p50 **1.27s** 比成功请求的 **1.72s** 还快，首包已正常到达 |
+| "截断请求 prompt 中位 132k ⇒ 上下文上限" | 132k 这个数是真的（那批行 `tokens_in` 中位 133 827），但它只说明"长 prompt 的请求更容易被客户端放弃"（想得久 ⇒ 更容易被中断），不能推出上游因上下文上限断开 |
+| "87.2M input tokens 已被上游计费，客户端只拿到半截" | 输入 token 确实计费（下游断开行合计 **100.7M** input tokens，772/839 行有 `tokens_in`），但性质是"客户端放弃时已经产生的输入"，与"截断"无关；输出侧上游按其实际生成计 |
+
+**对修复计划的影响**
+
+1. **"首字节前 failover" 的收益从"救回 680 例"缩到 2 例（0.25%）** —— 不值得为它引入首包缓冲与
+   交互延迟。该项从"待做"降为**不做**。
+2. **`/v1/responses` primary 从 ollama 换掉** 的主要理由（"它截断率最高"）消失，ollama 端点的
+   上游可靠性反而是全仓最好的。仍可因**配额/成本**换，但不再是可靠性问题。
+3. `streams_judged_total` 的口径本来就对：只统计"网关能解析方言 + 上游给出终态或确认截断"的流，
+   客户端断开天然不进入。代码在 `error_while_proxy()` 里用 `e.esource() == ErrorSource::Upstream`
+   守着 `mark_stream_truncated()`，**客户端断开不会触发流截断降级** —— 否则任何一次 Ctrl-C 都能把
+   健康 provider 熔断。线上 311 judged / 0 truncated / 0 次降级印证。
+4. **真正缺的是口径分离**：`Downstream ConnectionClosed` 仍按 `200 + error` 记账，会污染任何
+   "error 非空 = 失败"的成功率；`usage_missing_total` 也只在 `tokens_in==0 && tokens_out==0` 时
+   触发（这类行通常已带 tokens_in，线上至今仅 1 次），口径上仍应显式排除。建议新增
+   `maxllm_client_aborted_total{provider}`，并给 `request_logs.status` 一个独立取值；它是
+   **客户端行为指标**，不进熔断、不进失败率告警。
 
 ---
 
@@ -193,7 +266,7 @@ pool_health 接 timer（5 min）；probe 显式传 `--provider kimi`；探针请
 | `maxllm.err` | 23 行、全部停留在 11-04，无轮转 | logrotate（按大小/天），并修掉 `unknown provider 'auto'` 的误导文案（sentinel 不是 provider） |
 | 请求体落盘 | recordings 里 451 条 client_request + 388 条 client_response 存了完整 body | 脱敏（API key / 个人信息）或只存 hash + 长度；明确保留期 |
 | `/metrics` 暴露 | 0.0.0.0:3795 无鉴权 | 绑定内网/加 bearer，或由 collector 走 localhost（当前已是 localhost 抓取，可直接收口） |
-| 大 prompt | p50 110k–190k tokens；≥128k 的 ollama 请求截断率 38.5%（<128k 为 30.5%） | 路由前按模型上下文上限做大小检查，超限直接换 provider 或 413 |
+| 大 prompt | p50 96k tokens、p90 200k（`request_logs.tokens_in`）；原写"≥128k 截断率 38.5%"用的是被误分类的客户端放弃行，按 `Upstream` 口径重算**没有证据**（§1.1） | 无证据支持预检；若要做，动机应是**上游成本/额度**（长 prompt 每次都是全额输入计费）而不是截断 |
 
 ---
 
@@ -209,6 +282,11 @@ pool_health 接 timer（5 min）；probe 显式传 `--provider kimi`；探针请
 | P1 | 路由精确匹配 + rename 状态迁移 + 清僵尸行（§5） | 代码 | 1 天 |
 | P1 | body 哨兵精确匹配池名（§6） | 代码 | 0.5 天 |
 | P2 | health 池摘要 / probe 排除 / 轮转 / 脱敏（§7–8） | 混合 | 0.5 天 |
+| P1 | `client_aborted_total{provider}` + `request_logs.status` 独立取值，把客户端放弃从成功率口径里摘出去（§1.1） | 代码 | 0.5 天 |
+
+> **§1.1 订正后的两处降级**：`/v1/responses` primary 换 provider 不再是可靠性问题（ollama 端点
+> 上游失败率 0.00%，全仓最低）；"首字节前 failover" 收益只有 0.25%，**不做**。真正要补的是
+> 客户端放弃与网关/上游失败的**口径分离**（上表最后一行）。
 
 ---
 
@@ -219,7 +297,27 @@ pool_health 接 timer（5 min）；probe 显式传 `--provider kimi`；探针请
 curl -s http://<gateway>:3795/metrics
 
 # 2) 截断 vs 成功（在网关主机上，对 recordings/*.jsonl）
-#    client_response 的 error 字段非空且 status_code==200 即"静默截断"
+#    ⚠️ 不能只看 "error 非空"。pingora 的 error 前缀是 ErrorSource：
+#      Downstream … = 客户端先挂断（客户端行为，不是网关/上游失败）
+#      Upstream   … = 上游先挂断（这才是截断）
+#    判据：status_code==200 && error.startswith("Upstream")
+python3 - <<'EOF'
+import json,glob
+for p in sorted(glob.glob("recordings/*.jsonl")):
+    for line in open(p):
+        d=json.loads(line)
+        if d.get("event_type")!="client_response" or d.get("status_code")!=200: continue
+        e=(d.get("error") or "").strip()
+        if e.startswith("Upstream"):
+            print("TRUNCATED", d.get("provider"), d.get("model"), d.get("duration_ms"), e[:90])
+        elif e.startswith("Downstream"):
+            pass  # client abort: 客户端断开，见 §1.1
+EOF
+#    2026-11-08 实测：4 天 8 797 条 200 里 Upstream 只有 1 条、Downstream 798 条
+#
+# 2b) 复现"客户端断开"这条 error（证明它属于 Downstream 而非 Upstream）：
+#     发一个流式请求，读到首字节后立刻关闭连接，然后查最新一条 client_response：
+#     status 仍是 200、ttft_ms 有值、error 以 "Downstream ConnectionClosed …" 开头
 # 3) auto 池 usage 丢失：同一 provider 对比直连路由与池路由的 tokens_in/out
 curl -s http://<gateway>:3795/v1/responses/volc_1 \
   -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
@@ -233,9 +331,12 @@ curl -s http://<gateway>:3795/v1/responses/auto \
 口径说明：
 - "响应"均指 `client_response` 记录；一次客户端请求可能因 failover 产生多条
   `provider_response`，不计入分母。
-- "transport error" = client_response 的 `error` 字段匹配 `ConnectionClosed / ReadError /
-  ReadTimedout / DNS`；与业务 4xx/5xx 分开统计。
-- 截断率分母 = 该 provider 的 client_response 200 数。
+- "transport error" 必须按 `ErrorSource` 拆开：`Upstream …`（上游断 = 截断）与
+  `Downstream …`（客户端断 = 客户端放弃）是两件事，混在一起统计会把客户端行为算成网关故障
+  （§1.1 就是这么误判的）。窗口外客户端放弃率基线 0.4%–5%，属 agent 循环的正常中断。
+- 上游截断率分母 = 该 provider 的 client_response 200 数；客户端放弃率单独一列。
+- `request_logs` 里同一批行会带 `tokens_in`（客户端断开时已产生的输入 token 照样计费），
+  所以"下游断开"行的 token 不为零，不能拿 `tokens_in==0` 当截断判据。
 
 ---
 
@@ -248,6 +349,7 @@ curl -s http://<gateway>:3795/v1/responses/auto \
 | 审计项 | 状态 | 实现 | 验证 |
 |---|---|---|---|
 | P0-1 截断按 200 计成功 | ✅ 已修（暴露）+ ⏳ 未做（failover） | 新增 `maxllm_stream_truncated_total{provider}`、`maxllm_stream_truncated_before_first_byte_total{provider}`、`maxllm_streams_judged_total{provider}`；SSE 缺终止事件时补 `event: error`（Responses）或 `error`+`[DONE]`（chat）；`request_logs.error` 与日志 `truncated` 字段同步记账 | 线上 `/metrics` 已出现 `streams_judged_total`，无截断时 `stream_truncated_total` 不出现；集成测试 `test_truncated_native_responses_stream_is_booked_as_truncated` 断言 200 被记截断且客户端收到 error 事件 |
+| P0-1 口径订正（本轮） | ✅ 已订正 | `Downstream ConnectionClosed` 被误读为上游截断；实测 798/799 是客户端断开、真截断仅 1 条。代码侧已核实：`error_while_proxy()` 只用 `ErrorSource::Upstream` 触发 `mark_stream_truncated()`，客户端断开不会误触流截断降级 | 复现实验（读到首字节后 1s 断开 ⇒ 逐字节相同 error）；全量重算 4 天 8 797 条 200；线上 311 judged / 0 truncated |
 | P0-2 auto 池流式丢 usage | ✅ 已修 | auto 改写 body 时补解析 `stream`（原逻辑只在 `keep_request_content_length` 分支解析，auto 非 verbatim 走不到）；native Responses 流优先 `NativePassthroughStream`，不再套 chat translator（套了会破坏事件流并吃掉 usage） | 线上 `/v1/responses/auto` 实测 `Content-Type: text/event-stream` 且 `tokens_in/out` 入库；audit 前 2178/2200 零 usage，部署后新请求全部带 token |
 | P0-3 成本表为空 | ✅ 已修 | 内置价表补生产渠道（deepseek-v4-flash / MiniMax-M3 / mimo-v2.6-flash / glm-5.3-flash），订阅制与本地模型显式 0/0；新增 `[costs] enabled / warn_on_missing` | 线上 `cost_usd` 已非 0（minimax 单请求 0.020459）；`production_channels_have_a_price_or_an_explicit_zero` 单测防漏配 |
 | P1-4 只采不看 | ✅ 已修 | collector 拆三个 exporter：logs 按 `stream-name` 落 `maxllm_recordings` / `maxllm_logs`（OpenObserve 的 OTLP **metrics** 是按指标名分流的，`stream-name` 对 metrics 无效，已在配置里注明）；新增 dashboard + 告警，定义收敛到 `scripts/openobserve_alerts.py`（7 条，可重放）；dashboard 面板收敛到 `scripts/openobserve_dashboard.py`（幂等补面板，PUT 后回读校验——OpenObserve 的 update 接口接受 `{"v8": …}` 信封会 200 但静默丢掉 tabs，必须发裸 v8 + `?hash=`） | 三路数据实测有量：`maxllm_recordings` 49 条 / `maxllm_logs` 21 条 / `maxllm_requests_total` 5 分钟 286 样本；7 条告警 `enabled=true`；dashboard 7→11 面板（新增按 provider 截断率/截断速率、首字节前截断、脱敏计数） |
@@ -268,7 +370,7 @@ curl -s http://<gateway>:3795/v1/responses/auto \
 
 | 项 | 原因 | 建议 |
 |---|---|---|
-| `/v1/responses` primary 从 ollama 端点换掉 | 属成本/配额口径决策 | 新增的流截断率降级已让它在持续截断时**自动**被降级；若希望彻底不经手，改 `provider` 或让客户端走 `/v1/responses/auto` |
-| 首字节前的截断 failover | 需要"先缓冲首包再决定"的改写，影响交互延迟 | 先用 `stream_truncated_before_first_byte_total` 量化收益再决定 |
+| `/v1/responses` primary 从 ollama 端点换掉 | 属成本/配额口径决策。**订正**：原"它是截断率最高的一家"不成立 —— `ollama_local` 上游失败率 0.00%、`one_api_ollama_local` 0.11%，全仓最低；高的是 `opencode_go_2` 7.65% / `opencode_go_1` 2.58%（§1.1） | 若换，理由只能是成本/配额；从可靠性看没有理由动它 |
+| 首字节前的截断 failover | ~~收益是本批 680 例~~ **订正：只有 2/798（0.25%）** 在首字节前断开（§1.1） | **不做**。收益 0.25%，代价是首包缓冲 + 交互延迟；`stream_truncated_before_first_byte_total` 继续留着做监控即可 |
 | 超大 prompt 预检 | ≥128k 输入截断率显著更高 | 可先用 `maxllm_stream_truncated_total` × 请求 token 直方图确认 |
 | 告警真实出口 | `maxllm-http-sink` 仍是占位 URL（httpbin） | `scripts/openobserve_alerts.py --destination-url <webhook>` 一条命令替换 |
