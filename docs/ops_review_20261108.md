@@ -1015,6 +1015,232 @@ Format / Check / Clippy / Test / Responses policy / Ops scripts / Build Release�
 
 ---
 
+## 14. 缓存命中率攻坚（2026-11-09 02:1x–03:xx CST）：opencode affinity 是主根因，A/B 两杠杆落地
+
+用户三句话推进本轮：
+
+> 「我怎么感觉速度有点儿慢呢？是因为没有充分利用 session sticky 么？缓存命中率如何呢？」
+> →「给我优化缓存利用率，争取所有 provider 的缓存命中率 > 95%.」
+> →「A+B 做掉. kimi 要保留。」
+
+### 14.1 基线：三个主力 provider 掉在 95% 以下
+
+窗口 `2026-11-08T09:30:00Z` 起、只统计带 `cached_in` 的 `request completed` 行
+（脚本 `baseline.py`，12 158 行）：
+
+| provider | tokens_in | 命中率 | 备注 |
+|---|---:|---:|---|
+| minimax | 779 727 116 | 97.39% | |
+| open_design | 21 788 876 | 96.89% | |
+| volc_t_1 | 24 999 360 | 96.46% | |
+| ollama_local | 254 466 873 | 96.27% | |
+| volc_1 | 153 108 633 | 95.60% | |
+| **xiaomi** | 234 981 776 | **94.76%** | 差 0.24pp |
+| **opencode_go_1** | 76 397 749 | **67.67%** | |
+| **opencode_go_2** | 85 603 464 | **64.83%** | |
+| cmd_cli | 334 424 | 48.38% | 一次性 CLI 桥接测试流量，15 reqs 全落在 11-08 10:18–12:59，不计入主力 |
+| **合计** | **1 631 409 044** | **93.54%** | |
+
+其余 deepseek / humanizer_gpu3 / coding_home_* 等 ≤176 token，全是首 turn 冷启动，不参与判定。
+
+### 14.2 口径坑：`cached_in` 是 `1dda90d` 才加的字段
+
+- `cached_in` 首次出现在 `2026-11-08T08:42:42Z`。**把缺失的 `cached_in` 当 0，会把 93.54% 误算成 70.1%**。
+- 日志带 ANSI 色码，且 **`=` 两边也被色码包住**
+  （`cached_in\x1b[0m\x1b[2m=\x1b[0m118208`）：
+  - 先 `re.sub(r"\x1b\[[0-9;]*m", "", line)` 再匹配；
+  - 判字段是否存在必须用 `"cached_in" in raw`，**不能**用 `"cached_in=" in raw`。
+- 时间戳是 UTC（`Z`），用 `datetime.strptime(...).replace(tzinfo=timezone.utc)`；
+  `time.mktime` 会差 8 小时。
+
+### 14.3 opencode 掉到 65% 的真根因：网关不认客户端真正发的那个 session header
+
+**修法前的识别集合**只有 `x-opencode-session`、`x-session-affinity`、`x-opencode-session-id`，
+既不认 `x-session-id` / `thread-id`，也**没有任何 fallback** —— 解析不到就每请求铸一个全新 UUID。
+于是 sticky pin 每次都是新的，上游 prompt cache 永远对不上。
+
+**对照实验**（`opencode_affinity.py`，同一段 2 911 token 的 prompt 连发两次）：
+
+| 第二发带什么 | round2 `cached` |
+|---|---:|
+| 什么都不带 | **0** |
+| 固定 `x-session-affinity: <同一个值>` | **2 816 / 2 911 = 96.7%** |
+
+**join 分析**（`join_hit.py`）：log 的 `request_id` ↔ recordings 的 `request_uuid`
+**join 不上**，必须用 `(provider, tokens_in, tokens_out, timestamp ± 5 s)` join
+（实测 matched 12 779 / 12 780）：
+
+| provider | 有 session | 无 session |
+|---|---:|---:|
+| opencode_go_1 | 66.7% | 1.4% |
+| opencode_go_2 | 63.5% | 0.0% |
+| xiaomi | 94.7% | 33.2% |
+| minimax | 97.4% | 29.8% |
+
+两个被排除的怀疑：
+
+- **body 里的 session id 永远是冗余的** —— `bodyonly% = 0.0%`，全 provider 一致；
+  `upstream_request_filter` 在读下游 body 之前跑，body 里的 `prompt_cache_key` 本来就拿不到。
+- **跳 provider 不是主因** —— 同 provider 连续 vs 跳 provider 的命中率 **65.97% vs 64.19%**，
+  几乎没差；no-session 请求只占 **0.1% token**（opencode 111 reqs / 134k tok）。
+
+### 14.4 修复①：opencode affinity 优先级重写 + 来源计数器
+
+`upstream_request_filter` 改成四段优先级，**每段都计数**：
+
+```
+客户端自己的 x-opencode-session
+  → x-session-affinity / x-opencode-session-id
+  → ctx.session_id（request_filter 从 x-session-id / x-conversation-id / session-id / thread-id 解析）
+  → 全新 UUID
+```
+
+只有 `source != "client"` 才写入 header；新指标
+`maxllm_opencode_affinity_source_total{source=client|affinity_header|session|generated}`。
+
+**双机实测**（部署后 41 min）：`session = 285`、`generated = 16` —— `generated` 全是没有
+任何 session header 的探针类小请求（`tin = 37 / 90`）。
+
+### 14.5 修复②（A）fast-cohort 收紧 + 封顶；（B）sticky pin 速度逃生，与 A 解耦
+
+常量（`gateway.rs`）：
+
+```rust
+AUTO_POOL_COHORT_MEDIAN_MULTIPLIER = 1.5    // 原 2.5
+AUTO_POOL_COHORT_FLOOR_MS          = 5_000.0
+AUTO_POOL_COHORT_CEILING_MS        = 10_000.0    // 新增
+// ceiling = min( max(median*1.5, 5000), max(10000, median) )  ← 永不低于 median
+
+AUTO_POOL_PIN_ESCAPE_MULTIPLIER = 1.5
+AUTO_POOL_PIN_ESCAPE_FLOOR_MS   = 10_000.0
+fn auto_pool_pin_escapable(pinned_ms, median) -> bool {
+    pinned_ms > median * 1.5 && pinned_ms > 10_000.0
+}
+```
+
+**关键设计：A 和 B 解耦。** 轮转走 `auto_pool_fast_cohort`（受 A 收紧影响），
+**pin 分支改用 `!pin_is_slow()`，不再复用 `in_fast_cohort`** —— 否则收紧 A 会顺手把
+「只比中位数慢一点」的暖 pin 判死，每次抖动都要重付一遍 prompt cache，正好与本轮目标相反。
+
+**测试**：
+
+- `test_auto_pool_keeps_a_warm_pin_that_is_only_above_the_cohort`：6 s 的 pin（低于 10 s 逃生地板）
+  必须**保留**，同时轮转必须跳过 slow（`maxllm_auto_pool_slow_skips_total{provider="slow"}` 非 0）；
+- `test_auto_pool_escapes_a_pin_that_is_slow_enough`：`set_delay(10_500 ms)`，pin 后下一请求必须逃到 fast；
+- 单测 `cohort_ceiling_is_banded_and_never_below_the_median`、
+  `pin_escape_needs_both_relative_and_absolute_pain`。
+
+`cargo fmt --check` / `cargo test -p maxllm-translate -p maxllm-gateway -p maxllm-admin`
+（63 + 180 + 139 passed，4 ignored）/ `clippy -- -D warnings` 全绿。
+
+### 14.6 修复③：`request_logs` 落 `cached_tokens` + `session_id`（带在线迁移）
+
+- `models.rs` 的 `RequestLog` 加 `cached_tokens: u64`、`session_id: Option<String>`；
+- `sqlite_store.rs` 的 `CREATE TABLE` 加列，并新增 `migrate_request_log_columns()`：
+  `PRAGMA table_info(request_logs)` 发现缺列就 `ALTER TABLE`，`init_tables()` 末尾调用；
+- INSERT 改 17 占位符 + row reader + 测试；`api.rs` 测试构造补字段；
+- 新查询脚本 `cache_hit.py`（NAS `/tmp/cache_hit.py`、本机 `~/opt/maxllm/cache_hit.py`）：
+
+```sh
+python3 cache_hit.py --since 2026-11-08T18:24:00Z   # 或 --last-minutes N
+```
+
+只统计 `200 <= status < 400`。⚠️ **必须传 `--since` 部署时刻**
+（`2026-11-08T18:24:00Z` = 02:24 CST）：窗口一旦跨过迁移点，旧行的 `cached_tokens` / `session_id`
+全是 `0` / `NULL`，命中率会被拉到 3%。判别信号：`nosess% ≈ 100%` 就说明跨了迁移点。
+
+### 14.7 看板
+
+`scripts/openobserve_dashboard.py --apply` → dashboard `7525075825075421184`：
+**21 → 22 panels**，新增 “Prompt cache hit rate by provider”（查询带 `or ... * 0` 零填充）。
+
+### 14.8 双机部署（2026-11-09 02:23 / 02:24 CST）
+
+| 主机 | 备份 | 启动 | NRestarts |
+|---|---|---|---|
+| NAS | `maxllm-server.bak-20261109-022310-pcache` | 02:23:46 | 0 |
+| 本机 | `maxllm-server.bak-20261109-022401-pcache` | 02:24:35 | 0 |
+
+musl release 二进制；两台 `/health` `status=ok`、`version=0.3.10`；
+NAS 迁移后 `PRAGMA table_info(request_logs)` 已有 `15 = cached_tokens`、`16 = session_id`。
+
+### 14.9 复测（部署后窗口，`cache_hit.py --since <部署时刻>`）
+
+窗口 `2026-11-08T18:24:00Z → 19:25:00Z`（部署后 61 min，NAS，`cache_hit.py --since`）：
+
+| provider | reqs | tokens_in | 命中率 | 判定 |
+|---|---:|---:|---:|---|
+| opencode_go_2 | 523 | 74 783 959 | **98.67%** | ✅（修前 64.83%） |
+| volc_1 | 182 | 29 740 131 | **97.57%** | ✅ |
+| volc_t_1 | 22 | 2 668 052 | **97.10%** | ✅（修前同窗口 89.63%） |
+| xiaomi | 73 | 11 659 527 | **96.98%** | ✅（修前 94.76%） |
+| minimax | 126 | 16 761 756 | **93.18%** | ⚠️ 见下 |
+| opencode_go_1 | 2 | 301 813 | 71.89% | 样本 2（乒乓消除后流量归到 go_2） |
+| ollama_local | 4 | 148 | — | 只剩探针（`tin=37/90`） |
+| **合计** | **932** | **135 915 386** | **97.52%** | |
+
+**同长度前后对照**（各 60 min，日志口径，排除迁移影响）：
+
+| provider | 部署前 60 min | 部署后 61 min | Δ |
+|---|---:|---:|---:|
+| opencode_go_2 | 59.89% | 98.67% | **+38.78pp** |
+| opencode_go_1 | 56.61% | 71.89% (n=2) | +15.27pp |
+| volc_t_1 | 89.63% | 97.10% | **+7.47pp** |
+| volc_1 | 95.90% | 97.57% | +1.67pp |
+| xiaomi | 96.89% | 96.93% | +0.04pp |
+| minimax | 97.37% | 93.18% | −4.18pp |
+| **合计** | **82.85%** | **97.51%** | **+14.67pp** |
+
+**运行时指标**（部署后 61 min）：
+`session_affinity_hits=910 / misses=6 / evictions=0`；
+`opencode_affinity_source{session}=524 / {generated}=26`（`generated` 全是无 session 头的探针）；
+`auto_pool_slow_skips{opencode_go_1}=15 / {xiaomi}=13 / {minimax}=5 / {opencode_go_2}=1`。
+
+**关于 minimax 的 93.18%（唯一的主力红灯）** —— 不是回归，是分母变了：
+
+- **绝对 miss 反而降了**：同长度窗口 1.405 M → 1.143 M token；
+- **流量掉得更多**：53.4 M → 16.76 M token（−68%），而冷启动次数没跟着掉 ——
+  该窗口 4 次近全 miss（196 k / 211 k / 177 k / 214 k，全部落在同一个
+  `session=01a1b6f7` + `/v1/responses/auto` + `MiniMax-M3` 上）就是「同一个粗粒度
+  session 底下新起的对话」首次落到已 pin 住的 minimax，属于不可避免的首触；
+- **`hop = 0`**：按 `(session, path, model)` 分组后，minimax 窗口内没有任何
+  「上一条在别的 provider」的请求 —— A/B 没有把对话踢来踢去；
+- 9 小时基线里 minimax 是 **97.30%**，长期口径本来就过线。
+
+同一张分解表在部署后窗口重算，全池 `hop` 都是 0 或个位数
+（`volc_t_1` 58 k、`volc_1` 2 k），说明 sticky 在部署后是**真的钉住了**。
+
+### 14.10 残余归因：miss 里网关能动的那份已经动完了
+
+把基线窗口按 `(session, path, model)` 分组（比裸 session_id 可靠 —— 生产上一个 session id
+底下挂着多段不同上下文的对话），对每组内**同 provider 连续**的请求把 miss 拆成四类：
+
+- `first`：该组在该 provider 上的第一次请求（冷启动，不可避免）；
+- `hop`：上一条同组请求落在别的 provider（**网关可动**）；
+- `reset`：`miss > 50% × tokens_in`，前缀整体换了（客户端压缩上下文 / 换分支，网关动不了）；
+- `incr`：其余（新 turn 的增量；实测 `cached` 恰好等于上一发的 `tokens_in`，
+  说明上游**不把自己的输出写回前缀缓存**，这部分只能靠 provider 侧）。
+
+| provider | 命中率 | first | hop | reset | incr |
+|---|---:|---:|---:|---:|---:|
+| minimax | 97.30% | 3.8% | 0.0% | 59.5% | 36.7% |
+| xiaomi | 94.95% | 6.7% | 0.0% | 56.4% | 36.9% |
+| ollama_local | 96.29% | 14.1% | 0.0% | 38.3% | 47.6% |
+| volc_1 | 95.83% | 11.6% | 3.5% | 29.1% | 55.8% |
+| volc_t_1 | 94.67% | 9.1% | 22.0% | 40.2% | 28.7% |
+| opencode_go_1 | 65.59% | 1.8% | 26.9% | 62.5% | 8.8% |
+| opencode_go_2 | 70.75% | 2.2% | 21.0% | 63.4% | 13.4% |
+
+结论：**opencode 两个池成员的 `hop`（21–27%）就是 §14.3 的 affinity 根因**
+（`opencode_go_1 ↔ go_2` 互相乒乓 437 次），修完 sticky 就不再产生；
+`xiaomi` / `minimax` / `ollama_local` 的 `hop` 已经是 **0**，剩下的 `reset` + `incr`
+是客户端上下文行为与上游缓存语义，**网关侧没有下一个同量级的杠杆**。
+`volc_t_1` 的 `hop`（22%）来自 `volc_1 ↔ volc_t_1` 同模型（`deepseek-v4-flash`）的
+pin 抖动，A/B 落地后 `session_affinity_misses_total` 只有个位数，窗口拉长会自然收敛。
+
+
+---
+
 ## 附录 A：复现与口径
 
 ```sh
