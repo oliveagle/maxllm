@@ -15,3 +15,7 @@ DEEP_ANALYSIS.md
 mutants.out/
 mutants.out.old/
 mutants.out.*/
+
+# Python bytecode
+__pycache__/
+*.pyc
