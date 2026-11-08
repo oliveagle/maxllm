@@ -1641,7 +1641,7 @@ dependencies = [
 
 [[package]]
 name = "maxllm-admin"
-version = "0.3.9"
+version = "0.3.10"
 dependencies = [
  "ahash 0.8.12",
  "chrono",
@@ -1659,7 +1659,7 @@ dependencies = [
 
 [[package]]
 name = "maxllm-cli"
-version = "0.3.9"
+version = "0.3.10"
 dependencies = [
  "clap",
  "dirs",
@@ -1674,7 +1674,7 @@ dependencies = [
 
 [[package]]
 name = "maxllm-config"
-version = "0.3.9"
+version = "0.3.10"
 dependencies = [
  "regex",
  "serde",
@@ -1684,7 +1684,7 @@ dependencies = [
 
 [[package]]
 name = "maxllm-gateway"
-version = "0.3.9"
+version = "0.3.10"
 dependencies = [
  "ahash 0.8.12",
  "arc-swap",
@@ -1721,7 +1721,7 @@ dependencies = [
 
 [[package]]
 name = "maxllm-plugin"
-version = "0.3.9"
+version = "0.3.10"
 dependencies = [
  "ahash 0.8.12",
  "async-trait",
@@ -1747,7 +1747,7 @@ dependencies = [
 
 [[package]]
 name = "maxllm-translate"
-version = "0.3.9"
+version = "0.3.10"
 dependencies = [
  "hmac",
  "serde",
