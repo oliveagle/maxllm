@@ -16,7 +16,7 @@
 | 3 | 成本表为空，`cost_usd` 恒为 0，成本告警/预算失效 | 配置无 `[cost*]` 段；6,535 条完成日志 cost=0（仅 42 条非 0）；2,186 条 `no cost entry found` WARN（占全部 WARN 的 76%） | P0 |
 | 4 | 监控链路"只采不看"：无 maxllm 看板、无告警；日志全部灌进 `default` 流 | OpenObserve 20 条指标流均在更新，但 0 条 alert、2 个 dashboard 均与 maxllm 无关；collector 单 exporter 写死 `stream-name: default` | P1 |
 | 5 | provider 改名造成身份断裂：指标里 38 条 breaker series vs 配置 30 个 provider；旧路由被前缀匹配静默吞掉 | 9 条 `one_api_*` 僵尸 series；`one_api_volc_2` 仍 force-open 到 2026-11-27；旧 base_url `/v1/responses/one_api_*` 落到通用路由并被错误 provider 服务 | P1 |
-| 6 | body 哨兵 `auto` 在 `/v1/responses` 仍不可用（已知缺口未修）~~ **✅ 实测已不再触发**：`model='auto'` 最后一次出现在 2026-11-07T14:35Z；86 行历史里 74 行是 §2.2 已修的幽灵行、1 行是旧名前缀路由的 404 | 当天 11 次 404 + 2 次上游 400 由 `model:"auto"` 直接透传触发；391 次历史 404 集中在 11-07 12:00–14:00 三个小时里 | P1（见 §13.4） |
+| 6 | **body 哨兵 `auto` 在 `/v1/responses` 上仍然不可用**（真 bug，2026-11-08 23:1x 定位并修复）：`verbatim` 分支让 body 逐字节透传，`adopt_sentinel_model()` 只能解析、不能改写，字面量 `auto` 直接打到上游 | recordings 全量：失败上游尝试里 `model="auto"` **1 931 次**（`ollama_local 404×367`、`opencode_go_1 400×255`、`opencode_go_2 400×241`、`xiaomi 400×200`、`volc_1 404×189`、`minimax 400×118`）；`request_logs` 看不到，是因为 failover 之后成功那一行不带 `auto` | P1（已修 `c845b45`，见 §13.8） |
 | 7 | ~~`/health` 太浅、池健康检查未接线~~ **✅ 已收口**：`/health` 现在回 `pools{healthy,total}` + `open_providers`/`half_open_providers`；`maxllm-pool-health.timer` 5 min 一次；quota probe 已按改名后的 `kimi` 运行 | — | P1 |
 | 8 | ~~breaker 指标是惰性快照~~ **✅ 已收口**：`/metrics` 在 scrape 时输出 `effective_state()`，过期的 open 会算成 closed | `is_open()` 在下次请求时才 lazy half-open，gauge 直接读原子 state | P2（已修） |
 | 9 | ~~`maxllm.err` 长期未轮转~~ **✅ 已收口**：`rotate_logs.py` 的 `DEFAULT_LOGS` 早含它，timer 每日跑（阈值 20 MiB / 留 2 代），当前 0 字节；sentinel 文案随 §6 一起消失 | 23 行、全部停留在 11-04；`route '/v1/responses/auto' references unknown provider 'auto'` | P2（已修） |
@@ -433,7 +433,7 @@ Anthropic `cache_read_input_tokens`），落在 `ctx.cached_tokens_in`，暴露�
 
 ---
 
-## 6. P1：body 哨兵 `auto` 仍然不可用
+## 6. P1：body 哨兵 `auto` 仍然不可用（✅ 已修，见 §13.8）
 
 - `/v1/responses`（非池路由）收到 `{"model":"auto"}` 时，body 里的哨兵会被原样发给
   primary provider → 404，然后沿 fallback 链一路 404/400。
@@ -443,14 +443,17 @@ Anthropic `cache_read_input_tokens`），落在 `ctx.cached_tokens_in`，暴露�
   （`auto` / `auto_home`）时才走池；其他模型名保持原样。这样既保留显式模型语义，
   又消除哨兵的 404 风暴。
 
-**✅ 现状（2026-11-08 23:0x CST 复核）**：`adopt_sentinel_model()` 已经把「选中 provider
-是池成员」这一路修好（body 被改写成该条目的真实模型名，不再有 404 与 failover 风暴）；
-`request_logs` 里 `model='auto'` 的行**最后一次出现在 2026-11-07T14:35Z**，此后再无——
-历史 86 行里 74 行是已修的 `status=0` 幽灵行（§2.2），1 行是旧名前缀路由的 404。
-剩下唯一未覆盖的分支是「选中 provider 不在池里」（只有会话被钉在池外 provider 时才可能），
-现在该分支会打 WARN 点名 `provider` / `pool` **并且**不再重写 body。不改语义（不把显式
-路由静默改写成池路由），因为按 §6 的精确匹配方案等于改变路由契约，而实测该分支已不再
-触发。
+**❌ 订正（2026-11-08 23:1x CST）**：上一段「`request_logs` 里 `model='auto'` 最后一次是
+2026-11-07T14:35Z、所以已不再触发」是**看错了数据源** —— `request_logs` 记的是 failover
+之后成功那一行，上游收到字面量 `auto` 的**失败**尝试只留在 recordings 里。按 recordings
+重查：失败上游尝试 `model="auto"` 共 **1 931 次**，带哨兵的客户端请求 `/v1/responses` 128 次、
+`/v1/responses/responses` 30 次。
+
+**✅ 已修（`c845b45`，2026-11-08 23:1x 定位、23:2x 部署两台）**：根因是 `verbatim` 分支把
+body 按 Content-Length 逐字节透传，改写就会截断 —— 只要选中的 provider 是任一 auto 池的
+成员，就改成 chunked 帧让哨兵被改写成该 entry 的真实模型。这样不需要 §6 原来提的
+「精确匹配池名」方案（那会改变路由契约）：显式模型语义本来就由 `adopt_sentinel_model()`
+只认池名来保证。详见 §13.8。
 
 ---
 
@@ -929,12 +932,19 @@ OPENOBSERVE_ENDPOINT=<...> OPENOBSERVE_AUTH=<...> \
 阈值 20 MiB / 保留 2 代；当前 `maxllm.err` 0 字节（11-04 的 3.4K 已手工归档为
 `.err.20261104-archive`）。原来那条「无轮转」是**看文件时间戳得出的误判**，不是缺功能。
 
-### 13.4 body 哨兵 `auto`（§6）：实测已不再触发
+### 13.4 body 哨兵 `auto`（§6）：`request_logs` 看不到，真 bug 在上游侧
 
-`model='auto'` 在 `request_logs` 里最后一次出现是 **2026-11-07T14:35Z**；历史 86 行中
-74 行是 §2.2 已修的 `status=0` 幽灵行、1 行是旧名前缀路由的 404。`adopt_sentinel_model()`
-覆盖了「选中 provider 是池成员」的主路；剩余「选中 provider 不在池里」分支现在会 WARN
-点名 provider/pool。不改写显式模型语义，因为该分支已无实际流量。
+§6 当时的结论「已不再触发」是**看错了数据源**。`request_logs.model` 记的是网关最终选中的
+provider 与模型；哨兵只有在**上游尝试**里才见得到，而上游 400/404 之后网关会 failover，
+最后成功的那一行永远不会带 `auto` —— 所以「`request_logs` 里 `model='auto'` 停在 11-07」
+只说明幽灵行（§2.2）没了，不说明哨兵被正确改写。
+
+按 recordings 全量重查，真相反过来：**失败上游尝试里 `model="auto"` 共 1 931 次**，
+top 是 `ollama_local 404×367`、`opencode_go_1 400×255`、`opencode_go_2 400×241`、
+`xiaomi 400×200`、`volc_1 404×189`、`minimax 400×118`；带哨兵的客户端请求里
+`/v1/responses`+`auto` 128 次、`/v1/responses/responses`+`auto` 30 次；
+单链实例 `01a1bbad-18bc-7012-af66-732e2ef910f8` 是 ollama_local 404(model=auto) →
+minimax 500 → opencode_go_2 200。根因与修复见 §13.8。
 
 ### 13.5 二进制备份堆叠（本轮顺手清掉）
 
@@ -967,6 +977,41 @@ NAS 上实测清掉 31 个（657 MB → 156 MB），并把 `--bin-dir bin --bin-
 
 `open_design` 是否移出 auto 池、是否发版（bump 0.3.11 或补打 `v0.3.10` tag）、
 告警 webhook 换真实出口、VPS 0.3.8 → 0.3.10 升级 —— 四项都需要用户拍板或凭据。
+
+### 13.8 body 哨兵 `auto` 的真修复（`c845b45`，已部署两台）
+
+**根因**：`upstream_request_filter` 的 `verbatim` 分支让 body 保持 Content-Length 逐字节
+透传（native Responses 与 openai-kind 都会走），于是 `request_body_filter` 里的
+`adopt_sentinel_model()` **只能解析、不能改写** —— 改了长度就会把 body 截断。字面量
+`auto` 因此原样打到上游，404/400 → failover，每次还赔掉该会话的 prompt cache（上一条
+每 turn 都要付，不只是慢一次）。
+
+**修法**：只要选中的 provider **是任一 auto 池的成员**，就把 body 改成 chunked 帧
+（auto 路由本来就是这么做的），哨兵才有机会被改写成这个 entry 自己的 model：
+
+```rust
+let provider_serves_a_pool = hot.auto_pools.iter()
+    .any(|pool| pool.entry_for(&ctx.provider_name).is_some());
+let may_carry_pool_sentinel =
+    ctx.endpoint_type == EndpointType::Responses && provider_serves_a_pool;
+let verbatim = !is_auto_route && !may_carry_pool_sentinel && (/* 原条件 */);
+```
+
+判据用「在池里」而不是「native」：`openai_style` 会把 chat 翻译的 provider 也判成
+verbatim，1 931 次里相当一部分是这类。
+
+**回归测试**：`test_body_sentinel_is_rewritten_for_a_native_responses_provider` ——
+`native_responses = true` 的池成员承接 `POST /v1/responses {"model":"auto"}`，必须
+**1 次**上游调用且 `model == "model-member"`；去掉 `!may_carry_pool_sentinel` 该测试立刻
+变红（2 次调用、字面量 `auto` 被转发）。CI（`42493888653`，`c845b45`）七项全绿：
+Format / Check / Clippy / Test / Responses policy / Ops scripts / Build Release。
+
+**双机部署（2026-11-08 23:1x / 23:2x CST）**：musl release，sha256
+`7de0f4b73637e4b68f05a329784e361cfcef7a2358b6967587ed6b0fc3de51ce`；两台
+`--version` 0.3.10、`/health` status=ok、`NRestarts=0`、journal 无 panic。
+实测 `POST /v1/responses/deepseek {"model":"auto"}`：本机 200 / `model=deepseek-flash` /
+`fallback_used=0` / 646 ms，NAS 200 / `model=deepseek-flash` / 1.37 s —— 哨兵在到达上游
+之前就已改写，白打的那一跳没有了。
 
 ---
 
