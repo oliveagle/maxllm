@@ -138,14 +138,25 @@ pub fn responses_request_to_chat(body: &[u8]) -> Result<TranslatedRequest, Trans
         // asked. Spec-compliant (OpenAI, ollama, vLLM, Groq, DeepSeek, …).
         chat.insert("stream_options".into(), json!({ "include_usage": true }));
     }
-    if let Some(tools) = req.tools.as_ref() {
-        chat.insert("tools".into(), responses_tools_to_chat(tools));
+    // A conversion that drops every tool (all of them were Responses
+    // built-ins) must not leave an empty `tools` array behind: chat upstreams
+    // reject `tools: []`, and a `tool_choice` with no tools is rejected too.
+    // When nothing usable survives, both keys are omitted so the turn goes
+    // out as plain text instead of a body no parser accepts.
+    let converted_tools = req.tools.as_ref().map(responses_tools_to_chat);
+    let usable_tools = converted_tools
+        .as_ref()
+        .is_some_and(|t| !matches!(t, Value::Array(items) if items.is_empty()));
+    if let Some(tools) = converted_tools.filter(|_| usable_tools) {
+        chat.insert("tools".into(), tools);
     }
-    if let Some(tool_choice) = req.tool_choice.as_ref() {
-        chat.insert(
-            "tool_choice".into(),
-            responses_tool_choice_to_chat(tool_choice),
-        );
+    if usable_tools || req.tools.is_none() {
+        if let Some(tool_choice) = req.tool_choice.as_ref() {
+            chat.insert(
+                "tool_choice".into(),
+                responses_tool_choice_to_chat(tool_choice),
+            );
+        }
     }
     if let Some(v) = req.parallel_tool_calls {
         chat.insert("parallel_tool_calls".into(), json!(v));
@@ -660,18 +671,19 @@ fn responses_tool_choice_to_chat(tool_choice: &Value) -> Value {
     let choice_type = tool_choice.get("type").and_then(|t| t.as_str());
 
     // Flat function choice: {"type":"function","name":"f"}.
-    if choice_type == Some("function")
-        && tool_choice.get("function").is_none()
-        && tool_choice.get("name").is_some()
-    {
-        let mut func = Map::new();
+    if choice_type == Some("function") && tool_choice.get("function").is_none() {
         if let Some(name) = tool_choice.get("name") {
+            let mut func = Map::new();
             func.insert("name".into(), name.clone());
+            let mut out = Map::new();
+            out.insert("type".into(), Value::String("function".into()));
+            out.insert("function".into(), Value::Object(func));
+            return Value::Object(out);
         }
-        let mut out = Map::new();
-        out.insert("type".into(), Value::String("function".into()));
-        out.insert("function".into(), Value::Object(func));
-        return Value::Object(out);
+        // `type: function` that names neither the flat `name` nor the nested
+        // `function` cannot point at a function at all. Degrade instead of
+        // emitting a body the chat parser rejects.
+        return Value::String("auto".to_string());
     }
 
     // Allowed-tools choice: {"type":"allowed_tools","mode":…,"tools":[…]}.
@@ -707,6 +719,52 @@ fn responses_tool_choice_to_chat(tool_choice: &Value) -> Value {
         });
     }
 
+    // The nested chat spelling passes through untouched: the flat rewrite
+    // above only fires when `function` is absent.
+    if choice_type == Some("function") {
+        return tool_choice.clone();
+    }
+
+    // Any other object form names a Responses-only tool kind
+    // (`web_search_preview`, `mcp`, `file_search`, `local_shell`, `computer`).
+    // Chat contracts only spell a function choice, and the strict parsers
+    // reject the rest — DeepSeek answers 422 `tool_choice: field 'type':
+    // unknown variant 'web_search_preview', expected 'function'` (verified
+    // live) — so the choice degrades to "the model decides", exactly like the
+    // multi-tool allowed_tools case above. String choices carry no `type`
+    // and never reach this branch.
+    if choice_type.is_some() {
+        let mode = tool_choice
+            .get("mode")
+            .and_then(|m| m.as_str())
+            .unwrap_or("auto");
+        return Value::String(if mode == "required" {
+            "required".to_string()
+        } else {
+            "auto".to_string()
+        });
+    }
+
+    // Object form without a `type` discriminator: some clients send the
+    // nested chat shape directly. Give it the `type` the parser requires, or
+    // degrade to "auto" when it names no function at all — either way the
+    // body stays parseable instead of burning the failover chain.
+    if choice_type.is_none() && tool_choice.is_object() {
+        if let Some(name) = tool_choice
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .or_else(|| tool_choice.get("name"))
+        {
+            let mut func = Map::new();
+            func.insert("name".into(), name.clone());
+            let mut out = Map::new();
+            out.insert("type".into(), Value::String("function".into()));
+            out.insert("function".into(), Value::Object(func));
+            return Value::Object(out);
+        }
+        return Value::String("auto".to_string());
+    }
+
     tool_choice.clone()
 }
 
@@ -731,30 +789,66 @@ fn responses_tools_to_chat(tools: &Value) -> Value {
     };
 
     let mut out = Vec::with_capacity(items.len());
+    let mut dropped: Vec<&str> = Vec::new();
     for tool in items {
-        expand_tool_to_chat(tool, &mut out);
+        expand_tool_to_chat(tool, &mut out, &mut dropped);
+    }
+    if !dropped.is_empty() {
+        dropped.sort_unstable();
+        dropped.dedup();
+        tracing::warn!(
+            dropped = %dropped.join(","),
+            count = dropped.len(),
+            "dropped Responses tools the chat contract cannot express"
+        );
     }
     Value::Array(out)
 }
 
-/// Append one Responses tool to `out` in chat completions shape.
+/// Append one Responses tool to `out` in chat completions shape, or record
+/// its kind in `dropped` when the chat contract has no equivalent.
 ///
-/// A `namespace` tool is expanded recursively; a flat function tool is
-/// nested under `function`; anything else is copied unchanged.
-fn expand_tool_to_chat(tool: &Value, out: &mut Vec<Value>) {
+/// A `namespace` tool is expanded recursively; a function tool is nested
+/// under `function` (left alone when it already is the chat spelling);
+/// anything else is a server-side built-in the chat contract cannot spell
+/// and is dropped rather than forwarded.
+fn expand_tool_to_chat<'a>(tool: &'a Value, out: &mut Vec<Value>, dropped: &mut Vec<&'a str>) {
     if tool.get("type").and_then(|t| t.as_str()) == Some("namespace") {
         if let Some(subs) = tool.get("tools").and_then(|t| t.as_array()) {
             for sub in subs {
-                expand_tool_to_chat(sub, out);
+                expand_tool_to_chat(sub, out, dropped);
             }
         }
         return;
     }
 
-    let is_flat_function = tool.get("type").and_then(|t| t.as_str()) == Some("function")
-        && tool.get("function").is_none();
-    if !is_flat_function {
-        out.push(tool.clone());
+    let kind = tool.get("type").and_then(|t| t.as_str());
+    // A function tool, flat (Responses) or nested (chat). A tool with no
+    // `type` at all but a `name` is read as the flat form: some clients omit
+    // the discriminator, and the chat parser requires one either way.
+    let is_function = match kind {
+        Some("function") => true,
+        None => tool.get("name").is_some(),
+        Some(_) => false,
+    };
+    if !is_function {
+        dropped.push(kind.unwrap_or("<no type>"));
+        return;
+    }
+
+    if tool.get("function").is_some() {
+        // Already the chat spelling; re-wrapping would nest `function`
+        // inside `function`.
+        if tool
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(|n| n.as_str())
+            .is_some_and(|n| !n.is_empty())
+        {
+            out.push(tool.clone());
+            return;
+        }
+        dropped.push(kind.unwrap_or("<no type>"));
         return;
     }
 
@@ -763,6 +857,16 @@ fn expand_tool_to_chat(tool: &Value, out: &mut Vec<Value>) {
         if let Some(v) = tool.get(field) {
             func.insert(field.to_string(), v.clone());
         }
+    }
+    // `OpenAIFunction.name` is required: a tool that names nothing would
+    // still be rejected, so it is dropped like any other unusable tool.
+    if !func
+        .get("name")
+        .and_then(|n| n.as_str())
+        .is_some_and(|n| !n.is_empty())
+    {
+        dropped.push(kind.unwrap_or("<no type>"));
+        return;
     }
     let mut chat_tool = Map::new();
     chat_tool.insert("type".into(), Value::String("function".into()));
@@ -2807,6 +2911,82 @@ mod tests {
         assert_eq!(tool["function"]["name"], "fn");
         assert_eq!(tool["function"]["description"], "d");
         assert_eq!(v["tool_choice"], "auto");
+    }
+
+    /// The converter's output must be a body the gateway's own chat parser
+    /// accepts. A Responses request may carry built-in tools (`web_search`,
+    /// `file_search`, `local_shell`, `mcp`, …) that the chat contract cannot
+    /// express; copying them verbatim makes `OpenAITool` reject the whole
+    /// body with `missing field \`function\``, so `request_body_filter` WARNs
+    /// and forwards the raw body — which the chat upstream rejects too, and
+    /// the failover chain burns one round trip per provider.
+    #[test]
+    fn test_builtin_tool_does_not_break_the_chat_conversion() {
+        let body = br#"{
+            "model":"gpt-4o","input":"hi",
+            "tools":[
+                {"type":"function","name":"fn","description":"d","parameters":{"type":"object"}},
+                {"type":"web_search_preview"}
+            ]
+        }"#;
+        let out = responses_request_to_chat(body).unwrap();
+        use crate::ProviderTranslator;
+        let parsed = crate::openai::OpenAITranslator.translate_request(&out.body, None);
+        assert!(
+            parsed.is_ok(),
+            "the converted body must parse as chat: {:?}",
+            parsed.map(|_| ()).unwrap_err()
+        );
+        // The function tool the client can actually use must survive.
+        let v: Value = serde_json::from_slice(&out.body).unwrap();
+        assert_eq!(v["tools"][0]["function"]["name"], "fn");
+    }
+
+    /// Every tool in the list is a built-in the chat contract cannot spell:
+    /// the converter must drop them *and* the `tool_choice` that referred to
+    /// them. An empty `tools: []` and a `tool_choice` with no tools are both
+    /// rejected by chat upstreams, so both keys are omitted and the turn goes
+    /// out as plain text.
+    #[test]
+    fn test_a_builtin_only_tool_list_drops_tools_and_tool_choice() {
+        let body = br#"{
+            "model":"gpt-4o","input":"hi",
+            "tools":[{"type":"web_search_preview"},{"type":"local_shell"}],
+            "tool_choice":{"type":"web_search_preview"}
+        }"#;
+        let out = responses_request_to_chat(body).unwrap();
+        use crate::ProviderTranslator;
+        assert!(
+            crate::openai::OpenAITranslator
+                .translate_request(&out.body, None)
+                .is_ok(),
+            "a built-in-only request must still parse as chat"
+        );
+        let v: Value = serde_json::from_slice(&out.body).unwrap();
+        assert!(v.get("tools").is_none(), "tools: {:?}", v.get("tools"));
+        assert!(
+            v.get("tool_choice").is_none(),
+            "tool_choice: {:?}",
+            v.get("tool_choice")
+        );
+        assert!(v["messages"].as_array().is_some_and(|m| !m.is_empty()));
+    }
+
+    /// A `tool_choice` naming a Responses-only tool kind has no chat
+    /// equivalent (DeepSeek answers 422 `unknown variant 'web_search_preview'`,
+    /// verified live), so it degrades to "auto" while the function tools the
+    /// client can actually use survive untouched.
+    #[test]
+    fn test_builtin_tool_choice_degrades_to_auto() {
+        let body = br#"{
+            "model":"gpt-4o","input":"hi",
+            "tools":[{"type":"function","name":"fn","parameters":{"type":"object"}}],
+            "tool_choice":{"type":"web_search_preview"}
+        }"#;
+        let out = responses_request_to_chat(body).unwrap();
+        let v: Value = serde_json::from_slice(&out.body).unwrap();
+        assert_eq!(v["tool_choice"], "auto");
+        assert_eq!(v["tools"][0]["function"]["name"], "fn");
     }
 
     #[test]

@@ -3594,7 +3594,14 @@ impl ProxyHttp for AiGateway {
                         ctx.request_body_buf = translated.body;
                     }
                     Err(e) => {
-                        warn!(error = %e, "Failed to translate Responses request to chat format");
+                        warn!(
+                            error = %e,
+                            request_id = ?ctx.plugin_ctx.request_id,
+                            provider = %ctx.provider_name,
+                            endpoint_type = ?ctx.endpoint_type,
+                            model = %ctx.model,
+                            "Failed to translate Responses request to chat format"
+                        );
                         Self::send_error_response(
                             session,
                             400,
@@ -4007,7 +4014,24 @@ impl ProxyHttp for AiGateway {
                         *body = Some(Bytes::from(translated.body));
                     }
                     Err(e) => {
-                        warn!(error = %e, "Failed to translate request body");
+                        // Without this context the warning is unattributable:
+                        // it names neither the request nor the provider whose
+                        // translator rejected the body, which is what makes a
+                        // single untranslated request cost a full walk of the
+                        // failover chain to diagnose.
+                        warn!(
+                            error = %e,
+                            request_id = ?ctx.plugin_ctx.request_id,
+                            provider = %ctx.provider_name,
+                            endpoint_type = ?ctx.endpoint_type,
+                            model = %ctx.model,
+                            route = ctx
+                                .route_index
+                                .and_then(|i| hot.routes.get(i))
+                                .map(|r| r.path.as_str())
+                                .unwrap_or("<none>"),
+                            "Failed to translate request body"
+                        );
                         *body = Some(Bytes::from(std::mem::take(&mut ctx.request_body_buf)));
                     }
                 }
