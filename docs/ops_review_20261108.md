@@ -953,6 +953,6 @@ and will result in account ban." —— 把包月订阅通过自建网关转出�
 
 - 删除 crate `crates/maxllm-commandcode/`（独立 sidecar，工作区内无其它 crate 依赖它）；
 - `maxllm.toml` 去掉 `[providers.cmd_cli]` 与 `/v1/responses/cli_cmd`、`/v1/channels/cli_cmd` 两条路由；
-- 线上（oleNas01）停用 `maxllm-commandcode.service` 并把二进制移出 `bin/`；
+- 线上（NAS 生产节点）停用 `maxllm-commandcode.service` 并把二进制移出 `bin/`；
 - **保留** `kind = "commandcode"`（Provider API，厂商授权路径）——Go 计划下它恒 403，
   升级 Provider 计划后 `/v1/responses/cmd` 原生透传即可用，网关侧无需改动。
