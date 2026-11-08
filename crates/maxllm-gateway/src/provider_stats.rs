@@ -175,6 +175,27 @@ pub fn total_latency_ms(provider: &str) -> Option<f64> {
     Some(readings[readings.len() / 2])
 }
 
+/// Test-only: age `provider`'s samples past [`TOTAL_LATENCY_WINDOW`], the way
+/// ten minutes of silence would.
+///
+/// The window's whole promise is that a verdict outlives its evidence by
+/// nothing, and the failure it replaced was exactly a verdict that outlived
+/// it forever — but proving that from the auto pool needs time to pass, so
+/// the test moves this one provider's timestamps instead of sleeping. One
+/// provider at a time: the store is process-global and the gateway's cohort
+/// tests run beside this one, each on its own names.
+#[cfg(test)]
+pub(crate) fn expire_total_latency_evidence(provider: &str) {
+    let mut map = TOTAL_LATENCY.write().unwrap_or_else(|e| e.into_inner());
+    let Some(stats) = map.get_mut(provider) else {
+        return;
+    };
+    let aged = Instant::now() - TOTAL_LATENCY_WINDOW - Duration::from_secs(1);
+    for (at, _, _) in stats.samples.iter_mut() {
+        *at = aged;
+    }
+}
+
 /// Current latency estimate in milliseconds, `None` before the first
 /// successful attempt.
 pub fn latency_ms(provider: &str) -> Option<f64> {

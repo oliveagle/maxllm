@@ -8416,6 +8416,56 @@ mod auto_pool_latency_tests {
         assert!(names.contains(&"cohort-e"));
     }
 
+    /// The window exists so that an exclusion can never become a ban. A
+    /// provider the rotation stopped choosing stops being measured too, so
+    /// its evidence ages out and it reads as *unmeasured* again — the state
+    /// the rotation admits — instead of carrying the verdict that got it
+    /// dropped while its upstream prompt cache went cold beside it.
+    #[test]
+    fn cohort_readmits_a_provider_whose_evidence_aged_out() {
+        // Same shape as the exclusion test above: 30 s against a ~2 s tier.
+        crate::provider_stats::record_total_latency("expiry-a", 1_000.0, true);
+        crate::provider_stats::record_total_latency("expiry-b", 2_000.0, true);
+        crate::provider_stats::record_total_latency("expiry-c", 6_000.0, true);
+        crate::provider_stats::record_total_latency("expiry-d", 30_000.0, true);
+        let pool = pool_with_names(true, &["expiry-a", "expiry-b", "expiry-c", "expiry-d"]);
+        fn cohort_names(pool: &AutoPoolState) -> Vec<&str> {
+            let healthy: Vec<&AutoPoolEntry> = pool.entries.iter().collect();
+            auto_pool_fast_cohort(&healthy)
+                .iter()
+                .map(|e| e.provider.as_str())
+                .collect()
+        }
+
+        // Fresh evidence: the slow entry is still excluded, so the window
+        // has not made the filter toothless.
+        let before = cohort_names(&pool);
+        assert!(
+            !before.contains(&"expiry-d"),
+            "30 s against a 2 s median must be excluded while the evidence is fresh, got {before:?}"
+        );
+        assert!(before.contains(&"expiry-a"));
+
+        // Ten minutes of silence: the verdict is gone, and with it the ban.
+        crate::provider_stats::expire_total_latency_evidence("expiry-d");
+        let after = cohort_names(&pool);
+        assert!(
+            after.contains(&"expiry-d"),
+            "expired evidence must read as unmeasured, not as a permanent ban, got {after:?}"
+        );
+        // The tier that still has evidence keeps its own verdict — and it is
+        // a stricter one now that the 30 s outlier is no longer in it: the
+        // median falls from 6 s to 2 s, the ceiling from 9 s to 5 s, and the
+        // 6 s member goes with it. Losing the outlier tightens the filter
+        // rather than loosening it, which is the direction worth having.
+        assert!(after.contains(&"expiry-a"));
+        assert!(after.contains(&"expiry-b"));
+        assert!(
+            !after.contains(&"expiry-c"),
+            "with the outlier gone the tier median is 2 s and the ceiling 5 s, got {after:?}"
+        );
+    }
+
     #[test]
     fn cohort_returns_the_whole_tier_when_nothing_is_measured() {
         // A pool whose providers nobody has ever measured: the whole tier
