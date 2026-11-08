@@ -861,27 +861,44 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
 static AUTO_POOL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Auto-pool fast-cohort tuning. An entry whose EWMA latency exceeds the
-/// tier's median by more than [`AUTO_POOL_COHORT_MEDIAN_MULTIPLIER`]× — with
-/// an absolute floor so a uniformly-fast cluster is never cut in half — is
-/// skipped by the rotation; it stays available as a failover/last-resort
-/// target (it is never circuit-opened by this filter).
-const AUTO_POOL_COHORT_MEDIAN_MULTIPLIER: f64 = 2.5;
+/// tier's median by more than [`AUTO_POOL_COHORT_MEDIAN_MULTIPLIER`]× — clamped
+/// into the absolute `[floor, cap]` band — is skipped by the rotation; it stays
+/// available as a failover/last-resort target (it is never circuit-opened by
+/// this filter).
+///
+/// The multiplier is deliberately tight (1.5×): the rotation is where a request
+/// with *no* upstream cache to lose lands, so it should go to the fast half of
+/// the tier rather than to whatever is merely alive. Warm sessions are a
+/// separate question — see [`AUTO_POOL_PIN_ESCAPE_MULTIPLIER`], which is much
+/// looser so tightening this one does not bounce them.
+const AUTO_POOL_COHORT_MEDIAN_MULTIPLIER: f64 = 1.5;
 /// Absolute floor for the cohort ceiling (ms): even a 200 ms provider is not
 /// dropped because a 100 ms one exists.
 const AUTO_POOL_COHORT_FLOOR_MS: f64 = 5_000.0;
+/// Absolute cap for the cohort ceiling (ms). The multiplier alone would let a
+/// uniformly-slow tier keep a 25 s member in rotation (median 10 s × 1.5); the
+/// cap bounds the worst tolerated wait in absolute terms. It never bites below
+/// the median itself, so at least the fast half of a measured tier always stays.
+const AUTO_POOL_COHORT_CEILING_MS: f64 = 10_000.0;
+/// A sticky pin is abandoned for speed only when it is *both* this many times
+/// slower than the tier median *and* slower than
+/// [`AUTO_POOL_PIN_ESCAPE_FLOOR_MS`] in absolute terms. Two conditions on
+/// purpose: the rotation may be strict because an unpinned request has no
+/// cache to lose, while a warm session moves only when waiting on it is both
+/// relatively and absolutely painful — moving it throws away the upstream
+/// prompt cache the conversation was built on.
+const AUTO_POOL_PIN_ESCAPE_MULTIPLIER: f64 = 1.5;
+/// Absolute floor for the pin escape (ms): a pin never moves for being merely
+/// "not the fastest" — only for being slow enough that waiting on it hurts.
+const AUTO_POOL_PIN_ESCAPE_FLOOR_MS: f64 = 10_000.0;
 /// Every Nth rotation walks the *whole* preferred tier instead of the fast
 /// cohort, so a provider that recovered (or a brand-new one) is re-measured
 /// and can rejoin the fast cohort.
 const AUTO_POOL_EXPLORE_EVERY: u64 = 50;
 
-/// The low-latency cohort of `healthy` for one rotation: every entry whose
-/// whole-exchange EWMA (time-to-last-byte, not TTFB) is within the ceiling of
-/// the tier's median, plus every entry that has no measurement yet (it has
-/// not been proven slow, and the rotation
-/// is what produces its first measurement). When nothing has been measured —
-/// a freshly-started gateway — the whole tier is returned, so the first
-/// requests behave exactly like plain round-robin.
-fn auto_pool_fast_cohort<'a>(healthy: &[&'a AutoPoolEntry]) -> Vec<&'a AutoPoolEntry> {
+/// The median whole-exchange EWMA (time-to-last-byte, not TTFB) of `healthy`,
+/// or `None` when nothing in the tier has been measured yet.
+fn auto_pool_cohort_median(healthy: &[&AutoPoolEntry]) -> Option<f64> {
     let mut measured: Vec<f64> = Vec::with_capacity(healthy.len());
     for e in healthy.iter() {
         if let Some(ms) = crate::provider_stats::total_latency_ms(&e.provider) {
@@ -889,11 +906,42 @@ fn auto_pool_fast_cohort<'a>(healthy: &[&'a AutoPoolEntry]) -> Vec<&'a AutoPoolE
         }
     }
     if measured.is_empty() {
-        return healthy.to_vec();
+        return None;
     }
     measured.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let median = measured[measured.len() / 2];
-    let ceiling = (median * AUTO_POOL_COHORT_MEDIAN_MULTIPLIER).max(AUTO_POOL_COHORT_FLOOR_MS);
+    Some(measured[measured.len() / 2])
+}
+
+/// The rotation ceiling for a tier whose members have a median whole-exchange
+/// EWMA of `median` (ms): the multiplier, clamped into the absolute
+/// `[floor, cap]` band and never allowed below the median itself.
+fn auto_pool_cohort_ceiling(median: f64) -> f64 {
+    (median * AUTO_POOL_COHORT_MEDIAN_MULTIPLIER)
+        .max(AUTO_POOL_COHORT_FLOOR_MS)
+        .min(AUTO_POOL_COHORT_CEILING_MS.max(median))
+}
+
+/// Whether a *sticky pin* may be abandoned purely for speed. Deliberately
+/// looser than [`auto_pool_cohort_ceiling`] — see
+/// [`AUTO_POOL_PIN_ESCAPE_MULTIPLIER`].
+fn auto_pool_pin_escapable(pinned_ms: f64, median: f64) -> bool {
+    pinned_ms > median * AUTO_POOL_PIN_ESCAPE_MULTIPLIER
+        && pinned_ms > AUTO_POOL_PIN_ESCAPE_FLOOR_MS
+}
+
+/// The low-latency cohort of `healthy` for one rotation: every entry whose
+/// whole-exchange EWMA is within [`auto_pool_cohort_ceiling`] of the tier's
+/// median, plus every entry that has no measurement yet (it has not been
+/// proven slow, and the rotation is what produces its first measurement). When
+/// nothing has been measured — a freshly-started gateway — the whole tier is
+/// returned, so the first requests behave exactly like plain round-robin.
+fn auto_pool_fast_cohort<'a>(healthy: &[&'a AutoPoolEntry]) -> Vec<&'a AutoPoolEntry> {
+    let Some(median) = auto_pool_cohort_median(healthy) else {
+        // Nothing has been measured — a freshly-started gateway: the whole
+        // tier, so the first requests behave exactly like plain round-robin.
+        return healthy.to_vec();
+    };
+    let ceiling = auto_pool_cohort_ceiling(median);
     let cohort: Vec<&'a AutoPoolEntry> = healthy
         .iter()
         .copied()
@@ -1321,29 +1369,38 @@ impl AiGateway {
                 .unwrap_or(false)
         };
 
-        // The latency filter is computed once and reused: a sticky pin has to
-        // respect the same cohort as the round-robin, otherwise a session
-        // pinned to a provider that has since become an order of magnitude
-        // slower would keep waiting on it forever.
-        let fast_cohort: Option<Vec<&AutoPoolEntry>> = if pool.prefer_fast {
-            Some(auto_pool_fast_cohort(&healthy))
+        // Two different latency rules, on purpose.
+        //
+        // The round-robin rotation uses the strict fast cohort: a request with
+        // no pin has no upstream cache to lose, so it may as well go to the
+        // fastest healthy member of the tier.
+        //
+        // A sticky pin is judged by `auto_pool_pin_escapable` instead — much
+        // looser, and independent of the cohort. Coupling the two made every
+        // tightening of the rotation bounce warm sessions to another provider,
+        // and a session that moves loses the upstream prompt cache it was
+        // built on: one slow turn is cheaper than a cold conversation.
+        let cohort_median = if pool.prefer_fast {
+            auto_pool_cohort_median(&healthy)
         } else {
             None
         };
-        let in_fast_cohort = |name: &str| -> bool {
-            fast_cohort
-                .as_ref()
-                .is_none_or(|c| c.iter().any(|e| e.provider == name))
+        let pin_is_slow = |name: &str| -> bool {
+            let Some(median) = cohort_median else {
+                return false;
+            };
+            crate::provider_stats::total_latency_ms(name)
+                .is_some_and(|ms| auto_pool_pin_escapable(ms, median))
         };
 
         // 1. Session-sticky within the preferred tier: a session pinned to a
         //    pool provider keeps using it (a different key loses upstream
         //    context). A pin on the metered tier is not honoured once a
         //    subscription entry has recovered — the prepaid tier wins and
-        //    the session re-pins on the next successful response. A pin on a
-        //    provider the latency filter skipped is abandoned the same way:
-        //    one lost prompt cache is cheaper than every turn waiting on a
-        //    provider whose typical answer takes tens of seconds.
+        //    the session re-pins on the next successful response. A pin that
+        //    is *slow enough to escape* (see `auto_pool_pin_escapable`) is
+        //    abandoned the same way: a provider whose typical answer takes
+        //    tens of seconds costs more per turn than the cache a move loses.
         let mut chosen: Option<&AutoPoolEntry> = None;
         if ctx.path_pinned_provider.is_none() && route.session_sticky && hot.session_sticky_enabled
         {
@@ -1351,12 +1408,12 @@ impl AiGateway {
                 match self.sessions.get(&session_id) {
                     Some(pinned_name) => {
                         chosen = healthy.iter().copied().find(|e| {
-                            e.provider == pinned_name && admits(e) && in_fast_cohort(&e.provider)
+                            e.provider == pinned_name && admits(e) && !pin_is_slow(&e.provider)
                         });
                         // Pinned provider unavailable (open circuit, no
                         // longer in the pool, only in a lower billing tier,
-                        // its probe slot is busy, or its latency is far
-                        // above the tier median) — fall through to
+                        // its probe slot is busy, or slow enough to escape
+                        // — see `auto_pool_pin_escapable`) — fall through to
                         // round-robin; the session re-pins on the next
                         // successful response. A pin that cannot be honoured
                         // is a miss, not a hit.
@@ -3043,37 +3100,74 @@ impl ProxyHttp for AiGateway {
         // for upstream routing / prompt-cache affinity; without it the
         // upstream rejects the call with 400 MissingSessionID. The opencode
         // CLI always sends it (and Pingora forwards client headers verbatim);
-        // third-party clients often don't, so inject one:
-        // prefer the client's own session-affinity id so cache routing stays
-        // sticky across turns, otherwise generate a fresh UUID per request.
+        // third-party clients often don't, so one is injected.
         //
         // A header that is PRESENT but EMPTY is treated exactly like a
         // missing one: the upstream rejects an empty value with the same
         // 400 MissingSessionID (verified live), and a client whose session
         // template rendered to "" still sends the header. Only a non-blank
-        // client value is kept verbatim.
+        // client value is kept verbatim — and every injected source below is
+        // held to the same rule, so a present-but-empty affinity falls through
+        // to the next source instead of short-circuiting the lookup.
         let client_session = upstream_request
             .headers
             .get(maxllm_translate::opencode::SESSION_HEADER)
             .and_then(|v| v.to_str().ok())
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
-        if provider.kind == ProviderKind::OpenCode && client_session.is_none() {
-            // The affinity id is also subject to the blank-value rule: an
-            // empty `x-session-affinity` must not be injected as an empty
-            // session (the upstream rejects it). The sources are scanned in
-            // order and the first NON-BLANK one wins, so a present-but-empty
-            // affinity falls through to `x-opencode-session-id` instead of
-            // short-circuiting the lookup.
-            let session_id = ["x-session-affinity", "x-opencode-session-id"]
-                .iter()
-                .filter_map(|name| session.req_header().headers.get(*name))
-                .filter_map(|v| v.to_str().ok())
-                .map(|s| s.trim().to_string())
-                .find(|s| !s.is_empty())
-                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-            upstream_request
-                .insert_header(maxllm_translate::opencode::SESSION_HEADER, &session_id)?;
+        if provider.kind == ProviderKind::OpenCode {
+            // The source matters as much as the value: opencode.ai keys its
+            // prompt cache on this header, so a per-request value makes every
+            // turn a cold start. Measured on both opencode channels with one
+            // repeated 2911-token prompt: no affinity header → 0 cached tokens
+            // on both rounds; a fixed id → 2816/2911 (96.7%) on the second.
+            //
+            // Priority: the client's own header (it already decided what its
+            // conversation is called) → an explicit affinity header → the
+            // gateway's session identity → a fresh UUID. `ctx.session_id` is
+            // resolved from the request headers in `request_filter`, so it is
+            // known here, and it is the very id session-sticky pins on —
+            // reusing it keeps the upstream conversation warm exactly when the
+            // gateway keeps the request on the same provider.
+            //
+            // The body-carried spellings (`prompt_cache_key`,
+            // `client_metadata.*`, `metadata.user_id`) are *not* available
+            // here: pingora writes the upstream request header before it reads
+            // the downstream body. They are also redundant in practice — across
+            // every recorded request the body never produced a session id the
+            // headers had not already produced.
+            let (affinity_id, source) = match client_session {
+                Some(owned) => (owned, "client"),
+                None => {
+                    let affinity_header = ["x-session-affinity", "x-opencode-session-id"]
+                        .iter()
+                        .filter_map(|name| session.req_header().headers.get(*name))
+                        .filter_map(|v| v.to_str().ok())
+                        .map(|s| s.trim().to_string())
+                        .find(|s| !s.is_empty());
+                    if let Some(id) = affinity_header {
+                        (id, "affinity_header")
+                    } else if let Some(id) = ctx
+                        .session_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                    {
+                        (id, "session")
+                    } else {
+                        (uuid::Uuid::new_v4().to_string(), "generated")
+                    }
+                }
+            };
+            METRICS
+                .opencode_affinity_source_total
+                .with_label_values(&[source])
+                .inc();
+            if source != "client" {
+                upstream_request
+                    .insert_header(maxllm_translate::opencode::SESSION_HEADER, &affinity_id)?;
+            }
         }
 
         // The Cloudflare edge of opencode.ai and commandcode.ai bans requests
@@ -5927,10 +6021,12 @@ impl ProxyHttp for AiGateway {
                 model: ctx.model.clone(),
                 tokens_in: ctx.tokens_in,
                 tokens_out: ctx.tokens_out,
+                cached_tokens: ctx.cached_tokens_in,
                 cost_usd: cost,
                 latency_ms,
                 status: ctx.upstream_status,
                 request_id: ctx.plugin_ctx.request_id.clone(),
+                session_id: ctx.session_id.clone(),
                 client_ip: ctx.plugin_ctx.client_ip.clone(),
                 route_path: ctx.plugin_ctx.route_path.clone(),
                 endpoint_type: format!("{:?}", ctx.endpoint_type),
@@ -8275,7 +8371,8 @@ mod auto_pool_latency_tests {
     #[test]
     fn cohort_drops_a_provider_far_above_the_tier_median() {
         // fast-a/b ~1-2s, mid-c ~6s, slow-d ~30s: the median is ~6s, the
-        // ceiling is max(6*2.5, 5s) = 15s, so only slow-d is excluded.
+        // ceiling is min(max(6*1.5, 5s), max(10s, 6s)) = 9s, so only slow-d
+        // is excluded.
         crate::provider_stats::record_total_latency("cohort-a", 1000.0);
         crate::provider_stats::record_total_latency("cohort-b", 2000.0);
         crate::provider_stats::record_total_latency("cohort-c", 6000.0);
@@ -8316,7 +8413,8 @@ mod auto_pool_latency_tests {
     #[test]
     fn cohort_does_not_cut_a_homogeneous_cluster() {
         // A uniformly-fast cluster (all < 5s) must not be cut in half by the
-        // absolute floor: ceiling = max(median*2.5, 5s) >= 5s covers all.
+        // absolute floor: ceiling = min(max(median*1.5, 5s), max(10s, median))
+        // >= 5s covers all.
         crate::provider_stats::record_total_latency("cluster-a", 900.0);
         crate::provider_stats::record_total_latency("cluster-b", 1100.0);
         crate::provider_stats::record_total_latency("cluster-c", 1300.0);
@@ -8334,6 +8432,45 @@ mod auto_pool_latency_tests {
         let healthy: Vec<&AutoPoolEntry> = pool.entries.iter().collect();
         let cohort = auto_pool_fast_cohort(&healthy);
         assert_eq!(cohort.len(), healthy.len());
+    }
+
+    /// The rotation ceiling is `median × 1.5` inside an absolute `[5s, 10s]`
+    /// band, and never below the median — so at least the fast half of any
+    /// measured tier survives, while no entry waits on a >10 s member when the
+    /// tier is quicker than that.
+    #[test]
+    fn cohort_ceiling_is_banded_and_never_below_the_median() {
+        // A fast tier: the 5 s floor wins, so a 4 s member stays.
+        assert_eq!(auto_pool_cohort_ceiling(2_000.0), 5_000.0);
+        // A mid tier: the 1.5× multiplier is inside the band.
+        assert_eq!(auto_pool_cohort_ceiling(4_000.0), 6_000.0);
+        // A slow-ish tier: the 10 s cap bites (1.5 × 8 s = 12 s).
+        assert_eq!(auto_pool_cohort_ceiling(8_000.0), 10_000.0);
+        // A uniformly-slow tier: the cap must never cut below the median,
+        // otherwise more than half of the tier would be rotated out.
+        assert_eq!(auto_pool_cohort_ceiling(11_700.0), 11_700.0);
+        assert_eq!(auto_pool_cohort_ceiling(30_000.0), 30_000.0);
+    }
+
+    /// A warm session moves only when the pin is *both* relatively and
+    /// absolutely painful. Being merely "not the fastest" never moves it —
+    /// that is what keeps the upstream prompt cache alive.
+    #[test]
+    fn pin_escape_needs_both_relative_and_absolute_pain() {
+        // 12 s against a 2 s median: both conditions, escape.
+        assert!(auto_pool_pin_escapable(12_000.0, 2_000.0));
+        // 8 s against a 2 s median: 4× the median but under the 10 s floor —
+        // stay pinned, the cache is worth more than those seconds.
+        assert!(!auto_pool_pin_escapable(8_000.0, 2_000.0));
+        // 5 s against a 4 s median: over the floor? no — and only 1.25×.
+        assert!(!auto_pool_pin_escapable(5_000.0, 4_000.0));
+        // 11 s against a 10 s median: over the floor but only 1.1× — stay.
+        assert!(!auto_pool_pin_escapable(11_000.0, 10_000.0));
+        // Exactly at the boundaries: strictly greater on both, so no escape.
+        assert!(!auto_pool_pin_escapable(10_000.0, 10_000.0));
+        // An unmeasured tier never escapes (median 0 is handled by the
+        // caller returning `None`, but the predicate itself stays strict).
+        assert!(!auto_pool_pin_escapable(1_000.0, 0.0));
     }
 
     #[test]

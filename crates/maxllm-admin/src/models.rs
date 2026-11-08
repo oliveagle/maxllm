@@ -180,10 +180,17 @@ pub struct RequestLog {
     pub model: String,
     pub tokens_in: u64,
     pub tokens_out: u64,
+    /// Prompt tokens the upstream reported as served from its prompt cache.
+    /// `cached_tokens / tokens_in` is the cache hit rate, which is the number
+    /// this column exists to make queryable without re-parsing gateway logs.
+    pub cached_tokens: u64,
     pub cost_usd: Decimal,
     pub latency_ms: u64,
     pub status: u16,
     pub request_id: Option<String>,
+    /// Session identity the request resolved to (headers, then body). Joins a
+    /// request to the conversation whose upstream prompt cache it should hit.
+    pub session_id: Option<String>,
     pub client_ip: Option<String>,
     pub route_path: String,
     pub endpoint_type: String,

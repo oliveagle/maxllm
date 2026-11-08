@@ -134,10 +134,12 @@ impl SqliteStore {
                 model TEXT NOT NULL DEFAULT '',
                 tokens_in INTEGER NOT NULL DEFAULT 0,
                 tokens_out INTEGER NOT NULL DEFAULT 0,
+                cached_tokens INTEGER NOT NULL DEFAULT 0,
                 cost_usd REAL NOT NULL DEFAULT 0,
                 latency_ms INTEGER NOT NULL DEFAULT 0,
                 status INTEGER NOT NULL DEFAULT 0,
                 request_id TEXT,
+                session_id TEXT,
                 client_ip TEXT,
                 route_path TEXT NOT NULL DEFAULT '',
                 endpoint_type TEXT NOT NULL DEFAULT '',
@@ -180,6 +182,38 @@ impl SqliteStore {
             ",
         )
         .map_err(|e| StoreError::Internal(format!("failed to create tables: {e}")))?;
+        Self::migrate_request_log_columns(&conn)?;
+        Ok(())
+    }
+
+    /// Add `request_logs` columns introduced after the table was first
+    /// created. `CREATE TABLE IF NOT EXISTS` never alters an existing table,
+    /// so an in-place upgrade would otherwise fail every INSERT with "table
+    /// request_logs has no column named cached_tokens". Idempotent: a column
+    /// is added only when `pragma table_info` does not list it yet.
+    fn migrate_request_log_columns(conn: &Connection) -> Result<(), StoreError> {
+        let existing: Vec<String> = {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(request_logs)")
+                .map_err(|e| StoreError::Internal(e.to_string()))?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(|e| StoreError::Internal(e.to_string()))?;
+            rows.filter_map(|row| row.ok()).collect()
+        };
+        for (column, ddl) in [
+            ("cached_tokens", "INTEGER NOT NULL DEFAULT 0"),
+            ("session_id", "TEXT"),
+        ] {
+            if existing.iter().any(|name| name == column) {
+                continue;
+            }
+            conn.execute(
+                &format!("ALTER TABLE request_logs ADD COLUMN {column} {ddl}"),
+                [],
+            )
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        }
         Ok(())
     }
 }
@@ -613,9 +647,11 @@ impl AdminStore for SqliteStore {
         conn.execute(
             "INSERT INTO request_logs (
                 id, timestamp, provider, model, tokens_in, tokens_out,
-                cost_usd, latency_ms, status, request_id, client_ip,
-                route_path, endpoint_type, fallback_used, error
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                cached_tokens, cost_usd, latency_ms, status, request_id,
+                session_id, client_ip, route_path, endpoint_type,
+                fallback_used, error
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                      ?14, ?15, ?16, ?17)",
             params![
                 log.id,
                 log.timestamp.to_rfc3339(),
@@ -623,10 +659,12 @@ impl AdminStore for SqliteStore {
                 log.model,
                 log.tokens_in as i64,
                 log.tokens_out as i64,
+                log.cached_tokens as i64,
                 log.cost_usd,
                 log.latency_ms as i64,
                 log.status as i32,
                 log.request_id,
+                log.session_id,
                 log.client_ip,
                 log.route_path,
                 log.endpoint_type,
@@ -1014,10 +1052,15 @@ fn request_log_from_row(row: &rusqlite::Row) -> rusqlite::Result<RequestLog> {
         model: row.get("model")?,
         tokens_in: row.get::<_, i64>("tokens_in")? as u64,
         tokens_out: row.get::<_, i64>("tokens_out")? as u64,
+        // A read-only connection opened before the migration ran would not
+        // have these columns; an absent column reads as zero / no session
+        // rather than failing the whole page of logs.
+        cached_tokens: row.get::<_, i64>("cached_tokens").unwrap_or(0) as u64,
         cost_usd: row.get("cost_usd")?,
         latency_ms: row.get::<_, i64>("latency_ms")? as u64,
         status: row.get::<_, i32>("status")? as u16,
         request_id: row.get("request_id")?,
+        session_id: row.get::<_, Option<String>>("session_id").unwrap_or(None),
         client_ip: row.get("client_ip")?,
         route_path: row.get("route_path")?,
         endpoint_type: row.get("endpoint_type")?,
@@ -1290,10 +1333,12 @@ mod tests {
                 model: "gpt-4o".into(),
                 tokens_in: 100,
                 tokens_out: 50,
+                cached_tokens: 96,
                 cost_usd: 0.005,
                 latency_ms: 230,
                 status: 200,
                 request_id: Some("rid-1".into()),
+                session_id: Some("sid-1".into()),
                 client_ip: Some("127.0.0.1".into()),
                 route_path: "/v1/chat/completions".into(),
                 endpoint_type: "ChatCompletions".into(),
@@ -1310,10 +1355,12 @@ mod tests {
                 model: "claude-sonnet-4-20250514".into(),
                 tokens_in: 200,
                 tokens_out: 100,
+                cached_tokens: 0,
                 cost_usd: 0.01,
                 latency_ms: 450,
                 status: 200,
                 request_id: Some("rid-2".into()),
+                session_id: None,
                 client_ip: None,
                 route_path: "/v1/chat/completions".into(),
                 endpoint_type: "ChatCompletions".into(),

@@ -5754,16 +5754,21 @@ session_sticky = true
     assert_eq!(b_reqs.len(), 0, "the bound provider must not rotate away");
 }
 
-/// Latency-aware auto-pool rotation: once a provider's whole-exchange EWMA is
-/// far above the tier median, a *session pinned to it* must not keep waiting
-/// on it. The pin is abandoned like any other unhonourable pin, the request
-/// is served by a fast entry, and the session re-pins on that entry.
+/// The rotation cohort and the sticky pin are judged by *two different* rules.
 ///
-/// The slow mock answers after 6s — above the cohort's 5s absolute floor — so
-/// a three-provider tier with one slow entry deterministically excludes it
-/// (sorted measurements [fast, fast, slow] put the median on a fast entry).
+/// Once a provider's whole-exchange EWMA is above the rotation ceiling it is
+/// filtered out of the round-robin, so a three-provider tier with one slow
+/// entry deterministically excludes it (sorted measurements [fast, fast, slow]
+/// put the median on a fast entry) and no *new* session lands on it.
+///
+/// A session already pinned to it is a different question: at 6s it is above
+/// the cohort ceiling but below the pin escape's absolute 10s floor, so it
+/// stays. Moving it would throw away the upstream prompt cache the
+/// conversation was built on, and one slow turn is cheaper than a cold
+/// conversation. (`auto_pool_pin_escapable` — the escape itself — is pinned
+/// down by the unit tests and by the 10.5s sibling test below.)
 #[tokio::test]
-async fn test_auto_pool_drops_a_session_pinned_to_a_provider_the_latency_filter_skips() {
+async fn test_auto_pool_keeps_a_warm_pin_that_is_only_above_the_cohort() {
     let slow = MockServer::start().await;
     let fast = MockServer::start().await;
 
@@ -5855,34 +5860,36 @@ session_sticky = true
 
     // 1) First request pins session "sess-slow" to the slow entry (6s).
     assert_eq!(send(Some("sess-slow")).await, "from-slow");
-    // 2) and 3) Measure both fast entries (round-robin continues past the
-    //    now-measured slow entry because two measurements are not enough for
-    //    the median to point at a fast entry).
+    // 2) and 3) Measure both fast entries. Two measurements are not enough
+    //    for the median to point at a fast entry yet, so the slow one is still
+    //    inside the cohort and the round-robin walks past it by index.
     assert_eq!(send(None).await, "from-fast");
     assert_eq!(send(None).await, "from-fast");
 
-    // With the tier measured as [fast, fast, slow], the slow entry is far
-    // above the median and is filtered out. The pinned session must be moved
-    // off it instead of waiting another 6s.
+    // 4) With [fast, fast, slow] measured, the slow entry is above the
+    //    rotation ceiling: this rotation skips it (and books the skip counter)
+    //    instead of handing a new session a 6s wait.
+    assert_eq!(send(None).await, "from-fast");
+
+    // 5) The warm session, however, keeps its pin: 6s is under the pin
+    //    escape's absolute 10s floor, so the cohort filter does not bounce it.
     assert_eq!(
         send(Some("sess-slow")).await,
-        "from-fast",
-        "a session pinned to a latency-skipped provider must be re-pinned to a fast one"
+        "from-slow",
+        "a warm pin below the escape floor must not be bounced by the cohort filter"
     );
-    // The re-pin sticks: the next request on that session is fast too.
-    assert_eq!(send(Some("sess-slow")).await, "from-fast");
 
     let slow_reqs = slow.received_requests().await.unwrap_or_default();
     assert_eq!(
         slow_reqs.len(),
-        1,
-        "the slow entry must serve only the very first (pre-measurement) request"
+        2,
+        "the pin keeps serving the session it warmed (first request + this one)"
     );
     let fast_reqs = fast.received_requests().await.unwrap_or_default();
     assert_eq!(
         fast_reqs.len(),
-        4,
-        "every other request must land on a fast entry"
+        3,
+        "every request after the measurement lands on a fast entry"
     );
 
     // The filter is observable.
@@ -5900,6 +5907,132 @@ session_sticky = true
                 && !l.trim_end().ends_with(" 0")
         ),
         "the skip counter must record the slow entry; metrics tail:\n{body}"
+    );
+}
+
+/// The escape half of the sticky-pin rule: a pin that is *both* more than
+/// 1.5x the tier median and slower than 10s in absolute terms is abandoned for
+/// speed, exactly once, and the session re-pins on a fast entry. The slow mock
+/// answers after 10.5s, which clears the absolute floor that keeps the 6s
+/// sibling test pinned.
+#[tokio::test]
+async fn test_auto_pool_escapes_a_pin_that_is_slow_enough() {
+    let slow = MockServer::start().await;
+    let fast = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(openai_response("from-slow"))
+                .set_delay(Duration::from_millis(10_500)),
+        )
+        .mount(&slow)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from-fast")))
+        .mount(&fast)
+        .await;
+
+    // Slow declared first: with no measurements the whole tier is the cohort
+    // and the first request lands on the slow entry, pinning the session to it.
+    let config = r#"
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[metrics]
+enabled = true
+
+[session_sticky]
+enabled = true
+timeout_secs = 3600
+max_entries = 100
+
+[providers.slow]
+kind = "openai"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+
+[providers.fast_a]
+kind = "openai"
+base_url = "{FALLBACK_URL}"
+api_key = "fake-key"
+
+[providers.fast_b]
+kind = "openai"
+base_url = "{FALLBACK_URL}"
+api_key = "fake-key"
+
+[auto_model]
+enabled = true
+name = "auto"
+
+[[auto_model.pool]]
+provider = "slow"
+model = "model-slow"
+
+[[auto_model.pool]]
+provider = "fast_a"
+model = "model-fast-a"
+
+[[auto_model.pool]]
+provider = "fast_b"
+model = "model-fast-b"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "auto"
+auto_model = true
+session_sticky = true
+"#;
+    let gw = TestGateway::start_with_fallback(config, &slow.uri(), &fast.uri()).await;
+    let c = client();
+
+    let send = |session: Option<&'static str>| {
+        let mut req = c
+            .post(gw.url("/v1/chat/completions"))
+            .json(&chat_body("auto", "hi"));
+        if let Some(s) = session {
+            req = req.header("session-id", s);
+        }
+        async move {
+            let resp = req.send().await.unwrap();
+            assert_eq!(resp.status(), 200);
+            let body: Value = resp.json().await.unwrap();
+            body["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        }
+    };
+
+    // 1) Pins the session to the slow entry (10.5s).
+    assert_eq!(send(Some("sess-slow")).await, "from-slow");
+    // 2) and 3) Measure both fast entries: idx 1 and 2 of the still-unfiltered
+    //    cohort (its only measurement is the slow one, so the ceiling still
+    //    covers everything).
+    assert_eq!(send(None).await, "from-fast");
+    assert_eq!(send(None).await, "from-fast");
+
+    // The tier is now [fast, fast, slow] with a fast median: the pin is
+    // 1.5x+ over the median *and* over the 10s floor, so it escapes.
+    assert_eq!(
+        send(Some("sess-slow")).await,
+        "from-fast",
+        "a pin that clears both escape conditions must be abandoned for speed"
+    );
+
+    let slow_reqs = slow.received_requests().await.unwrap_or_default();
+    assert_eq!(
+        slow_reqs.len(),
+        1,
+        "the slow entry serves only the request that produced its measurement"
+    );
+    let fast_reqs = fast.received_requests().await.unwrap_or_default();
+    assert_eq!(
+        fast_reqs.len(),
+        3,
+        "every request after the escape must land on a fast entry"
     );
 }
 

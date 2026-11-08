@@ -34,6 +34,11 @@ pub struct GatewayMetrics {
     pub auto_pool_slow_skips_total: IntCounterVec,
     /// Session-sticky affinity cache hit/miss counters.
     pub session_affinity_hits_total: IntCounter,
+    /// Where the `x-opencode-session` affinity id injected for a client that
+    /// did not send one came from, per request. opencode.ai keys its prompt
+    /// cache on that header, so `generated` (a fresh UUID) is by construction a
+    /// cold conversation — a rising share here is a falling cache hit rate.
+    pub opencode_affinity_source_total: IntCounterVec,
     pub session_affinity_misses_total: IntCounter,
     pub session_affinity_evictions_total: IntCounter,
     pub session_affinity_size: IntGauge,
@@ -179,6 +184,18 @@ impl GatewayMetrics {
         .expect("metric");
         registry
             .register(Box::new(auto_pool_slow_skips_total.clone()))
+            .expect("register");
+
+        let opencode_affinity_source_total = IntCounterVec::new(
+            Opts::new(
+                "maxllm_opencode_affinity_source_total",
+                "Source of the x-opencode-session affinity id: the client's own header, an explicit affinity header, the gateway session identity, or a freshly generated per-request UUID",
+            ),
+            &["source"],
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(opencode_affinity_source_total.clone()))
             .expect("register");
 
         let session_affinity_hits_total = IntCounter::new(
@@ -419,6 +436,7 @@ impl GatewayMetrics {
             circuit_breaker_stream_opens_total,
             auto_pool_metered_selections_total,
             auto_pool_slow_skips_total,
+            opencode_affinity_source_total,
             session_affinity_hits_total,
             session_affinity_misses_total,
             session_affinity_evictions_total,
