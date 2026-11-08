@@ -1241,6 +1241,75 @@ NAS 迁移后 `PRAGMA table_info(request_logs)` 已有 `15 = cached_tokens`、`1
 `volc_t_1` 的 `hop`（22%）来自 `volc_1 ↔ volc_t_1` 同模型（`deepseek-v4-flash`）的
 pin 抖动，A/B 落地后 `session_affinity_misses_total` 只有个位数，窗口拉长会自然收敛。
 
+### 14.11 两个红灯的真根因：慢 provider 被永久封禁（修复 C，`7e1b9db`）
+
+A+B 落地后 `minimax`（93.18%）与 `opencode_go_1`（71.89%）**再无流量**，窗口冻结在
+各自被撤离的那一刻（19:07:37Z / 18:24Z）。按 `(session, route_path)` 分组看清了过程：
+
+| session | provider 迁移链 | 请求数 |
+|---|---|---:|
+| `01a1b6f6-cef2-` | go_1 → volc_1 → volc_t_1 → volc_1 → volc_t_1 | 175 |
+| `01a1b6f7-225f-` | go_1 → **minimax** → volc_1 → volc_t_1 | 403（minimax 的 126 发全在此） |
+| `01a1b6f7-4c39-` | volc_1 → **minimax** → volc_1 → xiaomi → volc_1 | 491 |
+
+minimax 在 19:07:37Z 打出最后一发、耗时 **88 903 ms** 后整条 session 逃走，再没回来。
+`maxllm_auto_pool_slow_skips_total` 同期累到 `go_1=39 / minimax=29 / xiaomi=31 / volc_1=4`。
+
+**两个 bug 叠加（都在 `provider_stats.rs`）：**
+
+1. **证据永不过期** —— `LatencyStats { ewma_ms, samples }` 没有时间戳。provider 被判慢
+   → 轮转不再选它 → 没有流量 → 估计值永远不更新 → **判定成了永久封禁**，而它的
+   上游 prompt cache 在旁边一起变冷。
+2. **EWMA α=0.3 对离群值过敏** —— 实测（`ewma.py`，窗口内全部成功请求）：
+
+   | provider | n | p50 | EWMA | 逃出 pin? | 在 cohort? |
+   |---|---:|---:|---:|---|---|
+   | ollama_local | 17 | 1 033 | 1 048 | 否 | 在 |
+   | opencode_go_2 | 1 270 | 4 543 | 3 983 | 否 | 在 |
+   | volc_t_1 | 273 | 3 889 | 4 262 | 否 | 在 |
+   | volc_1 | 729 | **6 585** | **10 792** | 否 | **被误踢** |
+   | minimax | 126 | **5 064** | **31 744** | **是** | 被踢 |
+   | opencode_go_1 | 2 | 41 416 | 34 568 | 是 | 被踢 |
+   | xiaomi | 165 | 25 357 | 74 202 | 是 | 被踢 |
+
+   一次 88.9 s 的离群把 minimax 从 ~5 s 顶到 ~32 s；volc_1 的 p50 只有 6.6 s 却被
+   10.8 s 的 EWMA 判出局。
+
+3. **再测量机制实际失效** —— `AUTO_POOL_EXPLORE_EVERY=50` 按**轮转次数**计，而
+   affinity 命中 2 511 : miss 11、2.75 h 只发生约 33 次轮转 ⇒ 探索轮转 0~1 次。
+4. **冷启动反馈回路** —— 被封的 provider 一旦重新有流量，第一发必然是全前缀 prefill
+   （慢）→ 又被判慢 → 又被封 + session 逃走 → 只留下一次 0% 冷 miss，数字更差。
+
+**顺带收口：`tin=37/90` 探针来源** —— 是本机健康检查脚本的 `probe_infer`
+（`POST /v1/responses/auto`，`input="reply with the single word: ok"`，≈90 token）与
+`probe_resp`（`POST /v1/responses`，`deepseek-v4.1-flash:cloud`，≈37 token），由两个
+每 10 分钟的 timer 拉起；指标导出脚本只 `GET /health`、`/metrics`，从不发请求。
+量级 ~90 token/发，对命中率可忽略，未改。
+
+**修复 C（commit `7e1b9db`）—— 三层，全在 `provider_stats.rs`：**
+
+| 层 | 做法 | 效果 |
+|---|---|---|
+| 证据会过期 | `TOTAL_LATENCY` 改成 10 分钟滑窗（`TOTAL_LATENCY_WINDOW`），空窗读作 `None` | 静默 >10 min → 回到 **unmeasured** → 重新进入 fast cohort，封禁不再是终局 |
+| 中位数而非 EWMA | 取窗口样本的中位数（偶数取靠上中间） | 单个 90 s 离群定不了 provider 的生死 |
+| 冷样本降级 | `warm = cached_tokens_in × 2 ≥ tokens_in`（命中 ≥50% 才算 warm）；窗口内有 warm 就只用 warm 中位数；没有 warm 且样本 `< 5` → `None`；≥5 才退化取全冷中位数 | 不拿「全前缀 prefill」判 provider；同时保证从不报 cache hit 的 provider 仍可测、pin 逃得掉 |
+
+**门禁**：`cargo fmt --check` / `cargo test`（gateway 63 + translate 184 + admin 139 +
+doc-tests，**0 failed**）/ `cargo clippy --all-targets -- -D warnings` 全绿。
+新增 5 个单测（中位数、单离群不动、证据过期、冷不压热、纯冷 5 发仍可测）+ 2 个集成测试
+改用 `openai_response_warm`（否则 mock 不报 `cached_tokens` → 全判冷 → 测不到行为）。
+
+**双机部署（2026-11-09 05:45 / 05:47 CST）**：musl static-pie release，
+sha256 `787844f3f5205ea7ba9f7f92b654d078f9441d87040421251240d009d2efe738`；备份
+`maxllm-server.bak-20261109-0545-slowverdict`（NAS）/ `-0547-`（本机）；
+两台 `active`、`NRestarts=0`、`/health status=ok version=0.3.10`、journal 无 panic。
+
+**诚实边界**：修后两家能重新被选中，但要过 95% 仍需**足够多的热而持续**流量
+（minimax ≈10–15 M 热 token、go_1 ≈2.3–3.5 M，约 15–20 发长 session）。
+一次性冷探针只会把数字拉低 —— **不为凑数人为喂流量**，等客户端自然回归。
+`xiaomi` 走 `/v1/responses`（非 auto 路由），generic 候选路径不查 `pin_is_slow`，
+本修复不影响它的钉住行为。
+
 
 ---
 
