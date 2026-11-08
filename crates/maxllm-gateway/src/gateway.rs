@@ -4599,7 +4599,15 @@ impl ProxyHttp for AiGateway {
                 // body (streaming or not) is passed through unchanged. Only
                 // errors are normalised into the OpenAI error shape, and usage
                 // is still extracted for the metrics/ledger.
-                if ctx.is_streaming {
+                // An error body is not SSE and carries no terminal event to
+                // wait for. Streaming it through the (verbatim) stream
+                // translator used to leave it to the truncation judge: the
+                // upstream 400 was booked as a "stream truncated" in the
+                // request log (masking the real error) and a
+                // gateway_stream_truncated event was appended to the JSON the
+                // client was reading. A 4xx/5xx takes the buffered path
+                // below, which normalizes the error instead.
+                if ctx.is_streaming && ctx.upstream_status < 400 {
                     if let Some(data) = body.as_ref() {
                         let translated: Option<Bytes> = match ctx.stream_translator.lock() {
                             Ok(mut guard) => guard.as_mut().map(|translator| {
@@ -5499,9 +5507,16 @@ impl ProxyHttp for AiGateway {
 
         let hot = self.hot.load();
 
+        // A 4xx/5xx is a failure in its own right — it cannot be a "200 cut
+        // short". Bounding `truncated` here (besides the guards in
+        // `mark_stream_truncated` and `observe_stream_chunk`) keeps the
+        // log/metrics honest even if a future path marks the flag on an
+        // error response: the real upstream error is reported, not a
+        // misleading "stream truncated".
         let truncated = ctx
             .stream_truncated
-            .load(std::sync::atomic::Ordering::Relaxed);
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && ctx.upstream_status < 400;
 
         // Stream health. A 200 whose body was cut mid-stream never reaches the
         // plain failure counter (`record_success` resets the streak, since the
@@ -6468,6 +6483,14 @@ fn stream_carries_terminal(bytes: &[u8]) -> bool {
 
 /// Mark this exchange as truncated (idempotent) and bump the counters once.
 fn mark_stream_truncated(ctx: &RequestCtx) -> bool {
+    // Truncation is a *successful* stream that ended before its terminal
+    // event. A 4xx/5xx body is a failure in its own right: there is no
+    // terminal event to expect, and booking it here would mask the real
+    // upstream error behind a "stream truncated" label in the request log
+    // and the metrics.
+    if ctx.upstream_status >= 400 {
+        return false;
+    }
     if ctx
         .stream_truncated
         .swap(true, std::sync::atomic::Ordering::Relaxed)
@@ -6513,7 +6536,11 @@ fn observe_stream_chunk(out: &mut Bytes, ctx: &mut RequestCtx, end_of_stream: bo
         ctx.stream_scan_tail.extend_from_slice(&window[keep..]);
     }
     extract_stream_usage(out, ctx, end_of_stream);
-    if !end_of_stream || ctx.stream_terminal_seen || !tracks_stream_terminal(ctx.endpoint_type) {
+    if !end_of_stream
+        || ctx.stream_terminal_seen
+        || !tracks_stream_terminal(ctx.endpoint_type)
+        || ctx.upstream_status >= 400
+    {
         return;
     }
     mark_stream_truncated(ctx);
@@ -7906,6 +7933,38 @@ mod stream_truncation_tests {
             );
             assert_eq!(chunk.as_ref(), b"event: message_stop\ndata: {}\n\n");
         }
+    }
+
+    /// A 4xx/5xx is a failure in its own right, not a 200 the upstream cut
+    /// short: there is no terminal event to expect. Judging it as truncation
+    /// used to (a) mask the real upstream error behind "stream truncated" in
+    /// the request log and (b) append a gateway_stream_truncated event to the
+    /// JSON error body the client was reading (a native Responses upstream
+    /// answers a streaming 4xx with plain JSON, not SSE).
+    #[test]
+    fn an_error_response_is_never_booked_as_a_truncated_stream() {
+        let mut ctx = responses_ctx();
+        ctx.upstream_status = 400;
+        let body =
+            b"{\"error\":{\"message\":\"content policy\",\"type\":\"invalid_request_error\"}}";
+        let mut chunk = Bytes::from_static(body);
+
+        observe_stream_chunk(&mut chunk, &mut ctx, true);
+
+        assert!(
+            !ctx.stream_truncated
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "a 4xx body is not a truncated 200"
+        );
+        assert_eq!(
+            chunk.as_ref(),
+            body,
+            "the error body must reach the client untouched"
+        );
+        assert!(
+            !mark_stream_truncated(&ctx),
+            "the truncation counter must stay untouched for a 4xx"
+        );
     }
 
     /// Truncation is sticky and counted once, however many paths notice it.

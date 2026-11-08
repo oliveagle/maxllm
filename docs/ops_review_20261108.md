@@ -149,6 +149,50 @@ response body is complete"`）。
    客户端验证：`client_aborted_total{provider="ollama_local"} 1`，且 `stream_truncated_total`
    与 `streams_judged_total` 均未被它影响。
 
+### 1.2 订正（2026-11-08 19:5x CST）：4xx/5xx 被误记为 `stream truncated`
+
+`request_logs` 里 2026-11-08 08:43 那条 `deepseek /v1/responses status=400
+error="stream truncated: upstream ended the body before a terminal event"`
+是**记账口径错误**：那是 deepseek 上游正常返回的一个 400（同分钟前后还有 6 条
+error=None 的 400），不是"200 被截断"。
+
+**根因**：`deepseek` 是 `native_responses = true`。流式 Responses 请求撞上 4xx 时，
+JSON 错误体走 native Responses **流式**直传分支（`if ctx.is_streaming`），该分支没有
+4xx 守卫 —— 而翻译路径（`if ctx.upstream_status >= 400` 提前返回）和 chat 路径都有。
+于是 `observe_stream_chunk` 把 JSON 错误体当 SSE 扫：找不到 `response.completed`
+终止事件 → `mark_stream_truncated`。后果有两层：
+
+1. **日志/指标误导**：`logging()` 里 `truncation_error` 无条件拼进 `error` 字段，
+   "stream truncated" 盖掉了真实错误；`maxllm_stream_truncated_total` 对 4xx 照样 +1，
+   会让截断率口径被上游的常规 4xx 污染。
+2. **客户端读到被污染的 body**：`observe_stream_chunk` 还在 JSON 错误体末尾**追加**
+   `event: error
+data: {…gateway_stream_truncated…}`，把 400/422 的 JSON 响应拼成了
+   半个 SSE（实测 `temperature: 9` → 400、`max_output_tokens: -1` → 422 均复现）。
+
+**修法（4 处，同一不变量：只有 2xx..399 的流才谈得上"截断"）**：
+
+| 位置 | 改动 |
+|---|---|
+| native Responses 流式分支 | `if ctx.is_streaming` → `if ctx.is_streaming && ctx.upstream_status < 400`，4xx 改走下方缓冲/规范化错误体路径（与翻译路径一致） |
+| `mark_stream_truncated()` | 入口加 `if ctx.upstream_status >= 400 { return false; }`（计数器唯一的记账点，单点兜底） |
+| `observe_stream_chunk()` | 提前返回条件加 `ctx.upstream_status >= 400`（不再往错误体追加 SSE 事件） |
+| `logging()` 的 `truncated` | `… && ctx.upstream_status < 400`（日志/指标双保险，即便未来有路径误标也保持诚实） |
+
+**验证（线上部署后逐项复测）**：
+
+| 检查 | 修复前 | 修复后 |
+|---|---|---|
+| `temperature: 9`（400）响应体 | JSON + 追加的 `gateway_stream_truncated` SSE 事件（~200B 冗余） | 纯 JSON 217B，`python3 -c json.load` 通过 |
+| `max_output_tokens: -1`（422）响应体 | 同上被污染 | 纯 JSON 288B |
+| `request_logs.error` | `"stream truncated: …"`（掩盖真实原因） | `None`（真实原因在响应体里） |
+| `maxllm_stream_truncated_total{provider="deepseek"}` | 两次 4xx 后 = 2 | 重启后发同样的两个 4xx，series **不出现**（未记账） |
+| 正常 200 流式 | — | 10039B 完整收尾，`streams_judged_total{deepseek}=1`、`stream_truncated_total` 仍为 0（无回归） |
+
+新增单测 `an_error_response_is_never_booked_as_a_truncated_stream`：400 流无终止事件
+→ 不标 truncated、body 原样、`mark_stream_truncated` 返回 false。unit 7/7、
+integration 132/132、fmt / clippy `-D warnings` 全绿。
+
 ---
 
 ## 2. P0-2：auto 池的流式请求丢失 usage（token/成本账本失效）
@@ -629,6 +673,7 @@ EOF
 | §828 异构 fallback 链的模型名 | ✅ 已修 | 400/422 `unknown model` 且该名属于本部署某 provider 时，同一 provider 带 `model_override` 重试一次：body 的 `model` 改写为该 provider 的 `default_model`；`model_override.is_some()` 并入 `is_auto_route` 使改写后的 body 走 chunked（native Responses 直传分支不改 body 的坑）；三道闸 = 先试“还持有该名”的 provider、拼错名不改写、每 provider 至多一次；新指标 `maxllm_model_rewrite_retries_total{provider}` | 线上 `/v1/responses/minimax`、`/v1/responses/deepseek` 发 `deepseek-v4.1-flash:cloud`：修复前 400 unknown model → 修复后 200（分别改写为 `MiniMax-M3`/`deepseek-flash`）；5 条新回归测试（含 native Responses 路径） |
 | §828 404「模型不存在」分支 | ✅ 已修 | vLLM / miniCPM 对未知模型答 **404**（`The model X does not exist. Valid aliases: …`），旧改写只认 400/422 ⇒ 整条路由 404。改为延迟到 body 判定：`pending_model_404` + `body_reports_unknown_model()`（强/弱特征分级，端点 404 不误判）→ 命中走与 400/422 相同的三道闸 + 原地改写重试，不命中走普通 failover 且模型名不变；与 429 共用 `fail_over_from_body_filter` | 线上 `/v1/responses/{olefedora_gpu0_minicpmv47,coding_home_olefedora_gpu0}` 发 `deepseek-v4.1-flash:cloud`：修复前 404 → 修复后 200（`"model":"minicpmv47-awq"`）；拼错名仍 404；指标各 +1；4 单测 + 3 集成测试 |
 | 503 谎报 “All providers are unavailable” | ✅ 已修 | `select_provider` 空结果改用 `unavailable_reason()`：逐候选点名 + breaker 状态（配额 force-open / 开闸 / 半开探针在飞 / 未配置）+ 路由路径 | 线上 `/v1/responses/{zhipu_1,volc_t_1}` → 503 `no provider available: zhipu_1=circuit open (quota force-open) — every candidate of route '/v1/responses/zhipu_1' is rejecting traffic`；`pool_health` 一轮 4 家配额 503 全部自解释 |
+| §1.2 4xx/5xx 误记为 `stream truncated` | ✅ 已修 | 只有 2xx..399 的流才谈得上"截断"：native Responses 流式分支加 `upstream_status < 400` 守卫（4xx 走缓冲/规范化错误体路径）；`mark_stream_truncated()` 入口对 ≥400 直接 return false（计数器唯一记账点）；`observe_stream_chunk()` 对 ≥400 提前返回（不再往 JSON 错误体追加 SSE 事件）；`logging()` 的 `truncated` 限定 `status < 400`（日志/指标双保险） | 线上 deepseek 流式 4xx（`temperature:9`→400、`max_output_tokens:-1`→422）：body 从"JSON+追加的 gateway_stream_truncated 事件"变纯 JSON；`request_logs.error` 不再写 "stream truncated"；`maxllm_stream_truncated_total{deepseek}` 对 4xx 不再记账；正常 200 流 10039B 完整收尾无回归；新单测 1 条，unit 7/7 + integration 132/132 + fmt/clippy 全绿 |
 
 ### 仍未做（需拍板或有前置）
 
