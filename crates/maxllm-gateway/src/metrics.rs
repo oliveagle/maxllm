@@ -56,6 +56,13 @@ pub struct GatewayMetrics {
     /// truncation). `stream_truncated_total / streams_judged_total` is the
     /// provider's live truncation ratio.
     pub streams_judged_total: IntCounterVec,
+    /// Responses the **client** abandoned mid-exchange (`ErrorSource::
+    /// Downstream`), i.e. it closed the connection while the gateway was still
+    /// writing the body. Kept apart from `stream_truncated_total` (a provider
+    /// fault) and from ordinary failures: a client that walks away is the
+    /// caller's decision, and counting it as either would make a healthy
+    /// provider look broken — see docs/ops_review_20261108.md §1.1.
+    pub client_aborted_total: IntCounterVec,
     /// Circuit force-opens caused by an excessive stream-truncation ratio.
     pub circuit_breaker_stream_opens_total: IntCounterVec,
     /// Failovers caused by an upstream HTTP error (the request is retried on
@@ -259,6 +266,18 @@ impl GatewayMetrics {
             .register(Box::new(streams_judged_total.clone()))
             .expect("register");
 
+        let client_aborted_total = IntCounterVec::new(
+            Opts::new(
+                "maxllm_client_aborted_total",
+                "Responses the client abandoned before the gateway finished the body",
+            ),
+            &["provider"],
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(client_aborted_total.clone()))
+            .expect("register");
+
         let circuit_breaker_stream_opens_total = IntCounterVec::new(
             Opts::new(
                 "maxllm_circuit_breaker_stream_opens_total",
@@ -328,6 +347,7 @@ impl GatewayMetrics {
             stream_truncated_before_first_byte_total,
             usage_missing_total,
             streams_judged_total,
+            client_aborted_total,
             circuit_breaker_stream_opens_total,
             auto_pool_metered_selections_total,
             session_affinity_hits_total,

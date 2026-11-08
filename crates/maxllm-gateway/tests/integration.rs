@@ -443,6 +443,19 @@ async fn test_health_endpoint() {
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["status"], "ok");
+    // A breaker whose fail window elapsed is only *half-open*: it will be
+    // probed by the next request. Reporting those as "open" made /health claim
+    // a dozen circuit-open providers when none were rejecting traffic.
+    assert_eq!(
+        body["open_providers"].as_array().map(|a| a.len()),
+        Some(0),
+        "a fresh config must report no open breakers: {body}"
+    );
+    assert_eq!(
+        body["half_open_providers"].as_array().map(|a| a.len()),
+        Some(0),
+        "no breaker has failed yet, so none may be half-open: {body}"
+    );
 }
 
 #[tokio::test]
@@ -7824,4 +7837,137 @@ async fn test_commandcode_upstream_script_ua_replaced() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
+}
+
+/// A client that hangs up mid-stream must be counted as a *client* abort, not
+/// as an upstream truncation and not as a gateway failure.
+///
+/// The 2026-11-08 audit read the 816 `Downstream ConnectionClosed … Prematurely
+/// before response body is complete` rows as upstream truncations and
+/// concluded 11.2% of all 200s were silently cut. pingora labels those with
+/// `ErrorSource::Downstream`, i.e. the remote client hung up; only one row in
+/// four days was a real upstream truncation.
+///
+/// The upstream here is a raw socket that answers with SSE headers plus one
+/// chunk and then holds the connection open, so the gateway is genuinely
+/// mid-body when the client walks away — exactly the shape that produced those
+/// rows.
+#[tokio::test]
+async fn test_client_abort_is_counted_apart_from_truncation() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut head = [0u8; 4096];
+                let _ = sock.read(&mut head).await;
+                let header = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n";
+                if sock.write_all(header.as_bytes()).await.is_err() {
+                    return;
+                }
+                let chunk = "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_abort\",\"object\":\"response\",\"status\":\"in_progress\"}}\n\n";
+                let framed = format!("{:x}\r\n{}\r\n", chunk.len(), chunk);
+                if sock.write_all(framed.as_bytes()).await.is_err() {
+                    return;
+                }
+                // Never finish the body: the gateway stays mid-stream, so the
+                // only way this exchange ends is the client closing its side.
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            });
+        }
+    });
+
+    let config = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[metrics]
+enabled = true
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.mock_opencode]
+kind = "opencode"
+base_url = "{MOCK_URL}"
+upstream_path = "/zen/go/v1/chat/completions"
+api_key = "fake-key"
+
+[[routes]]
+path = "/v1/responses/mock_opencode"
+provider = "mock_opencode"
+endpoint_type = "responses"
+"#;
+    let gw = TestGateway::start(config, &upstream).await;
+    let c = client();
+
+    // Raw TCP client: read the response head, then drop the socket. reqwest
+    // cannot express "abandon the body" without the stream feature, and this
+    // also makes the abort unconditional.
+    let body = r#"{"model":"mock-model","input":"hi","stream":true}"#;
+    let request = format!(
+        "POST /v1/responses/mock_opencode HTTP/1.1\r\n\
+         Host: 127.0.0.1\r\n\
+         Authorization: Bearer test-key-123\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", gw.port))
+        .await
+        .unwrap();
+    sock.write_all(request.as_bytes()).await.unwrap();
+    let mut buf = [0u8; 1024];
+    let read = sock.read(&mut buf).await.unwrap();
+    assert!(read > 0, "the gateway must start answering before we abort");
+    drop(sock);
+
+    let mut metric = String::new();
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let metrics = c
+            .get(gw.url("/metrics"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        if let Some(line) = metrics
+            .lines()
+            .find(|l| l.starts_with("maxllm_client_aborted_total{provider=\"mock_opencode\"}"))
+        {
+            metric = line.to_string();
+            break;
+        }
+    }
+    assert!(
+        metric.trim_end().ends_with(" 1"),
+        "the abandoned stream must be counted once as a client abort, got: {metric:?}"
+    );
+    let metrics = c
+        .get(gw.url("/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        !metrics.contains("maxllm_stream_truncated_total{provider=\"mock_opencode\"}"),
+        "a client that walks away is not an upstream truncation:\n{metrics}"
+    );
 }

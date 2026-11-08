@@ -181,6 +181,13 @@ pub struct RequestCtx {
     /// Sticky truncation flag, shared with the stream-translator wrapper so
     /// the `logging` hook can see it after the body filter has returned.
     pub stream_truncated: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The downstream walked away mid-exchange (`ErrorSource::Downstream`).
+    ///
+    /// This is neither a provider failure nor a gateway failure, so it must not
+    /// be booked as either: `logging` uses it to keep such a request out of
+    /// `usage_missing_total`, and `client_aborted_total` reports it on its own.
+    /// Set once, in `error_while_proxy`.
+    pub client_aborted: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Tail of the stream bytes already inspected for a terminal marker, so a
     /// marker split across two upstream chunks is still recognised.
     pub stream_scan_tail: Vec<u8>,
@@ -251,6 +258,7 @@ impl RequestCtx {
             stream_terminal_seen: false,
             stream_scan_tail: Vec::new(),
             stream_truncated: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            client_aborted: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             client_body_written: false,
             probe_request: false,
         }

@@ -36,7 +36,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Shared HTTP client for LLM-based auto-compaction summarization calls.
 static LLM_HTTP_CLIENT: once_cell::sync::Lazy<reqwest::Client> = once_cell::sync::Lazy::new(|| {
@@ -1885,11 +1885,19 @@ impl ProxyHttp for AiGateway {
             let providers_total = hot.providers.len();
             let mut providers_healthy = 0usize;
             let mut open_providers: Vec<&str> = Vec::new();
+            let mut half_open_providers: Vec<&str> = Vec::new();
             for (name, provider) in hot.providers.iter() {
-                if provider.circuit_breaker.effective_state() == 0 {
-                    providers_healthy += 1;
-                } else {
-                    open_providers.push(name.as_str());
+                // A breaker whose fail window elapsed is *half-open*: it will
+                // be probed by the next request that reaches it. Reporting it
+                // as "open" made /health claim a dozen circuit-open providers
+                // when in fact none were rejecting traffic (2026-11-08: 12 of
+                // the 16 listed were merely awaiting a probe).
+                match provider.circuit_breaker.effective_state() {
+                    crate::circuit_breaker::STATE_CLOSED => providers_healthy += 1,
+                    crate::circuit_breaker::STATE_HALF_OPEN => {
+                        half_open_providers.push(name.as_str())
+                    }
+                    _ => open_providers.push(name.as_str()),
                 }
             }
             let mut pools = serde_json::Map::new();
@@ -1915,6 +1923,7 @@ impl ProxyHttp for AiGateway {
                 );
             }
             open_providers.sort_unstable();
+            half_open_providers.sort_unstable();
             let body = serde_json::to_vec(&serde_json::json!({
                 "status": if degraded { "degraded" } else { "ok" },
                 "version": env!("CARGO_PKG_VERSION"),
@@ -1924,6 +1933,7 @@ impl ProxyHttp for AiGateway {
                 },
                 "pools": pools,
                 "open_providers": open_providers,
+                "half_open_providers": half_open_providers,
             }))
             .unwrap_or_else(|_| br#"{"status":"degraded"}"#.to_vec());
             let content_len = body.len().to_string();
@@ -4797,6 +4807,33 @@ impl ProxyHttp for AiGateway {
         e.retry
             .decide_reuse(client_reused && !session.as_ref().retry_buffer_truncated());
 
+        // A `Downstream` error means the *client* closed the connection. That
+        // is not the provider's fault and not ours, so give it its own counter
+        // instead of letting it blend into a 200 that "carries an error" (the
+        // 2026-11-08 audit read 816 of those as upstream truncations).
+        //
+        // `stream_terminal_seen` guards the race where the client hangs up at
+        // the same instant the terminal event goes out: that exchange was
+        // completed, and booking it as an abort would penalise a healthy
+        // provider for a client that was already done.
+        let client_gone =
+            e.esource() == &pingora::ErrorSource::Downstream && !ctx.stream_terminal_seen;
+        if client_gone
+            && !ctx
+                .client_aborted
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            METRICS
+                .client_aborted_total
+                .with_label_values(&[&ctx.provider_name])
+                .inc();
+            debug!(
+                provider = %ctx.provider_name,
+                error = %e,
+                "client closed the connection before the response body was complete"
+            );
+        }
+
         if ctx.upstream_responded {
             // Response headers already reached the client, so this attempt
             // cannot be replayed. It is still not a success: a streaming body
@@ -5038,7 +5075,13 @@ impl ProxyHttp for AiGateway {
         });
         // A 2xx/3xx that reported no tokens at all would be booked as a free
         // request; surface the gap instead of letting it hide in a zero row.
+        // A client abort is excluded: the usage was never going to arrive
+        // because the caller stopped listening, and counting it as "the
+        // provider reported nothing" would point at the wrong party.
         if !truncated
+            && !ctx
+                .client_aborted
+                .load(std::sync::atomic::Ordering::Relaxed)
             && ctx.upstream_status != 0
             && ctx.upstream_status < 400
             && ctx.tokens_in == 0
