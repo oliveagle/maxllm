@@ -93,6 +93,20 @@ pub trait AdminStore: Send + Sync {
     ) -> Result<Option<RateLimitPatternRow>, StoreError>;
     /// Drop a session binding (the pinned provider became unhealthy).
     fn delete_session_binding(&self, session_id: &str) -> Result<(), StoreError>;
+    /// Move a provider's resilience state to a new name.
+    ///
+    /// Renaming a provider in the config otherwise strands its state under the
+    /// old name: the next startup finds the row's provider missing from the
+    /// config and deletes it, so a quota force-open or an open circuit is lost
+    /// exactly when it still matters (the channel was just failing). This
+    /// carries the breaker row over and repoints the session → provider
+    /// affinity bindings in one step.
+    ///
+    /// When the target name already has a breaker row the two are merged with
+    /// [`CircuitBreakerStateRow::merge_stricter`] (counters are not summed).
+    /// Renaming a provider that has no state is not an error: the report simply
+    /// says nothing moved.
+    fn rename_provider(&self, from: &str, to: &str) -> Result<ProviderRenameReport, StoreError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -426,6 +440,55 @@ impl AdminStore for InMemoryStore {
         Ok(())
     }
 
+    fn rename_provider(&self, from: &str, to: &str) -> Result<ProviderRenameReport, StoreError> {
+        if from == to {
+            return Err(StoreError::Internal(
+                "rename source and target are the same provider".into(),
+            ));
+        }
+        let mut report = ProviderRenameReport {
+            from: from.to_string(),
+            to: to.to_string(),
+            breaker_migrated: false,
+            breaker_merged: false,
+            sessions_moved: 0,
+        };
+        {
+            let mut map = self
+                .circuit_breakers
+                .write()
+                .map_err(|_| StoreError::LockPoisoned)?;
+            if let Some(mut row) = map.remove(from) {
+                report.breaker_migrated = true;
+                match map.get(to) {
+                    Some(existing) => {
+                        report.breaker_merged = true;
+                        let mut merged = row.clone().merge_stricter(existing);
+                        merged.provider = to.to_string();
+                        map.insert(to.to_string(), merged);
+                    }
+                    None => {
+                        row.provider = to.to_string();
+                        map.insert(to.to_string(), row);
+                    }
+                }
+            }
+        }
+        {
+            let mut map = self
+                .session_bindings
+                .write()
+                .map_err(|_| StoreError::LockPoisoned)?;
+            for provider in map.values_mut() {
+                if provider == from {
+                    *provider = to.to_string();
+                    report.sessions_moved += 1;
+                }
+            }
+        }
+        Ok(report)
+    }
+
     fn save_rate_limit_pattern(&self, row: RateLimitPatternRow) -> Result<(), StoreError> {
         let mut map = self
             .rate_limit_patterns
@@ -547,6 +610,94 @@ mod tests {
         let rows = store.load_circuit_breaker_states().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].provider, "volc_1");
+    }
+
+    fn breaker_row(
+        provider: &str,
+        state: u8,
+        force_open_until: u64,
+        quota_opens: u64,
+    ) -> CircuitBreakerStateRow {
+        CircuitBreakerStateRow {
+            provider: provider.to_string(),
+            state,
+            failures: 3,
+            last_failure_at: 1_700_000_000_000,
+            force_open_until,
+            successes_half_open: 0,
+            transitions: 2,
+            quota_opens,
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn rename_provider_carries_breaker_state_and_pins() {
+        let store = InMemoryStore::new();
+        store
+            .save_circuit_breaker_state(breaker_row("volc_2", 1, 1_700_000_120_000, 2))
+            .unwrap();
+        store.save_session_binding("s1", "volc_2").unwrap();
+        store.save_session_binding("s2", "volc_2").unwrap();
+        store.save_session_binding("s3", "other").unwrap();
+
+        let report = store.rename_provider("volc_2", "volc_2b").unwrap();
+        assert_eq!(report.from, "volc_2");
+        assert_eq!(report.to, "volc_2b");
+        assert!(report.breaker_migrated);
+        assert!(!report.breaker_merged);
+        assert_eq!(report.sessions_moved, 2);
+
+        let rows = store.load_circuit_breaker_states().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].provider, "volc_2b");
+        // The force-open deadline must survive — that is the whole point.
+        assert_eq!(rows[0].force_open_until, 1_700_000_120_000);
+        assert_eq!(rows[0].state, 1);
+        assert_eq!(rows[0].quota_opens, 2);
+
+        let bindings = store.load_session_bindings().unwrap();
+        assert!(bindings.iter().any(|(id, p)| id == "s1" && p == "volc_2b"));
+        assert!(bindings.iter().any(|(id, p)| id == "s2" && p == "volc_2b"));
+        assert!(bindings.iter().any(|(id, p)| id == "s3" && p == "other"));
+    }
+
+    #[test]
+    fn rename_provider_merges_into_existing_state() {
+        let store = InMemoryStore::new();
+        store
+            .save_circuit_breaker_state(breaker_row("volc_2", 1, 1_700_000_120_000, 4))
+            .unwrap();
+        store
+            .save_circuit_breaker_state(breaker_row("volc_2b", 0, 0, 1))
+            .unwrap();
+
+        let report = store.rename_provider("volc_2", "volc_2b").unwrap();
+        assert!(report.breaker_migrated);
+        assert!(report.breaker_merged);
+
+        let rows = store.load_circuit_breaker_states().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].provider, "volc_2b");
+        // The stricter side wins: an open circuit stays open, the deadline
+        // stays, and the counters are not summed.
+        assert_eq!(rows[0].state, 1);
+        assert_eq!(rows[0].force_open_until, 1_700_000_120_000);
+        assert_eq!(rows[0].quota_opens, 4);
+    }
+
+    #[test]
+    fn rename_provider_rejects_same_name() {
+        let store = InMemoryStore::new();
+        assert!(store.rename_provider("volc_2", "volc_2").is_err());
+    }
+
+    #[test]
+    fn rename_provider_without_state_is_not_an_error() {
+        let store = InMemoryStore::new();
+        let report = store.rename_provider("ghost", "ghost2").unwrap();
+        assert!(!report.breaker_migrated);
+        assert_eq!(report.sessions_moved, 0);
     }
 
     #[test]

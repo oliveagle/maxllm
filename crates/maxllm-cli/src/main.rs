@@ -68,6 +68,11 @@ enum Commands {
         #[command(subcommand)]
         command: ConfigCommands,
     },
+    /// Admin operations that run against the SQLite store
+    Admin {
+        #[command(subcommand)]
+        command: AdminCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -92,6 +97,37 @@ enum KeysCommands {
         /// Path to the configuration file (used to determine listen port)
         #[arg(short, long)]
         config: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum AdminCommands {
+    /// Move a renamed provider's breaker state and session pins to its new name
+    ///
+    /// Rename the provider block in the config first, then run this, then
+    /// restart the gateway — otherwise the moved rows are pruned at startup.
+    RenameProvider {
+        /// Old provider name (as it appears in the database)
+        #[arg(long)]
+        from: String,
+        /// New provider name (must already exist in the config)
+        #[arg(long)]
+        to: String,
+        /// SQLite database path (overrides the config's [admin] db_path)
+        #[arg(long)]
+        db: Option<PathBuf>,
+        /// Path to the configuration file
+        #[arg(short, long, default_value = "maxllm.toml")]
+        config: PathBuf,
+        /// Report what would move, write nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+        /// Proceed even if the config does not reflect the rename yet
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -166,6 +202,25 @@ async fn main() {
         Commands::Config { command } => match command {
             ConfigCommands::Check { config } => commands::config::check(config),
             ConfigCommands::Providers { config } => commands::config::providers(config),
+        },
+        Commands::Admin { command } => match command {
+            AdminCommands::RenameProvider {
+                from,
+                to,
+                db,
+                config,
+                dry_run,
+                json,
+                force,
+            } => commands::admin::rename_provider(
+                db.as_deref(),
+                Some(config.as_path()),
+                &from,
+                &to,
+                dry_run,
+                json,
+                force,
+            ),
         },
     };
 

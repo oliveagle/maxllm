@@ -6,7 +6,7 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::models::*;
 use crate::store::{AdminStore, StoreError};
@@ -29,6 +29,25 @@ impl SqliteStore {
         };
         store.init_tables()?;
         Ok(store)
+    }
+
+    /// Open an existing SQLite database **read-only**.
+    ///
+    /// Used by ops commands that only preview a migration: a read-write
+    /// connection would take a write lock (and `CREATE TABLE IF NOT EXISTS`
+    /// from [`Self::init_tables`]) on a database a live gateway is writing
+    /// request logs into, which is exactly what a dry run must not do.
+    pub fn open_read_only(path: &Path) -> Result<Self, StoreError> {
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )
+        .map_err(|e| StoreError::Internal(format!("failed to open SQLite read-only: {e}")))?;
+        conn.execute_batch("PRAGMA busy_timeout = 5000;")
+            .map_err(|e| StoreError::Internal(format!("failed to set pragmas: {e}")))?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     /// Create an in-memory SQLite store (useful for tests).
@@ -849,6 +868,139 @@ impl AdminStore for SqliteStore {
         .map_err(|e| StoreError::Internal(e.to_string()))?;
         Ok(())
     }
+
+    fn rename_provider(&self, from: &str, to: &str) -> Result<ProviderRenameReport, StoreError> {
+        if from == to {
+            return Err(StoreError::Internal(
+                "rename source and target are the same provider".into(),
+            ));
+        }
+        let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        // One transaction: a crash between the breaker move and the session
+        // rewrite would leave half the state under the old name, which the
+        // startup prune then deletes.
+        let tx = conn
+            .transaction()
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+
+        let source = select_breaker_row(&tx, from)?;
+        let mut report = ProviderRenameReport {
+            from: from.to_string(),
+            to: to.to_string(),
+            breaker_migrated: false,
+            breaker_merged: false,
+            sessions_moved: 0,
+        };
+
+        if let Some(mut row) = source {
+            report.breaker_migrated = true;
+            match select_breaker_row(&tx, to)? {
+                Some(existing) => {
+                    report.breaker_merged = true;
+                    let mut merged = row.merge_stricter(&existing);
+                    merged.provider = to.to_string();
+                    write_breaker_row(&tx, &merged)?;
+                    tx.execute(
+                        "DELETE FROM circuit_breaker_state WHERE provider = ?1",
+                        params![from],
+                    )
+                    .map_err(|e| StoreError::Internal(e.to_string()))?;
+                }
+                None => {
+                    row.provider = to.to_string();
+                    tx.execute(
+                        "UPDATE circuit_breaker_state SET provider = ?1, updated_at = ?2
+                         WHERE provider = ?3",
+                        params![to, row.updated_at.to_rfc3339(), from],
+                    )
+                    .map_err(|e| StoreError::Internal(e.to_string()))?;
+                }
+            }
+        }
+
+        let moved = tx
+            .execute(
+                "UPDATE session_bindings SET provider = ?1, updated_at = ?2 WHERE provider = ?3",
+                params![to, chrono::Utc::now().to_rfc3339(), from],
+            )
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        report.sessions_moved = moved;
+
+        tx.commit()
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(report)
+    }
+}
+
+/// Read one breaker row, or `None` when the provider has no persisted state.
+fn select_breaker_row(
+    conn: &Connection,
+    provider: &str,
+) -> Result<Option<CircuitBreakerStateRow>, StoreError> {
+    conn.query_row(
+        "SELECT provider, state, failures, last_failure_at, force_open_until,
+                successes_half_open, transitions, quota_opens, updated_at
+         FROM circuit_breaker_state WHERE provider = ?1",
+        params![provider],
+        |row| {
+            let provider: String = row.get("provider")?;
+            let state: i32 = row.get("state")?;
+            let failures: i32 = row.get("failures")?;
+            let last_failure_at: i64 = row.get("last_failure_at")?;
+            let force_open_until: i64 = row.get("force_open_until")?;
+            let successes_half_open: i32 = row.get("successes_half_open")?;
+            let transitions: i64 = row.get("transitions")?;
+            let quota_opens: i64 = row.get("quota_opens")?;
+            let updated_at: String = row.get("updated_at")?;
+            Ok(CircuitBreakerStateRow {
+                provider,
+                state: state.clamp(0, 2) as u8,
+                failures: failures.max(0) as u32,
+                last_failure_at: last_failure_at.max(0) as u64,
+                force_open_until: force_open_until.max(0) as u64,
+                successes_half_open: successes_half_open.max(0) as u32,
+                transitions: transitions.max(0) as u64,
+                quota_opens: quota_opens.max(0) as u64,
+                updated_at: chrono::DateTime::parse_from_rfc3339(&updated_at)
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .unwrap_or_else(|_| chrono::Utc::now()),
+            })
+        },
+    )
+    .optional()
+    .map_err(|e| StoreError::Internal(e.to_string()))
+}
+
+/// Upsert a breaker row (the same statement `save_circuit_breaker_state` uses).
+fn write_breaker_row(conn: &Connection, row: &CircuitBreakerStateRow) -> Result<(), StoreError> {
+    conn.execute(
+        "INSERT INTO circuit_breaker_state (
+            provider, state, failures, last_failure_at, force_open_until,
+            successes_half_open, transitions, quota_opens, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        ON CONFLICT(provider) DO UPDATE SET
+            state = excluded.state,
+            failures = excluded.failures,
+            last_failure_at = excluded.last_failure_at,
+            force_open_until = excluded.force_open_until,
+            successes_half_open = excluded.successes_half_open,
+            transitions = excluded.transitions,
+            quota_opens = excluded.quota_opens,
+            updated_at = excluded.updated_at",
+        params![
+            row.provider,
+            row.state as i32,
+            row.failures as i32,
+            row.last_failure_at as i64,
+            row.force_open_until as i64,
+            row.successes_half_open as i32,
+            row.transitions as i64,
+            row.quota_opens as i64,
+            row.updated_at.to_rfc3339(),
+        ],
+    )
+    .map_err(|e| StoreError::Internal(e.to_string()))?;
+    Ok(())
 }
 
 fn request_log_from_row(row: &rusqlite::Row) -> rusqlite::Result<RequestLog> {
@@ -893,7 +1045,6 @@ fn spend_from_row(row: &rusqlite::Row) -> rusqlite::Result<SpendRecord> {
 }
 
 // We need the optional() method from rusqlite
-use rusqlite::OptionalExtension;
 
 #[cfg(test)]
 mod tests {
@@ -939,6 +1090,97 @@ mod tests {
 
         let by_hash = store.get_key_by_hash("hash1").unwrap().unwrap();
         assert_eq!(by_hash.id, "k1");
+    }
+
+    fn breaker_row(provider: &str, state: u8, force_open_until: u64) -> CircuitBreakerStateRow {
+        CircuitBreakerStateRow {
+            provider: provider.to_string(),
+            state,
+            failures: 2,
+            last_failure_at: 1_700_000_000_000,
+            force_open_until,
+            successes_half_open: 0,
+            transitions: 1,
+            quota_opens: 3,
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn sqlite_rename_provider_moves_state_and_pins() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .save_circuit_breaker_state(breaker_row("one_api_volc_2", 1, 1_700_000_120_000))
+            .unwrap();
+        store.save_session_binding("s1", "one_api_volc_2").unwrap();
+        store.save_session_binding("s2", "one_api_volc_2").unwrap();
+
+        let report = store.rename_provider("one_api_volc_2", "volc_2").unwrap();
+        assert!(report.breaker_migrated);
+        assert!(!report.breaker_merged);
+        assert_eq!(report.sessions_moved, 2);
+
+        let rows = store.load_circuit_breaker_states().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].provider, "volc_2");
+        assert_eq!(rows[0].force_open_until, 1_700_000_120_000);
+        assert_eq!(rows[0].state, 1);
+
+        let bindings = store.load_session_bindings().unwrap();
+        assert_eq!(bindings.len(), 2);
+        assert!(bindings.iter().all(|(_, p)| p == "volc_2"));
+    }
+
+    #[test]
+    fn sqlite_rename_provider_merges_when_the_target_already_has_state() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .save_circuit_breaker_state(breaker_row("old", 1, 1_700_000_120_000))
+            .unwrap();
+        store
+            .save_circuit_breaker_state(breaker_row("new", 0, 0))
+            .unwrap();
+
+        let report = store.rename_provider("old", "new").unwrap();
+        assert!(report.breaker_merged);
+
+        let rows = store.load_circuit_breaker_states().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].provider, "new");
+        assert_eq!(rows[0].state, 1);
+        assert_eq!(rows[0].force_open_until, 1_700_000_120_000);
+    }
+
+    #[test]
+    fn sqlite_rename_provider_rejects_same_name() {
+        let store = SqliteStore::in_memory().unwrap();
+        assert!(store.rename_provider("a", "a").is_err());
+    }
+
+    #[test]
+    fn sqlite_rename_provider_survives_a_reopen() {
+        // The gateway restores its breaker state from the store on startup, so
+        // the migrated row has to be durable — not just visible in-process.
+        let path = std::env::temp_dir().join(format!(
+            "maxllm-rename-{}-{}.db",
+            std::process::id(),
+            chrono::Utc::now().timestamp_millis()
+        ));
+        {
+            let store = SqliteStore::open(&path).unwrap();
+            store
+                .save_circuit_breaker_state(breaker_row("old", 1, 1_700_000_120_000))
+                .unwrap();
+            store.rename_provider("old", "new").unwrap();
+        }
+        {
+            let store = SqliteStore::open(&path).unwrap();
+            let rows = store.load_circuit_breaker_states().unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].provider, "new");
+            assert_eq!(rows[0].force_open_until, 1_700_000_120_000);
+        }
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

@@ -1279,6 +1279,56 @@ re-published at startup so a fresh process shows the restored state before the
 first request. With an in-memory admin store (no `db_path`) the state is
 process-local, as before.
 
+### Renaming a provider
+
+Both tables are keyed by the **provider name**, so renaming a provider in the
+config strands its state under the old name: the new name starts closed with no
+history, while the old row is dropped at the next startup (the restore prunes
+rows whose provider is no longer in the config) — a quota force-open or an open
+circuit evaporates exactly when it still matters.
+
+Rename in three steps, in this order:
+
+```bash
+# 1. rename the provider block in maxllm.toml (same base_url / api key env)
+#    e.g. [providers.one_api_volc_2] -> [providers.volc_2]
+
+# 2. carry the resilience state over (dry run first)
+./target/release/maxllm admin rename-provider \
+    --from one_api_volc_2 --to volc_2 --config maxllm.toml --dry-run
+./target/release/maxllm admin rename-provider \
+    --from one_api_volc_2 --to volc_2 --config maxllm.toml
+
+# 3. restart the gateway so the new name is restored from the store
+systemctl --user restart maxllm
+```
+
+The command runs against the SQLite store directly (`--db` overrides
+`[admin] db_path`), so it works with the gateway stopped or with
+`[admin] enabled = false`; `--dry-run` opens the database read-only. It moves
+the `circuit_breaker_state` row and repoints the `session_bindings` rows. When
+the target name already has a breaker row the two are merged keeping the
+stricter field of each (an open circuit stays open, the later force-open
+deadline wins, counters are not summed).
+
+The config is checked before anything is written: the target provider must
+already exist and the old name must already be gone — otherwise the migrated
+rows would be pruned at the next startup. `--force` overrides the check.
+
+A running gateway can do the same over the admin API:
+
+```bash
+curl -X POST http://localhost:8080/admin/providers/rename \
+  -H "Authorization: Bearer $MAXLLM_MASTER_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"from": "one_api_volc_2", "to": "volc_2"}'
+```
+
+When the startup restore does drop non-trivial state for an unknown provider
+(an open circuit, a quota force-open), it logs a warning naming the provider
+and pointing at this command, so a forgotten migration is visible instead of
+silent.
+
 ## Plugins
 
 14 built-in plugins with 5 lifecycle hooks (`on_request`, `on_upstream_request`, `on_response`, `on_response_body`, `on_logging`):
@@ -1689,13 +1739,25 @@ make clippy         # cargo clippy
 ### CLI Options
 
 ```
-maxllm [OPTIONS]
+maxllm <COMMAND>
+
+COMMANDS:
+  start              Start the gateway server (-c/--config, -d/--daemon)
+  stop               Stop a running gateway
+  status             Show gateway status
+  health             Check if the gateway is healthy
+  init               Generate a starter configuration file
+  test               Test connectivity to each configured provider
+  keys list|create   Manage virtual API keys (admin API)
+  config check|providers
+                     Validate a configuration file / list providers
+  admin rename-provider
+                     Move a renamed provider's breaker state and session pins
+  help               Print help for a subcommand
 
 OPTIONS:
-  -c, --config <CONFIG>    Path to configuration file (default: maxllm.toml)
-  -d, --daemon             Enable daemon mode
-  -h, --help               Print help
-  -V, --version            Print version
+  -h, --help         Print help
+  -V, --version      Print version
 ```
 
 ### Environment Variables

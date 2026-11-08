@@ -130,6 +130,9 @@ impl AdminApi {
             // -- Request logs -----------------------------------------------
             ("GET", "/admin/logs") => self.handle_request_logs(),
 
+            // -- Providers ---------------------------------------------------
+            ("POST", "/admin/providers/rename") => self.handle_rename_provider(body),
+
             // -- Model costs ------------------------------------------------
             ("GET", "/admin/models/costs") => self.handle_model_costs(),
 
@@ -186,6 +189,19 @@ impl AdminApi {
         self.store.delete_session_binding(session_id)
     }
 
+    /// Move a provider's resilience state to a new name.
+    ///
+    /// Called after the provider was renamed in the config: without this the
+    /// old name's breaker row is deleted by the next startup prune and the
+    /// new name starts from a clean slate.
+    pub fn rename_provider(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Result<crate::models::ProviderRenameReport, crate::store::StoreError> {
+        self.store.rename_provider(from, to)
+    }
+
     /// Persist a learned rate-limit pattern (upsert by fingerprint).
     pub fn save_rate_limit_pattern(
         &self,
@@ -234,6 +250,29 @@ impl AdminApi {
         match keys::revoke_key(self.store.as_ref(), id) {
             Ok(true) => ApiResponse::json(200, &serde_json::json!({ "deleted": true })),
             Ok(false) => ApiResponse::error(404, "key not found"),
+            Err(e) => ApiResponse::error(500, &e.to_string()),
+        }
+    }
+
+    // -- Provider handlers --------------------------------------------------
+
+    /// `POST /admin/providers/rename` — carry a renamed provider's breaker
+    /// state and session pins over to the new name.
+    fn handle_rename_provider(&self, body: &[u8]) -> ApiResponse {
+        let request: ProviderRenameRequest = match serde_json::from_slice(body) {
+            Ok(r) => r,
+            Err(e) => return ApiResponse::error(400, &format!("invalid request body: {e}")),
+        };
+        let from = request.from.trim();
+        let to = request.to.trim();
+        if from.is_empty() || to.is_empty() {
+            return ApiResponse::error(400, "both \"from\" and \"to\" are required");
+        }
+        if from == to {
+            return ApiResponse::error(400, "\"from\" and \"to\" are the same provider");
+        }
+        match self.store.rename_provider(from, to) {
+            Ok(report) => ApiResponse::json(200, &report),
             Err(e) => ApiResponse::error(500, &e.to_string()),
         }
     }
@@ -327,6 +366,65 @@ mod tests {
 
     fn parse_json(resp: &ApiResponse) -> serde_json::Value {
         serde_json::from_slice(&resp.body).unwrap()
+    }
+
+    #[test]
+    fn rename_provider_endpoint_moves_state() {
+        let store = Arc::new(InMemoryStore::new());
+        store
+            .save_circuit_breaker_state(CircuitBreakerStateRow {
+                provider: "old".into(),
+                state: 1,
+                failures: 1,
+                last_failure_at: 1,
+                force_open_until: 2_000_000_000_000,
+                successes_half_open: 0,
+                transitions: 1,
+                quota_opens: 1,
+                updated_at: chrono::Utc::now(),
+            })
+            .unwrap();
+        let api = AdminApi::new(
+            Arc::clone(&store) as Arc<dyn AdminStore>,
+            Arc::new(CostCalculator::new()),
+            MASTER_KEY,
+        );
+
+        let body = serde_json::to_vec(&serde_json::json!({"from": "old", "to": "new"})).unwrap();
+        let resp = api.handle_request("POST", "/admin/providers/rename", &body, MASTER_KEY);
+        assert_eq!(resp.status, 200);
+        let json = parse_json(&resp);
+        assert_eq!(json["from"], "old");
+        assert_eq!(json["to"], "new");
+        assert_eq!(json["breaker_migrated"], true);
+
+        let rows = store.load_circuit_breaker_states().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].provider, "new");
+        assert_eq!(rows[0].force_open_until, 2_000_000_000_000);
+    }
+
+    #[test]
+    fn rename_provider_endpoint_validates_input() {
+        let api = setup();
+        let same = serde_json::to_vec(&serde_json::json!({"from": "a", "to": "a"})).unwrap();
+        assert_eq!(
+            api.handle_request("POST", "/admin/providers/rename", &same, MASTER_KEY)
+                .status,
+            400
+        );
+        let missing = serde_json::to_vec(&serde_json::json!({"from": "a"})).unwrap();
+        assert_eq!(
+            api.handle_request("POST", "/admin/providers/rename", &missing, MASTER_KEY)
+                .status,
+            400
+        );
+        let empty = serde_json::to_vec(&serde_json::json!({"from": "  ", "to": "b"})).unwrap();
+        assert_eq!(
+            api.handle_request("POST", "/admin/providers/rename", &empty, MASTER_KEY)
+                .status,
+            400
+        );
     }
 
     #[test]

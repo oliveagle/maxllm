@@ -1,6 +1,7 @@
 // Copyright 2025 MaxLLM Contributors.
 // SPDX-License-Identifier: Apache-2.0
 
+pub mod admin;
 pub mod config;
 pub mod health;
 pub mod init;

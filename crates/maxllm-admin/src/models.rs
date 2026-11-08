@@ -213,6 +213,58 @@ pub struct CircuitBreakerStateRow {
     pub updated_at: DateTime<Utc>,
 }
 
+impl CircuitBreakerStateRow {
+    /// Fold `other` into this row, keeping the stricter of each field.
+    ///
+    /// Used when a rename targets a name that already carries breaker state:
+    /// the merged row must not look healthier than either input, or the
+    /// gateway would start trusting a channel whose history says otherwise.
+    /// Counters are not summed — a repeated rename must not inflate them.
+    pub fn merge_stricter(self, other: &Self) -> Self {
+        Self {
+            provider: self.provider,
+            state: self.state.max(other.state),
+            failures: self.failures.max(other.failures),
+            last_failure_at: self.last_failure_at.max(other.last_failure_at),
+            force_open_until: self.force_open_until.max(other.force_open_until),
+            successes_half_open: self.successes_half_open.min(other.successes_half_open),
+            transitions: self.transitions.max(other.transitions),
+            quota_opens: self.quota_opens.max(other.quota_opens),
+            updated_at: self.updated_at.max(other.updated_at),
+        }
+    }
+}
+
+/// Outcome of a provider rename.
+///
+/// A provider rename in the config used to strand the old name's resilience
+/// state: the breaker row kept the old name until the next restart, where the
+/// startup prune deleted it (the name was no longer in the config), and the
+/// new name started from a clean slate — a quota force-open or an open circuit
+/// silently evaporated. This report records what actually moved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProviderRenameReport {
+    /// The old provider name.
+    pub from: String,
+    /// The new provider name.
+    pub to: String,
+    /// A breaker row existed under `from` and now lives (or was merged) under `to`.
+    pub breaker_migrated: bool,
+    /// Both names had a breaker row; the stricter of the two was kept.
+    pub breaker_merged: bool,
+    /// Session pins rewritten from `from` to `to`.
+    pub sessions_moved: usize,
+}
+
+/// Body of `POST /admin/providers/rename`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProviderRenameRequest {
+    /// The old provider name.
+    pub from: String,
+    /// The new provider name.
+    pub to: String,
+}
+
 /// RBAC role for future use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

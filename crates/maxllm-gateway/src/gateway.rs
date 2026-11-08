@@ -1003,6 +1003,27 @@ impl AiGateway {
                         // name reads like live state to anyone inspecting the
                         // table. Prune it once at startup instead.
                         if !hot_state.providers.contains_key(&row.provider) {
+                            // Deleting is the right call for a provider that was
+                            // removed, but it also destroys real state when the
+                            // operator renamed the provider in the config and
+                            // forgot to migrate the row first (`maxllm admin
+                            // rename-provider`). Say so loudly instead of
+                            // counting the row away in silence.
+                            if row.state != 0
+                                || row.failures > 0
+                                || row.quota_opens > 0
+                                || row.force_open_until > crate::rate_limit::now_ms()
+                            {
+                                warn!(
+                                    provider = %row.provider,
+                                    state = row.state,
+                                    failures = row.failures,
+                                    quota_opens = row.quota_opens,
+                                    force_open_until = row.force_open_until,
+                                    "dropping circuit breaker state of a provider that is no longer in the config — \
+                                     if this was a rename, migrate the row first with `maxllm admin rename-provider`"
+                                );
+                            }
                             match admin_api.delete_circuit_breaker_state(&row.provider) {
                                 Ok(()) => pruned += 1,
                                 Err(e) => warn!(

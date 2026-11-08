@@ -16,12 +16,14 @@
 | 3 | 成本表为空，`cost_usd` 恒为 0，成本告警/预算失效 | 配置无 `[cost*]` 段；6,535 条完成日志 cost=0（仅 42 条非 0）；2,186 条 `no cost entry found` WARN（占全部 WARN 的 76%） | P0 |
 | 4 | 监控链路"只采不看"：无 maxllm 看板、无告警；日志全部灌进 `default` 流 | OpenObserve 20 条指标流均在更新，但 0 条 alert、2 个 dashboard 均与 maxllm 无关；collector 单 exporter 写死 `stream-name: default` | P1 |
 | 5 | provider 改名造成身份断裂：指标里 38 条 breaker series vs 配置 30 个 provider；旧路由被前缀匹配静默吞掉 | 9 条 `one_api_*` 僵尸 series；`one_api_volc_2` 仍 force-open 到 2026-11-27；旧 base_url `/v1/responses/one_api_*` 落到通用路由并被错误 provider 服务 | P1 |
-| 6 | body 哨兵 `auto` 在 `/v1/responses` 仍不可用（已知缺口未修） | 当天 11 次 404 + 2 次上游 400 由 `model:"auto"` 直接透传触发；391 次历史 404 集中在 11-07 12:00–14:00 三个小时里 | P1 |
+| 6 | body 哨兵 `auto` 在 `/v1/responses` 仍不可用（已知缺口未修）~~ **✅ 实测已不再触发**：`model='auto'` 最后一次出现在 2026-11-07T14:35Z；86 行历史里 74 行是 §2.2 已修的幽灵行、1 行是旧名前缀路由的 404 | 当天 11 次 404 + 2 次上游 400 由 `model:"auto"` 直接透传触发；391 次历史 404 集中在 11-07 12:00–14:00 三个小时里 | P1（见 §13.4） |
 | 7 | ~~`/health` 太浅、池健康检查未接线~~ **✅ 已收口**：`/health` 现在回 `pools{healthy,total}` + `open_providers`/`half_open_providers`；`maxllm-pool-health.timer` 5 min 一次；quota probe 已按改名后的 `kimi` 运行 | — | P1 |
-| 8 | breaker 指标是惰性快照，4 个 provider 长期显示 open 但实际已过 fail window | `is_open()` 在下次请求时才 lazy half-open，gauge 直接读原子 state | P2 |
-| 9 | `maxllm.err` 长期未轮转，且错误文案把 sentinel 当 provider | 23 行、全部停留在 11-04；`route '/v1/responses/auto' references unknown provider 'auto'` | P2 |
+| 8 | ~~breaker 指标是惰性快照~~ **✅ 已收口**：`/metrics` 在 scrape 时输出 `effective_state()`，过期的 open 会算成 closed | `is_open()` 在下次请求时才 lazy half-open，gauge 直接读原子 state | P2（已修） |
+| 9 | ~~`maxllm.err` 长期未轮转~~ **✅ 已收口**：`rotate_logs.py` 的 `DEFAULT_LOGS` 早含它，timer 每日跑（阈值 20 MiB / 留 2 代），当前 0 字节；sentinel 文案随 §6 一起消失 | 23 行、全部停留在 11-04；`route '/v1/responses/auto' references unknown provider 'auto'` | P2（已修） |
 | 10 | 自检探针流量计入生产指标 | 本机 loopback 探针命中已删除路由，产生 429/404/400 并写入 request_logs | P2 |
 | 11 | **`/v1/responses/<provider>` 只校验不钉住**（2026-11-08 晚发现并修复）：路径里的 provider 段被丢弃，请求按池路由走，最终由**别的** provider 作答，`route_path` 还记成 `/v1/responses` | 修复前 `/v1/responses/open_design` 实际由 `opencode_go_1` 作答；见 §12.1 | P1（已修 `ebcfa9f`） |
+| 12 | **provider 改名不迁移熔断 / 会话状态**（§5.3，本轮修复）：旧行留在 DB，新行从 0 开始，下次启动 prune 还把旧行删掉 | 改名当天 `volc_1` 的 9 次 quota-open 归零、`volc_2` 的 force-open 被"解除"；实测 `one_api_volc_1`→`volc_1` 合并后 state/failures/force_open_until/quota_opens 全部保留 | P1（新增 `maxllm admin rename-provider`，见 §13.1） |
+| 13 | **P2 三项按证据关掉，没有加机制**：请求体落盘（写入侧已脱敏 + 14 天保留）、`maxllm.err` 轮转（本就存在）、breaker gauge 语义（scrape 时算 effective state） | recordings 30 分片 84,833 行 `--dry-run` 0 行待擦；`maxllm.err` 0 字节 | P2（见 §13.2 / §13.3 / §8） |
 
 **正常项**（不用改）：session 亲和命中 3,488 / miss 22（size 8）；97.6% 的客户端请求
 以 200 结束；failover 链在 429/404 上工作正常；auto/auto_home 双池互不越界；OTel
@@ -414,6 +416,21 @@ Anthropic `cache_read_input_tokens`），落在 `ctx.cached_tokens_in`，暴露�
    等于把熔断器的记忆重置了。建议 provider rename 时按 `(base_url, model)` 迁移
    状态行，或提供 `maxllm admin rename-provider` 子命令。
 
+   **✅ 已修（2026-11-08 22:5x–23:0x CST）**：新增 `maxllm admin rename-provider`
+   （`AdminStore::rename_provider` + `POST /admin/providers/rename`），在**一个 SQLite
+   事务**里把 `circuit_breaker_state` 迁到新名、把 `session_bindings` 的 provider 列改写。
+   目标名已有行时按 `CircuitBreakerStateRow::merge_stricter` 合并（开着的仍开、较晚的
+   force-open deadline 胜出、计数器取 max 不相加）。`--dry-run` 走**只读连接**
+   （`SqliteStore::open_read_only`，不碰正在写 request_logs 的生产库）。命令先校验配置
+   顺序：`--to` 必须已在配置里、`--from` 必须已不在配置里，否则报错并提示「先改配置」——
+   因为启动时的 prune 会把迁错的行动删掉。配套改动：启动 prune 遇到**有实质状态**
+   （state≠0 / failures>0 / quota_opens>0 / 未过期 force-open）的未知 provider 行时
+   打 WARN 并点名该命令，不再静默计数。测试 +10（in-memory / sqlite / 重开文件库 /
+   API 端点 / 输入校验），workspace **845 全绿**，fmt+clippy 干净。实测：在 NAS 生产库
+   的副本上把 `one_api_volc_1`(state=1, failures=4, quota_opens=3) 迁到已有行的
+   `volc_1` → 合并结果为 `state=1/failures=4/force_open_until=1794153600000/quota_opens=3`，
+   两条 session pin 一并改写；真库上 `--dry-run` 只读可用。
+
 ---
 
 ## 6. P1：body 哨兵 `auto` 仍然不可用
@@ -425,6 +442,15 @@ Anthropic `cache_read_input_tokens`），落在 `ctx.cached_tokens_in`，暴露�
   （这个判断是对的）。**建议改成精确匹配**：只有当 body `model` 恰好等于某个池名
   （`auto` / `auto_home`）时才走池；其他模型名保持原样。这样既保留显式模型语义，
   又消除哨兵的 404 风暴。
+
+**✅ 现状（2026-11-08 23:0x CST 复核）**：`adopt_sentinel_model()` 已经把「选中 provider
+是池成员」这一路修好（body 被改写成该条目的真实模型名，不再有 404 与 failover 风暴）；
+`request_logs` 里 `model='auto'` 的行**最后一次出现在 2026-11-07T14:35Z**，此后再无——
+历史 86 行里 74 行是已修的 `status=0` 幽灵行（§2.2），1 行是旧名前缀路由的 404。
+剩下唯一未覆盖的分支是「选中 provider 不在池里」（只有会话被钉在池外 provider 时才可能），
+现在该分支会打 WARN 点名 `provider` / `pool` **并且**不再重写 body。不改语义（不把显式
+路由静默改写成池路由），因为按 §6 的精确匹配方案等于改变路由契约，而实测该分支已不再
+触发。
 
 ---
 
@@ -554,9 +580,9 @@ pool_health 接 timer（5 min）；probe 显式传 `--provider kimi`；探针请
 
 | 项 | 现状 | 建议 |
 |---|---|---|
-| breaker gauge 语义 | `state=1` 是惰性快照；4 个 provider fail window 已过仍显示 open | gauge 输出 effective state，或加 `last_failure_at`/`force_open_until` 标签 |
-| `maxllm.err` | 23 行、全部停留在 11-04，无轮转 | logrotate（按大小/天），并修掉 `unknown provider 'auto'` 的误导文案（sentinel 不是 provider） |
-| 请求体落盘 | recordings 里 451 条 client_request + 388 条 client_response 存了完整 body | 脱敏（API key / 个人信息）或只存 hash + 长度；明确保留期 |
+| breaker gauge 语义 | **✅ 已收口**：`/metrics` 在 scrape 时输出 `effective_state()`（惰性快照里 fail window 已过的 open 会被算成 closed） | — |
+| `maxllm.err` | **✅ 已收口**：`rotate_logs.py` 的 `DEFAULT_LOGS` 已含 `maxllm.err`，`maxllm-logrotate.timer` 每日 00:00 跑（`--max-bytes 20MiB --keep 2`）；文件当前 0 字节（11-04 的 3.4K 已归档为 `.err.20261104-archive`）。`unknown provider 'auto'` 文案来自 §6 的哨兵分支，已随 `adopt_sentinel_model` 收口 | — |
+| 请求体落盘 | **✅ 已收口**：`[recording] redact = true` + `redact_pii = true` 在**写入时**脱敏。实测：30 个分片 / 84,833 行里 `redact_recordings.py --dry-run`（含 PII 规则）判定 **0 行需要擦**；唯一命中 `secret` 的两行是一轮脱敏自测留下的 `[REDACTED]`/`[EMAIL]` 占位，说明写入侧规则真的生效。保留期由 `maxllm-logrotate.timer` 的 `--recordings-days 14` 执行 | — |
 | `/metrics` 暴露 | **✅ 已收口**：0.3.9 起远程抓取一律 `403 metrics is loopback-only`（loopback 抓取不受影响，collector 本来就走 localhost）；两台节点均已实测 | — |
 | `cmd` provider 403（2026-11-08 19:5x CST） | 直连上游 `api.commandcode.ai/provider/v1/{responses,chat/completions}` 均 403 `{"code":"upgrade_required","message":"Your Go plan doesn't include API access. Upgrade to Provider or higher"}` —— 是**订阅档位问题，不是网关 bug**（网关正确透传 403 JSON）。Go 档位能用的通道是 `cmd_cli`（CLI 桥，`maxllm-commandcode.service`） | 升级 Provider 档，或把 `/v1/responses/cmd` 路由指向 `cmd_cli`；`cmd` 的 403 由上游计费决定，网关侧无需改 |
 | 大 prompt | p50 96k tokens、p90 200k（`request_logs.tokens_in`）；原写"≥128k 截断率 38.5%"用的是被误分类的客户端放弃行，按 `Upstream` 口径重算**没有证据**（§1.1） | 无证据支持预检；若要做，动机应是**上游成本/额度**（长 prompt 每次都是全额输入计费）而不是截断 |
@@ -862,6 +888,58 @@ OPENOBSERVE_ENDPOINT=<...> OPENOBSERVE_AUTH=<...> \
 ```
 
 需要用户给一个 webhook（本机 dotvault 里没有飞书 bot 的 URL）。
+
+---
+
+## 13. 收尾轮（2026-11-08 22:5x–23:1x CST）：§5.3 落地，P2 三项按证据关掉
+
+本轮没有新增线上事故，做的是「把上一轮记下的建议改掉或证明不必改」。
+
+### 13.1 provider 改名的状态迁移（§5.3，已实现）
+
+- `maxllm-admin` 新增 `AdminStore::rename_provider(from, to)`：一个 SQLite 事务里搬
+  `circuit_breaker_state`、改 `session_bindings.provider`；目标名已有行时
+  `merge_stricter`（state/failures/last_failure_at/force_open_until/transitions/
+  quota_opens 取 max，successes_half_open 取 min，`updated_at` 取较新）。计数器**不相加**，
+  免得同一对名字反复迁移把历史越滚越大。
+- `maxllm admin rename-provider --from --to [--db] [--config] [--dry-run] [--json] [--force]`：
+  离线跑（网关停着也行、`[admin] enabled = false` 也行）；`--dry-run` 用
+  `SqliteStore::open_read_only()`，**不**在生产库上取写锁。
+- 顺序护栏：先查配置，`--to` 不在配置里 / `--from` 还在配置里都直接报错（`--force` 可越过），
+  因为启动 restore 会 prune 掉「provider 已不在配置里」的行 —— 迁早了等于白迁。
+- 网关侧：启动 prune 碰到**有实质状态**的未知 provider 行（state≠0 或 failures>0 或
+  quota_opens>0 或 force-open 未过期）不再静默删，改为 WARN 并点名该命令。
+- 测试：+10 个（in-memory 迁移/合并/同名拒绝/无状态；sqlite 迁移/合并/重开库后仍在；
+  API 端点成功与三种输入校验）。workspace **845 passed / 0 failed / 4 ignored**。
+- 验证：NAS 生产库副本上 `one_api_volc_1`(open, failures=4, quota_opens=3,
+  force_open_until=1794153600000) → `volc_1`（已有 closed 行），合并后四个字段全部保留，
+  两条 session pin 改写；真库 `--dry-run` 只读跑通。
+
+### 13.2 请求体落盘（§8）：写入侧已脱敏，历史分片无一需要擦
+
+`[recording] redact = true` / `redact_pii = true` 在写入时生效，脚本只是给「开关之前」
+的历史分片补刀。实测 NAS `recordings/` 30 个分片 84,833 行：`redact_recordings.py
+--dry-run`（PII 规则开）**0 行待擦**。全库扫 `secret` 只命中 2 行，是一轮脱敏自测写进去的
+`Ignore this test secret [REDACTED] and mail [EMAIL]` —— 反向证明写入侧规则在跑。
+保留期已由 `maxllm-logrotate.timer`（`--recordings-days 14`）执行，无需再加机制。
+
+### 13.3 `maxllm.err`（§8）：轮转早就在，只是文件是空的
+
+`rotate_logs.py` 的 `DEFAULT_LOGS` 本来就含 `maxllm.err`，timer 每日 00:00 跑，
+阈值 20 MiB / 保留 2 代；当前 `maxllm.err` 0 字节（11-04 的 3.4K 已手工归档为
+`.err.20261104-archive`）。原来那条「无轮转」是**看文件时间戳得出的误判**，不是缺功能。
+
+### 13.4 body 哨兵 `auto`（§6）：实测已不再触发
+
+`model='auto'` 在 `request_logs` 里最后一次出现是 **2026-11-07T14:35Z**；历史 86 行中
+74 行是 §2.2 已修的 `status=0` 幽灵行、1 行是旧名前缀路由的 404。`adopt_sentinel_model()`
+覆盖了「选中 provider 是池成员」的主路；剩余「选中 provider 不在池里」分支现在会 WARN
+点名 provider/pool。不改写显式模型语义，因为该分支已无实际流量。
+
+### 13.5 仍未做（不变）
+
+`open_design` 是否移出 auto 池、是否发版（bump 0.3.11 或补打 `v0.3.10` tag）、
+告警 webhook 换真实出口、VPS 0.3.8 → 0.3.10 升级 —— 四项都需要用户拍板或凭据。
 
 ---
 
