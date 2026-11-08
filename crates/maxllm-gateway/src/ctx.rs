@@ -36,6 +36,11 @@ pub struct RequestCtx {
     /// Token usage extracted from the response.
     pub tokens_in: u64,
     pub tokens_out: u64,
+    /// The part of `tokens_in` the upstream served from its prompt cache. It is
+    /// *included* in `tokens_in`, not additional: vendors bill cached input at
+    /// a fraction of the list price (MiniMax M3 ~$0.05/M vs $0.30/M), so
+    /// keeping it separate is what makes a cost figure meaningful.
+    pub cached_tokens_in: u64,
     /// Model used for the request.
     pub model: String,
     /// Whether a fallback provider was used.
@@ -219,6 +224,7 @@ impl RequestCtx {
             request_start: Instant::now(),
             tokens_in: 0,
             tokens_out: 0,
+            cached_tokens_in: 0,
             model: String::new(),
             fallback_used: false,
             original_provider: None,

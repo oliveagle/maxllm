@@ -5149,6 +5149,12 @@ impl ProxyHttp for AiGateway {
                 .tokens_out_total
                 .with_label_values(&[&ctx.provider_name, &ctx.model])
                 .inc_by(ctx.tokens_out);
+            if ctx.cached_tokens_in > 0 {
+                METRICS
+                    .cached_input_tokens_total
+                    .with_label_values(&[&ctx.provider_name, &ctx.model])
+                    .inc_by(ctx.cached_tokens_in);
+            }
         }
 
         let hot = self.hot.load();
@@ -5282,6 +5288,7 @@ impl ProxyHttp for AiGateway {
             request_id = ?ctx.plugin_ctx.request_id,
             tokens_in = ctx.tokens_in,
             tokens_out = ctx.tokens_out,
+            cached_in = ctx.cached_tokens_in,
             cost_usd = format!("{:.6}", cost),
             latency_ms = latency_ms,
             fallback = ctx.fallback_used,
@@ -6211,6 +6218,25 @@ fn copy_usage_tokens(usage: &serde_json::Value, ctx: &mut RequestCtx) {
     if ctx.upstream_cost_usd.is_none() {
         ctx.upstream_cost_usd = extract_usage_cost(usage);
     }
+    copy_cached_tokens(usage, ctx);
+}
+
+/// Copy the prompt-cache hit count out of a usage block.
+///
+/// Three shapes are in the wild and all of them report the cached part
+/// *inside* the input count, never on top of it:
+///   * chat completions / MiniMax / one-api: `prompt_tokens_details.cached_tokens`
+///   * Responses: `input_tokens_details.cached_tokens`
+///   * Anthropic messages: `cache_read_input_tokens`
+fn copy_cached_tokens(usage: &serde_json::Value, ctx: &mut RequestCtx) {
+    let cached = usage
+        .pointer("/prompt_tokens_details/cached_tokens")
+        .or_else(|| usage.pointer("/input_tokens_details/cached_tokens"))
+        .or_else(|| usage.get("cache_read_input_tokens"))
+        .and_then(|v| v.as_u64());
+    if let Some(cached) = cached {
+        ctx.cached_tokens_in = cached;
+    }
 }
 
 /// Find the byte index of the first occurrence of `needle` in `haystack`
@@ -6304,24 +6330,11 @@ fn extract_usage_cost(usage: &serde_json::Value) -> Option<f64> {
 
 /// Extract token usage from a response body.
 fn extract_usage(body: &serde_json::Value, ctx: &mut RequestCtx) {
+    // One parser for both paths: the streaming and the buffered response carry
+    // the same usage object, and keeping two copies is how the cached-token
+    // field would end up read on one path and ignored on the other.
     if let Some(usage) = body.get("usage") {
-        // OpenAI format
-        if let Some(pt) = usage.get("prompt_tokens").and_then(|v| v.as_u64()) {
-            ctx.tokens_in = pt;
-        }
-        if let Some(ct) = usage.get("completion_tokens").and_then(|v| v.as_u64()) {
-            ctx.tokens_out = ct;
-        }
-        // Anthropic format
-        if let Some(it) = usage.get("input_tokens").and_then(|v| v.as_u64()) {
-            ctx.tokens_in = it;
-        }
-        if let Some(ot) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
-            ctx.tokens_out = ot;
-        }
-        if ctx.upstream_cost_usd.is_none() {
-            ctx.upstream_cost_usd = extract_usage_cost(usage);
-        }
+        copy_usage_tokens(usage, ctx);
     }
 
     // Extract model from response if not set
@@ -6609,6 +6622,80 @@ mod stream_usage_tests {
         extract_stream_usage(chunk, &mut c, true);
         assert_eq!(c.tokens_in, 31);
         assert_eq!(c.tokens_out, 7);
+    }
+
+    /// The prompt-cache hit count arrives in three shapes, always *inside*
+    /// the input count. Losing it is what makes a cost figure quote list price
+    /// for tokens the vendor billed at a tenth of it.
+    #[test]
+    fn test_cached_input_tokens_are_extracted_on_every_shape() {
+        let json = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap();
+
+        // chat completions (also MiniMax / one-api behind a chat endpoint)
+        let mut c = ctx();
+        copy_usage_tokens(
+            &json(
+                r#"{"prompt_tokens":1000,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":896}}"#,
+            ),
+            &mut c,
+        );
+        assert_eq!(
+            (c.tokens_in, c.tokens_out, c.cached_tokens_in),
+            (1000, 5, 896)
+        );
+
+        // Responses
+        let mut c = ctx();
+        copy_usage_tokens(
+            &json(
+                r#"{"input_tokens":101,"output_tokens":7,"input_tokens_details":{"cached_tokens":96}}"#,
+            ),
+            &mut c,
+        );
+        assert_eq!((c.tokens_in, c.cached_tokens_in), (101, 96));
+
+        // Anthropic messages
+        let mut c = ctx();
+        copy_usage_tokens(
+            &json(r#"{"input_tokens":20,"output_tokens":3,"cache_read_input_tokens":18}"#),
+            &mut c,
+        );
+        assert_eq!((c.tokens_in, c.cached_tokens_in), (20, 18));
+
+        // A provider that reports no cache detail leaves the count at zero
+        // rather than inventing one.
+        let mut c = ctx();
+        copy_usage_tokens(
+            &json(r#"{"prompt_tokens":10,"completion_tokens":1}"#),
+            &mut c,
+        );
+        assert_eq!(c.cached_tokens_in, 0);
+    }
+
+    /// The buffered path must book the same numbers as the streaming one — they
+    /// used to be two hand-copied parsers.
+    #[test]
+    fn test_buffered_and_streamed_usage_agree() {
+        let mut buffered = ctx();
+        extract_usage(
+            &serde_json::from_str::<serde_json::Value>(
+                r#"{"model":"MiniMax-M3","usage":{"prompt_tokens":500,"completion_tokens":9,"prompt_tokens_details":{"cached_tokens":480}}}"#,
+            )
+            .unwrap(),
+            &mut buffered,
+        );
+        let mut streamed = ctx();
+        copy_usage_tokens(
+            &serde_json::from_str::<serde_json::Value>(
+                r#"{"prompt_tokens":500,"completion_tokens":9,"prompt_tokens_details":{"cached_tokens":480}}"#,
+            )
+            .unwrap(),
+            &mut streamed,
+        );
+        assert_eq!(buffered.tokens_in, streamed.tokens_in);
+        assert_eq!(buffered.tokens_out, streamed.tokens_out);
+        assert_eq!(buffered.cached_tokens_in, streamed.cached_tokens_in);
+        assert_eq!(buffered.model, "MiniMax-M3");
     }
 
     #[test]

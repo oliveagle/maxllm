@@ -78,6 +78,11 @@ pub struct GatewayMetrics {
     /// before writing. Non-zero means clients are pasting credentials or
     /// personal data through the gateway; the bytes never reach the log store.
     pub recording_redactions_total: IntCounter,
+    /// The part of the input tokens the upstream served from its prompt cache,
+    /// per provider and model. Cached input is billed at a fraction of the list
+    /// price, so `cached_tokens_in / tokens_in_total` is the discount factor a
+    /// cost figure is missing.
+    pub cached_input_tokens_total: IntCounterVec,
     /// Sessions that ended before the router was reached: no route, no
     /// provider, no tokens, no cost. They are not requests (an aborted
     /// `/health` scrape is the common case) and must not be booked as
@@ -340,6 +345,18 @@ impl GatewayMetrics {
             .register(Box::new(recording_redactions_total.clone()))
             .expect("register");
 
+        let cached_input_tokens_total = IntCounterVec::new(
+            Opts::new(
+                "maxllm_cached_input_tokens_total",
+                "Input tokens the upstream served from its prompt cache",
+            ),
+            &["provider", "model"],
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(cached_input_tokens_total.clone()))
+            .expect("register");
+
         let unrouted_sessions_total = IntCounter::new(
             "maxllm_unrouted_sessions_total",
             "Sessions that ended before the router was reached (no route or provider)",
@@ -375,6 +392,7 @@ impl GatewayMetrics {
             provider_retries_total,
             provider_inflight_requests,
             recording_redactions_total,
+            cached_input_tokens_total,
             unrouted_sessions_total,
         }
     }

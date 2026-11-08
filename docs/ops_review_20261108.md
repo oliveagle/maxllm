@@ -291,10 +291,16 @@ RST 探测 → 断言 `request_logs` 为空、`active_requests==0`；再发一�
    合计 62% input 命中），所以 $36 应视为**上限**，真实账单可能低一个档。
 2. **>512k 分档翻倍**未实现（当前 6 小时均值 92k/请求，暂未触发）。
 
-**下一步**：给 `ModelCost` 加缓存单价，在 `copy_usage_tokens`/`extract_usage` 里解析
-`prompt_tokens_details.cached_tokens` / `input_tokens_details.cached_tokens` /
-Anthropic `cache_read_input_tokens`，按 `(tokens_in - cached) × list + cached × cache_rate`
-计价，并加 `maxllm_cached_input_tokens_total{provider,model}` 让命中率可见。
+**已做（采集半）**：`copy_usage_tokens`/`extract_usage` 现在解析三种缓存字段
+（`prompt_tokens_details.cached_tokens` / `input_tokens_details.cached_tokens` /
+Anthropic `cache_read_input_tokens`），落在 `ctx.cached_tokens_in`，暴露为
+`maxllm_cached_input_tokens_total{provider,model}`（是 `tokens_in_total` 的**子集**，
+不是额外量），完成日志也带 `cached_in`。两条解析路径原来各抄一份，现在合流成
+`copy_usage_tokens`，单测钉住"三条形态 + 缓冲/流式同值"。
+
+**下一步**：拿到命中率之后再定单价 —— 给价格表加 `cached_input_per_1m`，按
+`(tokens_in - cached) × list + cached × cache_rate` 计价（未配置就维持现状：全按 list），
+这样在不知道渠道真实缓存单价时不会把账少记。
 
 ---
 
@@ -489,6 +495,7 @@ EOF
 | 新增（审计未列） | ✅ | **流截断率自动降级**：某 provider 在一分钟窗口内截断数 ≥4 且占比 ≥25% 时强制开闸 `fail_timeout`，路由自动走到 fallback 下一家（`maxllm_circuit_breaker_stream_opens_total` + `maxllm-stream-demotions` 告警） | 集成测试 `test_a_truncating_provider_is_demoted_and_traffic_moves_to_the_fallback`：4 次截断后第 5 个请求由健康 fallback 服务 |
 | P0-2 修复后实测 | ✅ 已核对 | 按 10 分钟切片复算 `request_logs`：03:00–04:09 UTC 285 个 200 全零 usage（只有 `one_api_*` 在服务）、04:10–06:19 40%、**06:20 UTC（14:23 CST 新二进制）起 208/208 = 100%**；当日 2 785 条零 usage 里 2 778 条无 error，几乎全在 06:20 之前 ⇒ 是 §2 的历史存量（§2.1） | 修复后窗口内仅剩的零 usage 行逐条带 `Downstream ConnectionClosed`（4/4 = 客户端放弃），不是提取缺口 |
 | P1-幽灵行 `provider="" status=0` | ✅ 已修 | 四个快路径把 `skip_logging` 挪到第一个 `await` 之前；`logging` 的 `active_requests.dec()` 改为只在 `active_request_counted` 时执行；新增 `is_unrouted_session()` 守卫（不写 `request_logs`、不算 `requests_total{status="0"}`，改记 `maxllm_unrouted_sessions_total`，客户端侧降 debug、内部侧保持 warn）；`request_path` 一进 `request_filter` 就落 ctx（§2.2） | 集成测试 `aborted_fast_path_probe_leaves_no_request_log` **修复前必失败**（4 条幽灵行）、修复后通过，且真实请求仍恰好 1 行；单元测试钉住判据；线上 13/13 探测复现、修复后 0 行、`active_requests` 恒 0 |
+| P0-3 缓存命中采集 | ✅ 已修（采集侧） | `ctx.cached_tokens_in` + `copy_cached_tokens()` 统一解析三种形态；`extract_usage` 与 `copy_usage_tokens` 合流（原来两份手抄，缓存字段只会在一条路径上被读到）；新增 `maxllm_cached_input_tokens_total{provider,model}`（`tokens_in_total` 的子集）+ 完成日志 `cached_in` | 单测 `test_cached_input_tokens_are_extracted_on_every_shape`（chat/Responses/Anthropic/无该字段）与 `test_buffered_and_streamed_usage_agree`；线上指标已出数（§3.1） |
 | P0-3 价格表复核 | ✅ 已核对（未改价） | `minimax`/`MiniMax-M3` 6 小时 1 290 请求、119.2M in / 0.51M out 记 $36.379，与内置 $0.30/M + $1.20/M 复算值 $36.377 一致，也与厂商公开价一致；**未建模** prompt cache 折价与 >512k 翻倍 ⇒ 该数字是上限（§3.1） | 反推单价 $0.3051/M 与配置单价吻合，排除重复计费/单位错位 |
 
 ### 仍未做（需拍板或有前置）

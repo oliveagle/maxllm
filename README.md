@@ -1409,6 +1409,7 @@ Available at `GET /metrics` when enabled:
 | `requests_total` | provider, model, status | Counter |
 | `tokens_in_total` | provider, model | Counter |
 | `tokens_out_total` | provider, model | Counter |
+| `cached_input_tokens_total` | provider, model | Counter |
 | `request_duration_seconds` | provider | Histogram |
 | `active_requests` | &mdash; | Gauge |
 | `fallbacks_total` | from_provider, to_provider | Counter |
@@ -1439,6 +1440,18 @@ failure). `active_requests` counts application requests in flight — the
 `/health`, `/version`, `/v1/models` and `/metrics` fast paths are not counted,
 so the gauge reads 0 when idle, and a scrape that hangs up mid-write can no
 longer drive it negative.
+
+`cached_input_tokens_total` is a **subset** of `tokens_in_total`: the tokens the
+upstream served from its prompt cache. Vendors bill those at a fraction of the
+list price (MiniMax M3: ~$0.05/M against $0.30/M), so the ratio
+`cached_input_tokens_total / tokens_in_total` is the discount a cost figure is
+missing. The gateway reads all three shapes in the wild —
+`prompt_tokens_details.cached_tokens` (chat completions, MiniMax, one-api),
+`input_tokens_details.cached_tokens` (Responses) and
+`cache_read_input_tokens` (Anthropic) — and logs the count on the
+`request completed` line as `cached_in`. Cost is still booked at the list price
+for now (see `docs/ops_review_20261108.md` §3.1): measure the hit rate first,
+then set a cache rate per model.
 
 `unrouted_sessions_total` counts sessions that ended **before the router was
 reached** — the usual cause is a client that resets the connection between the
