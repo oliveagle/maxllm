@@ -32,6 +32,15 @@ struct LatencyStats {
 static LATENCY: Lazy<RwLock<AHashMap<String, LatencyStats>>> =
     Lazy::new(|| RwLock::new(AHashMap::new()));
 
+/// EWMA of the *whole* exchange (request start to the client's last byte),
+/// as opposed to [`LATENCY`], which is time-to-first-byte. The two are
+/// different routing signals: TTFB answers "how fast does a provider start
+/// speaking", the full duration answers "how long is a client actually
+/// waiting" — a provider can have a snappy first byte and a slow generation,
+/// so the auto pool's latency filter uses this one.
+static TOTAL_LATENCY: Lazy<RwLock<AHashMap<String, LatencyStats>>> =
+    Lazy::new(|| RwLock::new(AHashMap::new()));
+
 static INFLIGHT: Lazy<RwLock<AHashMap<String, u64>>> = Lazy::new(|| RwLock::new(AHashMap::new()));
 
 /// Record one successful upstream attempt's latency for `provider`.
@@ -47,6 +56,30 @@ pub fn record_latency(provider: &str, latency_ms: f64) {
         EWMA_ALPHA * latency_ms + (1.0 - EWMA_ALPHA) * stats.ewma_ms
     };
     stats.samples += 1;
+}
+
+/// Record one completed exchange's total duration for `provider` (ms),
+/// for the auto pool's latency filter. Only successful exchanges count.
+pub fn record_total_latency(provider: &str, latency_ms: f64) {
+    let mut map = TOTAL_LATENCY.write().unwrap_or_else(|e| e.into_inner());
+    let stats = map.entry(provider.to_string()).or_default();
+    stats.ewma_ms = if stats.samples == 0 {
+        latency_ms
+    } else {
+        EWMA_ALPHA * latency_ms + (1.0 - EWMA_ALPHA) * stats.ewma_ms
+    };
+    stats.samples += 1;
+}
+
+/// Current whole-exchange latency estimate in milliseconds, `None` before the
+/// first successful exchange.
+pub fn total_latency_ms(provider: &str) -> Option<f64> {
+    TOTAL_LATENCY
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(provider)
+        .filter(|s| s.samples > 0)
+        .map(|s| s.ewma_ms)
 }
 
 /// Current latency estimate in milliseconds, `None` before the first
@@ -106,6 +139,21 @@ mod tests {
     fn ewma_first_sample_is_the_value() {
         record_latency("lat-ewma-1", 120.0);
         assert_eq!(latency_ms("lat-ewma-1"), Some(120.0));
+    }
+
+    #[test]
+    fn total_latency_ewma_mirrors_ttfb_ewma() {
+        // A slow generation (200 ms) after a fast first byte (100 ms): the
+        // total EWMA must converge on the whole-exchange number.
+        record_total_latency("lat-total-1", 100.0);
+        assert_eq!(total_latency_ms("lat-total-1"), Some(100.0));
+        record_total_latency("lat-total-1", 200.0);
+        assert_eq!(total_latency_ms("lat-total-1"), Some(130.0));
+    }
+
+    #[test]
+    fn total_latency_is_none_before_the_first_sample() {
+        assert_eq!(total_latency_ms("lat-total-never"), None);
     }
 
     #[test]

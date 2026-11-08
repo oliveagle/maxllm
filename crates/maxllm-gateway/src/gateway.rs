@@ -316,6 +316,9 @@ pub struct HotState {
 pub struct AutoPoolState {
     pub name: String,
     pub entries: Vec<AutoPoolEntry>,
+    /// Whether the rotation prefers the low-latency cohort inside the
+    /// preferred billing tier (see `[auto_model].prefer_fast`).
+    pub prefer_fast: bool,
 }
 
 impl AutoPoolState {
@@ -755,7 +758,11 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
             metered,
             "Auto pool ready (subscription tier first, metered only as last resort)"
         );
-        auto_pools.push(AutoPoolState { name, entries });
+        auto_pools.push(AutoPoolState {
+            name,
+            entries,
+            prefer_fast: auto.prefer_fast,
+        });
     }
 
     // Build the /v1/models response
@@ -852,6 +859,84 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
 
 /// Round-robin counter for the auto pool (shared across auto routes).
 static AUTO_POOL_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Auto-pool fast-cohort tuning. An entry whose EWMA latency exceeds the
+/// tier's median by more than [`AUTO_POOL_COHORT_MEDIAN_MULTIPLIER`]× — with
+/// an absolute floor so a uniformly-fast cluster is never cut in half — is
+/// skipped by the rotation; it stays available as a failover/last-resort
+/// target (it is never circuit-opened by this filter).
+const AUTO_POOL_COHORT_MEDIAN_MULTIPLIER: f64 = 2.5;
+/// Absolute floor for the cohort ceiling (ms): even a 200 ms provider is not
+/// dropped because a 100 ms one exists.
+const AUTO_POOL_COHORT_FLOOR_MS: f64 = 5_000.0;
+/// Every Nth rotation walks the *whole* preferred tier instead of the fast
+/// cohort, so a provider that recovered (or a brand-new one) is re-measured
+/// and can rejoin the fast cohort.
+const AUTO_POOL_EXPLORE_EVERY: u64 = 50;
+
+/// The low-latency cohort of `healthy` for one rotation: every entry whose
+/// whole-exchange EWMA (time-to-last-byte, not TTFB) is within the ceiling of
+/// the tier's median, plus every entry that has no measurement yet (it has
+/// not been proven slow, and the rotation
+/// is what produces its first measurement). When nothing has been measured —
+/// a freshly-started gateway — the whole tier is returned, so the first
+/// requests behave exactly like plain round-robin.
+fn auto_pool_fast_cohort<'a>(healthy: &[&'a AutoPoolEntry]) -> Vec<&'a AutoPoolEntry> {
+    let mut measured: Vec<f64> = Vec::with_capacity(healthy.len());
+    for e in healthy.iter() {
+        if let Some(ms) = crate::provider_stats::total_latency_ms(&e.provider) {
+            measured.push(ms);
+        }
+    }
+    if measured.is_empty() {
+        return healthy.to_vec();
+    }
+    measured.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = measured[measured.len() / 2];
+    let ceiling = (median * AUTO_POOL_COHORT_MEDIAN_MULTIPLIER).max(AUTO_POOL_COHORT_FLOOR_MS);
+    let cohort: Vec<&'a AutoPoolEntry> = healthy
+        .iter()
+        .copied()
+        .filter(
+            |e| match crate::provider_stats::total_latency_ms(&e.provider) {
+                Some(ms) => ms <= ceiling,
+                None => true,
+            },
+        )
+        .collect();
+    if cohort.is_empty() {
+        healthy.to_vec()
+    } else {
+        cohort
+    }
+}
+
+/// The entries one rotation may choose from, in tier order.
+///
+/// [`auto_pool_fast_cohort`] applied, except when the pool opted out
+/// (`prefer_fast = false`) or this is an exploration rotation, which walks
+/// the whole tier so a recovered provider can re-measure and rejoin. Every
+/// entry the filter removes is counted, so the effect of the decision is
+/// visible in `/metrics` and the request log is explainable.
+fn auto_pool_rotation<'a>(
+    pool: &AutoPoolState,
+    healthy: &[&'a AutoPoolEntry],
+    idx: u64,
+) -> Vec<&'a AutoPoolEntry> {
+    if !pool.prefer_fast || idx.is_multiple_of(AUTO_POOL_EXPLORE_EVERY) {
+        return healthy.to_vec();
+    }
+    let cohort = auto_pool_fast_cohort(healthy);
+    for e in healthy {
+        if !cohort.iter().any(|c| c.provider == e.provider) {
+            METRICS
+                .auto_pool_slow_skips_total
+                .with_label_values(&[&e.provider])
+                .inc();
+        }
+    }
+    cohort
+}
 
 impl AiGateway {
     pub fn new(config: &Config) -> Result<Self, Box<dyn std::error::Error>> {
@@ -1225,10 +1310,10 @@ impl AiGateway {
         let entry = match chosen {
             Some(entry) => entry,
             None => {
-                let idx =
-                    AUTO_POOL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as usize;
-                (0..healthy.len())
-                    .map(|i| healthy[(idx + i) % healthy.len()])
+                let idx = AUTO_POOL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let rotation = auto_pool_rotation(pool, &healthy, idx);
+                (0..rotation.len())
+                    .map(|i| rotation[(idx as usize + i) % rotation.len()])
                     .find(|e| admits(e))?
             }
         };
@@ -5644,6 +5729,13 @@ impl ProxyHttp for AiGateway {
         }
 
         let latency_ms = duration.as_millis() as u64;
+        // Feed the auto pool's latency filter with the *whole* exchange
+        // duration (time-to-last-byte). Successes only: the cohort must rank
+        // by how long a client actually waits, and a failed exchange is not a
+        // latency sample. TTFB keeps feeding the route latency strategy.
+        if ctx.upstream_status < 400 && !ctx.provider_name.is_empty() {
+            crate::provider_stats::record_total_latency(&ctx.provider_name, latency_ms as f64);
+        }
 
         info!(
             provider = %ctx.provider_name,
@@ -5813,9 +5905,10 @@ impl AiGateway {
             if healthy.is_empty() {
                 return None;
             }
-            let idx = AUTO_POOL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as usize;
-            let entry = (0..healthy.len())
-                .map(|i| healthy[(idx + i) % healthy.len()])
+            let idx = AUTO_POOL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let rotation = auto_pool_rotation(pool, &healthy, idx);
+            let entry = (0..rotation.len())
+                .map(|i| rotation[(idx as usize + i) % rotation.len()])
                 .find(|e| admit(&e.provider))?;
             if metered_tier {
                 METRICS.auto_pool_metered_selections_total.inc();
@@ -7979,6 +8072,134 @@ mod stream_truncation_tests {
             !mark_stream_truncated(&ctx),
             "later calls are no-ops, not double counts"
         );
+    }
+}
+
+#[cfg(test)]
+mod auto_pool_latency_tests {
+    use super::*;
+    use maxllm_config::BillingMode;
+
+    fn entry(provider: &str) -> AutoPoolEntry {
+        AutoPoolEntry {
+            provider: provider.to_string(),
+            model: format!("m-{provider}"),
+            billing: BillingMode::Subscription,
+        }
+    }
+
+    /// The latency store is process-global and the tests run in parallel, so
+    /// every test uses its own provider names — one test's recorded latencies
+    /// must never leak into another's cohort.
+    fn pool_with_names(prefer_fast: bool, names: &[&str]) -> AutoPoolState {
+        AutoPoolState {
+            name: "auto".to_string(),
+            entries: names.iter().map(|n| entry(n)).collect(),
+            prefer_fast,
+        }
+    }
+
+    #[test]
+    fn cohort_drops_a_provider_far_above_the_tier_median() {
+        // fast-a/b ~1-2s, mid-c ~6s, slow-d ~30s: the median is ~6s, the
+        // ceiling is max(6*2.5, 5s) = 15s, so only slow-d is excluded.
+        crate::provider_stats::record_total_latency("cohort-a", 1000.0);
+        crate::provider_stats::record_total_latency("cohort-b", 2000.0);
+        crate::provider_stats::record_total_latency("cohort-c", 6000.0);
+        crate::provider_stats::record_total_latency("cohort-d", 30000.0);
+        let pool = pool_with_names(
+            true,
+            &["cohort-a", "cohort-b", "cohort-c", "cohort-d", "cohort-e"],
+        );
+        let healthy: Vec<&AutoPoolEntry> = pool.entries.iter().collect();
+        let cohort = auto_pool_fast_cohort(&healthy);
+        let names: Vec<&str> = cohort.iter().map(|e| e.provider.as_str()).collect();
+        assert!(names.contains(&"cohort-a"));
+        assert!(names.contains(&"cohort-b"));
+        assert!(names.contains(&"cohort-c"));
+        assert!(
+            !names.contains(&"cohort-d"),
+            "30s vs 6s median must be excluded"
+        );
+        // Unmeasured entries are kept (they have not been proven slow, and the
+        // rotation is what produces their first measurement).
+        assert!(names.contains(&"cohort-e"));
+    }
+
+    #[test]
+    fn cohort_returns_the_whole_tier_when_nothing_is_measured() {
+        // A pool whose providers nobody has ever measured: the whole tier
+        // must be returned, so a freshly-started gateway behaves like plain
+        // round-robin. Unique names — the latency store is global.
+        let pool = pool_with_names(
+            true,
+            &["fresh-a", "fresh-b", "fresh-c", "fresh-d", "fresh-e"],
+        );
+        let healthy: Vec<&AutoPoolEntry> = pool.entries.iter().collect();
+        let cohort = auto_pool_fast_cohort(&healthy);
+        assert_eq!(cohort.len(), healthy.len());
+    }
+
+    #[test]
+    fn cohort_does_not_cut_a_homogeneous_cluster() {
+        // A uniformly-fast cluster (all < 5s) must not be cut in half by the
+        // absolute floor: ceiling = max(median*2.5, 5s) >= 5s covers all.
+        crate::provider_stats::record_total_latency("cluster-a", 900.0);
+        crate::provider_stats::record_total_latency("cluster-b", 1100.0);
+        crate::provider_stats::record_total_latency("cluster-c", 1300.0);
+        crate::provider_stats::record_total_latency("cluster-d", 1700.0);
+        let pool = pool_with_names(
+            true,
+            &[
+                "cluster-a",
+                "cluster-b",
+                "cluster-c",
+                "cluster-d",
+                "cluster-e",
+            ],
+        );
+        let healthy: Vec<&AutoPoolEntry> = pool.entries.iter().collect();
+        let cohort = auto_pool_fast_cohort(&healthy);
+        assert_eq!(cohort.len(), healthy.len());
+    }
+
+    #[test]
+    fn rotation_without_prefer_fast_walks_the_whole_tier() {
+        let pool = pool_with_names(false, &["rr-a", "rr-b", "rr-c", "rr-d", "rr-e"]);
+        let healthy: Vec<&AutoPoolEntry> = pool.entries.iter().collect();
+        let rotation = auto_pool_rotation(&pool, &healthy, 3);
+        assert_eq!(rotation.len(), healthy.len());
+    }
+
+    #[test]
+    fn exploration_rotation_walks_the_whole_tier_every_n() {
+        let pool = pool_with_names(true, &["xp-a", "xp-b", "xp-c", "xp-d", "xp-e"]);
+        let healthy: Vec<&AutoPoolEntry> = pool.entries.iter().collect();
+        // idx % AUTO_POOL_EXPLORE_EVERY == 0 => full tier, even when a slow
+        // provider would otherwise be filtered out.
+        let rotation = auto_pool_rotation(&pool, &healthy, AUTO_POOL_EXPLORE_EVERY);
+        assert_eq!(rotation.len(), healthy.len());
+    }
+
+    #[test]
+    fn rotation_counts_the_skipped_provider() {
+        crate::provider_stats::record_total_latency("skip-a", 1000.0);
+        crate::provider_stats::record_total_latency("skip-b", 2000.0);
+        crate::provider_stats::record_total_latency("skip-c", 6000.0);
+        crate::provider_stats::record_total_latency("skip-d", 30000.0);
+        let pool = pool_with_names(true, &["skip-a", "skip-b", "skip-c", "skip-d", "skip-e"]);
+        let healthy: Vec<&AutoPoolEntry> = pool.entries.iter().collect();
+        let before = METRICS
+            .auto_pool_slow_skips_total
+            .with_label_values(&["skip-d"])
+            .get();
+        let rotation = auto_pool_rotation(&pool, &healthy, 7);
+        assert!(!rotation.iter().any(|e| e.provider == "skip-d"));
+        let after = METRICS
+            .auto_pool_slow_skips_total
+            .with_label_values(&["skip-d"])
+            .get();
+        assert_eq!(after - before, 1);
     }
 }
 

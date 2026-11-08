@@ -27,6 +27,11 @@ pub struct GatewayMetrics {
     /// every subscription entry was unavailable (circuit open) — i.e. requests
     /// that fell back to a pay-per-token provider.
     pub auto_pool_metered_selections_total: IntCounter,
+    /// Auto-pool entries the latency filter skipped, per provider. A high
+    /// count means the provider's EWMA latency is far above the tier median
+    /// (see `[auto_model].prefer_fast`); it stays available as a failover and
+    /// is re-measured on the exploration rotations.
+    pub auto_pool_slow_skips_total: IntCounterVec,
     /// Session-sticky affinity cache hit/miss counters.
     pub session_affinity_hits_total: IntCounter,
     pub session_affinity_misses_total: IntCounter,
@@ -161,6 +166,19 @@ impl GatewayMetrics {
         .expect("metric");
         registry
             .register(Box::new(auto_pool_metered_selections_total.clone()))
+            .expect("register");
+
+        let auto_pool_slow_skips_total = IntCounterVec::new(
+            Opts::new(
+                "maxllm_auto_pool_slow_skips_total",
+                "Auto-pool entries skipped by the latency filter (their EWMA latency \
+                 is far above the tier median), per provider",
+            ),
+            &["provider"],
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(auto_pool_slow_skips_total.clone()))
             .expect("register");
 
         let session_affinity_hits_total = IntCounter::new(
@@ -400,6 +418,7 @@ impl GatewayMetrics {
             client_aborted_total,
             circuit_breaker_stream_opens_total,
             auto_pool_metered_selections_total,
+            auto_pool_slow_skips_total,
             session_affinity_hits_total,
             session_affinity_misses_total,
             session_affinity_evictions_total,

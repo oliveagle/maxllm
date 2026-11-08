@@ -99,6 +99,17 @@ pub struct AutoModelConfig {
     /// missing at startup.
     #[serde(default)]
     pub pool: Vec<AutoPoolEntry>,
+    /// Prefer the low-latency cohort inside the preferred billing tier.
+    ///
+    /// The rotation measures each provider's EWMA upstream latency; an entry
+    /// whose latency is far above the tier's median is skipped, so one slow
+    /// subscription plan cannot take an equal share of interactive traffic.
+    /// Every [`AUTO_POOL_EXPLORE_EVERY`]th rotation still walks the whole
+    /// tier, so a recovered (or brand-new) provider is re-measured and can
+    /// rejoin. Defaults to `true`; set `prefer_fast = false` to restore plain
+    /// round-robin over the whole tier.
+    #[serde(default = "default_true")]
+    pub prefer_fast: bool,
 }
 
 impl AutoModelConfig {
@@ -1201,6 +1212,24 @@ auto_model = true
         assert!(pool.enabled);
         assert_eq!(pool.pool.len(), 1);
         assert_eq!(pool.pool[0].model, "gpt-4o");
+        assert!(
+            pool.prefer_fast,
+            "prefer_fast must default to true so the latency filter is on"
+        );
+    }
+
+    #[test]
+    fn test_auto_model_prefer_fast_can_be_turned_off() {
+        let toml = format!(
+            r#"{PROVIDER_TOML}
+[auto_model]
+enabled = true
+prefer_fast = false
+pool = [{{ provider = "openai", model = "gpt-4o" }}]
+"#
+        );
+        let config = Config::parse(&toml).unwrap();
+        assert!(!config.auto_model.as_ref().unwrap().prefer_fast);
     }
 
     #[test]
