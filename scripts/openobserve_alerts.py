@@ -62,7 +62,13 @@ ALERTS: dict[str, tuple[str, str, float, int, int, str]] = {
     ),
     "maxllm-breakers-open": (
         "More than two providers circuit-open",
-        "sum(maxllm_circuit_breaker_state == 1)",
+        # The same provider is exported once per gateway node, so the raw
+        # gauge has two series for it. Summing those counted one provider as
+        # two the moment both nodes had it open, and the alert fired on a
+        # single provider's outage. max by (provider) collapses the nodes
+        # first, then `== 1` keeps only the open ones, so the sum is the
+        # number of distinct providers with an open circuit.
+        "sum(max by (provider) (maxllm_circuit_breaker_state) == 1)",
         2,
         15,
         30,

@@ -17,7 +17,7 @@
 | 4 | 监控链路"只采不看"：无 maxllm 看板、无告警；日志全部灌进 `default` 流 | OpenObserve 20 条指标流均在更新，但 0 条 alert、2 个 dashboard 均与 maxllm 无关；collector 单 exporter 写死 `stream-name: default` | P1 |
 | 5 | provider 改名造成身份断裂：指标里 38 条 breaker series vs 配置 30 个 provider；旧路由被前缀匹配静默吞掉 | 9 条 `one_api_*` 僵尸 series；`one_api_volc_2` 仍 force-open 到 2026-11-27；旧 base_url `/v1/responses/one_api_*` 落到通用路由并被错误 provider 服务 | P1 |
 | 6 | body 哨兵 `auto` 在 `/v1/responses` 仍不可用（已知缺口未修） | 当天 11 次 404 + 2 次上游 400 由 `model:"auto"` 直接透传触发；391 次历史 404 集中在 11-07 12:00–14:00 三个小时里 | P1 |
-| 7 | `/health` 太浅、池健康检查未接线；quota probe 只盯 kimi | `pool_health.py` 存在但无 timer/常驻进程；`maxllm-quota-probe-kimi` 单元仍引用改名前的 `one_api_kimi` | P1 |
+| 7 | ~~`/health` 太浅、池健康检查未接线~~ **✅ 已收口**：`/health` 现在回 `pools{healthy,total}` + `open_providers`/`half_open_providers`；`maxllm-pool-health.timer` 5 min 一次；quota probe 已按改名后的 `kimi` 运行 | — | P1 |
 | 8 | breaker 指标是惰性快照，4 个 provider 长期显示 open 但实际已过 fail window | `is_open()` 在下次请求时才 lazy half-open，gauge 直接读原子 state | P2 |
 | 9 | `maxllm.err` 长期未轮转，且错误文案把 sentinel 当 provider | 23 行、全部停留在 11-04；`route '/v1/responses/auto' references unknown provider 'auto'` | P2 |
 | 10 | 自检探针流量计入生产指标 | 本机 loopback 探针命中已删除路由，产生 429/404/400 并写入 request_logs | P2 |
@@ -384,6 +384,16 @@ Anthropic `cache_read_input_tokens`），落在 `ctx.cached_tokens_in`，暴露�
    breaker open 数、零 usage 比例、stream truncated 比例。
 3. 至少 4 条告警：5xx/4xx 比例、truncated 率 > 1%、零 usage 比例 > 5%、
    breaker open > 2 providers 持续 10 分钟。
+
+**收口（2026-11-08 22:1x–22:4x CST）**：三条都已落地，而且发现并修掉了**看板/告警本身算错**
+的一处（见 §12.7）。
+
+| 建议 | 现状 |
+|---|---|
+| 日志分流 | ✅ `stream-name: maxllm_logs` / `maxllm_recordings` 两个 exporter；指标按 OpenObserve 的命名规则天然一股一表（45 条 `maxllm_*` stream） |
+| 看板 | ✅ `MaxLLM Gateway — reliability & cost` 21 个面板（§12.7），16 条声明式面板逐条实测：10 条有数、6 条为空（截断/放弃/5xx/零 usage 当前本来就是 0）、**0 条报错** |
+| 告警 | ✅ 7 条（5xx 比例、4xx 比例、breaker open、truncation 率、零 usage 率、首字节前截断、录音脱敏、流降级），全部 `enabled` 且已挂 `maxllm-http-sink`；**出口仍是占位的 `httpbin.org`，要真告警得给 webhook**（§12.7 末） |
+| 探针 | ✅ `maxllm-pool-health.timer` 在跑（5 min）；探针带 `X-MaxLLM-Probe: 1`，不进指标/请求日志 |
 
 ---
 
@@ -799,8 +809,59 @@ maxllm_circuit_breaker_quota_opens_total{provider="open_design"} 1
 |---|---|---|
 | `open_design` 是否留在 `auto` 池 | **待用户拍板** | 402（余额为零）期间每 10 分钟仍白打一次；留在池里等用户充值，或移出池 |
 | `volc_1` 恢复观察 | 待 00:00 | 确认 `quota_opens` 不再增长、`/health` 里 `volc_1` 消失 |
-| 推送 `main` | **待用户确认** | 本地领先 origin（`481f9a7` / `0badb54` / `ebcfa9f` / `33a7599`）；push 后发版要 `gh workflow run CI --ref <tag>`（push 事件不触发 Actions） |
+| 推送 `main` | ✅ **已推** | `0badb54..a039aef`（4 commit）；push 事件确实不触发 Actions，已用 `gh workflow run CI --ref main` 补跑，run `42487933112` 七项全绿 |
+| 打 tag 发版 | **待用户拍板** | 远程 tag 只到 `v0.3.9` —— **`v0.3.10` 从未打 tag**，与上一轮记录的「tag v0.3.10 → 0badb54」不符；要发版需先 bump 0.3.11（或补打 tag） |
 | VPS 升级 0.3.8 → 0.3.10 | **阻塞** | 需 root 私钥/密码；拿到后跑 `ops/machines/<vps>/maxllm/deploy.sh`（SOURCE=NAS） |
+
+### 12.7 可观测性收口：看板/告警声明化，并修掉一处**跨节点重复计数**
+
+**先纠正我自己的一次误判**：这轮开头用 `GET /dashboards/<id>` 数面板时读的是 `v8.panels`，得出「看板
+0 个面板」；真实位置是 `v8.tabs[0].panels`，看板当时已有 12 个面板（脚本自己的计数是对的）。记在这里
+是因为「看板是空壳」这个结论一度写进了本轮的中间判断。
+
+**真 bug：同一个 provider 在 OpenObserve 里有两条 series。**
+
+采集把两台网关节点（NAS + 本机）的 `/metrics` 都送进同一批 metric stream，靠 `service_name` 区分
+（`maxllm-olenas01` / `maxllm-gateway`，新版 collector 另加 `node` 标签）。于是任何对 **gauge** 的
+`sum by (provider)` / `sum(...)` 都在**把节点当实例重复计数**：
+
+| 表达式 | 值 | 含义 |
+|---|---|---|
+| `sum(maxllm_circuit_breaker_state == 1)`（**修复前的告警**） | **10** | 10 条 (provider, 节点) 对 |
+| `sum(max by (provider) (maxllm_circuit_breaker_state) == 1)` | **6** | 6 个不同 provider |
+| 两台 `/health` 的并集 | 6 | `kimi` / `open_design` / `volc_1` / `volc_2` / `volc_t_1` / `zhipu_1` |
+
+告警阈值是「> 2 providers」，所以**一个 provider 在两台节点同时熔断就会被记成 2**，接近误报；而面板
+如果照抄 `sum by (provider)`，`2` 又会和状态码 `2 = HALF_OPEN` 撞车，读起来像「半开」。修法是先按
+provider 折叠再判断：`sum(max by (provider) (maxllm_circuit_breaker_state) == 1)`，去重后与两台
+`/health` 的并集**逐个对齐**（6 = 6）。告警与面板都已改成这个写法并重新 apply。
+
+计数器（requests / tokens / fallbacks）跨节点相加是正确的（那就是机队总量），不需要去重；这次只动
+gauge。
+
+**看板/告警本身变成可重建的**（`scripts/openobserve_dashboard.py`）：
+
+- 面板集从 12 → **21**：补上请求速率（按 provider）、5xx/4xx 比例、p95 延迟（
+  `histogram_quantile(0.95, …)`）、输入/输出 token 速率、breaker open 数、half-open 数、quota-open
+  次数、零 usage 比例、metered 池选中数；原来只有截断/放弃/脱敏那 5 条。
+- 脚本从「只加不改」改成**声明式校正**：标题在本文件里的面板，若 query / stream / unit 与声明不符就
+  改回来（正是这次修 breaker 面板所必需），未声明的面板（手工加的）一律不碰；空看板也能从内置
+  skeleton 播种（原来没有可克隆的模板时脚本直接退出）。
+- `--apply` 之后**逐面板回读校验** query + stream + unit —— 更新接口对「静默丢弃」的写入也回 200。
+
+**实测**（16 条声明式面板逐条打 Prometheus 兼容接口）：10 条有数、6 条为空（截断/客户端放弃/5xx/
+零 usage 当时本来就是 0）、**0 条报错**；重复执行 dry-run 输出 `nothing to add — 21 panels already
+present`（幂等）。
+
+**仍未做**：告警出口。7 条告警都 `enabled`、都挂在 `maxllm-http-sink` 上，但那个 destination 指向
+`https://httpbin.org/post`（占位）。也就是说**会触发、会发请求、但不会通知到任何人**。替换只需一条命令：
+
+```sh
+OPENOBSERVE_ENDPOINT=<...> OPENOBSERVE_AUTH=<...> \
+  python3 scripts/openobserve_alerts.py --apply --destination-url <飞书/钉钉/Slack webhook>
+```
+
+需要用户给一个 webhook（本机 dotvault 里没有飞书 bot 的 URL）。
 
 ---
 
@@ -917,7 +978,7 @@ EOF
 | `/v1/responses` primary 从 ollama 端点换掉 | 属成本/配额口径决策。**订正**：原"它是截断率最高的一家"不成立 —— `ollama_local` 上游失败率 0.00%、`one_api_ollama_local` 0.11%，全仓最低；高的是 `opencode_go_2` 7.65% / `opencode_go_1` 2.58%（§1.1） | 若换，理由只能是成本/配额；从可靠性看没有理由动它 |
 | 首字节前的截断 failover | ~~收益是本批 680 例~~ **订正：只有 2/816（0.25%）** 在首字节前断开（§1.1） | **不做**。收益 0.25%，代价是首包缓冲 + 交互延迟；`stream_truncated_before_first_byte_total` 继续留着做监控即可 |
 | 超大 prompt 预检 | **已用数据关（2026-11-08 19:5x CST）**：`request_logs` 全量按 token 分桶，`tokens_in ≥ 128k` 的 200 行 **4 886 条**，其中 `stream truncated` **0**、`Upstream` 错误 **0**、5xx **0**；`8k-32k`/`32k-128k` 桶同样 0。**≥128k 输入截断率显著更高不成立**（与 §1.1/§8 订正一致）。若要做预检，动机只剩上游成本/额度（长 prompt 全额输入计费），不是截断 |
-| 告警真实出口 | `maxllm-http-sink` 仍是占位 URL（httpbin） | `scripts/openobserve_alerts.py --destination-url <webhook>` 一条命令替换 |
+| 告警真实出口 | `maxllm-http-sink` 仍是占位 URL（httpbin）：7 条告警都会触发、都会 POST 到 httpbin，但没人被通知 | `scripts/openobserve_alerts.py --destination-url <webhook>` 一条命令替换（需要用户给 webhook，见 §12.7） |
 | `xiaomi` / `mimo-v2.6-flash` 留在 auto 池 | 该模型 p50 21s / p90 92s / p99 4min（成功请求最大 297s，无一条超过 300s），27 条 300s 客户端超时全部落在它身上（§1.1） | 成本/交互口径决策：移出池子，或接受 auto 池有 ~10% 的请求要等 90s+ |
 
 ## 附录 C：CLI 桥接下线 + `cmd` 识别机制逆向（2026-11-08 晚，v0.3.10）
