@@ -1174,7 +1174,6 @@ dependencies = [
  "http",
  "http-body",
  "pin-project-lite",
- "tokio",
 ]
 
 [[package]]
@@ -1667,22 +1666,6 @@ dependencies = [
  "maxllm-config",
  "nix 0.29.0",
  "reqwest",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "maxllm-commandcode"
-version = "0.3.9"
-dependencies = [
- "bytes",
- "clap",
- "http-body-util",
- "hyper",
- "hyper-util",
- "serde",
  "serde_json",
  "tokio",
  "tracing",

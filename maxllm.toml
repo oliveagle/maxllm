@@ -250,24 +250,6 @@ base_url = "https://api.commandcode.ai"
 api_key = "${CMD_API_KEY}"
 default_model = "deepseek/deepseek-v4.1-flash"
 
-# The Command Code CLI bridge (crates/maxllm-commandcode): the vendor's own
-# `cmd` client, driven in its documented non-interactive print mode and
-# translated into the OpenAI Responses contract by the sidecar binary. Use it
-# while the account is on the Go plan (the Provider API above answers 403
-# upgrade_required); the sidecar serves /v1/responses natively, so a client's
-# Responses body is forwarded byte-for-byte.
-# The served model id is deliberately not the CLI's own id: the CLI plan is a
-# flat subscription, and an id that matches a per-token price entry would be
-# booked as metered.
-[providers.cmd_cli]
-kind = "openai_compat"
-base_url = "http://127.0.0.1:3801"
-api_key = "local-bridge"
-upstream_path = "/v1/chat/completions"
-responses_path = "/v1/responses"
-native_responses = true
-default_model = "commandcode-cli/deepseek-v4.1-flash"
-
 # The Claude models are served on the Anthropic Messages route only. Give
 # them their own provider entry: the gateway then translates an OpenAI-format
 # request into the Anthropic Messages contract (and the answer back), and a
@@ -377,18 +359,6 @@ plugins = []
 # provider = "cmd"
 # endpoint_type = "responses"
 # timeout_secs = 120
-# plugins = ["rate_limiter", "cors"]
-
-# The Command Code CLI bridge (native Responses contract on the sidecar's
-# /v1/responses). NOTE: route matching is PREFIX based and the first match
-# wins, so this path must not start with "/v1/responses/cmd" -- the generic
-# /v1/responses route below would still swallow it, and the /v1/responses/cmd
-# route above would swallow this one.
-# [[routes]]
-# path = "/v1/responses/cli_cmd"
-# provider = "cmd_cli"
-# endpoint_type = "responses"
-# timeout_secs = 300
 # plugins = ["rate_limiter", "cors"]
 
 # The OpenDesign AMR link speaks the Responses contract natively too, so this

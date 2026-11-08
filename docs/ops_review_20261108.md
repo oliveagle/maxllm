@@ -776,3 +776,40 @@ EOF
 | 超大 prompt 预检 | **已用数据关（2026-11-08 19:5x CST）**：`request_logs` 全量按 token 分桶，`tokens_in ≥ 128k` 的 200 行 **4 886 条**，其中 `stream truncated` **0**、`Upstream` 错误 **0**、5xx **0**；`8k-32k`/`32k-128k` 桶同样 0。**≥128k 输入截断率显著更高不成立**（与 §1.1/§8 订正一致）。若要做预检，动机只剩上游成本/额度（长 prompt 全额输入计费），不是截断 |
 | 告警真实出口 | `maxllm-http-sink` 仍是占位 URL（httpbin） | `scripts/openobserve_alerts.py --destination-url <webhook>` 一条命令替换 |
 | `xiaomi` / `mimo-v2.6-flash` 留在 auto 池 | 该模型 p50 21s / p90 92s / p99 4min（成功请求最大 297s，无一条超过 300s），27 条 300s 客户端超时全部落在它身上（§1.1） | 成本/交互口径决策：移出池子，或接受 auto 池有 ~10% 的请求要等 90s+ |
+
+## 附录 C：CLI 桥接下线 + `cmd` 识别机制逆向（2026-11-08 晚，v0.3.10）
+
+### 结论：`cmd` 没有"魔法 token"来证明自己是 CLI
+
+逆向 `command-code@1.88.5`（`dist/cli.mjs`，3.4 MB 单文件 bundle）得到的识别链：
+
+| 层 | 机制 | 代码位置 |
+|---|---|---|
+| 路径面 | CLI 私有协议 = `/alpha/*`（`/alpha/generate`、`/alpha/agent/generate`、`/alpha/sandbox/*`、`/alpha/billing/*`、`/alpha/fingerprint/record`）；公开 API = `/provider/v1/*` | `uE="/alpha/generate"`、`ib="/alpha/agent/generate"`、`EP="/alpha/fingerprint/record"`、`cR="/provider/v1/systemone"` |
+| 自称头 | `User-Agent: cli`（常量 `kk`，**每个请求都带**）；`x-cli-surface`（仅 `acp`/`rpc` 面才带，普通 CLI 不带）；`x-cli-environment: production`；`x-command-code-version` | `buildCommandApiHeaders()` / `buildCommandAuthHeaders()` |
+| 设备指纹 | 首次运行上报机器指纹到 `/alpha/fingerprint/record`：`thumbmark = sha256(salt + "\0machine\0" + machineId\|MACs)`；`components` 里 machineId / MAC / OS 用户名 / 主机名 / git 邮箱全部 hash，另有 `runtime: "cli"` | `buildMachineFingerprint()` / `gatherRawSignals()` |
+| 凭证 | `Authorization: Bearer <apiKey>`，key 来自 `~/.commandcode/auth.json`（`apiKey`/`userId`/`userName`/`keyName`/`authenticatedAt`），或环境变量 `COMMAND_CODE_API_KEY` | `getCommandAuthKey()` / `getCommandApiKeyFromEnv()` |
+| 浏览器登录 | `https://commandcode.ai/studio/auth/cli?callback=…&state=…&client=…`，回环回调把 apiKey 落盘 | `buildCommandAuthUrl()` |
+| 服务端判定 | ① 路径族决定"这是 CLI 面"；② 套餐决定"能不能用 API"（Go 计划 → `/provider/v1/*` 恒 403 `upgrade_required`）；③ `/alpha/*` 上另有反代理护栏 | 厂商侧 |
+
+实测（用本机 key，2026-11-08 21:0x）：
+
+- `/alpha/namespaces`、`/alpha/billing/credits`、`/alpha/billing/subscriptions`、
+  `/alpha/sandbox/sessions` 用普通 `curl/8` UA 同样返回 200 —— **`User-Agent: cli`
+  不是这些端点的准入条件**，它只是客户端自称；
+- `POST /alpha/generate`（空 body）两种 UA 都是 403，响应体是一份
+  `syspool/<user>/main/<sha256>\t<size>` 的 202 行清单（CLI 上传的内容寻址文件池索引，
+  被原样回显在错误体里 —— 上游的一个信息泄漏，顺带说明 CLI 会把本机文件哈希上云）。
+
+### 下线 `cmd_cli`（v0.3.10）
+
+厂商自己在 `/alpha/*` 的 403 里写明："Proxy use detected. This endpoint only serves CLI.
+Use Command Code provider API instead. Continued proxying of your subscription violates the TOS
+and will result in account ban." —— 把包月订阅通过自建网关转出去属于厂商明令禁止的用法，
+因此本项目撤掉 CLI 桥接：
+
+- 删除 crate `crates/maxllm-commandcode/`（独立 sidecar，工作区内无其它 crate 依赖它）；
+- `maxllm.toml` 去掉 `[providers.cmd_cli]` 与 `/v1/responses/cli_cmd`、`/v1/channels/cli_cmd` 两条路由；
+- 线上（oleNas01）停用 `maxllm-commandcode.service` 并把二进制移出 `bin/`；
+- **保留** `kind = "commandcode"`（Provider API，厂商授权路径）——Go 计划下它恒 403，
+  升级 Provider 计划后 `/v1/responses/cmd` 原生透传即可用，网关侧无需改动。

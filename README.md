@@ -241,26 +241,14 @@ curl http://localhost:8080/passthrough/openai/v1/embeddings \
 | OpenDesign (open-design.ai) | `open_design` | OpenAI-compatible + native Responses | Bearer token |
 | Custom | `openai_compat` | OpenAI-compatible | Configurable |
 
-> **Command Code** has two ways in. `kind = "commandcode"` is the vendor's
-> **Provider API** (`/provider/v1/*`) — the sanctioned path, but it needs the
-> paid Provider plan (the Go plan answers `403 upgrade_required`). While the
-> account is on the Go plan, the sidecar binary `maxllm-commandcode` bridges
-> the vendor's own `cmd` client instead: it runs `cmd -p … --output-format
-> json` and serves the **OpenAI Responses contract** natively
-> (`POST /v1/responses`) plus Chat Completions, so a Responses client talks to
-> the subscription without any translation:
->
-> ```toml
-> [providers.cmd_cli]
-> kind = "openai_compat"
-> base_url = "http://127.0.0.1:3801"
-> upstream_path = "/v1/chat/completions"
-> responses_path = "/v1/responses"
-> native_responses = true
-> default_model = "commandcode-cli/deepseek-v4.1-flash"
-> ```
->
-> See [`crates/maxllm-commandcode/README.md`](crates/maxllm-commandcode/README.md).
+> **Command Code** is reachable through the vendor's **Provider API**
+> (`/provider/v1/*`) — the sanctioned path — which needs the paid Provider
+> plan (the Go plan answers `403 upgrade_required`). The vendor's other
+> surface (`/alpha/*`) is the private wire protocol of their own `cmd`
+> client and answers "This endpoint only serves CLI"; proxying a
+> subscription through it violates the vendor's terms, so the gateway does
+> not speak it. Upgrade the plan and `/v1/responses/cmd` lights up with no
+> translation — native Responses, byte-for-byte forwarding.
 
 > **AWS Bedrock** authenticates with AWS Signature V4. Credentials are read
 > from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (no STS assume-role
