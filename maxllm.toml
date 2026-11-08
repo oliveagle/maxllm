@@ -323,8 +323,11 @@ plugins = []
 
 # commandcode.ai speaks the Responses contract natively, so this route
 # forwards /v1/responses byte-for-byte to /provider/v1/responses.
+# Per-provider Responses route. NOTE: route matching is PREFIX based, so a
+# provider-specific path MUST be declared BEFORE any generic "/v1/responses"
+# route -- otherwise the generic one swallows it (it matches first).
 # [[routes]]
-# path = "/v1/responses"
+# path = "/v1/responses/cmd"
 # provider = "cmd"
 # endpoint_type = "responses"
 # timeout_secs = 120

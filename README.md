@@ -445,6 +445,11 @@ Pool entries naming an unknown provider are dropped at startup (with a warn),
 so a typo cannot silently shrink the pool. The auto route must come before
 any broader prefix route (`match_route` takes the first prefix match).
 
+The same rule governs every per-provider Responses route: `/v1/responses/<provider>`
+must be declared **before** a generic `/v1/responses` route, otherwise the
+generic one wins the prefix match and the request never reaches the provider
+it names (it is answered by that route's fallback chain instead).
+
 The sentinel is recognised on **any** route, not only on routes that declare
 `auto_model = true`. A client that selects `auto` in its model picker usually
 keeps its base URL on the summary route — only the model string changes — so
@@ -656,11 +661,18 @@ upstream_path = "/provider/v1/messages"
 api_key = "${CMD_API_KEY}"
 default_model = "claude-sonnet-5-5"
 
+# Per-provider path: declare it BEFORE any generic "/v1/responses" route
+# (route matching is prefix based, first match wins).
 [[routes]]
-path = "/v1/responses"
+path = "/v1/responses/cmd"
 provider = "cmd"
 endpoint_type = "responses"
 ```
+
+> **Plan gate.** The vendor's API routes are a paid add-on: the Go plan
+> covers the CLI only, and every call to `/provider/v1/*` then answers HTTP 403
+> `upgrade_required` ("Your Go plan doesn't include API access"). The Provider
+> plan ($15/mo) unlocks them. The gateway forwards that error verbatim.
 
 The full vendor catalogue (ids, context lengths and the endpoints each model
 is served on) is published at `GET https://api.commandcode.ai/provider/v1/models`
