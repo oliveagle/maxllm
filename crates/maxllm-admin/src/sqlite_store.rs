@@ -830,6 +830,16 @@ impl AdminStore for SqliteStore {
         }
     }
 
+    fn delete_circuit_breaker_state(&self, provider: &str) -> Result<(), StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        conn.execute(
+            "DELETE FROM circuit_breaker_state WHERE provider = ?1",
+            params![provider],
+        )
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
     fn delete_session_binding(&self, session_id: &str) -> Result<(), StoreError> {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         conn.execute(
@@ -1127,6 +1137,19 @@ mod tests {
         assert_eq!(rows[0].failures, 3);
         assert_eq!(rows[0].force_open_until, 1_700_000_120_000);
         assert_eq!(rows[0].quota_opens, 1);
+
+        // A renamed provider is pruned by name and leaves the live one alone.
+        store
+            .save_circuit_breaker_state(CircuitBreakerStateRow {
+                provider: "old-name".into(),
+                ..row.clone()
+            })
+            .unwrap();
+        assert_eq!(store.load_circuit_breaker_states().unwrap().len(), 2);
+        store.delete_circuit_breaker_state("old-name").unwrap();
+        let rows = store.load_circuit_breaker_states().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].provider, "OA-VOLC-1");
     }
 
     #[test]

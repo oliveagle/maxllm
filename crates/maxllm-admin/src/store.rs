@@ -73,6 +73,13 @@ pub trait AdminStore: Send + Sync {
     fn save_circuit_breaker_state(&self, row: CircuitBreakerStateRow) -> Result<(), StoreError>;
     /// Load every persisted circuit-breaker state (used on startup).
     fn load_circuit_breaker_states(&self) -> Result<Vec<CircuitBreakerStateRow>, StoreError>;
+    /// Drop a provider's persisted breaker state.
+    ///
+    /// Startup restore calls this for rows whose provider no longer exists in
+    /// the config (a rename leaves the old name behind forever otherwise, and
+    /// a stale force-open deadline on a dead name is indistinguishable from a
+    /// live one when somebody reads the table).
+    fn delete_circuit_breaker_state(&self, provider: &str) -> Result<(), StoreError>;
     /// Persist a session → provider affinity binding (upsert).
     fn save_session_binding(&self, session_id: &str, provider: &str) -> Result<(), StoreError>;
     /// Load every persisted session binding (used on startup).
@@ -384,6 +391,15 @@ impl AdminStore for InMemoryStore {
         Ok(map.values().cloned().collect())
     }
 
+    fn delete_circuit_breaker_state(&self, provider: &str) -> Result<(), StoreError> {
+        let mut map = self
+            .circuit_breakers
+            .write()
+            .map_err(|_| StoreError::LockPoisoned)?;
+        map.remove(provider);
+        Ok(())
+    }
+
     fn save_session_binding(&self, session_id: &str, provider: &str) -> Result<(), StoreError> {
         let mut map = self
             .session_bindings
@@ -500,6 +516,37 @@ mod tests {
         assert!(store.delete_key("k1").unwrap());
         assert!(store.get_key_by_hash("hash1").unwrap().is_none());
         assert!(!store.delete_key("k1").unwrap());
+    }
+
+    #[test]
+    fn circuit_breaker_state_delete_by_provider() {
+        let store = InMemoryStore::new();
+        let row = CircuitBreakerStateRow {
+            provider: "volc_1".into(),
+            state: 1,
+            failures: 3,
+            last_failure_at: 1_700_000_000_000,
+            force_open_until: 1_700_000_120_000,
+            successes_half_open: 0,
+            transitions: 1,
+            quota_opens: 1,
+            updated_at: Utc::now(),
+        };
+        store.save_circuit_breaker_state(row.clone()).unwrap();
+        store
+            .save_circuit_breaker_state(CircuitBreakerStateRow {
+                provider: "one_api_volc_1".into(),
+                ..row
+            })
+            .unwrap();
+        assert_eq!(store.load_circuit_breaker_states().unwrap().len(), 2);
+
+        store
+            .delete_circuit_breaker_state("one_api_volc_1")
+            .unwrap();
+        let rows = store.load_circuit_breaker_states().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].provider, "volc_1");
     }
 
     #[test]

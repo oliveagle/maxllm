@@ -159,6 +159,14 @@ impl AdminApi {
         self.store.load_circuit_breaker_states()
     }
 
+    /// Drop a provider's persisted breaker state (provider removed/renamed).
+    pub fn delete_circuit_breaker_state(
+        &self,
+        provider: &str,
+    ) -> Result<(), crate::store::StoreError> {
+        self.store.delete_circuit_breaker_state(provider)
+    }
+
     /// Persist a session → provider affinity binding (upsert).
     pub fn save_session_binding(
         &self,

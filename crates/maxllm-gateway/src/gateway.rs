@@ -801,7 +801,23 @@ impl AiGateway {
             match admin_api.load_circuit_breaker_states() {
                 Ok(rows) => {
                     let mut restored = 0usize;
+                    let mut pruned = 0usize;
                     for row in rows {
+                        // A renamed or deleted provider leaves its breaker row
+                        // behind forever; a stale `force_open_until` on a dead
+                        // name reads like live state to anyone inspecting the
+                        // table. Prune it once at startup instead.
+                        if !hot_state.providers.contains_key(&row.provider) {
+                            match admin_api.delete_circuit_breaker_state(&row.provider) {
+                                Ok(()) => pruned += 1,
+                                Err(e) => warn!(
+                                    provider = %row.provider,
+                                    error = %e,
+                                    "Failed to prune circuit breaker state for unknown provider"
+                                ),
+                            }
+                            continue;
+                        }
                         if let Some(breaker) = existing_breaker(&row.provider) {
                             breaker.restore(&row);
                             // Re-publish the gauges so a restarted process shows
@@ -826,19 +842,48 @@ impl AiGateway {
                     if restored > 0 {
                         info!(count = restored, "Restored circuit breaker states");
                     }
+                    if pruned > 0 {
+                        info!(
+                            count = pruned,
+                            "Pruned circuit breaker rows for providers no longer in the config"
+                        );
+                    }
                 }
                 Err(e) => warn!(error = %e, "Failed to restore circuit breaker states"),
             }
             match admin_api.load_session_bindings() {
                 Ok(bindings) => {
                     let mut restored = 0usize;
+                    let mut pruned = 0usize;
                     for (session_id, provider) in bindings {
+                        // A pin on a provider that no longer exists can never
+                        // be honoured, and keeping it in memory only inflates
+                        // the affinity gauges; drop the row as well so the
+                        // table stops growing by one rename's worth of names.
+                        if !hot_state.providers.contains_key(&provider) {
+                            match admin_api.delete_session_binding(&session_id) {
+                                Ok(()) => pruned += 1,
+                                Err(e) => warn!(
+                                    session_id = %session_id,
+                                    provider = %provider,
+                                    error = %e,
+                                    "Failed to prune session binding for unknown provider"
+                                ),
+                            }
+                            continue;
+                        }
                         sessions.set(&session_id, &provider);
                         restored += 1;
                     }
                     METRICS.session_affinity_size.set(sessions.len() as i64);
                     if restored > 0 {
                         info!(count = restored, "Restored session bindings");
+                    }
+                    if pruned > 0 {
+                        info!(
+                            count = pruned,
+                            "Pruned session bindings pinned to providers no longer in the config"
+                        );
                     }
                 }
                 Err(e) => warn!(error = %e, "Failed to restore session bindings"),
@@ -1029,13 +1074,16 @@ impl AiGateway {
                 match self.sessions.get(&session_id) {
                     Some(pinned_name) => {
                         chosen = healthy.iter().copied().find(|e| e.provider == pinned_name);
-                        if chosen.is_some() {
-                            METRICS.session_affinity_hits_total.inc();
-                        }
                         // Pinned provider unavailable (open circuit, no
                         // longer in the pool, or only in a lower billing
                         // tier) — fall through to round-robin; the session
-                        // re-pins on the next successful response.
+                        // re-pins on the next successful response. A pin that
+                        // cannot be honoured is a miss, not a hit.
+                        if chosen.is_some() {
+                            METRICS.session_affinity_hits_total.inc();
+                        } else {
+                            METRICS.session_affinity_misses_total.inc();
+                        }
                     }
                     None => {
                         METRICS.session_affinity_misses_total.inc();
@@ -1129,9 +1177,9 @@ impl AiGateway {
             if let Some(session_id) = ctx.session_id.clone() {
                 match self.sessions.get(&session_id) {
                     Some(pinned_name) => {
-                        METRICS.session_affinity_hits_total.inc();
                         if let Some(pinned) = candidates.iter().find(|c| c.name == pinned_name) {
                             if !pinned.state.circuit_breaker.is_open() {
+                                METRICS.session_affinity_hits_total.inc();
                                 ctx.provider_name = pinned_name.clone();
                                 ctx.fallback_used = pinned_name != route.provider;
                                 // The client asked for the sentinel while its
@@ -1163,9 +1211,11 @@ impl AiGateway {
                                 return Some(Arc::clone(&pinned.state));
                             }
                         }
-                        // Pinned provider is unavailable (open circuit) — fall
-                        // through to the normal selector; the session gets
-                        // re-pinned on the next successful response.
+                        // Pinned provider is unavailable (open circuit, or no
+                        // longer in this route's chain) — fall through to the
+                        // normal selector; the session gets re-pinned on the
+                        // next successful response.
+                        METRICS.session_affinity_misses_total.inc();
                     }
                     None => {
                         METRICS.session_affinity_misses_total.inc();
@@ -5130,6 +5180,7 @@ impl AiGateway {
                             return Some((entry.provider.clone(), Arc::clone(pair)));
                         }
                     }
+                    METRICS.session_affinity_misses_total.inc();
                 }
             }
             if healthy.is_empty() {
