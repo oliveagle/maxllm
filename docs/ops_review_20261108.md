@@ -308,6 +308,20 @@ Anthropic `cache_read_input_tokens`），落在 `ctx.cached_tokens_in`，暴露�
 对外接口不变。单测：`cached_input_is_billed_at_the_cache_rate` /
 `cached_tokens_are_clamped_to_the_input_count` / `cache_rate_override_and_glob`。
 
+**上线验证（2026-11-08 17:2x CST，二进制 `72005e5e…`，`NRestarts=0`）**：
+- 重启后 `maxllm_cached_input_tokens_total` / `maxllm_unrouted_sessions_total` 两项新指标
+  均出现，后者恒为 0；`maxllm_active_requests` 正常回落。
+- 命中率（重启以来累计）：`MiniMax-M3/minimax` **98.55%**、`mimo-v2.6-flash/xiaomi`
+  89.47%、`deepseek-v4-flash/volc_1` 81.41%、`opencode_go_2` 64.29%、`opencode_go_1`
+  52.86%。M3 的公开缓存价与"命中率 ~99%"的假设成立。
+- 成本（同一批 16 条 `minimax` 请求，新二进制）：`tokens_in` 1 294 769 / `tokens_out` 9 737，
+  记账 **$0.1002**；同样 token 全按 list 价应为 **$0.4001** ⇒ 该批折价 **4.0×**。
+  单条逐字核对：60 170 in / 68 out，其中 59 804 命中 ⇒ 366×0.30 + 59 804×0.05 +
+  68×1.20 = **$0.0031816**，与落库值完全一致（旧口径 $0.01813，5.7×）。
+- 幽灵行回归：重启后 `provider=""` 与 `status=0` 行均为 **0**；journal 无 error/panic。
+- 主线回归：`open_design` / `cmd` 路由仍解析（401 鉴权而非 404 unknown provider），
+  说明 rebase 到 `59ea47f` 后并发会话的 open-design 工作未回退。
+
 ---
 
 ## 4. P1：可观测性"只采不看"
