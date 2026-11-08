@@ -4043,6 +4043,293 @@ strategy = "fallback"
     );
 }
 
+/// vLLM-style upstreams answer an unknown model with **404** ("The model `X`
+/// does not exist. Valid aliases: …"), not the 400/422 one-api uses. The
+/// rewrite must cover that shape too — decided from the body, since a missing
+/// endpoint is a 404 as well.
+#[tokio::test]
+async fn test_404_unknown_model_is_rewritten_to_the_provider_default() {
+    let upstream = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .respond_with(move |req: &wiremock::Request| {
+            let sent: Value = serde_json::from_slice(&req.body).expect("json body");
+            if sent["model"] == "minicpmv47-awq" {
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "id": "resp_1",
+                    "object": "response",
+                    "created_at": 1,
+                    "model": "minicpmv47-awq",
+                    "status": "completed",
+                    "output": [{
+                        "type": "message", "id": "msg_1", "role": "assistant",
+                        "status": "completed",
+                        "content": [{"type": "output_text", "text": "from vllm", "annotations": []}]
+                    }]
+                }))
+            } else {
+                ResponseTemplate::new(404).set_body_json(json!({
+                    "error": {"message": format!(
+                        "The model `{}` does not exist. Valid aliases: minicpmv47-awq.",
+                        sent["model"].as_str().unwrap_or_default()
+                    )}
+                }))
+            }
+        })
+        .mount(&upstream)
+        .await;
+
+    let config = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+# Owns the model name the client sends; not on this route.
+[providers.owner]
+kind = "openai_compat"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+default_model = "deepseek-v4.1-flash:cloud"
+
+[providers.vllm]
+kind = "openai_compat"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+default_model = "minicpmv47-awq"
+native_responses = true
+responses_path = "/v1/responses"
+
+[[routes]]
+path = "/v1/responses/vllm"
+provider = "vllm"
+endpoint_type = "responses"
+strategy = "fallback"
+max_failover_attempts = 2
+"#;
+    let gw = TestGateway::start(config, &upstream.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/responses/vllm"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&json!({
+            "model": "deepseek-v4.1-flash:cloud",
+            "input": "hi",
+            "max_output_tokens": 16
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        200,
+        "the 404 body must be read, blamed on the model, and retried with the provider's own name"
+    );
+
+    let reqs = upstream.received_requests().await.unwrap_or_default();
+    assert_eq!(
+        reqs.len(),
+        2,
+        "one rejected attempt, then the rewritten retry"
+    );
+    let first: Value = serde_json::from_slice(&reqs[0].body).expect("json body");
+    assert_eq!(first["model"], "deepseek-v4.1-flash:cloud");
+    let second: Value = serde_json::from_slice(&reqs[1].body).expect("json body");
+    assert_eq!(
+        second["model"], "minicpmv47-awq",
+        "the retried body must carry the substituted model"
+    );
+}
+
+/// A 404 that is NOT a model rejection (a missing endpoint, a dead router)
+/// must walk the fallback chain with the client's model name untouched: the
+/// substitution exists only for "the model does not exist".
+#[tokio::test]
+async fn test_404_of_a_missing_endpoint_fails_over_without_rewriting() {
+    let primary = MockServer::start().await;
+    let fallback = MockServer::start().await;
+
+    // The primary is simply missing an endpoint — 404, no model mentioned.
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("404 page not found"))
+        .expect(1)
+        .mount(&primary)
+        .await;
+
+    // The fallback serves the request as the client sent it: the original
+    // model name must still be there, proving nothing was substituted.
+    Mock::given(method("POST"))
+        .respond_with(move |req: &wiremock::Request| {
+            let sent: Value = serde_json::from_slice(&req.body).expect("json body");
+            ResponseTemplate::new(200)
+                .set_body_json(openai_response(sent["model"].as_str().unwrap_or_default()))
+        })
+        .mount(&fallback)
+        .await;
+
+    let config = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+# Owns the model name the client sends; not on this route. Because the
+# primary's own default differs, the 404 IS rewritable at header time — the
+# body must then veto the rewrite and walk the chain instead.
+[providers.owner]
+kind = "openai_compat"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+default_model = "owner-model:cloud"
+
+[providers.primary]
+kind = "openai_compat"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+default_model = "primary-model"
+
+[providers.fallback]
+kind = "openai_compat"
+base_url = "{FALLBACK_URL}"
+api_key = "fake-key"
+default_model = "fallback-model"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "primary"
+fallback = ["fallback"]
+strategy = "fallback"
+max_failover_attempts = 4
+"#;
+    let gw = TestGateway::start_with_fallback(config, &primary.uri(), &fallback.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&chat_body("owner-model:cloud", "hi"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        200,
+        "a non-model 404 must be failed over, not rewritten"
+    );
+    let primary_reqs = primary.received_requests().await.unwrap_or_default();
+    assert_eq!(
+        primary_reqs.len(),
+        1,
+        "the 404 must not trigger a rewritten retry on the same provider"
+    );
+    let fallback_reqs = fallback.received_requests().await.unwrap_or_default();
+    assert_eq!(fallback_reqs.len(), 1);
+    let sent: Value = serde_json::from_slice(&fallback_reqs[0].body).expect("json body");
+    assert_eq!(
+        sent["model"], "owner-model:cloud",
+        "the client's model name must reach the fallback untouched"
+    );
+}
+
+/// At most one rewrite per provider: a second 404 that still blames the model
+/// is a genuine request fault and reaches the client (this is what stops the
+/// walk from ping-ponging on the same provider).
+#[tokio::test]
+async fn test_404_unknown_model_is_rewritten_only_once() {
+    let upstream = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "error": {"message": "The model `x` does not exist. Valid aliases: none."}
+        })))
+        .expect(2)
+        .mount(&upstream)
+        .await;
+
+    let config = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+# Owns the model name the client sends; not on this route.
+[providers.owner]
+kind = "openai_compat"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+default_model = "deepseek-v4.1-flash:cloud"
+
+[providers.vllm]
+kind = "openai_compat"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+default_model = "minicpmv47-awq"
+native_responses = true
+responses_path = "/v1/responses"
+
+[[routes]]
+path = "/v1/responses/vllm"
+provider = "vllm"
+endpoint_type = "responses"
+strategy = "fallback"
+max_failover_attempts = 2
+"#;
+    let gw = TestGateway::start(config, &upstream.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/responses/vllm"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&json!({
+            "model": "deepseek-v4.1-flash:cloud",
+            "input": "hi",
+            "max_output_tokens": 16
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        404,
+        "the second rejection is a genuine fault and must reach the client"
+    );
+    let reqs = upstream.received_requests().await.unwrap_or_default();
+    assert_eq!(
+        reqs.len(),
+        2,
+        "exactly one rewritten retry — never a loop on the same provider"
+    );
+    let first: Value = serde_json::from_slice(&reqs[0].body).expect("json body");
+    assert_eq!(first["model"], "deepseek-v4.1-flash:cloud");
+    let second: Value = serde_json::from_slice(&reqs[1].body).expect("json body");
+    assert_eq!(second["model"], "minicpmv47-awq");
+}
+
 /// A 503 must name the candidate(s) and the reason instead of claiming that
 /// "all providers are unavailable" on a single-provider route.
 #[tokio::test]

@@ -1432,6 +1432,98 @@ impl AiGateway {
                 .any(|e| e.model == ctx.model)
     }
 
+    /// The model the current provider should be asked for instead of the name
+    /// the client sent, when the provider plainly does not carry it.
+    ///
+    /// `None` when the request is not rewritable: it rotates over an auto pool
+    /// (the pool entry's model is authoritative for that entry), no replayable
+    /// client body was captured, the name belongs to no provider of this
+    /// deployment (a typo must stay an error), a later candidate still carries
+    /// the name (that candidate should serve it, not a rewrite here), or this
+    /// provider already got its one rewrite (a second rejection is a genuine
+    /// request fault, not a missing model).
+    fn model_rewrite_target(
+        &self,
+        hot: &HotState,
+        ctx: &RequestCtx,
+        provider: &ProviderState,
+    ) -> Option<String> {
+        if ctx.auto_target.is_some() || ctx.client_body.is_none() {
+            return None;
+        }
+        if ctx
+            .model_rewritten_providers
+            .iter()
+            .any(|p| p == &ctx.provider_name)
+        {
+            return None;
+        }
+        if !self.no_later_candidate_carries_model(hot, ctx) {
+            return None;
+        }
+        if !Self::model_belongs_to_some_provider(hot, ctx) {
+            return None;
+        }
+        provider
+            .default_model
+            .as_deref()
+            .filter(|dm| !dm.is_empty() && *dm != ctx.model)
+            .map(str::to_string)
+    }
+
+    /// Reset the request for an in-place retry of the same provider with its
+    /// own `default_model` substituted for the name the client sent, and build
+    /// the pingora retry error that triggers it.
+    ///
+    /// Shared by the header-time 400/422 decision and the body-time 404 one
+    /// (vLLM answers an unknown model with 404). The body is replayed from the
+    /// client's original bytes because the translated copy of the failed
+    /// attempt still carries the old model — the same state reset a failover
+    /// performs, minus the provider switch.
+    fn begin_model_rewrite(
+        &self,
+        ctx: &mut RequestCtx,
+        status: u16,
+        rewrite_to: String,
+    ) -> Box<pingora::Error> {
+        let original_model = ctx.model.clone();
+        ctx.model_rewritten_providers
+            .push(ctx.provider_name.clone());
+        ctx.model = rewrite_to.clone();
+        ctx.plugin_ctx.model = rewrite_to.clone();
+        ctx.model_override = Some(rewrite_to.clone());
+        ctx.body_translated = false;
+        ctx.upstream_responded = false;
+        ctx.request_body_buf.clear();
+        ctx.replay_body = ctx.client_body.clone();
+        ctx.replay_injected = false;
+        ctx.keep_request_content_length = false;
+        if let Ok(mut guard) = ctx.stream_translator.lock() {
+            *guard = None;
+        }
+        METRICS
+            .model_rewrite_retries_total
+            .with_label_values(&[&ctx.provider_name])
+            .inc();
+        info!(
+            status = %status,
+            provider = %ctx.provider_name,
+            from = %original_model,
+            to = %rewrite_to,
+            "upstream does not carry the requested model — rewriting to its own default and retrying it"
+        );
+        let mut e = pingora::Error::explain(
+            pingora::ErrorType::HTTPStatus(status),
+            format!(
+                "provider '{}' does not carry model '{original_model}'; retrying it with '{}'",
+                ctx.provider_name, rewrite_to
+            ),
+        );
+        e.as_up();
+        e.set_retry(true);
+        e
+    }
+
     /// Explain why routing produced no provider, naming every candidate and
     /// its circuit state.
     ///
@@ -2044,6 +2136,44 @@ fn should_failover_status(status: u16, ctx: &RequestCtx, provider: &ProviderStat
         // 2xx/3xx and anything else: the provider answered.
         _ => false,
     }
+}
+
+/// Whether a 404 error body is the "the model does not exist" rejection of an
+/// OpenAI-compatible upstream (vLLM: "The model `X` does not exist. Valid
+/// aliases: …", one-api: "unknown model") rather than a missing endpoint —
+/// which answers the same status with "not found" and must not be rewritten.
+fn body_reports_unknown_model(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    // Phrasings that alone identify an unknown model — no bare "not found".
+    const STRONG: &[&str] = &[
+        "unknown model",
+        "no such model",
+        "model_not_found",
+        "model not found",
+        "model does not exist",
+        "model doesn't exist",
+        "does not exist. valid aliases",
+        "no model named",
+        "invalid model",
+        "unsupported model",
+        "model is not supported",
+        "model not supported",
+    ];
+    if STRONG.iter().any(|m| lower.contains(m)) {
+        return true;
+    }
+    // Weak phrasings ("does not exist", "not found") also describe a missing
+    // endpoint, so only trust them when the body is explicitly about a model.
+    let mentions_model = lower.contains("model") || lower.contains("模型");
+    const WEAK: &[&str] = &[
+        "does not exist",
+        "doesn't exist",
+        "not exist",
+        "not found",
+        "不存在",
+        "未找到",
+    ];
+    mentions_model && WEAK.iter().any(|m| lower.contains(m))
 }
 
 #[async_trait]
@@ -3840,6 +3970,15 @@ impl ProxyHttp for AiGateway {
         let Some(provider) = hot.providers.get(&ctx.provider_name) else {
             return Ok(());
         };
+        // A 404 whose body may name the requested model as unknown: defer the
+        // decision until the body arrives (a missing endpoint answers 404
+        // too). Deferring is only worth it when a rewrite is actually
+        // possible; otherwise the ordinary failover below proceeds at once.
+        if status == 404 && self.model_rewrite_target(&hot, ctx, provider).is_some() {
+            ctx.pending_model_404 = true;
+            ctx.model_404_body_buf.clear();
+            return Ok(());
+        }
         if !should_failover_status(status, ctx, provider) {
             return Ok(());
         }
@@ -3857,72 +3996,28 @@ impl ProxyHttp for AiGateway {
             return Ok(());
         }
         // A provider that does not carry the requested model answers 400/422
-        // (one-api's `invalid params, unknown model`). When the name belongs
-        // to *another* provider of the route — the pooled `/v1/responses`
-        // primary serves `deepseek-v4.1-flash:cloud`, which no cloud fallback
-        // knows — a plain failover collects the same 400 from every entry and
-        // the route dies together with its primary. Rewrite the body's model
-        // to THIS provider's own default and retry it once before spending a
-        // provider of the chain. A second 400 after the rewrite is a genuine
+        // (one-api's `invalid params, unknown model`) — or 404 naming the
+        // model as unknown (vLLM's "The model `X` does not exist. Valid
+        // aliases: …"). When the name belongs to *another* provider of the
+        // route — the pooled `/v1/responses` primary serves
+        // `deepseek-v4.1-flash:cloud`, which no cloud fallback knows — a plain
+        // failover collects the same rejection from every entry and the route
+        // dies together with its primary. Rewrite the body's model to THIS
+        // provider's own default and retry it once before spending a provider
+        // of the chain. A second rejection after the rewrite is a genuine
         // request fault and is returned to the client (at most one rewrite
         // per provider, so the walk can never ping-pong).
         //
         // Only the plain fallback chain is rewritten: an auto pool already
         // carries a per-entry model, which is authoritative for that entry.
-        if matches!(status, 400 | 422)
-            && ctx.auto_target.is_none()
-            && ctx.client_body.is_some()
-            && self.no_later_candidate_carries_model(&hot, ctx)
-            && Self::model_belongs_to_some_provider(&hot, ctx)
-        {
-            let rewrite_to = provider
-                .default_model
-                .as_deref()
-                .filter(|dm| !dm.is_empty() && *dm != ctx.model)
-                .map(str::to_string);
-            if let Some(rewrite_to) = rewrite_to {
-                if !ctx.model_rewritten_providers.contains(&ctx.provider_name) {
-                    let original_model = ctx.model.clone();
-                    ctx.model_rewritten_providers
-                        .push(ctx.provider_name.clone());
-                    ctx.model = rewrite_to.clone();
-                    ctx.plugin_ctx.model = rewrite_to.clone();
-                    ctx.model_override = Some(rewrite_to.clone());
-                    // Replay the whole client body: the translated copy of
-                    // the failed attempt carries the old model and cannot be
-                    // reused. Same state reset a failover performs, minus the
-                    // provider switch.
-                    ctx.body_translated = false;
-                    ctx.upstream_responded = false;
-                    ctx.request_body_buf.clear();
-                    ctx.replay_body = ctx.client_body.clone();
-                    ctx.replay_injected = false;
-                    ctx.keep_request_content_length = false;
-                    if let Ok(mut guard) = ctx.stream_translator.lock() {
-                        *guard = None;
-                    }
-                    METRICS
-                        .model_rewrite_retries_total
-                        .with_label_values(&[&ctx.provider_name])
-                        .inc();
-                    info!(
-                        status = %status,
-                        provider = %ctx.provider_name,
-                        from = %original_model,
-                        to = %rewrite_to,
-                        "upstream does not carry the requested model — rewriting to its own default and retrying it"
-                    );
-                    let mut e = pingora::Error::explain(
-                        pingora::ErrorType::HTTPStatus(status),
-                        format!(
-                            "provider '{}' does not carry model '{original_model}'; retrying it with '{}'",
-                            ctx.provider_name, rewrite_to
-                        ),
-                    );
-                    e.as_up();
-                    e.set_retry(true);
-                    return Err(e);
-                }
+        //
+        // A 400/422 is unambiguous, so the decision is taken here. A 404 is
+        // not: a missing endpoint answers the same status, and only the body
+        // can tell the two apart — that decision waits for the body filter
+        // (see `pending_model_404`).
+        if matches!(status, 400 | 422) {
+            if let Some(rewrite_to) = self.model_rewrite_target(&hot, ctx, provider) {
+                return Err(self.begin_model_rewrite(ctx, status, rewrite_to));
             }
         }
         // A 5xx is a transient provider failure: when the route allows it
@@ -4137,6 +4232,45 @@ impl ProxyHttp for AiGateway {
             ctx.client_body_written = true;
         }
 
+        // ── Pending model-lookup decision (404 that may name the model as
+        // unknown) ───────────────────────────────────────────────────────
+        //
+        // vLLM-style upstreams reject a model they do not carry with 404
+        // "The model `X` does not exist", indistinguishable from a missing
+        // endpoint until the body arrives. When the body blames the model,
+        // retry the SAME provider once with its own default model
+        // substituted; any other 404 takes the ordinary failover path.
+        if ctx.pending_model_404 {
+            if let Some(data) = body.as_ref() {
+                if ctx.model_404_body_buf.len() < 64 * 1024 {
+                    ctx.model_404_body_buf.extend_from_slice(data);
+                }
+            }
+            if !end_of_stream {
+                return Ok(None);
+            }
+            ctx.pending_model_404 = false;
+            let body_text =
+                String::from_utf8_lossy(&std::mem::take(&mut ctx.model_404_body_buf)).to_string();
+            let model_is_unknown = body_reports_unknown_model(&body_text);
+
+            let hot = self.hot.load();
+            let rewrite_to = hot
+                .providers
+                .get(&ctx.provider_name)
+                .filter(|_| model_is_unknown)
+                .and_then(|provider| self.model_rewrite_target(&hot, ctx, provider));
+            if let Some(rewrite_to) = rewrite_to {
+                return Err(self.begin_model_rewrite(ctx, 404, rewrite_to));
+            }
+            return self.fail_over_from_body_filter(
+                session,
+                ctx,
+                404,
+                "404 does not name the requested model",
+            );
+        }
+
         // ── Pending rate-limit decision (429 whose headers did not pin the
         // reset instant) ──────────────────────────────────────────────────
         //
@@ -4272,59 +4406,14 @@ impl ProxyHttp for AiGateway {
                 self.persist_circuit_breaker(&provider_name, &p.circuit_breaker);
             }
 
-            // A quota-exhausted provider must not keep the session pinned.
-            self.unpin_session(ctx);
-
-            if !body_is_replayable(session, ctx) {
-                info!(
-                    status = status,
-                    provider = %provider_name,
-                    "429 failover refused — the request body exceeds the 64 KiB replay buffer"
-                );
-                return Ok(None);
-            }
-
-            // Same failover budget as the header-time path: when it is spent,
-            // the 429 reaches the client as-is.
-            let hot = self.hot.load();
-            if ctx.failover_count >= max_failover_attempts(&hot.routes, ctx.route_index) {
-                info!(
-                    status = status,
-                    provider = %provider_name,
-                    attempts = ctx.failover_count,
-                    "429 rate-limit resolved but the failover budget is spent — returning the error to the client"
-                );
-                return Ok(None);
-            }
-
-            // Audit trail: the failed provider answered 429 (the final
-            // provider's answer is recorded by `response_filter`).
-            self.record_event(EVENT_PROVIDER_RESPONSE, ctx, Some(status), None, None, None);
-
-            // Walk the fallback chain like any other failover.
-            let Some((failed_provider, next_provider)) = self.switch_to_fallback(ctx) else {
-                // No fallback left — the error reaches the client as-is.
-                return Ok(None);
-            };
-            METRICS
-                .http_failovers_total
-                .with_label_values(&[&failed_provider, &next_provider, &status.to_string()])
-                .inc();
-            info!(
-                status = status,
-                provider = %next_provider,
-                failed_provider = %failed_provider,
-                "429 resolved via the layered rate-limit resolver — retrying on the fallback provider"
+            // A quota-exhausted provider must not keep the session pinned,
+            // and the request walks on to the next provider of the chain.
+            return self.fail_over_from_body_filter(
+                session,
+                ctx,
+                status,
+                "429 resolved via the layered rate-limit resolver",
             );
-            let mut e = pingora::Error::explain(
-                pingora::ErrorType::HTTPStatus(status),
-                format!(
-                    "provider '{failed_provider}' answered 429; rate-limit resolved; retrying on '{next_provider}'"
-                ),
-            );
-            e.as_up();
-            e.set_retry(true);
-            return Err(e);
         }
 
         // Time-to-first-token: the first response chunk marks the moment the
@@ -5973,6 +6062,77 @@ impl AiGateway {
             }
         }
     }
+
+    /// Walk the fallback chain from the body filter, after a decision that had
+    /// to wait for the whole upstream error body (429 rate-limit resolution,
+    /// 404 model lookup).
+    ///
+    /// `Ok(None)` delivers the upstream error to the client as-is — the body
+    /// cannot be replayed, the failover budget is spent, or no fallback is
+    /// left. The retry error walks on to the next provider of the chain.
+    fn fail_over_from_body_filter(
+        &self,
+        session: &mut Session,
+        ctx: &mut RequestCtx,
+        status: u16,
+        reason: &str,
+    ) -> pingora::Result<Option<std::time::Duration>> {
+        // A provider that failed must not keep the session pinned.
+        self.unpin_session(ctx);
+
+        if !body_is_replayable(session, ctx) {
+            info!(
+                status = status,
+                provider = %ctx.provider_name,
+                "failover refused — the request body exceeds the 64 KiB replay buffer"
+            );
+            return Ok(None);
+        }
+
+        // Same failover budget as the header-time path: when it is spent, the
+        // provider's answer reaches the client as-is.
+        let hot = self.hot.load();
+        if ctx.failover_count >= max_failover_attempts(&hot.routes, ctx.route_index) {
+            info!(
+                status = status,
+                provider = %ctx.provider_name,
+                attempts = ctx.failover_count,
+                reason = reason,
+                "body-time decision reached, but the failover budget is spent — returning the error to the client"
+            );
+            return Ok(None);
+        }
+
+        // Audit trail: the failed provider answered (the final provider's
+        // answer is recorded by `response_filter`).
+        self.record_event(EVENT_PROVIDER_RESPONSE, ctx, Some(status), None, None, None);
+
+        // Walk the fallback chain like any other failover.
+        let Some((failed_provider, next_provider)) = self.switch_to_fallback(ctx) else {
+            // No fallback left — the error reaches the client as-is.
+            return Ok(None);
+        };
+        METRICS
+            .http_failovers_total
+            .with_label_values(&[&failed_provider, &next_provider, &status.to_string()])
+            .inc();
+        info!(
+            status = status,
+            provider = %next_provider,
+            failed_provider = %failed_provider,
+            reason = reason,
+            "retrying on the fallback provider"
+        );
+        let mut e = pingora::Error::explain(
+            pingora::ErrorType::HTTPStatus(status),
+            format!(
+                "provider '{failed_provider}' answered {status} ({reason}); retrying on '{next_provider}'"
+            ),
+        );
+        e.as_up();
+        e.set_retry(true);
+        Err(e)
+    }
 }
 
 impl AiGateway {
@@ -6614,6 +6774,50 @@ fn extract_usage(body: &serde_json::Value, ctx: &mut RequestCtx) {
         if let Some(model) = body.get("model").and_then(|m| m.as_str()) {
             ctx.model = model.to_string();
         }
+    }
+}
+
+#[cfg(test)]
+mod unknown_model_body_tests {
+    use super::body_reports_unknown_model;
+
+    #[test]
+    fn vllm_alias_rejection_is_an_unknown_model() {
+        assert!(body_reports_unknown_model(
+            r#"{"error":{"message":"The model `deepseek-v4.1-flash:cloud` does not exist. Valid aliases: minicpmv47-awq."}}"#
+        ));
+    }
+
+    #[test]
+    fn one_api_rejection_is_an_unknown_model() {
+        assert!(body_reports_unknown_model(
+            r#"{"error":{"message":"invalid params, unknown model 'x'"}}"#
+        ));
+        assert!(body_reports_unknown_model(
+            r#"{"error":{"code":"model_not_found","message":"Model not found"}}"#
+        ));
+    }
+
+    #[test]
+    fn a_missing_endpoint_is_not_an_unknown_model() {
+        assert!(!body_reports_unknown_model("404 page not found"));
+        assert!(!body_reports_unknown_model(
+            r#"{"error":{"message":"Not Found","code":404}}"#
+        ));
+        assert!(!body_reports_unknown_model(""));
+    }
+
+    #[test]
+    fn weak_phrasings_need_a_model_mention() {
+        // "not found" alone is an endpoint 404; naming the model makes it a
+        // model rejection.
+        assert!(!body_reports_unknown_model("resource not found"));
+        assert!(body_reports_unknown_model(
+            r#"{"error":{"message":"model `x` not found"}}"#
+        ));
+        assert!(body_reports_unknown_model(
+            r#"{"error":{"message":"请求的模型不存在"}}"#
+        ));
     }
 }
 
