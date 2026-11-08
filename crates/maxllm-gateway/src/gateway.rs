@@ -1929,11 +1929,20 @@ impl ProxyHttp for AiGateway {
         ctx: &mut Self::CTX,
     ) -> pingora::Result<bool> {
         let path = session.req_header().uri.path();
+        // Record it before anything can fail: a session that never reaches the
+        // router still gets its path into the logs and the recorder.
+        if ctx.request_path.is_empty() {
+            ctx.request_path = path.to_string();
+        }
 
         // Health check endpoint. The body carries enough state for an
         // operator (or a monitor) to see which pools are starving and which
         // providers are circuit-open without scraping Prometheus.
         if path == "/health" || path == "/healthz" {
+            // Fast path: not an application request. Set the flag before the
+            // first `await` — an aborted scrape must not reach `logging`
+            // unmarked (see the guard there).
+            ctx.skip_logging = true;
             let hot = self.hot.load();
             let providers_total = hot.providers.len();
             let mut providers_healthy = 0usize;
@@ -1997,13 +2006,16 @@ impl ProxyHttp for AiGateway {
             session
                 .write_response_body(Some(Bytes::from(body)), true)
                 .await?;
-            ctx.skip_logging = true;
             return Ok(true);
         }
 
         // Version endpoint — a GET that used to fall through to the POST-only
         // API guard and answer 405.
         if path == "/version" {
+            // Fast path: not an application request. Set the flag before the
+            // first `await` — an aborted scrape must not reach `logging`
+            // unmarked (see the guard there).
+            ctx.skip_logging = true;
             let body = format!(r#"{{"version":"{}"}}"#, env!("CARGO_PKG_VERSION")).into_bytes();
             let content_len = body.len().to_string();
             let mut resp = ResponseHeader::build(200, Some(2))?;
@@ -2013,7 +2025,6 @@ impl ProxyHttp for AiGateway {
             session
                 .write_response_body(Some(Bytes::from(body)), true)
                 .await?;
-            ctx.skip_logging = true;
             return Ok(true);
         }
 
@@ -2022,6 +2033,10 @@ impl ProxyHttp for AiGateway {
 
         // /v1/models endpoint — OpenAI-compatible model list (fast path)
         if path == "/v1/models" {
+            // Fast path: not an application request. Set the flag before the
+            // first `await` — an aborted scrape must not reach `logging`
+            // unmarked (see the guard there).
+            ctx.skip_logging = true;
             let body_bytes = hot.models_response.clone();
             let content_len = body_bytes.len().to_string();
             let mut resp = ResponseHeader::build(200, Some(2))?;
@@ -2029,7 +2044,6 @@ impl ProxyHttp for AiGateway {
             resp.insert_header("Content-Length", &content_len)?;
             session.write_response_header(Box::new(resp), false).await?;
             session.write_response_body(Some(body_bytes), true).await?;
-            ctx.skip_logging = true;
             return Ok(true);
         }
 
@@ -2038,6 +2052,10 @@ impl ProxyHttp for AiGateway {
         // gauge, and the exposition must not include the scrape itself —
         // otherwise the gauge could never read 0 while it is being scraped.
         if path == "/metrics" && hot.metrics_enabled {
+            // Fast path: not an application request. Set the flag before the
+            // first `await` — an aborted scrape must not reach `logging`
+            // unmarked (see the guard there).
+            ctx.skip_logging = true;
             // The exposition names every provider, model, key and price in the
             // deployment, so it is served to loopback scrapers only unless the
             // operator opts in. Nothing below the route layer is reached here,
@@ -2080,11 +2098,13 @@ impl ProxyHttp for AiGateway {
             session
                 .write_response_body(Some(Bytes::from(body)), true)
                 .await?;
-            ctx.skip_logging = true;
             return Ok(true);
         }
 
         METRICS.active_requests.inc();
+        // Paired with the decrement in `logging`: the hook must only give back
+        // the slot this request took.
+        ctx.active_request_counted = true;
 
         // Own the path for later use (after the borrow above is done)
         let path = path.to_string();
@@ -5044,12 +5064,43 @@ impl ProxyHttp for AiGateway {
             return;
         }
 
-        METRICS.active_requests.dec();
+        // Only a request that passed the fast paths ever incremented the
+        // gauge; giving it back unconditionally drove the gauge negative
+        // whenever a scrape hung up before its response was written.
+        if ctx.active_request_counted {
+            METRICS.active_requests.dec();
+        }
 
         // The request is done — it no longer counts towards the provider's
         // in-flight load.
         if !ctx.provider_name.is_empty() {
             crate::provider_stats::release(&ctx.provider_name);
+        }
+
+        // A session that never reached the router has no route, no provider,
+        // no model, no tokens and no cost. Booking it as a request used to
+        // write a phantom `request_logs` row (provider "", endpoint type taken
+        // from the default, latency 0, status 0) and a
+        // `requests_total{provider="none",model="unknown",status="0"}` sample,
+        // which then showed up as a "status 0" failure in every report. The
+        // 2026-11-08 audit traced 88 such rows — and reproduced them by
+        // resetting a socket after `GET /health` — so counting them apart
+        // keeps the status-0 population honest.
+        if is_unrouted_session(ctx) {
+            METRICS.unrouted_sessions_total.inc();
+            match e {
+                // A client that hangs up between the request line and the
+                // response is routine (scrapes, port checks, tab reloads).
+                Some(err) if err.esource() == &pingora::ErrorSource::Downstream => {
+                    debug!(error = %err, path = %ctx.request_path, "session ended before routing (client)");
+                }
+                // Anything else here is a gateway defect and must be visible.
+                Some(err) => {
+                    warn!(error = %err, path = %ctx.request_path, "session ended before routing (internal)");
+                }
+                None => {}
+            }
+            return;
         }
 
         if ctx.probe_request {
@@ -5951,6 +6002,18 @@ const STREAM_SCAN_TAIL: usize = 32;
 /// speak a provider-specific SSE grammar the gateway does not parse (Anthropic
 /// ends on `message_stop`, Gemini on `finishReason`, …), so treating a missing
 /// OpenAI marker as truncation there would flag every healthy stream.
+/// Whether this session ended before the router was reached: it has no route
+/// index and no provider, so it never had a model, a token count or a cost.
+///
+/// Such a session is not a *request* and must not be booked as one. The
+/// logging hook used to write a `request_logs` row for it with an empty
+/// provider and a status of 0 — an aborted `/health` or `/metrics` scrape was
+/// the usual cause — which then read as a provider failure in every report
+/// built from that table.
+fn is_unrouted_session(ctx: &RequestCtx) -> bool {
+    ctx.route_index.is_none() && ctx.provider_name.is_empty()
+}
+
 fn tracks_stream_terminal(endpoint: EndpointType) -> bool {
     matches!(
         endpoint,
@@ -6883,6 +6946,25 @@ mod failover_policy_tests {
 mod helper_function_tests {
     use super::*;
     use maxllm_config::ProviderKind;
+
+    /// The logging guard must fire for a context that never got a route, and
+    /// only for that: a routed request keeps its journal row.
+    #[test]
+    fn unrouted_session_predicate_needs_both_a_route_and_a_provider() {
+        let ctx = RequestCtx::new();
+        assert!(
+            is_unrouted_session(&ctx),
+            "a fresh context has not been routed"
+        );
+
+        let mut routed = RequestCtx::new();
+        routed.route_index = Some(0);
+        assert!(!is_unrouted_session(&routed), "route matched");
+
+        let mut selected = RequestCtx::new();
+        selected.provider_name = "mock_openai".into();
+        assert!(!is_unrouted_session(&selected), "provider selected");
+    }
 
     /// Every provider kind maps to a non-empty `owned_by` label.
     #[test]

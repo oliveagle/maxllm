@@ -43,4 +43,5 @@ tokio = { version = "1", features = ["full", "test-util"] }
 serde_json = { workspace = true }
 wiremock = "0.6"
 portpicker = "0.1"
+socket2 = "0.6"
 tempfile = "3"

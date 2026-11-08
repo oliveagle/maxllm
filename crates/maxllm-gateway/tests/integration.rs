@@ -8300,3 +8300,144 @@ endpoint_type = "responses"
         "a client that walks away is not an upstream truncation:\n{metrics}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Phantom request-log rows
+// ---------------------------------------------------------------------------
+
+const UNROUTED_CONFIG: &str = r#"
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[metrics]
+enabled = true
+
+[admin]
+master_key = "test-master-key"
+enabled = true
+
+[providers.mock_openai]
+kind = "openai"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "mock_openai"
+"#;
+
+/// Send `path` and drop the socket with `SO_LINGER=0`, i.e. reset it while the
+/// gateway is answering. That is what a monitor (or a browser) does when it
+/// hangs up in the middle of a scrape, and it is how the phantom
+/// `request_logs` rows were produced in production.
+async fn reset_after_request(port: u16, path: &str) {
+    use std::io::Write as _;
+    let sock = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )
+    .expect("socket");
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    sock.connect(&addr.into()).expect("connect to gateway");
+    (&sock)
+        .write_all(format!("GET {path} HTTP/1.1\r\nHost: test\r\n\r\n").as_bytes())
+        .expect("write request");
+    // Zero linger = close with RST. Dropping the socket then aborts the
+    // connection instead of closing it, so the gateway's response write fails
+    // the way it does when a monitor hangs up mid-scrape.
+    sock.set_linger(Some(Duration::ZERO))
+        .expect("set SO_LINGER");
+    drop(sock);
+    // Give the gateway a moment to notice the reset.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+}
+
+#[tokio::test]
+async fn aborted_fast_path_probe_leaves_no_request_log() {
+    let mock = MockServer::start().await;
+    openai_mock(&mock).await;
+    let gw = TestGateway::start(UNROUTED_CONFIG, &mock.uri()).await;
+    let c = Client::new();
+
+    let logs = |gw: &TestGateway| {
+        let c = c.clone();
+        let url = gw.url("/admin/logs");
+        async move {
+            let v: Value = c
+                .get(url)
+                .bearer_auth("test-master-key")
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            v.as_array().cloned().unwrap_or_default()
+        }
+    };
+
+    // The readiness poll in the harness hits /health, which is a fast path and
+    // must not be booked either.
+    assert!(
+        logs(&gw).await.is_empty(),
+        "a served /health must not be written to the request journal"
+    );
+
+    // A fast path whose client resets mid-write: the write fails inside
+    // `request_filter`, which used to escape with `skip_logging` still false
+    // and book a row with an empty provider and a status of 0.
+    for path in ["/health", "/metrics", "/v1/models", "/version"] {
+        reset_after_request(gw.port, path).await;
+    }
+    let after = logs(&gw).await;
+    assert!(
+        after.is_empty(),
+        "aborted fast-path probes must not appear in the request journal, got {after:#?}"
+    );
+
+    // A real request still books exactly one row: the guard must not suppress
+    // the journal.
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let rows = logs(&gw).await;
+    assert_eq!(rows.len(), 1, "exactly one real request: {rows:#?}");
+    assert_eq!(rows[0]["provider"], "mock_openai");
+    assert_eq!(rows[0]["status"], 200);
+
+    // The unrouted sessions are counted, and the gauge they no longer
+    // decrement stays at zero instead of drifting negative.
+    let metrics = c
+        .get(gw.url("/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let counter = |name: &str| -> f64 {
+        metrics
+            .lines()
+            .find(|l| l.starts_with(&format!("{name} ")))
+            .and_then(|l| l.rsplit(' ').next())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| panic!("metric {name} missing from:\n{metrics}"))
+    };
+    // The counter only fires for sessions that die *before* the fast-path flag
+    // is set (a reset that races the request line, a TLS/HTTP parse failure),
+    // so its value here is timing-dependent. Assert it is registered and
+    // parseable rather than pinning a number.
+    let _ = counter("maxllm_unrouted_sessions_total");
+    assert_eq!(
+        counter("maxllm_active_requests"),
+        0.0,
+        "an aborted fast-path probe must not push the gauge negative:\n{metrics}"
+    );
+}

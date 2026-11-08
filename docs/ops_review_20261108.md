@@ -191,6 +191,67 @@ response body is complete"`）。
    `/v1/chat/completions` 非流式；`test_opencode_streaming_usage_is_recorded` 只覆盖直连路由。
 4. 修好前，任何基于 `/metrics` 的 token/成本报表都只能代表约 34% 的流量。
 
+### 2.1 修复后实测（2026-11-08 17:0x CST）：usage 覆盖率 0% → 100%
+
+§2 的三个建议在 `2cdb156` 落地并部署（14:06–14:23 CST 滚动重启）。用 `request_logs`
+按 10 分钟切片复算，修复前后是断崖式的两段：
+
+| 窗口（UTC） | 200 数 | 带 usage | 备注 |
+|---|---|---|---|
+| 03:00–04:09 | 285 | **0** | 只有 `one_api_*` 在服务，全灭 |
+| 04:10–06:19 | 1 968 | 780（40%） | 混合：`ollama_local` 74% 有，`volc_1` 只有 9% |
+| 06:20–06:29 | 208 | **208（100%）** | 14:23 CST 新二进制 |
+| 06:50–08:29 | 1 508 | 1 507 | 之后一直满 |
+
+**当日 `tokens_in=0 && tokens_out=0` 的 200 共 2 785 条，其中 2 778 条 `error` 为空**
+（即不是客户端断开），几乎全部落在 06:20 之前 —— 这是 §2 那个 bug 的历史存量，不是
+新故障；`2cdb156` 之后不再产生。**不要**拿"零 usage 比例"当作新的可靠性信号，除非
+把窗口限定在该次部署之后。
+
+剩余的少数零 usage 行（例：17:0x 前 2 小时内 4 条）逐条查过，**4/4 都带
+`Downstream ConnectionClosed …`**，即客户端在 token 到达前就断开（`ollama_local` 3 + `minimax` 1），
+属 §1.1 的客户端放弃，已由 `client_aborted_total` 与 `usage_missing_total` 的排除规则
+分开记账，不是提取缺口。
+
+### 2.2 `request_logs` 里的幽灵行：provider 为空、status=0（已修）
+
+排查"2 小时内 6 条 `status=0` 且 provider 为空"的行时定位到一条真实缺陷。这类行的形状
+完全一致：`provider=""`、`model=""`、`latency_ms=0`、`route_path=""`、`client_ip=NULL`、
+`endpoint_type=ChatCompletions`（`EndpointType::default()`），历史累计 88 条（10-31 起，
+常成簇出现，间隔 5–200 ms）。
+
+**根因**：`request_filter` 的四个快路径（`/health`、`/version`、`/v1/models`、`/metrics`）
+把 `ctx.skip_logging = true` 放在 `write_response_header/body(...).await?` **之后**。
+客户端在网关写响应时重置连接（监控挂断、端口探测、浏览器重载）→ 写操作返回
+`WriteError … Connection reset by peer` → `?` 直接把错误抛出 `request_filter`，
+`skip_logging` 仍是 `false` → `logging` 钩子照常记账：写一条 provider 为空的
+`request_logs`、给 `requests_total{provider="none",model="unknown",status="0"}` +1、
+并对**从未自增过**的 `active_requests` 做一次 `dec`（快路径在 `inc` 之前就返回了），
+所以监控挂断得越多，`active_requests` 漂得越负。
+
+**复现**（线上现役二进制，100% 命中）：对 `/health` 发一个请求后立刻用
+`SO_LINGER=0` 关闭 → 每次都新增一行幽灵行；13/13 次探测（health/metrics/models/version）
+全部命中。修复后在同样探测下：0 行、`active_requests` 保持 0。
+
+**修复**（`fix/phantom-request-rows`）：
+1. 四个快路径把 `skip_logging = true` 挪到第一个 `await` 之前；
+2. `logging` 里 `active_requests.dec()` 改为只在 `ctx.active_request_counted`（真正
+   `inc` 过）时执行，杜绝负值漂移；
+3. `logging` 增加 `is_unrouted_session()` 守卫：既没有 `route_index` 也没有
+   `provider_name` 的会话（从未到达路由层）不再写 `request_logs`、不再算作
+   `requests_total{status="0"}`，改记新指标 `maxllm_unrouted_sessions_total`；
+   其中 `ErrorSource::Downstream`（客户端挂断）降为 `debug`，其余（内部缺陷）保持 `warn`；
+4. `request_path` 在 `request_filter` 一进来就落进 ctx，未路由的会话也能在日志里看到路径。
+
+**测试**：集成测试 `aborted_fast_path_probe_leaves_no_request_log`（四个快路径各做一次
+RST 探测 → 断言 `request_logs` 为空、`active_requests==0`；再发一个真实
+`/v1/chat/completions` → 断言恰好 1 行且 `provider=="mock_openai"`、`status==200`，
+证明守卫没有把正常请求一起吞掉）；单元测试 `unrouted_session_predicate_needs_both_a_route_and_a_provider`
+钉住判据。**该集成测试在修复前必然失败**（实测断言输出 4 条幽灵行），修复后通过。
+
+**运维口径**：历史上那 88 条幽灵行保留原样（审计数据不改写），统计时用
+`WHERE provider <> ''` 过滤；`status=0` 的真实含义应从这一行起只看"有 provider"的行。
+
 ---
 
 ## 3. P0-3：成本账本整体不可用
@@ -203,6 +264,37 @@ response body is complete"`）。
 
 **建议**：补价格表（至少 6 家云 provider），或明确关闭 cost 模块并删掉 WARN 噪声；
 同时把 usage 缺失率做成指标（`maxllm_usage_missing_total`）。
+
+### 3.1 价格表复核（2026-11-08 17:0x CST）：单价对得上，但口径还缺缓存
+
+`2cdb156` 之后账本已有数。以开销最大的 `minimax`（`MiniMax-M3`）为例，取 6 小时窗口：
+
+| 项 | 值 |
+|---|---|
+| 请求数 | 1 290 |
+| `tokens_in` | 119 229 901 |
+| `tokens_out` | 508 589 |
+| 记账成本 | **$36.379** |
+| 反推单价 | $0.3051 / 1M input |
+
+用内置价格表（`crates/maxllm-admin/src/costs.rs`：MiniMax-M3 = $0.30/M in + $1.20/M out）
+复算：119.230 × 0.30 + 0.5086 × 1.20 = **$36.377**，与落库值一致 ⇒ 没有重复计费、
+没有单位错位。单价本身也与厂商公开价一致（M3 标准档 $0.30 / $1.20，prompt < 512k；
+超过 512k 翻倍）。
+
+**尚未建模的两点**（本轮未改，属于下一轮）：
+1. **prompt cache 未折价**。M3 支持自动 prompt 缓存，缓存命中的 input 在第三方渠道约
+   $0.05/M，而账本把**全部** input 都按 $0.30/M 记。命中的部分目前只被转发给客户端
+   （`crates/maxllm-translate/src/responses.rs:1075` 会读 `prompt_tokens_details.cached_tokens`
+   并写进 `input_tokens_details`），**没有进入 `copy_usage_tokens`/`extract_usage` 的成本路径**。
+   历史缓存命中率无法回算（流式响应体不落盘；少数落盘的 `minimax` usage 块里 7/8 有缓存、
+   合计 62% input 命中），所以 $36 应视为**上限**，真实账单可能低一个档。
+2. **>512k 分档翻倍**未实现（当前 6 小时均值 92k/请求，暂未触发）。
+
+**下一步**：给 `ModelCost` 加缓存单价，在 `copy_usage_tokens`/`extract_usage` 里解析
+`prompt_tokens_details.cached_tokens` / `input_tokens_details.cached_tokens` /
+Anthropic `cache_read_input_tokens`，按 `(tokens_in - cached) × list + cached × cache_rate`
+计价，并加 `maxllm_cached_input_tokens_total{provider,model}` 让命中率可见。
 
 ---
 
@@ -339,6 +431,22 @@ curl -s http://<gateway>:3795/v1/responses/auto \
   -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
   -d '{"model":"auto","stream":true,"input":"say ok"}'
 # 期望：两者都记录 tokens；实测直连 85/17，池路由 0/0，且池路由 Content-Type=json 但 body 是 SSE
+
+# 4) 幽灵行（provider 为空、status=0）的复现：对快路径发请求后立刻 RST
+#    （修复前 13/13 命中，修复后 0 行；见 §2.2）
+python3 - <<'EOF'
+import socket, struct, time, sqlite3
+def rows():
+    c = sqlite3.connect("maxllm.db")
+    return c.execute("select count(*) from request_logs where provider=''").fetchone()[0]
+print("before", rows())
+s = socket.socket(); s.connect(("127.0.0.1", 3795))
+s.sendall(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
+s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+s.close(); time.sleep(0.2)
+print("after ", rows())   # 修复前 +1，修复后不变
+EOF
+# 统计口径：request_logs 里过滤掉历史幽灵行 —— WHERE provider <> ''
 ```
 
 口径说明：
@@ -379,6 +487,9 @@ curl -s http://<gateway>:3795/v1/responses/auto \
 | P2 recordings 落盘脱敏 | ✅ 已修 | recorder 落盘前两层脱敏：①凭据键（`authorization`/`api_key`/`token`/`password`/`cookie`… 按归一化名精确匹配，`max_tokens` 等计数不受影响）整值替换 `[REDACTED]`；②自由文本里的高置信密钥形状（`Bearer …`/`sk-…`/`AKIA…`/`ghp_…`/`xox?-…`/`AIza…`/JWT/`api_key=…`）；`redact_pii` 另清邮箱/手机号/身份证。命中条目标 `redacted: true` 并计 `maxllm_recording_redactions_total`。历史分片用 `scripts/redact_recordings.py` 原地重写（同规则、原子替换、`--dry-run`） | 8 条 recorder 单测（键/嵌套/数组/自由文本/PII/可关闭/落盘断言）+ 脚本合成数据自测；线上历史分片 dry-run 为 0 命中（32 982 行 / 920 条 body 无凭据与 PII，脚本 no-op，未重写） |
 | 新增（本轮自查） | ✅ | **降级保持时间递增（反抖动）**：连续流降级若无干净窗口间隔，保持时间按 1/5/15/30 分钟递增（不低于 provider 自己的 `fail_timeout`）；窗口内 ≥4 条判定的流且 0 截断视为恢复、阶梯归零。原实现固定 `fail_timeout`=60s ⇒ 系统性截断的 provider 每 60s 被放回池子、立刻再截断 4 条，客户端每个周期都吃一次坏答案，等于没降级 | 单测 `test_repeated_stream_demotions_escalate_the_hold`（60/300/900/1800）+ `test_a_clean_window_resets_the_demotion_hold`；线上已部署 `5f8a951f…` |
 | 新增（审计未列） | ✅ | **流截断率自动降级**：某 provider 在一分钟窗口内截断数 ≥4 且占比 ≥25% 时强制开闸 `fail_timeout`，路由自动走到 fallback 下一家（`maxllm_circuit_breaker_stream_opens_total` + `maxllm-stream-demotions` 告警） | 集成测试 `test_a_truncating_provider_is_demoted_and_traffic_moves_to_the_fallback`：4 次截断后第 5 个请求由健康 fallback 服务 |
+| P0-2 修复后实测 | ✅ 已核对 | 按 10 分钟切片复算 `request_logs`：03:00–04:09 UTC 285 个 200 全零 usage（只有 `one_api_*` 在服务）、04:10–06:19 40%、**06:20 UTC（14:23 CST 新二进制）起 208/208 = 100%**；当日 2 785 条零 usage 里 2 778 条无 error，几乎全在 06:20 之前 ⇒ 是 §2 的历史存量（§2.1） | 修复后窗口内仅剩的零 usage 行逐条带 `Downstream ConnectionClosed`（4/4 = 客户端放弃），不是提取缺口 |
+| P1-幽灵行 `provider="" status=0` | ✅ 已修 | 四个快路径把 `skip_logging` 挪到第一个 `await` 之前；`logging` 的 `active_requests.dec()` 改为只在 `active_request_counted` 时执行；新增 `is_unrouted_session()` 守卫（不写 `request_logs`、不算 `requests_total{status="0"}`，改记 `maxllm_unrouted_sessions_total`，客户端侧降 debug、内部侧保持 warn）；`request_path` 一进 `request_filter` 就落 ctx（§2.2） | 集成测试 `aborted_fast_path_probe_leaves_no_request_log` **修复前必失败**（4 条幽灵行）、修复后通过，且真实请求仍恰好 1 行；单元测试钉住判据；线上 13/13 探测复现、修复后 0 行、`active_requests` 恒 0 |
+| P0-3 价格表复核 | ✅ 已核对（未改价） | `minimax`/`MiniMax-M3` 6 小时 1 290 请求、119.2M in / 0.51M out 记 $36.379，与内置 $0.30/M + $1.20/M 复算值 $36.377 一致，也与厂商公开价一致；**未建模** prompt cache 折价与 >512k 翻倍 ⇒ 该数字是上限（§3.1） | 反推单价 $0.3051/M 与配置单价吻合，排除重复计费/单位错位 |
 
 ### 仍未做（需拍板或有前置）
 

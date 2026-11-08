@@ -1428,6 +1428,7 @@ Available at `GET /metrics` when enabled:
 | `client_aborted_total` | provider | Counter |
 | `usage_missing_total` | provider, model | Counter |
 | `recording_redactions_total` | &mdash; | Counter |
+| `unrouted_sessions_total` | &mdash; | Counter |
 | `auto_pool_metered_selections_total` | &mdash; | Counter |
 | `provider_inflight_requests` | provider | Gauge |
 
@@ -1435,7 +1436,17 @@ Available at `GET /metrics` when enabled:
 provider that served it (after any failover), the model and the upstream
 status; the status is `0` when the provider never answered (a connect or DNS
 failure). `active_requests` counts application requests in flight — the
-`/metrics` scrape itself is not counted, so the gauge reads 0 when idle.
+`/health`, `/version`, `/v1/models` and `/metrics` fast paths are not counted,
+so the gauge reads 0 when idle, and a scrape that hangs up mid-write can no
+longer drive it negative.
+
+`unrouted_sessions_total` counts sessions that ended **before the router was
+reached** — the usual cause is a client that resets the connection between the
+request line and the response (a hung-up scrape, a port check). Such a session
+has no route, provider, model, tokens or cost, so it is not a request: it is
+counted here instead of being written to `request_logs` as a phantom row with
+an empty provider and a status of `0`. Ignore empty-provider rows older than
+the 2026-11-08 fix; `SELECT … WHERE provider <> ''` is the honest population.
 
 `client_aborted_total` counts the responses the **client** abandoned, i.e. it
 closed the connection while the gateway was still writing the body (pingora

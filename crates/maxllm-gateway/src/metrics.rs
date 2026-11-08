@@ -78,6 +78,11 @@ pub struct GatewayMetrics {
     /// before writing. Non-zero means clients are pasting credentials or
     /// personal data through the gateway; the bytes never reach the log store.
     pub recording_redactions_total: IntCounter,
+    /// Sessions that ended before the router was reached: no route, no
+    /// provider, no tokens, no cost. They are not requests (an aborted
+    /// `/health` scrape is the common case) and must not be booked as
+    /// status-0 provider failures.
+    pub unrouted_sessions_total: IntCounter,
 }
 
 impl GatewayMetrics {
@@ -335,6 +340,15 @@ impl GatewayMetrics {
             .register(Box::new(recording_redactions_total.clone()))
             .expect("register");
 
+        let unrouted_sessions_total = IntCounter::new(
+            "maxllm_unrouted_sessions_total",
+            "Sessions that ended before the router was reached (no route or provider)",
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(unrouted_sessions_total.clone()))
+            .expect("register");
+
         Self {
             registry,
             requests_total,
@@ -361,6 +375,7 @@ impl GatewayMetrics {
             provider_retries_total,
             provider_inflight_requests,
             recording_redactions_total,
+            unrouted_sessions_total,
         }
     }
 

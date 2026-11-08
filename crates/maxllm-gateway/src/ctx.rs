@@ -51,6 +51,12 @@ pub struct RequestCtx {
     pub upstream_send_time: Option<Instant>,
     /// Skip the logging hook (health/metrics endpoints).
     pub skip_logging: bool,
+    /// Whether this request incremented `active_requests`. Only a request that
+    /// passed the fast paths does, and the logging hook may only decrement the
+    /// gauge it actually incremented — an aborted `/health` scrape used to
+    /// decrement it without ever incrementing it, so the gauge drifted
+    /// negative under a monitor that hung up early.
+    pub active_request_counted: bool,
     /// Plugin context visible to all plugins.
     pub plugin_ctx: PluginCtx,
     /// ID of the virtual key that authenticated this request (set by the
@@ -220,6 +226,7 @@ impl RequestCtx {
             upstream_cost_usd: None,
             upstream_send_time: None,
             skip_logging: false,
+            active_request_counted: false,
             virtual_key_id: None,
             virtual_key_allowed_models: Vec::new(),
             key_in_flight: None,
