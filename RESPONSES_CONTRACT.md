@@ -274,8 +274,8 @@ with a plain JSON body is left untouched rather than half-converted.
 ## Verified end to end
 
 - Real multi-turn opencode sessions (10 steps, tool calls, file writes,
-  pytest) complete on deepseek, one_api_minimax, one_api_xiaomi and
-  one_api_ollama_local with zero "Invalid ... stream event", zero hangs, and
+  pytest) complete on deepseek, minimax, xiaomi and
+  ollama_local with zero "Invalid ... stream event", zero hangs, and
   real usage.
 - A fork-style request carrying every client field (`store`, `service_tier`,
   `prompt_cache_key`, `include`, `text.verbosity`, `reasoning.effort+summary`,

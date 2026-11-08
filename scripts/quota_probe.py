@@ -19,8 +19,8 @@ recover" exactly, and "how long did it stay down" after the fact.
 
 Usage::
 
-    python3 scripts/quota_probe.py --config maxllm.toml --provider one_api_kimi --once
-    python3 scripts/quota_probe.py --config maxllm.toml --provider one_api_kimi \\
+    python3 scripts/quota_probe.py --config maxllm.toml --provider kimi --once
+    python3 scripts/quota_probe.py --config maxllm.toml --provider kimi \\
         --interval 600 --log logs/kimi-quota.jsonl
 
 Exit status: 0 as soon as an upstream answers 200 (recovered), 1 when

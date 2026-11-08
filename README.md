@@ -348,7 +348,7 @@ home pool.
 [auto_model]              # sentinel "auto": cloud vendors
 enabled = true
 [[auto_model.pool]]
-provider = "one_api_volc_1"
+provider = "volc_1"
 model = "deepseek-v4-flash"
 
 [auto_models.auto_home]   # sentinel "auto_home": home GPUs
@@ -486,8 +486,8 @@ message. `--pool` narrows it to one sentinel (or a comma list):
 ```bash
 python3 scripts/pool_health.py --config maxllm.toml --env-file maxllm.env
 # pool=25 healthy=12 failed=13 elapsed=32.7s
-# ok   200   1463ms auto          one_api_volc_1      deepseek-v4-flash  text='ok'
-# BAD  403    102ms auto          one_api_zhipu_1     glm-5.3-flash      {"code": "model_access_denied", ...}
+# ok   200   1463ms auto          volc_1              deepseek-v4-flash  text='ok'
+# BAD  403    102ms auto          zhipu_1             glm-5.3-flash      {"code": "model_access_denied", ...}
 python3 scripts/pool_health.py --config maxllm.toml --pool auto_home --env-file maxllm.env
 ```
 
@@ -551,7 +551,7 @@ in `scripts/check_responses_policy.py`), not a silent default. See
 rules and the gate:
 
 ```toml
-[providers.one_api_kimi]
+[providers.kimi]
 kind = "openai_compat"
 base_url = "https://api.kimi.com"
 upstream_path = "/coding/v1/chat/completions"   # the chat half
@@ -567,15 +567,15 @@ posting a minimal Responses body to the derived path:
 
 | provider | derived path | result |
 |---|---|---|
-| `one_api_volc_1/2` | `/api/coding/v3/responses` | 200 |
-| `one_api_volc_t_1` | `/api/plan/v3/responses` | 200 |
-| `one_api_minimax` | `/v1/responses` | 200 |
-| `one_api_xiaomi` | `/v1/responses` | 200 |
-| `one_api_ollama_local` | `/v1/responses` | 200 |
+| `volc_1/2` | `/api/coding/v3/responses` | 200 |
+| `volc_t_1` | `/api/plan/v3/responses` | 200 |
+| `minimax` | `/v1/responses` | 200 |
+| `xiaomi` | `/v1/responses` | 200 |
+| `ollama_local` | `/v1/responses` | 200 |
 | `deepseek` | `/v1/responses` | 200 |
-| `one_api_kimi` | `/coding/v1/responses` | quota 429 (route exists) |
+| `kimi` | `/coding/v1/responses` | quota 429 (route exists) |
 | `olefedora_gpu0_minicpmv47`, `coding_home_olefedora_gpu0`, `humanizer_gpu3` | `/v1/responses` | 200 (sglang / llama.cpp) |
-| `one_api_zhipu_1` | derived `/api/coding/paas/v4/responses` → **`/api/v1/responses`** | derived path 404; vendor path 429 (route exists, weekly quota exhausted until 2026-11-10 22:58:54) — so `responses_path` is set explicitly |
+| `zhipu_1` | derived `/api/coding/paas/v4/responses` → **`/api/v1/responses`** | derived path 404; vendor path 429 (route exists, weekly quota exhausted until 2026-11-10 22:58:54) — so `responses_path` is set explicitly |
 
 Two ways to tell whether a request is being translated or forwarded natively:
 a translated request must carry `input` (the gateway rejects it with `400
@@ -699,8 +699,8 @@ max_entries = 10000   # LRU cap
 
 [[routes]]
 path = "/v1/responses"
-provider = "one_api_ollama_local"
-fallback = ["one_api_volc_1", "one_api_minimax", "..."]
+provider = "ollama_local"
+fallback = ["volc_1", "minimax", "..."]
 strategy = "fallback"
 endpoint_type = "responses"
 session_sticky = true   # opt-in
@@ -723,7 +723,7 @@ config hot-reload — which rebuilds every provider — does not reset breaker
 state. Configured per provider:
 
 ```toml
-[providers.one_api_kimi]
+[providers.kimi]
 kind = "openai_compat"
 base_url = "https://api.kimi.com"
 upstream_path = "/coding/v1/chat/completions"
@@ -782,8 +782,8 @@ retry is also skipped once the provider's circuit breaker is open.
 ```toml
 [[routes]]
 path = "/v1/responses"
-provider = "one_api_ollama_local"
-fallback = ["one_api_volc_1", "one_api_minimax", "opencode_go_1", "..."]
+provider = "ollama_local"
+fallback = ["volc_1", "minimax", "opencode_go_1", "..."]
 strategy = "fallback"
 max_failover_attempts = 6   # how many providers one request may walk
 ```
@@ -853,7 +853,7 @@ again. Declare the offset on the provider and the zone-less stamps in *its*
 messages are read in that zone:
 
 ```toml
-[providers.one_api_zhipu_1]
+[providers.zhipu_1]
 kind = "openai_compat"
 base_url = "https://open.bigmodel.cn"
 api_key = "${ZHIPU_API_KEY}"
@@ -906,7 +906,7 @@ provider **directly at its `base_url`** (the gateway's breaker is open — that
 is the point) with the cheapest possible request:
 
 ```bash
-python3 scripts/quota_probe.py --config maxllm.toml --provider one_api_kimi \
+python3 scripts/quota_probe.py --config maxllm.toml --provider kimi \
     --interval 600 --log logs/quota-probe-kimi.jsonl
 # 2026-11-08 00:13:06+0800 BAD  429  254ms elapsed=    0.3s {"message": "You've reached our weekly ..."}
 # ... 600 s later ...
