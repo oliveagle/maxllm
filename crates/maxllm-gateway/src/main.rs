@@ -6,6 +6,7 @@
 //
 // http://www.apache.org/licenses/LICENSE-2.0
 
+mod breaker_sync;
 mod circuit_breaker;
 mod ctx;
 mod gateway;
@@ -224,6 +225,11 @@ fn start_config_watcher(config_path: PathBuf, hot: Arc<arc_swap::ArcSwap<gateway
                     new_state.model_aliases.len()
                 ));
             }
+
+            // The operator's parked providers (a known quota wall) are
+            // applied on every reload, so a new parking entry takes effect
+            // without a restart.
+            gateway::apply_quota_parking(&new_config, &new_state);
 
             // Atomic swap
             hot.store(Arc::new(new_state));

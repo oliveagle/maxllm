@@ -699,8 +699,18 @@ async fn test_upstream_500_returns_error() {
         .send()
         .await
         .unwrap();
-    // Gateway forwards the upstream 500
-    assert_eq!(resp.status(), 500);
+    // The gateway owns the answer: the client gets its own 503, never the
+    // provider's error body.
+    assert_eq!(resp.status(), 503);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "gateway_error");
+    assert!(
+        !body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("internal"),
+        "the provider's error text must not reach the client: {body}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -4392,8 +4402,8 @@ strategy = "fallback"
         .unwrap();
     assert_eq!(
         first.status(),
-        500,
-        "the first attempt reaches the upstream"
+        503,
+        "the first attempt reaches the upstream and the gateway answers with its own 503"
     );
 
     let second = c
@@ -4446,8 +4456,28 @@ async fn test_all_providers_fail_returns_last_error() {
         .await
         .unwrap();
 
-    // Both providers failed; the client receives the LAST provider's error.
-    assert_eq!(resp.status(), 429);
+    // Both providers failed and no failover is left: the client receives the
+    // gateway's own error, not the last provider's quota message.
+    assert_eq!(resp.status(), 503);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "gateway_error");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no provider available"),
+        "the message names the situation: {body}"
+    );
+    assert_eq!(
+        primary.received_requests().await.unwrap_or_default().len(),
+        1,
+        "the primary is tried once"
+    );
+    assert_eq!(
+        fallback.received_requests().await.unwrap_or_default().len(),
+        1,
+        "the fallback is tried once"
+    );
 }
 
 #[tokio::test]
@@ -4484,8 +4514,8 @@ async fn test_failover_budget_is_respected() {
         .unwrap();
 
     // max_failover_attempts = 1: p1 fails -> p2; p2 fails -> budget spent, the
-    // error of p2 is returned and p3 is never touched.
-    assert_eq!(resp.status(), 500);
+    // gateway answers the client itself and p3 is never touched.
+    assert_eq!(resp.status(), 503);
     let fallback_reqs = fallback.received_requests().await.unwrap();
     assert_eq!(fallback_reqs.len(), 1, "p2 is tried once");
 }
@@ -8327,7 +8357,7 @@ async fn test_large_body_fails_over_with_the_whole_body() {
     let filler = "x".repeat(100_000);
     let body = json!({
         "model": "gpt-4o",
-        "messages": [{"role": "user", "content": filler}],
+        "input": [{"role": "user", "content": filler}],
     });
 
     let outcome = tokio::time::timeout(
@@ -8350,7 +8380,7 @@ async fn test_large_body_fails_over_with_the_whole_body() {
     let served = alive.received_requests().await.unwrap_or_default();
     assert_eq!(served.len(), 1, "the fallback is tried once");
     let sent: Value = serde_json::from_slice(&served[0].body).expect("json body");
-    let content = sent["messages"][0]["content"].as_str().unwrap_or_default();
+    let content = sent["input"][0]["content"].as_str().unwrap_or_default();
     assert_eq!(
         content.len(),
         100_000,
@@ -8380,7 +8410,7 @@ async fn test_large_body_survives_a_connect_failure() {
     let filler = "x".repeat(100_000);
     let body = json!({
         "model": "gpt-4o",
-        "messages": [{"role": "user", "content": filler}],
+        "input": [{"role": "user", "content": filler}],
     });
 
     let outcome = tokio::time::timeout(
@@ -9807,4 +9837,835 @@ async fn test_responses_path_unknown_provider_is_rejected() {
             .contains("unknown provider or pool 'no_such_provider'"),
         "the 404 must name the unknown segment: {body}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Quota exhaustion (429) and the failover it must trigger
+// ---------------------------------------------------------------------------
+
+/// Zhipu's weekly/monthly quota error: no rate-limit headers at all (the
+/// reset instant is only in the body, in Beijing wall clock).
+const QUOTA_429_BODY: &str =
+    r#"{"error":{"code":"1310","message":"您已达到每周/每月使用上限，您的限额将在 2026-11-10 22:58:54 重置。"}}"#;
+
+const QUOTA_429_FALLBACK_CONFIG: &str = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.quota_dead]
+kind = "openai_compat"
+base_url = "{MOCK_URL}"
+upstream_path = "/v1/chat/completions"
+api_key = "fake-key"
+native_responses = true
+responses_path = "/v1/responses"
+
+[providers.alive]
+kind = "openai_compat"
+base_url = "{FALLBACK_URL}"
+upstream_path = "/v1/chat/completions"
+api_key = "fake-key"
+native_responses = true
+responses_path = "/v1/responses"
+
+[[routes]]
+path = "/v1/responses"
+provider = "quota_dead"
+fallback = ["alive"]
+strategy = "fallback"
+endpoint_type = "responses"
+max_failover_attempts = 3
+"#;
+
+/// A provider whose quota is exhausted answers 429 and must not leak that
+/// error to the client: the request has to fail over to the next provider.
+#[tokio::test]
+async fn test_quota_429_fails_over_to_the_next_provider() {
+    let dead = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .set_body_string(QUOTA_429_BODY)
+                .insert_header("content-type", "application/json"),
+        )
+        .mount(&dead)
+        .await;
+
+    let alive = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from-alive")))
+        .mount(&alive)
+        .await;
+
+    let gw = TestGateway::start_with_fallback(
+        QUOTA_429_FALLBACK_CONFIG,
+        &dead.uri(),
+        &alive.uri(),
+    )
+    .await;
+
+    let body = json!({"model": "gpt-4o", "input": "hi"});
+    let resp = client()
+        .post(gw.url("/v1/responses"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&body)
+        .send()
+        .await
+        .expect("request completes");
+
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    assert_eq!(
+        status,
+        200,
+        "a quota 429 must fail over, not reach the client (body: {text})"
+    );
+    let served = alive.received_requests().await.unwrap_or_default();
+    assert_eq!(served.len(), 1, "the fallback is tried once");
+}
+
+/// The same, with the request size a long codex session actually produces
+/// (~200k tokens of context): the body no longer fits pingora's 64 KiB
+/// replay buffer, so the failover must still happen — the client must never
+/// see the upstream's quota error.
+#[tokio::test]
+async fn test_quota_429_fails_over_with_a_large_body() {
+    let dead = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .set_body_string(QUOTA_429_BODY)
+                .insert_header("content-type", "application/json"),
+        )
+        .mount(&dead)
+        .await;
+
+    let alive = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from-alive")))
+        .mount(&alive)
+        .await;
+
+    let gw = TestGateway::start_with_fallback(
+        QUOTA_429_FALLBACK_CONFIG,
+        &dead.uri(),
+        &alive.uri(),
+    )
+    .await;
+
+    let filler = "x".repeat(700_000);
+    let body = json!({
+        "model": "gpt-4o",
+        "input": [{"role": "user", "content": filler}],
+    });
+
+    let resp = tokio::time::timeout(
+        Duration::from_secs(30),
+        client()
+            .post(gw.url("/v1/responses"))
+            .header("Authorization", "Bearer test-key-123")
+            .json(&body)
+            .send(),
+    )
+    .await
+    .expect("a large-body failover must not hang the client")
+    .expect("request completes");
+
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    assert_eq!(
+        status,
+        200,
+        "a quota 429 must fail over even with a large body (body: {text})"
+    );
+    let served = alive.received_requests().await.unwrap_or_default();
+    assert_eq!(served.len(), 1, "the fallback is tried once");
+    let sent: Value = serde_json::from_slice(&served[0].body).expect("json body");
+    let content = sent["input"][0]["content"].as_str().unwrap_or_default();
+    assert_eq!(
+        content.len(),
+        700_000,
+        "the replayed body must be complete, got {} bytes",
+        content.len()
+    );
+}
+
+const QUOTA_429_AUTO_POOL_CONFIG: &str = r#"
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[providers.quota_dead]
+kind = "openai_compat"
+base_url = "{MOCK_URL}"
+upstream_path = "/v1/chat/completions"
+api_key = "fake-key"
+native_responses = true
+responses_path = "/v1/responses"
+
+[providers.alive]
+kind = "openai_compat"
+base_url = "{POOL_A_URL}"
+upstream_path = "/v1/chat/completions"
+api_key = "fake-key"
+native_responses = true
+responses_path = "/v1/responses"
+
+[auto_model]
+enabled = true
+name = "auto"
+
+[[auto_model.pool]]
+provider = "quota_dead"
+model = "model-a"
+
+[[auto_model.pool]]
+provider = "alive"
+model = "model-b"
+
+[[routes]]
+path = "/v1/responses/auto"
+provider = "auto"
+auto_model = true
+session_sticky = true
+"#;
+
+const QUOTA_429_AUTO_POOL_SINGLE_CONFIG: &str = r#"
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[providers.dead]
+kind = "openai"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+
+[[auto_model.pool]]
+provider = "dead"
+model = "model-a"
+
+[[routes]]
+path = "/v1/responses/auto"
+provider = "auto"
+auto_model = true
+"#;
+
+/// The auto pool: a quota-exhausted member must not leak its 429 to the
+/// client — the request has to rotate to the next member of the pool.
+#[tokio::test]
+async fn test_quota_429_in_the_auto_pool_rotates_to_the_next_member() {
+    let dead = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .set_body_string(QUOTA_429_BODY)
+                .insert_header("content-type", "application/json"),
+        )
+        .mount(&dead)
+        .await;
+
+    let alive = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from-alive")))
+        .mount(&alive)
+        .await;
+
+    let dead_uri = dead.uri();
+    let alive_uri = alive.uri();
+    let (mut child, base, _cfg) = spawn_gateway_with_pool(
+        QUOTA_429_AUTO_POOL_CONFIG,
+        [dead_uri.as_str(), alive_uri.as_str(), alive_uri.as_str()],
+    )
+    .await;
+    let c = client();
+
+    let body = json!({"model": "auto", "input": "hi"});
+    let resp = c
+        .post(format!("{base}/v1/responses/auto"))
+        .json(&body)
+        .send()
+        .await
+        .expect("request completes");
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    let _ = child.kill();
+    assert_eq!(
+        status,
+        200,
+        "a quota 429 in the pool must rotate, not reach the client (body: {text})"
+    );
+    let served = alive.received_requests().await.unwrap_or_default();
+    assert_eq!(served.len(), 1, "the next pool member is tried once");
+}
+
+/// Same, with the body size a long codex session produces.
+#[tokio::test]
+async fn test_quota_429_in_the_auto_pool_rotates_with_a_large_body() {
+    let dead = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .set_body_string(QUOTA_429_BODY)
+                .insert_header("content-type", "application/json"),
+        )
+        .mount(&dead)
+        .await;
+
+    let alive = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from-alive")))
+        .mount(&alive)
+        .await;
+
+    let dead_uri = dead.uri();
+    let alive_uri = alive.uri();
+    let (mut child, base, _cfg) = spawn_gateway_with_pool(
+        QUOTA_429_AUTO_POOL_CONFIG,
+        [dead_uri.as_str(), alive_uri.as_str(), alive_uri.as_str()],
+    )
+    .await;
+    let c = client();
+
+    let filler = "x".repeat(700_000);
+    let body = json!({"model": "auto", "input": [{"role": "user", "content": filler}]});
+    let resp = tokio::time::timeout(
+        Duration::from_secs(30),
+        c.post(format!("{base}/v1/responses/auto"))
+            .json(&body)
+            .send(),
+    )
+    .await
+    .expect("a large-body failover must not hang the client")
+    .expect("request completes");
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    let _ = child.kill();
+    assert_eq!(
+        status,
+        200,
+        "a quota 429 in the pool must rotate even with a large body (body: {text})"
+    );
+    let served = alive.received_requests().await.unwrap_or_default();
+    assert_eq!(served.len(), 1, "the next pool member is tried once");
+    let sent: Value = serde_json::from_slice(&served[0].body).expect("json body");
+    let content = sent["input"][0]["content"].as_str().unwrap_or_default();
+    assert_eq!(
+        content.len(),
+        700_000,
+        "the replayed body must be complete, got {} bytes",
+        content.len()
+    );
+}
+
+
+/// A route with no fallback, and the layered rate-limit resolver enabled —
+/// the production shape of the incident: the 429's reset instant is only in
+/// the body, so the decision is deferred to the body filter.
+const QUOTA_429_RESOLVER_NO_FALLBACK_CONFIG: &str = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[rate_limit_learning]
+enabled = true
+laya_url = "{LAYA_URL}"
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.quota_dead]
+kind = "openai_compat"
+base_url = "{MOCK_URL}"
+upstream_path = "/v1/chat/completions"
+api_key = "fake-key"
+native_responses = true
+responses_path = "/v1/responses"
+utc_offset_minutes = 480
+
+[[routes]]
+path = "/v1/responses"
+provider = "quota_dead"
+strategy = "fallback"
+endpoint_type = "responses"
+max_failover_attempts = 3
+"#;
+
+// ---------------------------------------------------------------------------
+// The gateway owns the error: no upstream error reaches the client
+// ---------------------------------------------------------------------------
+
+/// A quota wall with no fallback: the client gets the gateway's own 503,
+/// never the upstream's quota message.
+#[tokio::test]
+async fn test_quota_429_without_a_fallback_is_answered_by_the_gateway() {
+    let dead = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .set_body_string(QUOTA_429_BODY)
+                .insert_header("content-type", "application/json"),
+        )
+        .mount(&dead)
+        .await;
+
+    let gw = TestGateway::start_with_fallback(
+        QUOTA_429_RESOLVER_NO_FALLBACK_CONFIG,
+        &dead.uri(),
+        &dead.uri(),
+    )
+    .await;
+
+    let body = json!({"model": "gpt-4o", "input": "hi"});
+    let resp = client()
+        .post(gw.url("/v1/responses"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&body)
+        .send()
+        .await
+        .expect("request completes");
+
+    let status = resp.status();
+    let upstream_status = resp
+        .headers()
+        .get("x-maxllm-upstream-status")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_string());
+    let text = resp.text().await.unwrap_or_default();
+
+    assert_eq!(
+        status,
+        503,
+        "a quota wall with no fallback must become the gateway's own 503 (body: {text})"
+    );
+    assert!(
+        !text.contains("您已达到每周/每月使用上限"),
+        "the upstream's quota message must not reach the client: {text}"
+    );
+    let parsed: Value = serde_json::from_str(&text).expect("the answer is JSON");
+    assert_eq!(parsed["error"]["type"], "gateway_error");
+    assert_eq!(parsed["error"]["code"], 503);
+    assert!(
+        parsed["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no provider available"),
+        "the message names the situation: {text}"
+    );
+    assert_eq!(
+        upstream_status.as_deref(),
+        Some("429"),
+        "the upstream's own status travels with the answer"
+    );
+}
+
+/// The production shape: an auto pool whose only member is quota-dead. The
+/// client must get the gateway's own error — not the upstream's quota text.
+#[tokio::test]
+async fn test_quota_429_in_the_auto_pool_without_a_healthy_member_is_answered_by_the_gateway() {
+    let dead = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .set_body_string(QUOTA_429_BODY)
+                .insert_header("content-type", "application/json"),
+        )
+        .mount(&dead)
+        .await;
+
+    let dead_uri = dead.uri();
+    let (mut child, base, _cfg) = spawn_gateway_with_pool(
+        QUOTA_429_AUTO_POOL_SINGLE_CONFIG,
+        [dead_uri.as_str(), dead_uri.as_str(), dead_uri.as_str()],
+    )
+    .await;
+
+    let body = json!({"model": "auto", "input": "hi"});
+    let resp = client()
+        .post(format!("{base}/v1/responses/auto"))
+        .json(&body)
+        .send()
+        .await
+        .expect("request completes");
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    let _ = child.kill();
+
+    assert_eq!(
+        status,
+        503,
+        "a dead auto pool must become the gateway's own 503 (body: {text})"
+    );
+    assert!(
+        !text.contains("您已达到每周/每月使用上限"),
+        "the upstream's quota message must not reach the client: {text}"
+    );
+    let parsed: Value = serde_json::from_str(&text).expect("the answer is JSON");
+    assert_eq!(parsed["error"]["type"], "gateway_error");
+}
+
+/// A client's own mistake keeps the upstream's answer: a 404 that names the
+/// model as unknown is the client's answer to hear, not the gateway's.
+#[tokio::test]
+async fn test_a_client_fault_keeps_the_upstreams_answer() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(404)
+                .set_body_string(r#"{"error":{"message":"The model `x` does not exist","type":"invalid_request_error"}}"#)
+                .insert_header("content-type", "application/json"),
+        )
+        .mount(&mock)
+        .await;
+
+    let gw = TestGateway::start_with_fallback(
+        QUOTA_429_RESOLVER_NO_FALLBACK_CONFIG,
+        &mock.uri(),
+        &mock.uri(),
+    )
+    .await;
+
+    let body = json!({"model": "gpt-4o", "input": "hi"});
+    let resp = client()
+        .post(gw.url("/v1/responses"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&body)
+        .send()
+        .await
+        .expect("request completes");
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+
+    assert_eq!(
+        status, 404,
+        "a request fault stays the upstream's answer (body: {text})"
+    );
+    assert!(
+        text.contains("does not exist"),
+        "the upstream's diagnosis survives: {text}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Cross-node breaker sharing, operator parking, and the breaker endpoints
+// ---------------------------------------------------------------------------
+
+/// Spawn a gateway on a fixed port (the cross-node test needs to know both
+/// gateways' addresses before either of them starts).
+async fn spawn_gateway_on(config: &str, port: u16) -> (Child, tempfile::NamedTempFile) {
+    let config_str = config.replace("{PORT}", &port.to_string());
+    let mut config_file = tempfile::NamedTempFile::new().expect("temp file");
+    config_file
+        .write_all(config_str.as_bytes())
+        .expect("write config");
+    let child = Command::new(env!("CARGO_BIN_EXE_maxllm-server"))
+        .arg("--config")
+        .arg(config_file.path())
+        .env("RUST_LOG", "warn")
+        .env_remove("HTTPS_PROXY")
+        .env_remove("HTTP_PROXY")
+        .env_remove("https_proxy")
+        .env_remove("http_proxy")
+        .spawn()
+        .expect("spawn gateway");
+    let base = format!("http://127.0.0.1:{port}");
+    let c = client();
+    for _ in 0..60 {
+        if c.get(format!("{base}/health"))
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    (child, config_file)
+}
+
+/// A quota wall learned on one node must be adopted by its peer: the peer
+/// must not spend a request discovering the same wall.
+#[tokio::test]
+async fn test_a_quota_wall_learned_on_one_node_is_adopted_by_the_peer() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .set_body_string(QUOTA_429_BODY)
+                .insert_header("content-type", "application/json"),
+        )
+        .mount(&mock)
+        .await;
+
+    let port_a = portpicker::pick_unused_port().expect("free port");
+    let port_b = portpicker::pick_unused_port().expect("free port");
+
+    let config = |port: u16, peer: u16| {
+        format!(
+            r#"
+[server]
+listen = "127.0.0.1:{port}"
+threads = 1
+
+[rate_limit_learning]
+enabled = true
+
+[admin]
+master_key = "test-master-key"
+enabled = true
+
+[breaker_sync]
+enabled = true
+interval_secs = 1
+peers = ["http://127.0.0.1:{peer}"]
+auth_token = "test-master-key"
+
+[providers.dead]
+kind = "openai_compat"
+base_url = "{mock}"
+upstream_path = "/v1/chat/completions"
+api_key = "fake-key"
+native_responses = true
+responses_path = "/v1/responses"
+utc_offset_minutes = 480
+
+[[routes]]
+path = "/v1/responses"
+provider = "dead"
+strategy = "fallback"
+endpoint_type = "responses"
+"#,
+            port = port,
+            peer = peer,
+            mock = mock.uri()
+        )
+    };
+
+    let (mut child_a, _cfg_a) = spawn_gateway_on(&config(port_a, port_b), port_a).await;
+    let (mut child_b, _cfg_b) = spawn_gateway_on(&config(port_b, port_a), port_b).await;
+
+    // Node A learns the wall: the request is answered by the gateway itself
+    // and the provider is parked.
+    let body = json!({"model": "gpt-4o", "input": "hi"});
+    let resp = client()
+        .post(format!("http://127.0.0.1:{port_a}/v1/responses"))
+        .json(&body)
+        .send()
+        .await
+        .expect("request completes");
+    assert_eq!(resp.status(), 503, "the quota wall becomes the gateway's 503");
+    let calls_after_a = mock.received_requests().await.unwrap_or_default().len();
+    assert_eq!(calls_after_a, 1, "node A asked the provider once");
+
+    // Node B adopts the wall from A (the poll runs every second).
+    let mut adopted = false;
+    for _ in 0..40 {
+        let report: Value = client()
+            .get(format!("http://127.0.0.1:{port_b}/admin/breakers"))
+            .bearer_auth("test-master-key")
+            .send()
+            .await
+            .expect("the breaker report answers")
+            .json()
+            .await
+            .expect("the report is JSON");
+        let until = report["breakers"]
+            .as_array()
+            .and_then(|b| {
+                b.iter()
+                    .find(|e| e["provider"] == "dead")
+                    .and_then(|e| e["force_open_until"].as_u64())
+            })
+            .unwrap_or(0);
+        if until > 0 {
+            adopted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(adopted, "node B must adopt node A's quota force-open");
+
+    // …and must not ask the provider again.
+    let resp = client()
+        .post(format!("http://127.0.0.1:{port_b}/v1/responses"))
+        .json(&body)
+        .send()
+        .await
+        .expect("request completes");
+    assert_eq!(
+        resp.status(),
+        503,
+        "the peer answers with the gateway's own error"
+    );
+    let calls_after_b = mock.received_requests().await.unwrap_or_default().len();
+    assert_eq!(
+        calls_after_b, calls_after_a,
+        "the peer must not spend a request on a provider it knows is quota-dead"
+    );
+
+    let _ = child_a.kill();
+    let _ = child_b.kill();
+}
+
+/// A provider the operator parked is never called — the wall the operator
+/// knows about costs no request.
+#[tokio::test]
+async fn test_a_parked_provider_is_never_called() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("never")))
+        .mount(&mock)
+        .await;
+
+    let config = format!(
+        r#"
+[server]
+listen = "127.0.0.1:{{PORT}}"
+threads = 1
+
+[quota_parking]
+"mock_openai" = "2099-01-01T00:00:00Z"
+
+[providers.mock_openai]
+kind = "openai"
+base_url = "{{MOCK_URL}}"
+api_key = "fake-key"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "mock_openai"
+"#
+    );
+    let gw = TestGateway::start_with_fallback(&config, &mock.uri(), &mock.uri()).await;
+
+    let body = json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]});
+    let resp = client()
+        .post(gw.url("/v1/chat/completions"))
+        .json(&body)
+        .send()
+        .await
+        .expect("request completes");
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+
+    assert_eq!(status, 503, "a parked provider cannot serve (body: {text})");
+    assert!(
+        text.contains("circuit open"),
+        "the answer names the parked provider: {text}"
+    );
+    assert!(
+        mock.received_requests().await.unwrap_or_default().is_empty(),
+        "a parked provider must not be called at all"
+    );
+}
+
+/// The operator's park / unpark, and the live breaker report.
+#[tokio::test]
+async fn test_the_breaker_endpoints_park_and_release_a_provider() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("ok")))
+        .mount(&mock)
+        .await;
+
+    let config = r#"
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[admin]
+master_key = "test-master-key"
+enabled = true
+
+[providers.mock_openai]
+kind = "openai"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "mock_openai"
+"#;
+    let gw = TestGateway::start_with_fallback(config, &mock.uri(), &mock.uri()).await;
+    let c = client();
+
+    // The report lists the provider.
+    let report: Value = c
+        .get(gw.url("/admin/breakers"))
+        .bearer_auth("test-master-key")
+        .send()
+        .await
+        .expect("the report answers")
+        .json()
+        .await
+        .expect("the report is JSON");
+    let entry = report["breakers"]
+        .as_array()
+        .and_then(|b| b.iter().find(|e| e["provider"] == "mock_openai"))
+        .expect("the provider is listed");
+    assert_eq!(entry["state"], 0, "a fresh provider is closed");
+
+    // Park it.
+    let parked: Value = c
+        .post(gw.url("/admin/breakers/force-open"))
+        .bearer_auth("test-master-key")
+        .json(&json!({"provider": "mock_openai", "until": "2099-01-01T00:00:00Z"}))
+        .send()
+        .await
+        .expect("the park answers")
+        .json()
+        .await
+        .expect("the park is JSON");
+    assert!(parked["force_open_until"].as_u64().unwrap_or(0) > 0);
+
+    let report: Value = c
+        .get(gw.url("/admin/breakers"))
+        .bearer_auth("test-master-key")
+        .send()
+        .await
+        .expect("the report answers")
+        .json()
+        .await
+        .expect("the report is JSON");
+    let entry = report["breakers"]
+        .as_array()
+        .and_then(|b| b.iter().find(|e| e["provider"] == "mock_openai"))
+        .expect("the provider is listed");
+    assert_eq!(entry["state"], 1, "a parked provider reads as open");
+
+    // Release it.
+    let released: Value = c
+        .post(gw.url("/admin/breakers/close"))
+        .bearer_auth("test-master-key")
+        .json(&json!({"provider": "mock_openai"}))
+        .send()
+        .await
+        .expect("the release answers")
+        .json()
+        .await
+        .expect("the release is JSON");
+    assert_eq!(released["force_open_until"], 0);
+
+    // A wrong key is refused.
+    let resp = c
+        .get(gw.url("/admin/breakers"))
+        .bearer_auth("wrong-key")
+        .send()
+        .await
+        .expect("the request completes");
+    assert_eq!(resp.status(), 401, "the breaker report needs the master key");
 }

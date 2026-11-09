@@ -80,6 +80,71 @@ pub struct Config {
     /// request whose model equals a pool's name rotates over that pool only.
     #[serde(default)]
     pub auto_models: HashMap<String, AutoModelConfig>,
+    /// Providers parked until a known instant (`[quota_parking]`).
+    ///
+    /// An operator knows more than the gateway: a vendor's weekly quota is
+    /// exhausted until a specific moment, and every node should keep that
+    /// provider out of the rotation until then instead of discovering the
+    /// wall with a 429 of its own.
+    #[serde(default)]
+    pub quota_parking: HashMap<String, QuotaParkingSpec>,
+    /// Cross-node breaker sharing (`[breaker_sync]`).
+    ///
+    /// The circuit breaker is per node: a provider that ran out of quota on
+    /// one node is still probed by the next one, so every node pays one
+    /// failed request before it learns the same wall. With the peers
+    /// configured here, a quota force-open learned on one node is adopted by
+    /// the others.
+    #[serde(default)]
+    pub breaker_sync: Option<BreakerSyncConfig>,
+}
+
+/// A provider parked until a known instant.
+#[derive(Debug, Clone)]
+pub enum QuotaParkingSpec {
+    /// An RFC3339 timestamp, e.g. `"2026-11-10T22:58:54+08:00"`.
+    Timestamp(String),
+    /// Epoch milliseconds.
+    EpochMs(i64),
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum QuotaParkingRepr {
+    Timestamp(String),
+    EpochMs(i64),
+}
+
+impl<'de> Deserialize<'de> for QuotaParkingSpec {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match QuotaParkingRepr::deserialize(deserializer)? {
+            QuotaParkingRepr::Timestamp(ts) => Ok(QuotaParkingSpec::Timestamp(ts)),
+            QuotaParkingRepr::EpochMs(ms) => Ok(QuotaParkingSpec::EpochMs(ms)),
+        }
+    }
+}
+
+/// Cross-node breaker sharing.
+#[derive(Debug, Deserialize, Clone)]
+pub struct BreakerSyncConfig {
+    /// Master switch.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// How often the peers are polled, in seconds.
+    #[serde(default = "default_breaker_sync_interval")]
+    pub interval_secs: u64,
+    /// The peers' base URLs, e.g. `["http://10.126.126.199:18081"]`.
+    #[serde(default)]
+    pub peers: Vec<String>,
+    /// The bearer token the peers expect. The config file expands
+    /// `${ENV_VAR}`, so this normally reads `"${MAXLLM_MASTER_KEY}"` and no
+    /// secret is stored in the file itself.
+    #[serde(default)]
+    pub auth_token: Option<String>,
+}
+
+fn default_breaker_sync_interval() -> u64 {
+    15
 }
 
 /// Configuration for one auto sentinel model.

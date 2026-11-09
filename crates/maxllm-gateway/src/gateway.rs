@@ -416,6 +416,66 @@ pub struct AiGateway {
     /// regex → laya decision). Replaces the blind cooldown a 429 used to
     /// trigger with an exact "this provider is available again at T".
     pub rate_limit_resolver: Arc<crate::rate_limit_resolver::RateLimitResolver>,
+    /// The hash of the admin master key. The gateway serves the breaker
+    /// endpoints itself (they act on the *live* circuit breakers), so it
+    /// needs the key to authenticate them.
+    pub admin_key_hash: Option<String>,
+}
+
+/// The instant a parked provider becomes usable again, in epoch ms.
+///
+/// Accepts an RFC3339 timestamp, epoch milliseconds or epoch seconds.
+fn parking_until_ms(spec: &maxllm_config::QuotaParkingSpec) -> Option<u64> {
+    use maxllm_config::QuotaParkingSpec;
+    match spec {
+        QuotaParkingSpec::EpochMs(ms) => u64::try_from(*ms).ok(),
+        QuotaParkingSpec::Timestamp(ts) => parse_instant_ms(ts),
+    }
+}
+
+/// Parse an instant: RFC3339, epoch milliseconds or epoch seconds.
+fn parse_instant_ms(value: &str) -> Option<u64> {
+    let trimmed = value.trim();
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(trimmed) {
+        return u64::try_from(dt.timestamp_millis()).ok();
+    }
+    let n: i64 = trimmed.parse().ok()?;
+    if n.unsigned_abs() < 100_000_000_000 {
+        // Too small for epoch milliseconds — epoch seconds.
+        u64::try_from(n.checked_mul(1000)?).ok()
+    } else {
+        u64::try_from(n).ok()
+    }
+}
+
+/// Park the providers the operator marked as out of quota.
+///
+/// The operator knows more than the gateway: a vendor's weekly quota is
+/// exhausted until a specific moment, and every node that loads this config
+/// should keep the provider out of the rotation until then — instead of
+/// each node discovering the wall with a 429 (and a failed request) of its
+/// own.
+pub fn apply_quota_parking(config: &Config, hot: &HotState) {
+    for (name, spec) in &config.quota_parking {
+        let Some(until) = parking_until_ms(spec) else {
+            warn!(provider = %name, "quota parking entry could not be parsed — ignored");
+            continue;
+        };
+        let Some(provider) = hot.providers.get(name) else {
+            warn!(provider = %name, "quota parking entry names an unknown provider — ignored");
+            continue;
+        };
+        provider.circuit_breaker.park_until(until);
+        METRICS
+            .circuit_breaker_state
+            .with_label_values(&[name])
+            .set(provider.circuit_breaker.state() as i64);
+        info!(
+            provider = %name,
+            until = until,
+            "provider parked by the configuration (quota wall)"
+        );
+    }
 }
 
 /// Build the hot-reloadable state from a config.
@@ -1202,14 +1262,45 @@ impl AiGateway {
             );
         }
 
+        let hot = Arc::new(arc_swap::ArcSwap::from_pointee(hot_state));
+
+        // The operator's parked providers (a known quota wall) are applied
+        // before the first request: the gateway must not spend one request
+        // discovering what the operator already knows.
+        apply_quota_parking(config, &hot.load());
+
+        // Cross-node breaker sharing: a quota force-open learned on one node
+        // is adopted by the peers, so the wall costs one learning event
+        // instead of one per node.
+        if let Some(sync) = &config.breaker_sync {
+            if sync.enabled && !sync.peers.is_empty() {
+                crate::breaker_sync::spawn(
+                    Arc::clone(&hot),
+                    admin_api.clone(),
+                    sync.peers.clone(),
+                    sync.interval_secs,
+                    sync.auth_token.clone(),
+                );
+                info!(
+                    peers = ?sync.peers,
+                    interval_secs = sync.interval_secs,
+                    "Cross-node breaker sync started"
+                );
+            }
+        }
+
         Ok(Self {
-            hot: Arc::new(arc_swap::ArcSwap::from_pointee(hot_state)),
+            hot,
             budget_enforcer,
             key_rate_limiter: Arc::new(crate::key_rate_limit::KeyRateLimiter::new()),
             admin_api,
             sessions,
             recorder,
             rate_limit_resolver,
+            admin_key_hash: config
+                .admin
+                .as_ref()
+                .map(|a| maxllm_admin::keys::hash_key(&a.master_key)),
         })
     }
 
@@ -2381,6 +2472,21 @@ fn should_failover_status(status: u16, ctx: &RequestCtx, provider: &ProviderStat
         // 2xx/3xx and anything else: the provider answered.
         _ => false,
     }
+}
+
+/// Whether the gateway answers such an upstream status itself.
+///
+/// A quota wall (429), an empty account (402), a credential the provider
+/// rejected (401/403) and a server fault (5xx) are the *provider's* problem:
+/// the client did nothing wrong, and the upstream's own wording ("您的限额将
+/// 在 2026-11-10 22:58:54 重置") says nothing the client can act on. The
+/// gateway answers with its own 503 instead of passing it through.
+///
+/// A rejected request (400/422) and a missing endpoint or model
+/// (404/405/410) stay as they are: they are the client's answer to give, and
+/// the upstream words them best.
+fn gateway_owns_status(status: u16) -> bool {
+    matches!(status, 401 | 402 | 403 | 408 | 409 | 425 | 429) || (500..=599).contains(&status)
 }
 
 /// Whether a 404 error body is the "the model does not exist" rejection of an
@@ -4244,6 +4350,19 @@ impl ProxyHttp for AiGateway {
                 // ("It will reset at …"). Wait for it instead of failing over
                 // at header time — pingora has not written the header to the
                 // client yet, so the deferred decision is invisible.
+                //
+                // …but only when a failover is actually possible. The
+                // deferred decision happens at body time, when the response
+                // header may already have reached the client: a request
+                // that cannot fail over must be answered by the gateway
+                // itself (503 + its own error body), never by the
+                // upstream's quota message. The body still flows (it is
+                // collected internally to learn the reset instant), but the
+                // client gets the gateway's answer.
+                let hot = self.hot.load();
+                let can_fail_over = self.has_usable_fallback(ctx)
+                    && ctx.failover_count < self.failover_budget(&hot, ctx)
+                    && body_is_replayable(session, ctx);
                 ctx.pending_rate_limit = Some(status);
                 ctx.rate_limit_body_buf.clear();
                 // Keep the headers around: the resolver's header layer may
@@ -4258,6 +4377,10 @@ impl ProxyHttp for AiGateway {
                         )
                     })
                     .collect();
+                if !can_fail_over {
+                    let message = self.no_provider_message_after_failure(&hot, ctx, status);
+                    self.own_the_error(upstream_response, ctx, status, message, None);
+                }
                 return Ok(()); // let the body flow to the body filter
             }
         }
@@ -4348,6 +4471,14 @@ impl ProxyHttp for AiGateway {
             ctx.attempt_trail
                 .push(format!("{}=toobig", ctx.provider_name));
             self.record_event(EVENT_PROVIDER_RESPONSE, ctx, Some(status), None, None, None);
+            if gateway_owns_status(status) {
+                let message = format!(
+                    "provider '{}' answered {status} and the request body cannot be replayed on another provider",
+                    ctx.provider_name
+                );
+                let hint = self.retry_after_hint(ctx, retry_after);
+                self.own_the_error(upstream_response, ctx, status, message, hint);
+            }
             return Ok(());
         }
         // A provider that does not carry the requested model answers 400/422
@@ -4413,13 +4544,21 @@ impl ProxyHttp for AiGateway {
                 return Err(e);
             }
         }
-        if ctx.failover_count >= max_failover_attempts(&hot.routes, ctx.route_index) {
+        if ctx.failover_count >= self.failover_budget(&hot, ctx) {
             info!(
                 status = %status,
                 provider = %ctx.provider_name,
                 attempts = ctx.failover_count,
                 "upstream answered with an error and the failover budget is spent — returning the error to the client"
             );
+            if gateway_owns_status(status) {
+                let message = format!(
+                    "no provider available: provider '{}' answered {status} and the failover budget ({} attempts) is spent",
+                    ctx.provider_name, ctx.failover_count
+                );
+                let hint = self.retry_after_hint(ctx, retry_after);
+                self.own_the_error(upstream_response, ctx, status, message, hint);
+            }
             return Ok(());
         }
         // Audit trail: the failed provider answered (the final provider's
@@ -4429,6 +4568,14 @@ impl ProxyHttp for AiGateway {
         ctx.attempt_trail
             .push(format!("{}={}", ctx.provider_name, status));
         let Some((failed_provider, next_provider)) = self.switch_to_fallback(ctx) else {
+            // No other provider can serve this request: the gateway answers
+            // the client itself instead of passing the provider's error
+            // through (the client's request was not the problem).
+            if gateway_owns_status(status) {
+                let message = self.no_provider_message_after_failure(&hot, ctx, status);
+                let hint = self.retry_after_hint(ctx, retry_after);
+                self.own_the_error(upstream_response, ctx, status, message, hint);
+            }
             return Ok(());
         };
 
@@ -4466,7 +4613,16 @@ impl ProxyHttp for AiGateway {
     ) -> pingora::Result<()> {
         let hot = self.hot.load();
         let status = upstream_response.status.as_u16();
-        ctx.upstream_status = status;
+        // When the gateway owns the answer, the status on the wire is the
+        // gateway's 503 — the upstream's own status is kept for the audit
+        // trail and the metrics, so a provider's quota wall stays visible
+        // as a 429 in the request log.
+        let upstream_status = ctx
+            .own_error
+            .as_ref()
+            .map(|e| e.upstream_status)
+            .unwrap_or(status);
+        ctx.upstream_status = upstream_status;
         let provider = hot.providers.get(&ctx.provider_name);
 
         // Circuit breaker bookkeeping happens in `upstream_response_filter`,
@@ -4474,7 +4630,14 @@ impl ProxyHttp for AiGateway {
         // recorded even when the request walks on to the next provider.
 
         // Audit trail: the upstream answered.
-        self.record_event(EVENT_PROVIDER_RESPONSE, ctx, Some(status), None, None, None);
+        self.record_event(
+            EVENT_PROVIDER_RESPONSE,
+            ctx,
+            Some(upstream_status),
+            None,
+            None,
+            None,
+        );
 
         // Only remove Content-Length when the body will be translated (changes size).
         // Passthrough, native, and Embeddings keep the original Content-Length.
@@ -4648,6 +4811,13 @@ impl ProxyHttp for AiGateway {
                 }
             }
             if !end_of_stream {
+                // The client must not see the upstream's quota message when
+                // the gateway owns the answer: the chunk is kept internally
+                // (the reset-instant learning needs it) and dropped on the
+                // way out.
+                if ctx.own_error.is_some() {
+                    *body = None;
+                }
                 return Ok(None);
             }
 
@@ -4763,12 +4933,43 @@ impl ProxyHttp for AiGateway {
 
             // A quota-exhausted provider must not keep the session pinned,
             // and the request walks on to the next provider of the chain.
+            if let Some(err) = ctx.own_error.clone() {
+                // No failover was possible (the header phase decided it):
+                // the gateway answers the client itself. The upstream's last
+                // chunk is dropped, the gateway's error takes its place.
+                *body = Some(Bytes::from(err.render()));
+                ctx.own_error_sent = true;
+                return Ok(None);
+            }
             return self.fail_over_from_body_filter(
                 session,
                 ctx,
                 status,
                 "429 resolved via the layered rate-limit resolver",
             );
+        }
+
+        // ── The gateway's own answer ──────────────────────────────────────
+        //
+        // The upstream failed and no other provider could serve the request:
+        // the gateway answers the client itself (a 503 with its own error
+        // body) instead of passing the provider's error through. The
+        // upstream's body never reaches the client — the first chunk
+        // carries the gateway's error, the rest is dropped.
+        if let Some(err) = ctx.own_error.clone() {
+            if ctx.own_error_sent {
+                *body = None;
+            } else {
+                *body = Some(Bytes::from(err.render()));
+                ctx.own_error_sent = true;
+                info!(
+                    provider = %err.upstream_provider,
+                    upstream_status = err.upstream_status,
+                    retry_after_secs = err.retry_after_secs.unwrap_or(0),
+                    "the gateway's own error is delivered to the client"
+                );
+            }
+            return Ok(None);
         }
 
         // Time-to-first-token: the first response chunk marks the moment the
@@ -6112,6 +6313,131 @@ impl AiGateway {
             )
     }
 
+    /// Answer the client on the gateway's own behalf: the upstream failed and
+    /// no other provider can serve the request.
+    ///
+    /// The upstream's status and body are replaced by a 503 carrying the
+    /// gateway's own error — the client's request was not the problem, and
+    /// the provider's error text is not something the client can act on.
+    /// The upstream's request id (`x-log-id` and friends) stays in the
+    /// headers: it is what support needs to trace the failed attempt.
+    fn own_the_error(
+        &self,
+        upstream_response: &mut ResponseHeader,
+        ctx: &mut RequestCtx,
+        upstream_status: u16,
+        message: String,
+        retry_after_secs: Option<u64>,
+    ) {
+        ctx.own_error = Some(crate::ctx::GatewayError {
+            status: 503,
+            message,
+            upstream_status,
+            upstream_provider: ctx.provider_name.clone(),
+            retry_after_secs,
+        });
+        upstream_response.status = http::StatusCode::SERVICE_UNAVAILABLE;
+        let _ = upstream_response.remove_header("content-length");
+        let _ = upstream_response.remove_header("content-type");
+        let _ = upstream_response.insert_header("content-type", "application/json");
+        if let Some(secs) = retry_after_secs {
+            let _ = upstream_response.insert_header("retry-after", &secs.to_string());
+        }
+        // The upstream's own status travels with the answer: a 503 that
+        // stands for a 429 quota wall has to stay visible as one.
+        let _ = upstream_response.insert_header(
+            "X-MaxLLM-Upstream-Status",
+            upstream_status.to_string(),
+        );
+        info!(
+            provider = %ctx.provider_name,
+            upstream_status = upstream_status,
+            retry_after_secs = retry_after_secs.unwrap_or(0),
+            "the upstream failed and no failover was possible — the gateway answers the client itself"
+        );
+    }
+
+    /// The message the client gets when the provider that answered failed and
+    /// no other candidate of the route can take the request.
+    fn no_provider_message_after_failure(
+        &self,
+        hot: &HotState,
+        ctx: &RequestCtx,
+        status: u16,
+    ) -> String {
+        let scope = ctx
+            .route_index
+            .and_then(|i| hot.routes.get(i))
+            .map(|r| format!("route '{}'", r.path))
+            .unwrap_or_else(|| "this request".to_string());
+        format!(
+            "no provider available: provider '{}' answered {status} and no other candidate of {scope} can serve the request",
+            ctx.provider_name
+        )
+    }
+
+    /// How long the client should wait before retrying: the time left until
+    /// the provider's quota resets (when the gateway knows it), else the
+    /// `Retry-After` the upstream sent, else nothing.
+    fn retry_after_hint(&self, ctx: &RequestCtx, upstream_retry_after: Option<u64>) -> Option<u64> {
+        let hot = self.hot.load();
+        if let Some(p) = hot.providers.get(&ctx.provider_name) {
+            let until = p.circuit_breaker.force_open_until_ms();
+            let now = crate::rate_limit::now_ms();
+            if until > now {
+                let secs = (until - now + 999) / 1000;
+                return Some(secs.min(86_400));
+            }
+        }
+        upstream_retry_after
+    }
+
+    /// The failover budget of this request: the route's configured budget, but
+    /// never smaller than the number of candidates the request may walk.
+    ///
+    /// An auto pool with N members needs N attempts to try them all. A
+    /// budget below the pool size stops the walk while healthy members are
+    /// still untried, and the client gets the error of the last member
+    /// instead of an answer.
+    fn failover_budget(&self, hot: &HotState, ctx: &RequestCtx) -> u32 {
+        let configured = max_failover_attempts(&hot.routes, ctx.route_index);
+        let candidates = ctx
+            .route_index
+            .and_then(|i| hot.routes.get(i))
+            .and_then(|route| hot.request_pool(route, ctx))
+            .map(|pool| pool.entries.len() as u32)
+            .unwrap_or(0);
+        configured.max(candidates)
+    }
+
+    /// Whether another provider could serve this request.
+    ///
+    /// A *peek*: the candidates are inspected without reserving a half-open
+    /// probe slot and without changing any state, so it is safe to call at
+    /// header time (before the failover decision is taken).
+    fn has_usable_fallback(&self, ctx: &RequestCtx) -> bool {
+        // A path-pinned provider is served alone: the caller named it.
+        if ctx.path_pinned_provider.is_some() {
+            return false;
+        }
+        let hot = self.hot.load();
+        let Some(route) = ctx.route_index.and_then(|i| hot.routes.get(i)) else {
+            return false;
+        };
+        let usable = |name: &str| -> bool {
+            name != ctx.provider_name
+                && !ctx.attempted_providers.iter().any(|p| p == name)
+                && hot.providers
+                    .get(name)
+                    .map(|p| p.circuit_breaker.allows_traffic())
+                    .unwrap_or(false)
+        };
+        if let Some(pool) = hot.request_pool(route, ctx) {
+            return pool.entries.iter().any(|e| usable(&e.provider));
+        }
+        route.fallback.iter().any(|name| usable(name))
+    }
+
     /// The next provider to try: the first healthy provider of the route's
     /// fallback chain that this request has not tried yet (skipping open
     /// circuits), so the walk is strictly forward through the chain.
@@ -6506,7 +6832,7 @@ impl AiGateway {
         // Same failover budget as the header-time path: when it is spent, the
         // provider's answer reaches the client as-is.
         let hot = self.hot.load();
-        if ctx.failover_count >= max_failover_attempts(&hot.routes, ctx.route_index) {
+        if ctx.failover_count >= self.failover_budget(&hot, ctx) {
             info!(
                 status = status,
                 provider = %ctx.provider_name,
@@ -6556,6 +6882,27 @@ impl AiGateway {
         session: &mut Session,
         path: &str,
     ) -> pingora::Result<bool> {
+        // Extract method
+        let method = session.req_header().method.to_string();
+
+        // Extract auth key from Authorization header
+        let auth_key = session
+            .req_header()
+            .headers
+            .get("Authorization")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.strip_prefix("Bearer ").unwrap_or(v).to_string())
+            .unwrap_or_default();
+
+        // The breaker endpoints are served by the gateway itself: they act on
+        // the *live* circuit breakers, which the admin API (a different crate,
+        // with its own store) does not see.
+        if path.starts_with("/admin/breakers") {
+            return self
+                .handle_breaker_admin(&method, path, &auth_key, session)
+                .await;
+        }
+
         let admin_api = match &self.admin_api {
             Some(api) => api,
             None => {
@@ -6579,18 +6926,6 @@ impl AiGateway {
                 return Ok(true);
             }
         };
-
-        // Extract method
-        let method = session.req_header().method.to_string();
-
-        // Extract auth key from Authorization header
-        let auth_key = session
-            .req_header()
-            .headers
-            .get("Authorization")
-            .and_then(|v| v.to_str().ok())
-            .map(|v| v.strip_prefix("Bearer ").unwrap_or(v).to_string())
-            .unwrap_or_default();
 
         // Read the request body for POST requests
         let body_bytes = if method == "POST" {
@@ -6620,6 +6955,228 @@ impl AiGateway {
 }
 
 impl AiGateway {
+    /// The breaker endpoints: the live circuit-breaker state, and the
+    /// operator's park / unpark.
+    ///
+    /// They are served by the gateway and not by the admin API: they act on
+    /// the *live* breakers (the hot state's providers), which the admin API —
+    /// a different crate with its own store — does not see. The peers read
+    /// `GET /admin/breakers` to adopt a quota force-open this node learned.
+    async fn handle_breaker_admin(
+        &self,
+        method: &str,
+        path: &str,
+        auth_key: &str,
+        session: &mut Session,
+    ) -> pingora::Result<bool> {
+        let Some(expected) = self.admin_key_hash.as_ref() else {
+            return self
+                .write_admin_json(
+                    session,
+                    404,
+                    &serde_json::json!({"error": "the admin API is not enabled"}),
+                )
+                .await;
+        };
+        if maxllm_admin::keys::hash_key(auth_key) != *expected {
+            return self
+                .write_admin_json(
+                    session,
+                    401,
+                    &serde_json::json!({"error": "invalid admin key"}),
+                )
+                .await;
+        }
+
+        let body = if method == "POST" {
+            match session.read_request_body().await? {
+                Some(b) => b.to_vec(),
+                None => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+
+        let path = path.trim_end_matches('/');
+        let (status, payload) = match (method, path) {
+            ("GET", "/admin/breakers") => (200, self.breaker_report()),
+            ("POST", "/admin/breakers/force-open") => self.force_open_breaker(&body),
+            ("POST", "/admin/breakers/close") => self.close_breaker(&body),
+            _ => (404, serde_json::json!({"error": "not found"})),
+        };
+        self.write_admin_json(session, status, &payload).await
+    }
+
+    /// Write one JSON answer to an admin client.
+    async fn write_admin_json(
+        &self,
+        session: &mut Session,
+        status: u16,
+        payload: &serde_json::Value,
+    ) -> pingora::Result<bool> {
+        let body_bytes = payload.to_string().into_bytes();
+        let content_len = body_bytes.len().to_string();
+        let mut resp = ResponseHeader::build(status, Some(2))?;
+        resp.insert_header("Content-Type", "application/json")?;
+        resp.insert_header("Content-Length", &content_len)?;
+        session.write_response_header(Box::new(resp), false).await?;
+        session
+            .write_response_body(Some(Bytes::from(body_bytes)), true)
+            .await?;
+        METRICS.active_requests.dec();
+        Ok(true)
+    }
+
+    /// The live circuit-breaker state of every provider.
+    fn breaker_report(&self) -> serde_json::Value {
+        let hot = self.hot.load();
+        let mut breakers: Vec<serde_json::Value> = hot
+            .providers
+            .iter()
+            .map(|(name, provider)| {
+                let cb = &provider.circuit_breaker;
+                let state = cb.effective_state();
+                let until = cb.force_open_until_ms();
+                serde_json::json!({
+                    "provider": name,
+                    "state": state,
+                    "state_name": match state {
+                        crate::circuit_breaker::STATE_OPEN => "open",
+                        crate::circuit_breaker::STATE_HALF_OPEN => "half-open",
+                        _ => "closed",
+                    },
+                    "force_open_until": until,
+                    "force_open_until_iso": until
+                        .checked_div(1000)
+                        .and_then(|s| chrono::DateTime::from_timestamp_millis(s as i64 * 1000))
+                        .map(|t| t.to_rfc3339()),
+                    "quota_opens": cb.quota_opens(),
+                    "failures": cb.failure_count(),
+                    "transitions": cb.state_transitions(),
+                })
+            })
+            .collect();
+        breakers.sort_by(|a, b| {
+            a["provider"]
+                .as_str()
+                .unwrap_or_default()
+                .cmp(b["provider"].as_str().unwrap_or_default())
+        });
+        serde_json::json!({ "breakers": breakers })
+    }
+
+    /// Park a provider until a known instant.
+    ///
+    /// The operator's escape hatch for what the gateway cannot learn on its
+    /// own: a vendor says "this account is out of quota until T", and every
+    /// node should keep the provider out of the rotation until then.
+    fn force_open_breaker(&self, body: &[u8]) -> (u16, serde_json::Value) {
+        let parsed: serde_json::Value = match serde_json::from_slice(body) {
+            Ok(v) => v,
+            Err(e) => {
+                return (
+                    400,
+                    serde_json::json!({"error": format!("invalid JSON body: {e}")}),
+                )
+            }
+        };
+        let provider = parsed
+            .get("provider")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        if provider.is_empty() {
+            return (400, serde_json::json!({"error": "the provider name is required"}));
+        }
+        let until = parsed
+            .get("until_ms")
+            .and_then(|v| v.as_u64())
+            .or_else(|| {
+                parsed
+                    .get("until")
+                    .and_then(|v| v.as_str())
+                    .and_then(parse_instant_ms)
+            });
+        let Some(until) = until else {
+            return (
+                400,
+                serde_json::json!({"error": "until (RFC3339) or until_ms (epoch ms) is required"}),
+            );
+        };
+        let hot = self.hot.load();
+        let Some(state) = hot.providers.get(&provider) else {
+            return (
+                404,
+                serde_json::json!({"error": format!("unknown provider '{provider}'")}),
+            );
+        };
+        if until <= crate::rate_limit::now_ms() {
+            return (400, serde_json::json!({"error": "the instant is in the past"}));
+        }
+        state.circuit_breaker.park_until(until);
+        METRICS
+            .circuit_breaker_state
+            .with_label_values(&[&provider])
+            .set(state.circuit_breaker.state() as i64);
+        self.persist_circuit_breaker(&provider, &state.circuit_breaker);
+        info!(
+            provider = %provider,
+            until = until,
+            "provider parked by an operator request"
+        );
+        (
+            200,
+            serde_json::json!({
+                "provider": provider,
+                "force_open_until": until,
+                "state": state.circuit_breaker.effective_state(),
+            }),
+        )
+    }
+
+    /// Release a parked provider: it is usable again right away.
+    fn close_breaker(&self, body: &[u8]) -> (u16, serde_json::Value) {
+        let parsed: serde_json::Value = match serde_json::from_slice(body) {
+            Ok(v) => v,
+            Err(e) => {
+                return (
+                    400,
+                    serde_json::json!({"error": format!("invalid JSON body: {e}")}),
+                )
+            }
+        };
+        let provider = parsed
+            .get("provider")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        if provider.is_empty() {
+            return (400, serde_json::json!({"error": "the provider name is required"}));
+        }
+        let hot = self.hot.load();
+        let Some(state) = hot.providers.get(&provider) else {
+            return (
+                404,
+                serde_json::json!({"error": format!("unknown provider '{provider}'")}),
+            );
+        };
+        state.circuit_breaker.clear_quota();
+        METRICS
+            .circuit_breaker_state
+            .with_label_values(&[&provider])
+            .set(state.circuit_breaker.state() as i64);
+        self.persist_circuit_breaker(&provider, &state.circuit_breaker);
+        info!(provider = %provider, "provider released by an operator request");
+        (
+            200,
+            serde_json::json!({
+                "provider": provider,
+                "force_open_until": 0,
+                "state": state.circuit_breaker.effective_state(),
+            }),
+        )
+    }
+
     /// Send a guardrail block error response and abort the request.
     async fn send_guardrail_block(
         &self,

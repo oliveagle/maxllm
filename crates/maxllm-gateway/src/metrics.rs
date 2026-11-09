@@ -49,6 +49,9 @@ pub struct GatewayMetrics {
     pub circuit_breaker_transitions_total: IntGaugeVec,
     /// Force-opens caused by HTTP 429 (quota exhaustion) per provider.
     pub circuit_breaker_quota_opens_total: IntCounterVec,
+    /// Quota force-opens adopted from a peer node (cross-node breaker sync)
+    /// per provider.
+    pub circuit_breaker_peer_quota_opens_total: IntCounterVec,
     /// Streaming responses whose upstream ended the body before the protocol
     /// terminal event (`response.completed` / `[DONE]`). The gateway appends
     /// an explicit error event and records the exchange as truncated instead
@@ -271,6 +274,18 @@ impl GatewayMetrics {
             .register(Box::new(circuit_breaker_quota_opens_total.clone()))
             .expect("register");
 
+        let circuit_breaker_peer_quota_opens_total = IntCounterVec::new(
+            Opts::new(
+                "maxllm_circuit_breaker_peer_quota_opens_total",
+                "Quota force-opens adopted from a peer node per provider",
+            ),
+            &["provider"],
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(circuit_breaker_peer_quota_opens_total.clone()))
+            .expect("register");
+
         let stream_truncated_total = IntCounterVec::new(
             Opts::new(
                 "maxllm_stream_truncated_total",
@@ -445,6 +460,7 @@ impl GatewayMetrics {
             circuit_breaker_state,
             circuit_breaker_transitions_total,
             circuit_breaker_quota_opens_total,
+            circuit_breaker_peer_quota_opens_total,
             http_failovers_total,
             provider_retries_total,
             model_rewrite_retries_total,

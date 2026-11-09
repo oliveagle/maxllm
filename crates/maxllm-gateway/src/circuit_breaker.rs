@@ -338,6 +338,60 @@ impl CircuitBreaker {
         self.state_transitions.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Extend the quota force-open to a later instant.
+    ///
+    /// Used by the cross-node sync: a peer that knows the provider is out of
+    /// quota until a later moment must never *shorten* a deadline this node
+    /// already knows (the local observation is at least as fresh as the
+    /// peer's).
+    ///
+    /// The quota counters are not touched: the open belongs to the node that
+    /// saw the upstream's answer, not to the node that heard about it.
+    pub fn extend_quota_until(&self, reset_at_ms: u64) -> bool {
+        let now = now_ms();
+        if reset_at_ms <= now {
+            return false;
+        }
+        let current = self.force_open_until_ms.load(Ordering::Relaxed);
+        if current >= reset_at_ms {
+            return false;
+        }
+        self.park_until(reset_at_ms);
+        true
+    }
+
+    /// Park the provider until an absolute epoch-ms instant.
+    ///
+    /// The operator's decision (a known quota wall, a topped-up account) or
+    /// a peer's: the deadline is set as it is, and the quota counters stay
+    /// untouched — they count what the upstream answered, not what the
+    /// operator or a peer said.
+    pub fn park_until(&self, reset_at_ms: u64) {
+        let now = now_ms();
+        if reset_at_ms <= now {
+            return;
+        }
+        self.force_open_until_ms
+            .store(reset_at_ms, Ordering::Relaxed);
+        self.state.store(STATE_OPEN, Ordering::Relaxed);
+        self.failures.store(self.max_fails, Ordering::Relaxed);
+        self.pending_probes.store(0, Ordering::Relaxed);
+        self.last_probe_admit_ms.store(0, Ordering::Relaxed);
+    }
+
+    /// Drop the quota force-open: the provider is usable again.
+    ///
+    /// The operator's escape hatch — a topped-up account does not have to
+    /// wait for the cooldown to end.
+    pub fn clear_quota(&self) {
+        self.force_open_until_ms.store(0, Ordering::Relaxed);
+        self.failures.store(0, Ordering::Relaxed);
+        self.successes_half_open.store(0, Ordering::Relaxed);
+        self.pending_probes.store(0, Ordering::Relaxed);
+        self.last_probe_admit_ms.store(0, Ordering::Relaxed);
+        self.state.store(STATE_CLOSED, Ordering::Relaxed);
+    }
+
     /// Record a failure. Increments failure count and updates timestamp.
     pub fn record_failure(&self) {
         self.record_http_failure(500, None);
@@ -493,10 +547,11 @@ impl CircuitBreaker {
         }
     }
 
-    /// Consecutive failures recorded against the breaker. Only the tests
-    /// read it directly — production code observes the state, not the count
-    /// (since the count is reset to zero once half-open probing starts).
-    #[cfg(test)]
+    /// Consecutive failures recorded against the breaker. Production code
+    /// observes the state, not the count (since the count is reset to zero
+    /// once half-open probing starts) — but the admin endpoint reports it,
+    /// because an operator reading "circuit open" wants to know whether the
+    /// provider failed twice or twenty times.
     pub fn failure_count(&self) -> u32 {
         self.failures.load(Ordering::Relaxed)
     }
