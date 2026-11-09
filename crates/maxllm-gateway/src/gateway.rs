@@ -5291,8 +5291,12 @@ impl ProxyHttp for AiGateway {
         // force-open — without it, an out-of-credit provider stays "healthy"
         // in the breaker and every rotation pays an extra upstream round trip
         // before the failover chain finds someone else. Any other server error
-        // counts against `max_fails`. Successes reset the half-open probe and
-        // re-pin the session to this provider.
+        // counts against `max_fails` — except a 500 whose body carries a quota
+        // message (MiniMax answers an exhausted Token Plan on /v1/responses
+        // with `500 server_error` and "已达到 Token Plan 用量上限…"), which is
+        // classified exactly like a 429 by the body-time resolver below.
+        // Successes reset the half-open probe and re-pin the session to this
+        // provider.
         let retry_after = upstream_response
             .headers
             .get("retry-after")
@@ -5308,21 +5312,31 @@ impl ProxyHttp for AiGateway {
         // does, the force-open deadline is set here and the failover proceeds
         // immediately (the body never arrives on the retried attempt).
         //
-        // When it does not, and the learning resolver is enabled, the 429's
+        // When it does not, and the learning resolver is enabled, the error's
         // body is awaited in `upstream_response_body_filter` — that is where
         // the layered decision (learned patterns → body regex → laya) runs.
         // Without the resolver the pre-learning behaviour applies: a plain
         // Retry-After (or the default) cooldown, decided here.
+        //
+        // The same deferral covers a 500: its status alone proves nothing
+        // (MiniMax wears its quota wall as `500 server_error`), so the body's
+        // phrasing decides — quota wall → the cooldown ladder, anything else
+        // → the ordinary failure the accounting block below would have
+        // booked. The header layer stays 429-only: a Retry-After on a 500 is
+        // a transient hint, not a quota reset.
         //
         // `quota_resolved` guards the generic accounting block below: once
         // the header layer pinned the reset instant it already force-opened
         // the breaker and counted a quota open, so that block must not run
         // again (it would double-count the failure and the quota-open).
         let mut quota_resolved_by_header = false;
-        if quota_open && self.rate_limit_resolver.is_enabled() {
-            if let Some((reset_at_ms, source)) =
+        if (quota_open || status == 500) && self.rate_limit_resolver.is_enabled() {
+            let header_reset = if quota_open {
                 crate::rate_limit::resolve_from_headers(&upstream_response.headers)
-            {
+            } else {
+                None
+            };
+            if let Some((reset_at_ms, source)) = header_reset {
                 quota_resolved_by_header = true;
                 let hot = self.hot.load();
                 if let Some(p) = hot.providers.get(&ctx.provider_name) {
@@ -5808,10 +5822,11 @@ impl ProxyHttp for AiGateway {
             );
         }
 
-        // ── Pending rate-limit decision (429 whose headers did not pin the
-        // reset instant) ──────────────────────────────────────────────────
+        // ── Pending rate-limit decision (a 429 whose headers did not pin
+        // the reset instant, or a 500 whose body may wear a quota message)
+        // ─────────────────────────────────────────────────────────────────
         //
-        // The 429 body is collected here; when it is complete the layered
+        // The error body is collected here; when it is complete the layered
         // resolver runs (learned patterns → body regex → laya). The decision
         // then replaces the blind cooldown: a precise reset instant
         // force-opens the provider until that moment, and a *non*-rate-limit
@@ -5822,8 +5837,7 @@ impl ProxyHttp for AiGateway {
         // anything to the client, so deciding here and returning a retry
         // error is invisible to the client — the failed attempt is replaced
         // whole by the next provider's attempt.
-        if let Some(status) = ctx.pending_rate_limit {
-            let _ = status; // status is 429 for the deferred path; kept for logging below
+        if ctx.pending_rate_limit.is_some() {
             if let Some(data) = body.as_ref() {
                 if ctx.rate_limit_body_buf.len() < 64 * 1024 {
                     ctx.rate_limit_body_buf.extend_from_slice(data);
@@ -5916,7 +5930,8 @@ impl ProxyHttp for AiGateway {
                             provider = %provider_name,
                             reset_at_ms = reset_at_ms,
                             source = %source,
-                            "429 quota force-opened until the resolved reset instant"
+                            status = status,
+                            "{status} quota force-opened until the resolved reset instant"
                         );
                     }
                     crate::rate_limit::RateLimitDecision::QuotaUnknown => {
@@ -5936,7 +5951,8 @@ impl ProxyHttp for AiGateway {
                         info!(
                             provider = %provider_name,
                             cooldown_ms = cooldown_ms,
-                            "429 quota force-opened on the cooldown ladder (reset instant unresolved)"
+                            status = status,
+                            "{status} quota force-opened on the cooldown ladder (reset instant unresolved)"
                         );
                     }
                     crate::rate_limit::RateLimitDecision::OrdinaryFailure => {
@@ -5944,7 +5960,8 @@ impl ProxyHttp for AiGateway {
                         p.circuit_breaker.record_failure();
                         info!(
                             provider = %provider_name,
-                            "429 classified as an ordinary failure (not a rate limit)"
+                            status = status,
+                            "{status} classified as an ordinary failure (not a rate limit)"
                         );
                     }
                 }
@@ -5955,8 +5972,13 @@ impl ProxyHttp for AiGateway {
                 self.persist_circuit_breaker(&provider_name, &p.circuit_breaker);
             }
 
-            // A quota-exhausted provider must not keep the session pinned,
-            // and the request walks on to the next provider of the chain.
+            // A failed provider must not keep the session pinned — including
+            // the no-failover path below, where the request is over but the
+            // next request must not start pinned to a provider that just
+            // failed.
+            self.unpin_session(ctx);
+
+            // The request walks on to the next provider of the chain.
             if let Some(err) = ctx.own_error.clone() {
                 // No failover was possible (the header phase decided it):
                 // the gateway answers the client itself. The upstream's last
@@ -5969,7 +5991,7 @@ impl ProxyHttp for AiGateway {
                 session,
                 ctx,
                 status,
-                "429 resolved via the layered rate-limit resolver",
+                "resolved via the layered rate-limit resolver",
             );
         }
 

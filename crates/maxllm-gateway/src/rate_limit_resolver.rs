@@ -128,15 +128,21 @@ impl RateLimitResolver {
             return (RateLimitDecision::QuotaUnknown, None);
         }
 
-        // Layer 1: headers — cheapest and most precise.
-        if let Some((reset_at_ms, source)) = rate_limit::resolve_from_headers(headers) {
-            return (
-                RateLimitDecision::QuotaUntil {
-                    reset_at_ms,
-                    source,
-                },
-                None,
-            );
+        // Layer 1: headers — cheapest and most precise. A header-declared
+        // reset instant is only trusted for a 429: a 500 that reaches the
+        // resolver (a possible quota wall wearing a server-error status) must
+        // be decided by its body — a Retry-After on a 500 is a transient
+        // hint, not a quota reset.
+        if status == 429 {
+            if let Some((reset_at_ms, source)) = rate_limit::resolve_from_headers(headers) {
+                return (
+                    RateLimitDecision::QuotaUntil {
+                        reset_at_ms,
+                        source,
+                    },
+                    None,
+                );
+            }
         }
 
         let text = String::from_utf8_lossy(body);
@@ -230,24 +236,40 @@ impl RateLimitResolver {
             return (decision, learned);
         }
 
-        // Nothing decided — the safest reading of an unclassifiable 429 is
-        // "rate limited, reset time unknown" → default cooldown.
-        (
-            RateLimitDecision::QuotaUnknown,
-            fingerprint.map(|fp| LearnedUpdate {
-                fingerprint: fp,
-                is_rate_limit: true,
-                reset_expression: None,
-                sample_message: text.chars().take(400).collect(),
-            }),
-        )
+        // Nothing decided — the safest reading of an unclassifiable error
+        // depends on its status. An unclassifiable 429 is "rate limited,
+        // reset time unknown" → the default cooldown. Any other status (a
+        // 500 whose body says nothing conclusive) is an ordinary transient
+        // failure: a quota wall wearing a 500 status carries the quota
+        // phrasing, and the layers above already caught that.
+        if status == 429 {
+            (
+                RateLimitDecision::QuotaUnknown,
+                fingerprint.map(|fp| LearnedUpdate {
+                    fingerprint: fp,
+                    is_rate_limit: true,
+                    reset_expression: None,
+                    sample_message: text.chars().take(400).collect(),
+                }),
+            )
+        } else {
+            (
+                RateLimitDecision::OrdinaryFailure,
+                fingerprint.map(|fp| LearnedUpdate {
+                    fingerprint: fp,
+                    is_rate_limit: false,
+                    reset_expression: None,
+                    sample_message: text.chars().take(400).collect(),
+                }),
+            )
+        }
     }
 
     /// Deterministic-only resolution — used when no tokio runtime context
     /// is available (headers + learned patterns + body regex, no laya).
     pub fn resolve_sync(
         &self,
-        _status: u16,
+        status: u16,
         headers: &http::HeaderMap,
         body: &[u8],
         utc_offset_minutes: i32,
@@ -255,14 +277,17 @@ impl RateLimitResolver {
         if !self.config.enabled {
             return (RateLimitDecision::QuotaUnknown, None);
         }
-        if let Some((reset_at_ms, source)) = rate_limit::resolve_from_headers(headers) {
-            return (
-                RateLimitDecision::QuotaUntil {
-                    reset_at_ms,
-                    source,
-                },
-                None,
-            );
+        // The header layer is trusted for a 429 only (see [`Self::resolve`]).
+        if status == 429 {
+            if let Some((reset_at_ms, source)) = rate_limit::resolve_from_headers(headers) {
+                return (
+                    RateLimitDecision::QuotaUntil {
+                        reset_at_ms,
+                        source,
+                    },
+                    None,
+                );
+            }
         }
         let text = String::from_utf8_lossy(body);
         let (is_rate_limit, candidates) =
@@ -314,15 +339,32 @@ impl RateLimitResolver {
                 ),
             },
             Some(false) => (RateLimitDecision::OrdinaryFailure, None),
-            None => (
-                RateLimitDecision::QuotaUnknown,
-                fingerprint.map(|fp| LearnedUpdate {
-                    fingerprint: fp,
-                    is_rate_limit: true,
-                    reset_expression: None,
-                    sample_message: text.chars().take(400).collect(),
-                }),
-            ),
+            None => {
+                // Status-aware fallback, mirroring [`Self::resolve`]: an
+                // unclassifiable 429 parks on the cooldown ladder; any other
+                // status is an ordinary transient failure.
+                if status == 429 {
+                    (
+                        RateLimitDecision::QuotaUnknown,
+                        fingerprint.map(|fp| LearnedUpdate {
+                            fingerprint: fp,
+                            is_rate_limit: true,
+                            reset_expression: None,
+                            sample_message: text.chars().take(400).collect(),
+                        }),
+                    )
+                } else {
+                    (
+                        RateLimitDecision::OrdinaryFailure,
+                        fingerprint.map(|fp| LearnedUpdate {
+                            fingerprint: fp,
+                            is_rate_limit: false,
+                            reset_expression: None,
+                            sample_message: text.chars().take(400).collect(),
+                        }),
+                    )
+                }
+            }
         }
     }
 
@@ -530,5 +572,64 @@ mod tests {
             .await;
         assert_eq!(decision, RateLimitDecision::QuotaUnknown);
         assert!(learned.is_some());
+    }
+
+    #[tokio::test]
+    async fn unclassifiable_500_is_an_ordinary_failure() {
+        let cfg = ResolverConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        // Unreachable laya — the deterministic layers must decide alone.
+        let resolver = RateLimitResolver::new(cfg, Some("http://127.0.0.1:1"), None, None);
+        // A 500 whose body says nothing conclusive is a transient server
+        // error, never a quota wall: without this, every flaky upstream 500
+        // would park the provider on the quota cooldown ladder.
+        let (decision, learned) = resolver
+            .resolve(500, &headers(&[]), b"something entirely unexpected", 0)
+            .await;
+        assert_eq!(decision, RateLimitDecision::OrdinaryFailure);
+        let learned = learned.expect("the shape must be learned");
+        assert!(
+            !learned.is_rate_limit,
+            "an inconclusive 500 is not a rate limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn unclassifiable_500_is_an_ordinary_failure_sync() {
+        let cfg = ResolverConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let resolver = RateLimitResolver::new(cfg, Some("http://127.0.0.1:1"), None, None);
+        let (decision, _) = resolver.resolve_sync(500, &headers(&[]), b"unexpected", 0);
+        assert_eq!(decision, RateLimitDecision::OrdinaryFailure);
+        // The 429 sync path keeps the ladder fallback.
+        let (decision429, _) = resolver.resolve_sync(429, &headers(&[]), b"unexpected", 0);
+        assert_eq!(decision429, RateLimitDecision::QuotaUnknown);
+    }
+
+    #[tokio::test]
+    async fn quota_phrase_on_a_500_is_still_a_quota_wall() {
+        let cfg = ResolverConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        // MiniMax's real shape: the responses endpoint answers an exhausted
+        // Token Plan with HTTP 500 and this body. The quota phrase must win
+        // over the status — the provider is parked, not booked as a flaky 5xx.
+        let resolver = RateLimitResolver::new(cfg, Some("http://127.0.0.1:1"), None, None);
+        let body = r#"{"error":{"message":"已达到 Token Plan 用量上限：请升级 Token Plan 套餐或购买积分补充用量。 (2056)","code":"server_error"}}"#;
+        let (decision, learned) = resolver
+            .resolve(500, &headers(&[]), body.as_bytes(), 0)
+            .await;
+        assert_eq!(
+            decision,
+            RateLimitDecision::QuotaUnknown,
+            "a quota-phrased 500 parks on the ladder (no reset instant in the message)"
+        );
+        let learned = learned.expect("the shape must be learned");
+        assert!(learned.is_rate_limit);
     }
 }
