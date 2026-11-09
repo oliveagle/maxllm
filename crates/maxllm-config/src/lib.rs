@@ -432,6 +432,19 @@ pub struct ProviderConfig {
     /// TLS handshake), in seconds. Unset means no separate total budget.
     #[serde(default)]
     pub total_connect_timeout_secs: Option<u64>,
+    /// How long the gateway waits for the upstream to produce something, in
+    /// seconds.
+    ///
+    /// This is the *stall* budget, not the answer budget: a stream that
+    /// keeps sending tokens may take as long as it needs, but an upstream
+    /// that accepts the connection and then says nothing is cut off here
+    /// instead of holding the client for the route's own (much longer)
+    /// timeout. The default route timeout is 120 s — two minutes of a
+    /// client waiting on an upstream that is never going to answer.
+    ///
+    /// Unset means the route's timeout, as before.
+    #[serde(default)]
+    pub read_timeout_secs: Option<u64>,
     /// Fixed UTC offset used to interpret **zone-less** reset timestamps in
     /// upstream rate-limit messages, e.g. Zhipu's
     /// `您的限额将在 2026-11-10 22:58:54 重置` (Beijing time, but written
@@ -1116,6 +1129,36 @@ total_connect_timeout_secs = 60
         let p = &config.providers["opencode"];
         assert_eq!(p.connect_timeout_secs, Some(30));
         assert_eq!(p.total_connect_timeout_secs, Some(60));
+    }
+
+    /// The stall budget: how long an upstream may stay silent before the
+    /// gateway gives up on it. Unset means the route's timeout applies.
+    #[test]
+    fn test_read_timeout_defaults_to_unset_and_is_parsed() {
+        let toml = r#"
+[server]
+listen = "0.0.0.0:8080"
+
+[providers.openai]
+kind = "openai"
+base_url = "https://api.openai.com"
+api_key = "sk-test"
+"#;
+        let config = Config::parse(toml).unwrap();
+        assert_eq!(config.providers["openai"].read_timeout_secs, None);
+
+        let toml = r#"
+[server]
+listen = "0.0.0.0:8080"
+
+[providers.opencode]
+kind = "opencode"
+base_url = "https://opencode.ai"
+api_key = "sk-test"
+read_timeout_secs = 45
+"#;
+        let config = Config::parse(toml).unwrap();
+        assert_eq!(config.providers["opencode"].read_timeout_secs, Some(45));
     }
 
     #[test]

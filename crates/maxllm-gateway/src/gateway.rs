@@ -228,6 +228,15 @@ fn is_script_like_user_agent(ua_lower: &str) -> bool {
 /// Default TCP connect timeout to an upstream, in seconds.
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 
+/// How long the gateway waits for an upstream that says nothing, in seconds.
+///
+/// This is the *stall* budget, not the answer budget: a stream that keeps
+/// sending tokens may take as long as it needs, but an upstream that
+/// accepts the connection and then goes quiet is cut off here. It used to
+/// be the route's timeout (120 s everywhere), which meant a hung upstream
+/// held the client for two minutes before the pool could try anyone else.
+const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Default request-level failover budget: how many providers one request may
 /// walk when providers fail. Matches litellm_lb_go's
 /// `maxResponsesFailoverAttempts` (six upstreams, one past the largest
@@ -293,6 +302,10 @@ pub struct ProviderState {
     pub connect_timeout: Duration,
     /// Total budget for the upstream connection (TCP connect + TLS).
     pub total_connect_timeout: Option<Duration>,
+    /// The provider's own stall budget: how long the upstream may stay
+    /// silent before the gateway gives up on it. `None` means the route's
+    /// timeout applies.
+    pub read_timeout: Option<Duration>,
     /// Fixed UTC offset (minutes east of UTC) used to read zone-less reset
     /// timestamps in this upstream's rate-limit messages. 0 = UTC.
     pub utc_offset_minutes: i32,
@@ -696,6 +709,7 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
                         .unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECS),
                 ),
                 total_connect_timeout: conf.total_connect_timeout_secs.map(Duration::from_secs),
+                read_timeout: conf.read_timeout_secs.map(Duration::from_secs),
                 utc_offset_minutes: conf.utc_offset_minutes(),
             }),
         );
@@ -1410,7 +1424,15 @@ fn auto_pool_warm_target<'a>(
     healthy: &[&'a AutoPoolEntry],
     admits: &dyn Fn(&AutoPoolEntry) -> bool,
 ) -> Option<&'a AutoPoolEntry> {
-    let mut best: Option<(&'a AutoPoolEntry, f64, u64)> = None;
+    // A member that is slow *per token* is ranked below one that is not.
+    // The escape exists to get the session off a member that costs it
+    // time; landing it on another member that is just as slow spends the
+    // same wait *and* the upstream prompt cache the move threw away. A
+    // slow member is still a candidate — when the whole tier is slow, the
+    // least bad one is still better than none — but it never wins over a
+    // member of the same warmth that is fast.
+    let decode_median = auto_pool_decode_median(healthy);
+    let mut best: Option<(&'a AutoPoolEntry, f64, u64, bool)> = None;
     for entry in healthy {
         if !admits(entry) {
             continue;
@@ -1422,10 +1444,13 @@ fn auto_pool_warm_target<'a>(
             continue;
         }
         let inflight = crate::provider_stats::inflight(&entry.provider);
+        let slow = auto_pool_decode_is_slow(&entry.provider, decode_median);
         let better = match best {
             None => true,
-            Some((_, best_ratio, best_inflight)) => {
-                if ev.ratio > best_ratio + 0.02 {
+            Some((_, best_ratio, best_inflight, best_slow)) => {
+                if slow != best_slow {
+                    !slow
+                } else if ev.ratio > best_ratio + 0.02 {
                     true
                 } else if (ev.ratio - best_ratio).abs() <= 0.02 {
                     inflight < best_inflight
@@ -1435,10 +1460,10 @@ fn auto_pool_warm_target<'a>(
             }
         };
         if better {
-            best = Some((entry, ev.ratio, inflight));
+            best = Some((entry, ev.ratio, inflight, slow));
         }
     }
-    best.map(|(entry, _, _)| entry)
+    best.map(|(entry, _, _, _)| entry)
 }
 
 /// How often the routing evidence is written to the store.
@@ -2027,6 +2052,17 @@ impl AiGateway {
                 .map(|p| !p.circuit_breaker.is_open())
                 .unwrap_or(false)
         };
+        // The *read-only* twin of `admits`: it says whether the member could
+        // take the traffic, without reserving its half-open probe slot.
+        // A scan that reserves a slot on every member it walks past leaves
+        // the members it did not pick permanently half-open and answering
+        // 503 — the same bug the pool filter already had to be fixed for.
+        let allows = |e: &AutoPoolEntry| -> bool {
+            hot.providers
+                .get(&e.provider)
+                .map(|p| p.circuit_breaker.allows_traffic())
+                .unwrap_or(false)
+        };
 
         // Two different latency rules, on purpose.
         //
@@ -2074,7 +2110,10 @@ impl AiGateway {
                             // conversation warm: back to the rotation and
                             // the session would be handed the cold member
                             // it just left.
-                            chosen = auto_pool_warm_target(&healthy, &admits);
+                            // The scan is read-only; only the member that
+                            // will actually serve the request reserves a
+                            // probe slot.
+                            chosen = auto_pool_warm_target(&healthy, &allows).filter(|e| admits(e));
                             if chosen.is_some() {
                                 METRICS
                                     .session_affinity_cold_escapes_total
@@ -3689,7 +3728,15 @@ impl ProxyHttp for AiGateway {
         // route configured for a slow upstream is still cut off by the
         // hard-coded defaults below. Unset (or zero) keeps the defaults.
         let route_timeout = route_timeout_secs(&hot.routes, ctx.route_index);
-        peer.options.read_timeout = Some(route_timeout.unwrap_or(Duration::from_secs(120)));
+        // The provider's own stall budget wins: an upstream that accepts the
+        // connection and then says nothing must not hold the client for the
+        // route's much longer timeout. The route's timeout is the fallback.
+        peer.options.read_timeout = Some(
+            provider
+                .read_timeout
+                .or(route_timeout)
+                .unwrap_or(DEFAULT_READ_TIMEOUT),
+        );
         peer.options.write_timeout = Some(route_timeout.unwrap_or(Duration::from_secs(30)));
 
         Ok(Box::new(peer))
@@ -9186,6 +9233,7 @@ mod failover_policy_tests {
             responses_path: None,
             connect_timeout: Duration::from_secs(10),
             total_connect_timeout: None,
+            read_timeout: None,
             utc_offset_minutes: 0,
         }
     }
@@ -9980,6 +10028,93 @@ mod auto_pool_latency_tests {
             auto_pool_warm_target(&healthy, &admits).is_none(),
             "no warm member can take the traffic"
         );
+    }
+
+    /// The escape must not land on another member that is just as slow.
+    ///
+    /// Leaving a slow member and arriving at a slow one spends the same
+    /// wait *and* the upstream prompt cache the move threw away. Measured
+    /// on NAS (2026-11-09), `xiaomi` needed 27 792 ms per 1 000 output
+    /// tokens while `ollama_local` needed 7 875 — a factor of 3.5 on the
+    /// client's critical path.
+    #[test]
+    fn the_escape_prefers_a_fast_member_over_a_slow_one() {
+        for name in ["warm-target-slow", "warm-target-fast", "warm-target-third"] {
+            crate::provider_stats::forget(name);
+        }
+        // Two members are warm — the candidates — and the third is cold, so
+        // it is not a target but it does set the tier's median rate.
+        for _ in 0..3 {
+            crate::provider_stats::record_cache_ratio("warm-target-slow", 1_800, 2_000);
+            crate::provider_stats::record_cache_ratio("warm-target-fast", 1_800, 2_000);
+            crate::provider_stats::record_cache_ratio("warm-target-third", 20, 2_000);
+        }
+        // 51 758 ms/1k against 4 000 ms/1k and 6 000 ms/1k: the tier's
+        // median rate is 6 000, so the slow member is over the bar and the
+        // fast one is not.
+        for _ in 0..5 {
+            crate::provider_stats::record_total_latency("warm-target-slow", 13_250.0, true, 256);
+            crate::provider_stats::record_total_latency("warm-target-fast", 4_000.0, true, 1_000);
+            crate::provider_stats::record_total_latency("warm-target-third", 6_000.0, true, 1_000);
+        }
+        let pool = pool_with_names(
+            true,
+            &["warm-target-slow", "warm-target-fast", "warm-target-third"],
+        );
+        let healthy: Vec<&AutoPoolEntry> = pool.entries.iter().collect();
+        let admits = |_: &AutoPoolEntry| true;
+        assert_eq!(
+            auto_pool_warm_target(&healthy, &admits).map(|e| e.provider.as_str()),
+            Some("warm-target-fast"),
+            "an escape must not arrive at another member that is just as slow"
+        );
+        for name in ["warm-target-slow", "warm-target-fast", "warm-target-third"] {
+            crate::provider_stats::forget(name);
+        }
+    }
+
+    /// When the whole tier is slow, the least bad member still beats none:
+    /// the escape exists to get off the member the session just left.
+    #[test]
+    fn the_escape_still_lands_when_every_member_is_slow() {
+        let names = [
+            "all-slow-a",
+            "all-slow-b",
+            "all-slow-f1",
+            "all-slow-f2",
+            "all-slow-f3",
+        ];
+        for name in names {
+            crate::provider_stats::forget(name);
+        }
+        for _ in 0..3 {
+            crate::provider_stats::record_cache_ratio("all-slow-a", 1_800, 2_000);
+            crate::provider_stats::record_cache_ratio("all-slow-b", 1_800, 2_000);
+            crate::provider_stats::record_cache_ratio("all-slow-f1", 20, 2_000);
+            crate::provider_stats::record_cache_ratio("all-slow-f2", 20, 2_000);
+            crate::provider_stats::record_cache_ratio("all-slow-f3", 20, 2_000);
+        }
+        // Three fast members pull the tier's median rate down, so the two
+        // warm members are both over the bar — a tier that is slow all by
+        // itself. The escape must still have a target: the session has to
+        // get off the member it just left.
+        for _ in 0..5 {
+            crate::provider_stats::record_total_latency("all-slow-a", 50_000.0, true, 1_000);
+            crate::provider_stats::record_total_latency("all-slow-b", 60_000.0, true, 1_000);
+            for fast in ["all-slow-f1", "all-slow-f2", "all-slow-f3"] {
+                crate::provider_stats::record_total_latency(fast, 1_000.0, true, 1_000);
+            }
+        }
+        let pool = pool_with_names(true, &names);
+        let healthy: Vec<&AutoPoolEntry> = pool.entries.iter().collect();
+        let admits = |_: &AutoPoolEntry| true;
+        assert!(
+            auto_pool_warm_target(&healthy, &admits).is_some(),
+            "a slow tier must still have an escape target"
+        );
+        for name in names {
+            crate::provider_stats::forget(name);
+        }
     }
 
     /// A pin on a member that does not keep the conversation warm has nothing
