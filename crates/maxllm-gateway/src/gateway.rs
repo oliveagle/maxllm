@@ -5909,13 +5909,21 @@ impl ProxyHttp for AiGateway {
             }
 
             // Apply the decision to the circuit breaker, then fail over.
-            // A health probe must not move a production breaker.
+            //
+            // A health probe must not move a production breaker for *ordinary*
+            // failures — a probe must not trip the circuit on a transient
+            // error. A quota wall is different: it is a deterministic fact
+            // (the body says quota), and a parked member's only visitor is
+            // usually the probe (real rotation skips open circuits). A probe
+            // that reads a quota message — a 429-style body, or a 500 wearing
+            // one — must re-park the member on the cooldown ladder. Without
+            // it, the wall decays to half-open between real hits, is probed
+            // every round, and the failover it triggers answers 200 — so the
+            // wall is misreported as served while burning one upstream round
+            // trip per probe. This mirrors the header-phase 429 path, which
+            // already lets a probe force-open on a header-declared reset.
             let hot = self.hot.load();
-            if let Some(p) = hot
-                .providers
-                .get(&provider_name)
-                .filter(|_| !ctx.probe_request)
-            {
+            if let Some(p) = hot.providers.get(&provider_name) {
                 match &decision {
                     crate::rate_limit::RateLimitDecision::QuotaUntil {
                         reset_at_ms,
@@ -5956,11 +5964,16 @@ impl ProxyHttp for AiGateway {
                         );
                     }
                     crate::rate_limit::RateLimitDecision::OrdinaryFailure => {
-                        // Not a rate limit — ordinary failure accounting.
-                        p.circuit_breaker.record_failure();
+                        // Not a rate limit — ordinary failure accounting. A
+                        // probe must not move the breaker for this: only a
+                        // quota wall parks on a probe's observation.
+                        if !ctx.probe_request {
+                            p.circuit_breaker.record_failure();
+                        }
                         info!(
                             provider = %provider_name,
                             status = status,
+                            probe = ctx.probe_request,
                             "{status} classified as an ordinary failure (not a rate limit)"
                         );
                     }
