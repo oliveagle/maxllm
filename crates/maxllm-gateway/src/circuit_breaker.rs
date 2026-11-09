@@ -416,6 +416,21 @@ impl CircuitBreaker {
         self.state.store(STATE_CLOSED, Ordering::Relaxed);
     }
 
+    /// Drop the quota force-open, but only if it ends at the given instant.
+    ///
+    /// Used by the cross-node release relay: the node that releases a park
+    /// tells the peers "the wall I knew about (until T) is over". A peer
+    /// that holds exactly that deadline drops it; a peer that holds a later
+    /// deadline keeps it — that one knows something the releaser does not.
+    pub fn clear_quota_until(&self, reset_at_ms: u64) -> bool {
+        let current = self.force_open_until_ms.load(Ordering::Relaxed);
+        if current == 0 || current != reset_at_ms {
+            return false;
+        }
+        self.clear_quota();
+        true
+    }
+
     /// Record a quota wall whose reset instant stayed unknown.
     ///
     /// The provider is parked for the current rung of the cooldown ladder
