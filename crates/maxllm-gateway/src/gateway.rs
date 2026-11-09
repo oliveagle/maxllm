@@ -5750,6 +5750,23 @@ impl ProxyHttp for AiGateway {
         }
     }
 
+    /// A health probe is synthetic traffic. It is already kept out of every
+    /// production signal via `ctx.probe_request` (metrics, request logs,
+    /// breaker accounting) and its outcome is already reported once at INFO by
+    /// `logging`. Letting pingora *also* shout `ERROR Fail to proxy: …` for it
+    /// cost ~11 lines every 5 minutes — about 2 900 ERROR/day, 87% of the whole
+    /// ERROR volume — which buried exactly the real failures this log exists
+    /// to surface. The dead LAN endpoints behind `auto_home` are a compute-side
+    /// fact (§14.13), not a gateway fault: probe them quietly, once, at INFO.
+    fn suppress_error_log(
+        &self,
+        _session: &Session,
+        ctx: &Self::CTX,
+        _error: &pingora::Error,
+    ) -> bool {
+        ctx.probe_request
+    }
+
     async fn logging(
         &self,
         session: &mut Session,
