@@ -237,6 +237,21 @@ const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 /// held the client for two minutes before the pool could try anyone else.
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// How long the gateway waits for an upstream's **first** byte, in seconds.
+///
+/// The stall budget above is a *per read* budget, so it only catches an
+/// upstream that goes completely quiet. An upstream that accepts the request
+/// and then sends its headers only when it has an answer holds the client
+/// for the whole response budget — and the pool has a dozen other members
+/// that could answer in two seconds. Measured on the NAS pool on
+/// 2026-11-09, the first byte of a healthy member arrives in 1.5–2.1 s
+/// (p99 ≈ 10 s), while four requests in four hours waited 64–128 s for one.
+///
+/// Only streaming requests are bounded this way: for a non-streaming request
+/// the headers arrive *with* the answer, so the first byte is the answer and
+/// the route's own timeout governs it.
+const DEFAULT_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Default request-level failover budget: how many providers one request may
 /// walk when providers fail. Matches litellm_lb_go's
 /// `maxResponsesFailoverAttempts` (six upstreams, one past the largest
@@ -306,6 +321,10 @@ pub struct ProviderState {
     /// silent before the gateway gives up on it. `None` means the route's
     /// timeout applies.
     pub read_timeout: Option<Duration>,
+    /// How long the upstream may take to produce its **first** byte.
+    /// `None` means the built-in default; `Some(ZERO)` disables the
+    /// deadline for this provider.
+    pub first_byte_timeout: Option<Duration>,
     /// Fixed UTC offset (minutes east of UTC) used to read zone-less reset
     /// timestamps in this upstream's rate-limit messages. 0 = UTC.
     pub utc_offset_minutes: i32,
@@ -710,6 +729,11 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
                 ),
                 total_connect_timeout: conf.total_connect_timeout_secs.map(Duration::from_secs),
                 read_timeout: conf.read_timeout_secs.map(Duration::from_secs),
+                first_byte_timeout: match conf.first_byte_timeout_secs {
+                    Some(0) => Some(Duration::ZERO),
+                    Some(secs) => Some(Duration::from_secs(secs)),
+                    None => None,
+                },
                 utc_offset_minutes: conf.utc_offset_minutes(),
             }),
         );
@@ -2910,1243 +2934,43 @@ impl AiGateway {
 /// buffer for a non-final chunk keeps the body open while sending nothing;
 /// the accumulated bytes are forwarded as one piece at `end_of_stream`.
 impl AiGateway {
-    /// Apply the repairs a **native Responses** request body needs before it
-    /// is forwarded upstream.
+    /// Decide the first-byte deadline of this request.
     ///
-    /// Two layers: the generic Responses normalisation (a chat-style nested
-    /// function tool -> the official flat shape) and the provider's own fixes
-    /// (the OpenDesign link answers HTTP 400 `upstream_error` for the
-    /// non-standard `tool_choice: "any"` that codex-cli sends).
-    fn normalize_native_responses_body(provider: &ProviderState, body: &[u8]) -> Vec<u8> {
-        let normalized = maxllm_translate::responses::normalize_responses_request(body);
-        provider
-            .translator
-            .normalize_native_responses_request(&normalized)
-    }
-
-    /// Buffer one request body chunk, keeping the upstream body open until the
-    /// whole body has been read.
-    ///
-    /// Once the final chunk arrives, the `client_request` audit event is
-    /// recorded with the full original body — before any translation rewrites
-    /// `request_body_buf`.
-    fn buffer_request_body_chunk(
-        &self,
-        ctx: &mut RequestCtx,
-        body: &mut Option<Bytes>,
-        end_of_stream: bool,
-    ) {
-        if let Some(data) = body.take() {
-            ctx.request_body_buf.extend_from_slice(&data);
-            if end_of_stream && !ctx.client_request_recorded {
-                ctx.client_request_recorded = true;
-                ctx.client_body = Some(ctx.request_body_buf.clone());
-                self.record_event(
-                    EVENT_CLIENT_REQUEST,
-                    ctx,
-                    None,
-                    None,
-                    None,
-                    ctx.client_body.clone(),
-                );
-            }
-            if !end_of_stream {
-                *body = Some(Bytes::new());
-            }
+    /// The deadline says how long the upstream may take to produce its first
+    /// byte. It only applies to a streaming request: there the first byte is
+    /// the first token, which a healthy member of the pool produces in a
+    /// couple of seconds, so a member that needs much longer is one the
+    /// request should not wait for — the pool has a dozen other members that
+    /// can answer right away. A non-streaming request gets its answer in
+    /// one piece, so its first byte is the whole answer and the route's own
+    /// timeout governs it.
+    fn decide_first_byte_budget(&self, ctx: &mut RequestCtx) {
+        if ctx.first_byte_budget.get().is_some() {
+            // Already decided (the first attempt of a failover decides for
+            // all of them).
+            return;
         }
-    }
-
-    /// Rewrite a body-level `auto` sentinel to the model of the pool entry the
-    /// request has already landed on.
-    ///
-    /// A route that is not an auto route only reveals the sentinel in the
-    /// request body (`{"model": "auto"}`), and the provider is picked before
-    /// the body is read, so the sentinel cannot influence that first hop. When
-    /// the picked provider is itself a pool member — the session is pinned to
-    /// one from an earlier turn, or the route's own provider is listed in the
-    /// pool — forwarding the literal sentinel makes the upstream answer 404 and
-    /// routes every single turn through a failover to a different member,
-    /// which also throws away the upstream's prompt cache for the whole
-    /// conversation. Rewriting the body to the entry's model keeps the request
-    /// where it already is.
-    ///
-    /// Only chunked requests are rewritten: a Content-Length-framed body whose
-    /// length changes would be truncated by the upstream.
-    async fn adopt_sentinel_model(
-        &self,
-        hot: &HotState,
-        session: &mut Session,
-        ctx: &mut RequestCtx,
-    ) -> pingora::Result<()> {
-        if ctx.request_body_buf.is_empty() || ctx.provider_name.is_empty() {
-            return Ok(());
-        }
-        let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(&ctx.request_body_buf)
-        else {
-            return Ok(());
-        };
-        // The body names the pool: `auto`, `auto_home`, or whatever sentinel
-        // the request carries. A model that is not a pool name is forwarded
-        // untouched.
-        let Some(sentinel) = parsed
-            .get("model")
-            .and_then(|m| m.as_str())
-            .map(str::to_string)
-        else {
-            return Ok(());
-        };
-        let Some(pool) = hot.pool_named(&sentinel) else {
-            return Ok(());
-        };
-        let Some((provider, model)) = pool
-            .entry_for(&ctx.provider_name)
-            .map(|e| (e.provider.clone(), e.model.clone()))
-        else {
-            warn!(
-                provider = %ctx.provider_name,
-                pool = %sentinel,
-                "body names an auto pool, but the selected provider is not one of its members; the sentinel will reach the upstream"
-            );
-            return Ok(());
-        };
-        if let Some(obj) = parsed.as_object_mut() {
-            obj.insert("model".into(), serde_json::Value::String(model.clone()));
-        }
-        if let Ok(bytes) = serde_json::to_vec(&parsed) {
-            ctx.request_body_buf = bytes;
-        }
-        ctx.auto_pool = Some(pool.name.clone());
-        ctx.auto_target = Some((provider, model.clone()));
-        ctx.model = model.clone();
-        Self::enforce_model_allowlist(session, ctx, &model, None).await?;
-        ctx.plugin_ctx.model = model;
-        Ok(())
-    }
-}
-
-/// Extract the model from a Gemini-style request path
-/// (`/v1beta/models/gemini-2.5-flash:generateContent`). Returns `None` when
-/// the path does not carry a model.
-fn model_from_request_path(path: &str) -> Option<String> {
-    let marker = "/models/";
-    let idx = path.find(marker)?;
-    let rest = &path[idx + marker.len()..];
-    let end = rest.find([':', '/', '?']).unwrap_or(rest.len());
-    if end == 0 {
-        None
-    } else {
-        Some(rest[..end].to_string())
-    }
-}
-
-/// Resolve the upstream time budget for a request: a route may declare
-/// `timeout_secs`, which overrides the hard-coded read/write defaults.
-/// Returns `None` when the route does not configure one (or is unmatched).
-fn route_timeout_secs(routes: &[RouteConfig], route_index: Option<usize>) -> Option<Duration> {
-    route_index
-        .and_then(|i| routes.get(i))
-        .and_then(|r| r.timeout_secs)
-        .filter(|secs| *secs > 0)
-        .map(Duration::from_secs)
-}
-
-/// The route's request-level failover budget: how many providers one request
-/// may walk when the current provider fails. Unset (or absent) routes keep
-/// the built-in default, which matches litellm_lb_go's bound.
-/// Whether this request can be sent to another provider at all.
-///
-/// Pingora buffers at most `BODY_BUF_LIMIT` (64 KiB) of the client body for a
-/// retry and silently drops the excess. Once the whole body has been read from
-/// the client, replaying that prefix hands the next upstream an incomplete
-/// body while the client waits for a response — neither side can make
-/// progress, so both sit there until a timeout. That is a hang, not an error,
-/// and it is what a ~100 KB codex request used to do whenever its first
-/// provider answered 404.
-///
-/// So a failover is only started when the body is either still readable from
-/// the client (nothing consumed yet, e.g. a connect failure) or small enough
-/// to be replayed whole.
-fn body_is_replayable(session: &mut Session, ctx: &RequestCtx) -> bool {
-    // The body we already read is re-injected on the retry, so the replay
-    // buffer's truncation does not matter.
-    if ctx.client_body.is_some() {
-        return true;
-    }
-    let truncated = session.as_ref().retry_buffer_truncated();
-    !(truncated && session.as_mut().is_body_done())
-}
-
-fn max_failover_attempts(routes: &[RouteConfig], route_index: Option<usize>) -> u32 {
-    route_index
-        .and_then(|i| routes.get(i))
-        .map(|r| r.max_failover_attempts)
-        .unwrap_or(DEFAULT_MAX_FAILOVER_ATTEMPTS)
-}
-
-/// The route's same-provider retry budget: how many times a transient
-/// upstream failure (HTTP 5xx) may be retried on the SAME provider before
-/// the request moves to the next provider of the fallback chain, plus the
-/// backoff to wait between those retries.
-///
-/// Unset (or absent) routes keep the built-in default: no same-provider
-/// retry at all — a failed attempt walks straight to the fallback chain.
-fn same_provider_retries(routes: &[RouteConfig], route_index: Option<usize>) -> (u32, u64) {
-    route_index
-        .and_then(|i| routes.get(i))
-        .map(|r| (r.num_retries, r.retry_backoff_ms))
-        .unwrap_or((0, DEFAULT_RETRY_BACKOFF_MS))
-}
-
-/// Whether an upstream HTTP status means "this provider failed" rather than
-/// "this request is wrong" — i.e. whether another provider of the pool may
-/// still serve the request.
-///
-/// Mirrors litellm_lb_go's `responsesFailoverAllowed`: quota exhaustion, rate
-/// limits, auth rejections, a missing model and server errors all fail over,
-/// while 400/422 are request faults every upstream would reject the same way.
-///
-/// The pool needs one exception: the requested model is sent to the first
-/// provider of the chain, and a provider that does not carry it answers
-/// 400 (one-api's `invalid params, unknown model`). A provider whose own
-/// default model differs from the requested model is treated as not carrying
-/// it, so the request walks on to a provider that has the model.
-fn should_failover_status(status: u16, ctx: &RequestCtx, provider: &ProviderState) -> bool {
-    match status {
-        // The provider cannot serve this request now or at all: quota
-        // exhausted (429), auth rejected (401/403), model or endpoint
-        // missing (404/405/410), timed out (408), conflicting (409/425),
-        // unaffordable (402).
-        401 | 402 | 403 | 404 | 405 | 408 | 409 | 410 | 425 | 429 => true,
-        // The provider itself failed.
-        500..=599 => true,
-        // The request is wrong — unless this provider simply does not carry
-        // the requested model (its own default differs from the request).
-        400 | 422 => {
-            !ctx.model.is_empty()
-                && provider
-                    .default_model
-                    .as_deref()
-                    .is_some_and(|default_model| default_model != ctx.model)
-        }
-        // 2xx/3xx and anything else: the provider answered.
-        _ => false,
-    }
-}
-
-/// Whether the gateway answers such an upstream status itself.
-///
-/// A quota wall (429), an empty account (402), a credential the provider
-/// rejected (401/403) and a server fault (5xx) are the *provider's* problem:
-/// the client did nothing wrong, and the upstream's own wording ("您的限额将
-/// 在 2026-11-10 22:58:54 重置") says nothing the client can act on. The
-/// gateway answers with its own 503 instead of passing it through.
-///
-/// A rejected request (400/422) and a missing endpoint or model
-/// (404/405/410) stay as they are: they are the client's answer to give, and
-/// the upstream words them best.
-fn gateway_owns_status(status: u16) -> bool {
-    matches!(status, 401 | 402 | 403 | 408 | 409 | 425 | 429) || (500..=599).contains(&status)
-}
-
-/// Whether a 404 error body is the "the model does not exist" rejection of an
-/// OpenAI-compatible upstream (vLLM: "The model `X` does not exist. Valid
-/// aliases: …", one-api: "unknown model") rather than a missing endpoint —
-/// which answers the same status with "not found" and must not be rewritten.
-fn body_reports_unknown_model(body: &str) -> bool {
-    let lower = body.to_ascii_lowercase();
-    // Phrasings that alone identify an unknown model — no bare "not found".
-    const STRONG: &[&str] = &[
-        "unknown model",
-        "no such model",
-        "model_not_found",
-        "model not found",
-        "model does not exist",
-        "model doesn't exist",
-        "does not exist. valid aliases",
-        "no model named",
-        "invalid model",
-        "unsupported model",
-        "model is not supported",
-        "model not supported",
-    ];
-    if STRONG.iter().any(|m| lower.contains(m)) {
-        return true;
-    }
-    // Weak phrasings ("does not exist", "not found") also describe a missing
-    // endpoint, so only trust them when the body is explicitly about a model.
-    let mentions_model = lower.contains("model") || lower.contains("模型");
-    const WEAK: &[&str] = &[
-        "does not exist",
-        "doesn't exist",
-        "not exist",
-        "not found",
-        "不存在",
-        "未找到",
-    ];
-    mentions_model && WEAK.iter().any(|m| lower.contains(m))
-}
-
-#[async_trait]
-impl ProxyHttp for AiGateway {
-    type CTX = RequestCtx;
-
-    fn new_ctx(&self) -> Self::CTX {
-        RequestCtx::new()
-    }
-
-    async fn request_filter(
-        &self,
-        session: &mut Session,
-        ctx: &mut Self::CTX,
-    ) -> pingora::Result<bool> {
-        let path = session.req_header().uri.path();
-        // Record it before anything can fail: a session that never reaches the
-        // router still gets its path into the logs and the recorder.
-        if ctx.request_path.is_empty() {
-            ctx.request_path = path.to_string();
-        }
-
-        // Health check endpoint. The body carries enough state for an
-        // operator (or a monitor) to see which pools are starving and which
-        // providers are circuit-open without scraping Prometheus.
-        if path == "/health" || path == "/healthz" {
-            // Fast path: not an application request. Set the flag before the
-            // first `await` — an aborted scrape must not reach `logging`
-            // unmarked (see the guard there).
-            ctx.skip_logging = true;
-            let hot = self.hot.load();
-            let providers_total = hot.providers.len();
-            let mut providers_healthy = 0usize;
-            let mut open_providers: Vec<&str> = Vec::new();
-            let mut half_open_providers: Vec<&str> = Vec::new();
-            for (name, provider) in hot.providers.iter() {
-                // A breaker whose fail window elapsed is *half-open*: it will
-                // be probed by the next request that reaches it. Reporting it
-                // as "open" made /health claim a dozen circuit-open providers
-                // when in fact none were rejecting traffic (2026-11-08: 12 of
-                // the 16 listed were merely awaiting a probe).
-                match provider.circuit_breaker.effective_state() {
-                    crate::circuit_breaker::STATE_CLOSED => providers_healthy += 1,
-                    crate::circuit_breaker::STATE_HALF_OPEN => {
-                        half_open_providers.push(name.as_str())
-                    }
-                    _ => open_providers.push(name.as_str()),
-                }
-            }
-            let mut pools = serde_json::Map::new();
-            let mut degraded = providers_total > 0 && providers_healthy == 0;
-            for pool in &hot.auto_pools {
-                let total = pool.entries.len();
-                let healthy = pool
-                    .entries
-                    .iter()
-                    .filter(|entry| {
-                        hot.providers
-                            .get(&entry.provider)
-                            .map(|p| p.circuit_breaker.effective_state() == 0)
-                            .unwrap_or(false)
-                    })
-                    .count();
-                if total > 0 && healthy == 0 {
-                    degraded = true;
-                }
-                pools.insert(
-                    pool.name.clone(),
-                    serde_json::json!({"healthy": healthy, "total": total}),
-                );
-            }
-            open_providers.sort_unstable();
-            half_open_providers.sort_unstable();
-            let mut health = serde_json::json!({
-                "status": if degraded { "degraded" } else { "ok" },
-                "layer": 2,
-                "version": env!("CARGO_PKG_VERSION"),
-                "providers": {
-                    "healthy": providers_healthy,
-                    "total": providers_total,
-                },
-                "pools": pools,
-                "open_providers": open_providers,
-                "half_open_providers": half_open_providers,
-            });
-            if let Some(id) = build_id() {
-                health["build_id"] = id.into();
-            }
-            let body = serde_json::to_vec(&health)
-                .unwrap_or_else(|_| br#"{"status":"degraded"}"#.to_vec());
-            let content_len = body.len().to_string();
-            let mut resp = ResponseHeader::build(200, Some(2))?;
-            resp.insert_header("Content-Type", "application/json")?;
-            resp.insert_header("Content-Length", &content_len)?;
-            session.write_response_header(Box::new(resp), false).await?;
-            session
-                .write_response_body(Some(Bytes::from(body)), true)
-                .await?;
-            return Ok(true);
-        }
-
-        // Version endpoint — a GET that used to fall through to the POST-only
-        // API guard and answer 405.
-        if path == "/version" {
-            // Fast path: not an application request. Set the flag before the
-            // first `await` — an aborted scrape must not reach `logging`
-            // unmarked (see the guard there).
-            ctx.skip_logging = true;
-            let mut version = serde_json::json!({
-                "layer": 2,
-                "version": env!("CARGO_PKG_VERSION"),
-            });
-            if let Some(id) = build_id() {
-                version["build_id"] = id.into();
-            }
-            let body = serde_json::to_vec(&version).unwrap_or_default();
-            let content_len = body.len().to_string();
-            let mut resp = ResponseHeader::build(200, Some(2))?;
-            resp.insert_header("Content-Type", "application/json")?;
-            resp.insert_header("Content-Length", &content_len)?;
-            session.write_response_header(Box::new(resp), false).await?;
-            session
-                .write_response_body(Some(Bytes::from(body)), true)
-                .await?;
-            return Ok(true);
-        }
-
-        // Load hot state snapshot for this request
-        let hot = self.hot.load();
-
-        // /v1/models endpoint — OpenAI-compatible model list (fast path)
-        if path == "/v1/models" {
-            // Fast path: not an application request. Set the flag before the
-            // first `await` — an aborted scrape must not reach `logging`
-            // unmarked (see the guard there).
-            ctx.skip_logging = true;
-            let body_bytes = hot.models_response.clone();
-            let content_len = body_bytes.len().to_string();
-            let mut resp = ResponseHeader::build(200, Some(2))?;
-            resp.insert_header("Content-Type", "application/json")?;
-            resp.insert_header("Content-Length", &content_len)?;
-            session.write_response_header(Box::new(resp), false).await?;
-            session.write_response_body(Some(body_bytes), true).await?;
-            return Ok(true);
-        }
-
-        // Metrics endpoint (bypasses plugins). The scrape is not an
-        // application request: it is not counted in the active-request
-        // gauge, and the exposition must not include the scrape itself —
-        // otherwise the gauge could never read 0 while it is being scraped.
-        if path == "/metrics" && hot.metrics_enabled {
-            // Fast path: not an application request. Set the flag before the
-            // first `await` — an aborted scrape must not reach `logging`
-            // unmarked (see the guard there).
-            ctx.skip_logging = true;
-            // The exposition names every provider, model, key and price in the
-            // deployment, so it is served to loopback scrapers only unless the
-            // operator opts in. Nothing below the route layer is reached here,
-            // so this check is the whole authorisation story for the endpoint.
-            let client_ip = session
-                .client_addr()
-                .and_then(|addr| addr.as_inet().map(|sock| sock.ip()));
-            if !metrics_visible_to(hot.metrics_allow_remote, client_ip) {
-                return Self::send_error_response(
-                    session,
-                    403,
-                    "metrics is loopback-only; set [metrics] allow_remote = true to expose it",
-                )
-                .await;
-            }
-            // The breaker gauge is otherwise only written on transitions, so
-            // a provider whose fail window elapsed kept reading OPEN until a
-            // request happened to touch it. Evaluate the effective state at
-            // scrape time (read-only: no probe slot is consumed).
-            for (name, provider) in hot.providers.iter() {
-                METRICS
-                    .circuit_breaker_state
-                    .with_label_values(&[name])
-                    .set(provider.circuit_breaker.effective_state() as i64);
-            }
-            // The in-flight gauge is derived from the counter the
-            // least-connections router reads, so it can never drift.
-            for (provider, count) in crate::provider_stats::inflight_counts() {
-                METRICS
-                    .provider_inflight_requests
-                    .with_label_values(&[&provider])
-                    .set(count as i64);
-            }
-            let body = METRICS.encode();
-            let content_len = body.len().to_string();
-            let mut resp = ResponseHeader::build(200, Some(2))?;
-            resp.insert_header("Content-Type", "text/plain; version=0.0.4")?;
-            resp.insert_header("Content-Length", &content_len)?;
-            session.write_response_header(Box::new(resp), false).await?;
-            session
-                .write_response_body(Some(Bytes::from(body)), true)
-                .await?;
-            return Ok(true);
-        }
-
-        METRICS.active_requests.inc();
-        // Paired with the decrement in `logging`: the hook must only give back
-        // the slot this request took.
-        ctx.active_request_counted = true;
-
-        // Own the path for later use (after the borrow above is done)
-        let path = path.to_string();
-
-        // Reject non-POST methods on API routes (health/metrics/models already handled above)
-        let method = session.req_header().method.clone();
-        if method != http::method::Method::POST
-            && !path.starts_with("/admin/")
-            && path != "/v1/models"
-        {
-            METRICS.active_requests.dec();
-            ctx.skip_logging = true;
-            return Self::send_error_response(
-                session,
-                405,
-                &format!("Method {} not allowed. Use POST.", method),
-            )
-            .await;
-        }
-
-        // Admin API endpoints
-        if path.starts_with("/admin/") {
-            let handled = self.handle_admin_request(session, &path).await?;
-            // The admin handler answers the request itself and already
-            // decremented the active-request gauge — the logging hook must
-            // not decrement it a second time.
-            ctx.skip_logging = true;
-            return Ok(handled);
-        }
-
-        // Extract client IP for plugins
-        if let Some(addr) = session.client_addr() {
-            if let Some(sock) = addr.as_inet() {
-                ctx.plugin_ctx.client_ip = Some(sock.ip().to_string());
-            }
-        }
-
-        // ── Virtual-key authentication ──
-        // When the admin module is enabled, a bearer token that resolves to
-        // a virtual key created through the admin API is validated against
-        // the key store here (active, unexpired, within budget) and its key
-        // id is remembered so the logging hook can record spend against it.
-        // The `key_auth` plugin defers to this check via the
-        // `virtual_key_auth` extension marker, so static config keys keep
-        // working unchanged and keys that are neither static nor virtual
-        // still hit the plugin's 401.
-        if let Some(enforcer) = &self.budget_enforcer {
-            let auth = session
-                .req_header()
-                .headers
-                .get("Authorization")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
-            let token = auth.strip_prefix("Bearer ").unwrap_or(auth);
-            if token.starts_with("sk-maxllm-") {
-                match maxllm_admin::keys::validate_key(enforcer.store().as_ref(), token) {
-                    Ok(Some(mut key)) => {
-                        // Roll an expired budget window forward so stale
-                        // spend from a previous window does not block the key.
-                        if let Err(e) = enforcer.reset_key_budget_if_expired(&mut key) {
-                            warn!(error = %e, "Failed to reset expired budget window");
-                        }
-                        match enforcer.check_budget(&key) {
-                            Ok(()) => {
-                                // Per-key rate limits: the RPM sliding
-                                // window is consumed here; the TPM window is
-                                // peeked (tokens are recorded when the
-                                // response completes) and an in-flight slot
-                                // is taken for the concurrency limit.
-                                // The checks are lazy: a key that is
-                                // already over its RPM limit is not charged
-                                // for a TPM peek or a concurrency slot.
-                                let denied = self
-                                    .key_rate_limiter
-                                    .check_request(&key.id, key.rpm_limit)
-                                    .err()
-                                    .map(|_| "rate limit exceeded (requests per minute)")
-                                    .or_else(|| {
-                                        self.key_rate_limiter
-                                            .check_tokens(&key.id, key.tpm_limit)
-                                            .err()
-                                            .map(|_| "rate limit exceeded (tokens per minute)")
-                                    })
-                                    .or_else(|| {
-                                        self.key_rate_limiter
-                                            .acquire(&key.id, key.max_parallel_requests)
-                                            .err()
-                                            .map(|_| "too many parallel requests")
-                                    });
-                                if let Some(reason) = denied {
-                                    METRICS.active_requests.dec();
-                                    ctx.skip_logging = true;
-                                    return Self::send_error_response(session, 429, reason).await;
-                                }
-                                ctx.key_in_flight =
-                                    Some(crate::key_rate_limit::KeyInFlightGuard::new(
-                                        Arc::clone(&self.key_rate_limiter),
-                                        key.id.clone(),
-                                    ));
-                                ctx.plugin_ctx.client_id = Some(key.id.clone());
-                                ctx.plugin_ctx
-                                    .extensions
-                                    .insert("virtual_key_auth".into(), "1".into());
-                                ctx.virtual_key_id = Some(key.id.clone());
-                                ctx.virtual_key_allowed_models = key.allowed_models.clone();
-                            }
-                            Err(e) => {
-                                METRICS.active_requests.dec();
-                                ctx.skip_logging = true;
-                                return Self::send_error_response(
-                                    session,
-                                    e.http_status(),
-                                    &e.to_string(),
-                                )
-                                .await;
-                            }
-                        }
-                    }
-                    Ok(None) => {
-                        // Not a virtual key — fall through to the plugin
-                        // chain (a static config key or an unknown token).
-                    }
-                    Err(maxllm_admin::keys::KeyError::Revoked) => {
-                        METRICS.active_requests.dec();
-                        ctx.skip_logging = true;
-                        return Self::send_error_response(session, 401, "API key revoked").await;
-                    }
-                    Err(maxllm_admin::keys::KeyError::Expired) => {
-                        METRICS.active_requests.dec();
-                        ctx.skip_logging = true;
-                        return Self::send_error_response(session, 401, "API key expired").await;
-                    }
-                    Err(maxllm_admin::keys::KeyError::BudgetExceeded) => {
-                        METRICS.active_requests.dec();
-                        ctx.skip_logging = true;
-                        return Self::send_error_response(session, 402, "budget exceeded").await;
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "Virtual-key validation failed");
-                        METRICS.active_requests.dec();
-                        ctx.skip_logging = true;
-                        return Self::send_error_response(session, 500, "key validation error")
-                            .await;
-                    }
-                }
-            }
-        }
-
-        // Run global plugin chain (auth, request_id, ip_restriction, etc.)
-        if let Some(resp) = hot
-            .global_chain
-            .run_request(session, &mut ctx.plugin_ctx)
-            .await?
-        {
-            METRICS.active_requests.dec();
-            ctx.skip_logging = true;
-            resp.send(session).await?;
-            return Ok(true);
-        }
-
-        // Route matching
-        let route_index = match Self::match_route(&hot, &path) {
-            Some(idx) => idx,
-            None => {
-                METRICS.active_requests.dec();
-                ctx.skip_logging = true;
-                return Self::send_error_response(
-                    session,
-                    404,
-                    &format!("No route matches path: {path}"),
-                )
-                .await;
-            }
-        };
-
-        ctx.route_index = Some(route_index);
-        ctx.plugin_ctx.route_path = hot.routes[route_index].path.clone();
-        let route = &hot.routes[route_index];
-        ctx.endpoint_type = route.endpoint_type;
-
-        // `/v1/responses` is a prefix route on purpose: a client points its
-        // base URL at `/v1/responses/<provider-or-pool>` and appends
-        // `/responses`. The same prefix match silently swallowed retired
-        // provider names (`/v1/responses/one_api_*`) and served them from the
-        // generic pool. Reject a segment that names neither a provider nor a
-        // pool, and say which names are valid.
-        if let Some(segment) = Self::unknown_responses_subroute(&hot, route, &path) {
-            METRICS.active_requests.dec();
-            ctx.skip_logging = true;
-            return Self::send_error_response(
-                session,
-                404,
-                &format!(
-                    "unknown provider or pool '{segment}' in {path}; use /v1/responses/<provider>, /v1/responses/auto or /v1/responses/auto_home"
-                ),
-            )
-            .await;
-        }
-
-        // The segment named a real provider but no explicit route matched it,
-        // so the request is sitting on the pooled `/v1/responses` route. Pin
-        // it: the caller asked for that provider, not for the pool.
-        if let Some(pin) = Self::responses_subroute_pin(&hot, route, &path) {
-            ctx.plugin_ctx.route_path = format!("/v1/responses/{pin}");
-            ctx.path_pinned_provider = Some(pin);
-        }
-
-        // For passthrough, extract the path suffix after the route prefix
-        if route.endpoint_type == EndpointType::Passthrough {
-            let suffix = &path[route.path.len()..];
-            ctx.passthrough_path = Some(if suffix.is_empty() || suffix == "/" {
-                "/".to_string()
-            } else if !suffix.starts_with('/') {
-                format!("/{suffix}")
-            } else {
-                suffix.to_string()
-            });
-        }
-
-        // Store route-specific guardrail scope
-        if !route.guardrails.is_empty() {
-            ctx.route_guardrails = Some(route.guardrails.clone());
-        }
-
-        // Run route-specific plugin chain (rate_limit, cors, etc.)
-        if let Some(resp) = hot.route_chains[route_index]
-            .run_request(session, &mut ctx.plugin_ctx)
-            .await?
-        {
-            METRICS.active_requests.dec();
-            ctx.skip_logging = true;
-            resp.send(session).await?;
-            return Ok(true);
-        }
-
-        // Capture the request identity for the recorder and session-sticky.
-        ctx.request_method = session.req_header().method.to_string();
-        ctx.request_path = path.clone();
-        // A synthetic health probe is served normally but kept out of every
-        // production signal: metrics, request logs and breaker accounting.
-        ctx.probe_request = session.req_header().headers.get("x-maxllm-probe").is_some();
-
-        // Session-sticky: capture the session identity from the request
-        // headers. codex-cli sends `session-id`, Claude Code sends
-        // `X-Session-ID` / `X-Conversation-ID`; the body fallback is applied
-        // later in request_body_filter.
-        ctx.session_id = crate::session_sticky::resolve_from_headers(&session.req_header().headers);
-
-        // Select provider (with circuit breaker check and routing strategy)
-        let _provider = match self.select_provider(&hot, route, ctx) {
-            Some(p) => {
-                // The request is in flight for this provider — the
-                // least-connections strategy counts it.
-                crate::provider_stats::acquire(&ctx.provider_name);
-                p
-            }
-            None => {
-                METRICS.active_requests.dec();
-                ctx.skip_logging = true;
-                return Self::send_error_response(
-                    session,
-                    503,
-                    &self.unavailable_reason(&hot, route, ctx),
-                )
-                .await;
-            }
-        };
-
-        // ── Bedrock SigV4 path ──
-        // Bedrock authenticates with AWS SigV4, whose signature covers the
-        // SHA-256 of the translated request payload. The exact bytes must be
-        // known before the request headers are written. Pingora's proxy
-        // pipeline streams body chunks after the headers have been sent, so
-        // the payload hash cannot be embedded in the Authorization header
-        // there. Bedrock requests are therefore read, translated, signed and
-        // sent via reqwest in `handle_bedrock_request` (which buffers the
-        // full body), and the response is translated back before returning.
-        if let Some(provider) = hot.providers.get(&ctx.provider_name) {
-            if provider.kind == maxllm_config::ProviderKind::Bedrock {
-                self.handle_bedrock_request(session, ctx, provider).await?;
-                return Ok(true);
-            }
-        }
-
-        // Sync plugin ctx with request ctx
-        ctx.plugin_ctx.provider_name = ctx.provider_name.clone();
-
-        // The `client_request` audit event is recorded by the body filter,
-        // where the full request body is known — recording it here would
-        // duplicate the event without the body.
-
-        Ok(false)
-    }
-
-    async fn upstream_peer(
-        &self,
-        _session: &mut Session,
-        ctx: &mut Self::CTX,
-    ) -> pingora::Result<Box<HttpPeer>> {
-        // Resolve the upstream hostname here instead of letting
-        // `HttpPeer::new` do it: pingora's constructor calls
-        // `to_socket_addrs().unwrap()` internally and PANICS the worker
-        // thread when DNS fails (e.g. a corp-only host reached from a
-        // non-corp network), leaving the client with a dropped connection
-        // instead of a 502. Look the address up asynchronously and surface a
-        // clean error. Passing a resolved `SocketAddr` to `HttpPeer::new`
-        // skips the fallible lookup entirely.
-        //
-        // A DNS failure means this provider is unreachable *before* the
-        // connect phase, so it would bypass `fail_to_connect`'s failover.
-        // Treat it like a connect failure: count it against the breaker,
-        // switch to the next pool/fallback provider, and resolve again —
-        // bounded by the same failover budget.
-        let addr = loop {
-            let hot = self.hot.load();
-            let provider = match hot.providers.get(&ctx.provider_name) {
-                Some(p) => p,
-                None => {
-                    warn!(provider = %ctx.provider_name, "provider not found in upstream_peer (config may have been reloaded)");
-                    return Err(pingora::Error::explain(
-                        pingora::ErrorType::HTTPStatus(502),
-                        format!("provider '{}' no longer exists", ctx.provider_name),
-                    ));
-                }
-            };
-            // Clone what the lookup needs: the provider borrow must not
-            // cross the await point. `to_socket_addrs` accepts (String, u16).
-            let host = provider.host.clone();
-            let port = provider.port;
-            let resolved = match tokio::net::lookup_host((host.clone(), port)).await {
-                Ok(mut addrs) => addrs.next(),
-                Err(_) => None,
-            };
-            match resolved {
-                Some(a) => break a,
-                None => {
-                    if !self.try_dns_failover(ctx).await {
-                        return Err(pingora::Error::explain(
-                            pingora::ErrorType::HTTPStatus(502),
-                            format!("DNS resolution failed for '{}'", host),
-                        ));
-                    }
-                }
-            }
-        };
-        let hot = self.hot.load();
-        let provider = match hot.providers.get(&ctx.provider_name) {
-            Some(p) => p,
-            None => {
-                return Err(pingora::Error::explain(
-                    pingora::ErrorType::HTTPStatus(502),
-                    format!("provider '{}' no longer exists", ctx.provider_name),
-                ));
-            }
-        };
-        let mut peer = HttpPeer::new(addr, provider.tls, provider.sni.clone());
-        peer.options.connection_timeout = Some(provider.connect_timeout);
-        peer.options.total_connection_timeout = provider.total_connect_timeout;
-        // A route may declare its own upstream time budget (`timeout_secs`).
-        // Honour it instead of silently ignoring the setting, otherwise a
-        // route configured for a slow upstream is still cut off by the
-        // hard-coded defaults below. Unset (or zero) keeps the defaults.
-        let route_timeout = route_timeout_secs(&hot.routes, ctx.route_index);
-        // The provider's own stall budget wins: an upstream that accepts the
-        // connection and then says nothing must not hold the client for the
-        // route's much longer timeout. The route's timeout is the fallback.
-        peer.options.read_timeout = Some(
-            provider
-                .read_timeout
-                .or(route_timeout)
-                .unwrap_or(DEFAULT_READ_TIMEOUT),
-        );
-        peer.options.write_timeout = Some(route_timeout.unwrap_or(Duration::from_secs(30)));
-
-        Ok(Box::new(peer))
-    }
-
-    async fn upstream_request_filter(
-        &self,
-        session: &mut Session,
-        upstream_request: &mut RequestHeader,
-        ctx: &mut Self::CTX,
-    ) -> pingora::Result<()> {
-        // A same-provider retry carries a backoff to wait before the next
-        // attempt, so a transient upstream error is not hammered again
-        // immediately. Consumed here — before the request is (re)sent — and
-        // cleared, so only the retried attempt waits.
-        if let Some(backoff_ms) = ctx.pending_retry_backoff_ms.take() {
-            if backoff_ms > 0 {
-                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-            }
+        if !ctx.is_streaming {
+            ctx.first_byte_budget.set(None);
+            return;
         }
         let hot = self.hot.load();
-        let provider = match hot.providers.get(&ctx.provider_name) {
-            Some(p) => p,
-            None => {
-                warn!(provider = %ctx.provider_name, "provider not found in upstream_request_filter (config may have been reloaded)");
-                return Err(pingora::Error::explain(
-                    pingora::ErrorType::HTTPStatus(502),
-                    format!("provider '{}' no longer exists", ctx.provider_name),
-                ));
-            }
-        };
-
-        // Set upstream path based on endpoint type
-        let path = match ctx.endpoint_type {
-            EndpointType::Responses => {
-                if ctx.native_responses {
-                    // The provider speaks the Responses contract natively: the
-                    // request is forwarded unchanged to its own /responses path.
-                    provider
-                        .responses_path
-                        .clone()
-                        .unwrap_or_else(|| provider.translator.upstream_path().to_string())
-                } else if provider.kind == ProviderKind::Gemini {
-                    // Responses is translated into chat completions for the
-                    // upstream call, so it uses the provider's chat path.
-                    let model = provider
-                        .default_model
-                        .as_deref()
-                        .unwrap_or("gemini-2.5-flash");
-                    format!(
-                        "/v1beta/models/{}:generateContent?key={}",
-                        model, provider.api_key
-                    )
-                } else {
-                    provider.translator.upstream_path().to_string()
-                }
-            }
-            EndpointType::Passthrough => {
-                // Use the suffix path captured from the client request
-                ctx.passthrough_path
-                    .clone()
-                    .unwrap_or_else(|| "/".to_string())
-            }
-            EndpointType::Native => {
-                // Use the original client request path (already in provider format).
-                // For Gemini, append API key as query param.
-                let original = session.req_header().uri.path().to_string();
-                if provider.kind == ProviderKind::Gemini {
-                    format!("{}?key={}", original, provider.api_key)
-                } else {
-                    native_upstream_path(&original, provider.translator.upstream_path())
-                }
-            }
-            EndpointType::Embeddings => {
-                // Embeddings endpoint: use the embeddings path for each provider
-                if provider.kind == ProviderKind::Gemini {
-                    let model = provider
-                        .default_model
-                        .as_deref()
-                        .unwrap_or("text-embedding-004");
-                    format!(
-                        "/v1beta/models/{}:embedContent?key={}",
-                        model, provider.api_key
-                    )
-                } else if provider.kind == ProviderKind::Cohere {
-                    "/v2/embed".to_string()
-                } else {
-                    // OpenAI and OpenAI-compatible providers
-                    "/v1/embeddings".to_string()
-                }
-            }
-            _ => {
-                // Normal (chat completions): use translator's upstream path
-                if provider.kind == ProviderKind::Gemini {
-                    let model = provider
-                        .default_model
-                        .as_deref()
-                        .unwrap_or("gemini-2.5-flash");
-                    // Always use generateContent (non-streaming endpoint).
-                    // If client requested streaming, the gateway will convert
-                    // the JSON response to SSE in upstream_response_body_filter.
-                    format!(
-                        "/v1beta/models/{}:generateContent?key={}",
-                        model, provider.api_key
-                    )
-                } else {
-                    provider.translator.upstream_path().to_string()
-                }
-            }
-        };
-        upstream_request.set_uri(path.parse().expect("valid path"));
-
-        // Remove downstream auth header — providers use their own auth
-        let _ = upstream_request.remove_header("Authorization");
-
-        // Remove Accept-Encoding to prevent upstream from gzip-compressing the response.
-        // The gateway needs raw bytes to translate provider responses (e.g. Gemini → OpenAI).
-        // Without this, compressed responses skip translation and leak native format to clients.
-        if ctx.endpoint_type != EndpointType::Passthrough {
-            let _ = upstream_request.remove_header("Accept-Encoding");
-        }
-
-        // Set provider-specific headers.
-        //
-        // `Native` / `Passthrough` forward the client body byte-for-byte, so the
-        // body's framing headers must stay the client's own. The translators all
-        // hardcode `Content-Type: application/json`, which silently rewrote a
-        // multipart upload (`/v1/audio/transcriptions`) into "application/json"
-        // while the body stayed multipart — vLLM then parsed the form as JSON and
-        // answered 400 `body.file: Field required` (2026-11-10, ASR via gateway).
-        // Keep the client's Content-Type whenever it sent one; only fill in the
-        // translator default when the client left it out.
-        let keep_client_content_type = matches!(
-            ctx.endpoint_type,
-            EndpointType::Native | EndpointType::Passthrough
-        );
-        for (key, value) in provider.translator.upstream_headers(&provider.api_key) {
-            if keep_client_content_type
-                && key.eq_ignore_ascii_case("content-type")
-                && upstream_request.headers.get("Content-Type").is_some()
-            {
-                continue;
-            }
-            upstream_request.insert_header(key, &value)?;
-        }
-
-        // Set Host header
-        upstream_request.insert_header("Host", &provider.host)?;
-
-        // opencode.ai requires an `x-opencode-session` header on every request
-        // for upstream routing / prompt-cache affinity; without it the
-        // upstream rejects the call with 400 MissingSessionID. The opencode
-        // CLI always sends it (and Pingora forwards client headers verbatim);
-        // third-party clients often don't, so one is injected.
-        //
-        // A header that is PRESENT but EMPTY is treated exactly like a
-        // missing one: the upstream rejects an empty value with the same
-        // 400 MissingSessionID (verified live), and a client whose session
-        // template rendered to "" still sends the header. Only a non-blank
-        // client value is kept verbatim — and every injected source below is
-        // held to the same rule, so a present-but-empty affinity falls through
-        // to the next source instead of short-circuiting the lookup.
-        let client_session = upstream_request
-            .headers
-            .get(maxllm_translate::opencode::SESSION_HEADER)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-        if provider.kind == ProviderKind::OpenCode {
-            // The source matters as much as the value: opencode.ai keys its
-            // prompt cache on this header, so a per-request value makes every
-            // turn a cold start. Measured on both opencode channels with one
-            // repeated 2911-token prompt: no affinity header → 0 cached tokens
-            // on both rounds; a fixed id → 2816/2911 (96.7%) on the second.
-            //
-            // Priority: the client's own header (it already decided what its
-            // conversation is called) → an explicit affinity header → the
-            // gateway's session identity → a fresh UUID. `ctx.session_id` is
-            // resolved from the request headers in `request_filter`, so it is
-            // known here, and it is the very id session-sticky pins on —
-            // reusing it keeps the upstream conversation warm exactly when the
-            // gateway keeps the request on the same provider.
-            //
-            // The body-carried spellings (`prompt_cache_key`,
-            // `client_metadata.*`, `metadata.user_id`) are *not* available
-            // here: pingora writes the upstream request header before it reads
-            // the downstream body. They are also redundant in practice — across
-            // every recorded request the body never produced a session id the
-            // headers had not already produced.
-            let (affinity_id, source) = match client_session {
-                Some(owned) => (owned, "client"),
-                None => {
-                    let affinity_header = ["x-session-affinity", "x-opencode-session-id"]
-                        .iter()
-                        .filter_map(|name| session.req_header().headers.get(*name))
-                        .filter_map(|v| v.to_str().ok())
-                        .map(|s| s.trim().to_string())
-                        .find(|s| !s.is_empty());
-                    if let Some(id) = affinity_header {
-                        (id, "affinity_header")
-                    } else if let Some(id) = ctx
-                        .session_id
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_string)
-                    {
-                        (id, "session")
-                    } else {
-                        (uuid::Uuid::new_v4().to_string(), "generated")
-                    }
-                }
-            };
-            METRICS
-                .opencode_affinity_source_total
-                .with_label_values(&[source])
-                .inc();
-            if source != "client" {
-                upstream_request
-                    .insert_header(maxllm_translate::opencode::SESSION_HEADER, &affinity_id)?;
-            }
-        }
-
-        // The Cloudflare edge of opencode.ai and commandcode.ai bans requests
-        // whose User-Agent looks like a script / HTTP-client fingerprint (e.g.
-        // `Python-urllib/3.11`) with HTTP 403 "error code: 1010" (browser
-        // signature banned). Pingora forwards the client's User-Agent
-        // verbatim, so an SDK client would otherwise be banned outright.
-        // Inject a safe, generic UA unless the client already sent one that
-        // is not a known script fingerprint (curl / browser UAs are verified
-        // allowed by both upstreams).
-        if matches!(
-            provider.kind,
-            ProviderKind::OpenCode | ProviderKind::CommandCode
-        ) {
-            let ua = upstream_request
-                .headers
-                .get("User-Agent")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_ascii_lowercase());
-            let needs_injection = match &ua {
-                None => true,
-                Some(s) => is_script_like_user_agent(s),
-            };
-            if needs_injection {
-                upstream_request.insert_header("User-Agent", SAFE_UPSTREAM_UA)?;
-            }
-        }
-
-        // Body framing strategy:
-        // - Passthrough endpoints: keep original Content-Length (body forwarded as-is)
-        // - OpenAI/Azure (body-passthrough translators): keep original Content-Length
-        //   because OpenAI/Cloudflare REJECTS Transfer-Encoding: chunked with 400.
-        //   The body flows through request_body_filter without modification.
-        // - Other translators (Gemini, Anthropic, etc.): remove Content-Length
-        //   and use chunked encoding since body size changes after translation.
-        if ctx.endpoint_type == EndpointType::Passthrough {
-            // Keep original Content-Length
-        } else {
-            // The request body is forwarded verbatim (its size must not change)
-            // when the upstream already speaks the request's contract: a
-            // native Responses upstream, or a chat-body passthrough to an
-            // openai-like upstream. A Responses request destined for a chat-only
-            // upstream must be rewritten into chat completions — it is never
-            // verbatim, even when that upstream is openai-like.
-            let is_native_responses =
-                ctx.endpoint_type == EndpointType::Responses && ctx.native_responses;
-            let is_responses_to_chat =
-                ctx.endpoint_type == EndpointType::Responses && !ctx.native_responses;
-            let openai_style = provider.translator.name() == "openai"
-                || provider.translator.name() == "azure_openai";
-            // A route that rewrites the request body's model field — the auto
-            // sentinel resolution, or a model substitution after a 400
-            // "unknown model" — changes the body's size, so the request must
-            // travel chunked: never verbatim passthrough. Without this the
-            // retry re-enters the `keep_request_content_length` branch, which
-            // forwards the body untouched and the substitution never reaches
-            // the upstream (2026-11-08: native-Responses providers answered
-            // the same 400 twice while `ctx.model` already showed the new
-            // name).
-            let is_auto_route = ctx.auto_target.is_some()
-                || ctx.model_override.is_some()
-                || hot
-                    .routes
-                    .get(ctx.route_index.unwrap_or(usize::MAX))
-                    .map(|r| r.auto_model)
-                    .unwrap_or(false);
-            // A provider whose upstream rejects part of the Responses
-            // contract repairs the body before forwarding it (the OpenDesign
-            // link answers 400 for the non-standard `tool_choice: "any"`).
-            // A repaired body is a different size, so it cannot keep the
-            // client's Content-Length framing — it travels chunked, like any
-            // other body the gateway rewrites.
-            let repairs_native_body =
-                is_native_responses && provider.translator.repairs_native_responses_body();
-            // The provider was picked before the body was read, so a pool
-            // sentinel (`{"model": "auto"}`) can only be seen later, in
-            // request_body_filter. A body kept byte-verbatim cannot be
-            // rewritten there (changing its length would truncate it), and the
-            // literal sentinel reaches the upstream — which answers 404/400 and
-            // costs a failover plus the conversation's prompt cache on every
-            // turn. When the provider serves an auto pool, frame the body
-            // chunked like the auto route already does, so the sentinel can be
-            // resolved to this entry's model.
-            let provider_serves_a_pool = hot
-                .auto_pools
-                .iter()
-                .any(|pool| pool.entry_for(&ctx.provider_name).is_some());
-            let may_carry_pool_sentinel =
-                ctx.endpoint_type == EndpointType::Responses && provider_serves_a_pool;
-            // A Responses body rewritten into chat completions has an
-            // unpredictable size (the chat form can be larger than the
-            // Responses form), so it travels chunked instead of keeping the
-            // original Content-Length — which would truncate a larger body.
-            let verbatim = !is_auto_route
-                && !may_carry_pool_sentinel
-                && ((is_native_responses && !repairs_native_body)
-                    || (openai_style && !is_responses_to_chat));
-
-            let compaction_enabled = ctx
-                .plugin_ctx
-                .extensions
-                .get("auto_compact")
-                .map(|v| v.as_str())
-                == Some("1");
-            if verbatim && !compaction_enabled {
-                // Mark as body-passthrough so request_body_filter lets chunks flow
-                ctx.keep_request_content_length = true;
-                // Keep original Content-Length header (don't remove, don't set chunked).
-                // A native Responses body may be normalised (nested function
-                // tools -> flat) in request_body_filter; remember the original
-                // Content-Length so the rewritten body can be padded to match.
-                if is_native_responses {
-                    if let Some(cl) = upstream_request.headers.get("Content-Length") {
-                        if let Ok(cl_str) = cl.to_str() {
-                            ctx.plugin_ctx
-                                .extensions
-                                .insert("original_content_length".into(), cl_str.to_string());
-                        }
-                    }
-                }
-            } else if verbatim && compaction_enabled {
-                // Compaction will modify the body but OpenAI/Cloudflare rejects
-                // Transfer-Encoding: chunked. Strategy: keep the ORIGINAL
-                // Content-Length, then in request_body_filter, pad the compacted
-                // body with spaces to match the original size. JSON parsers
-                // ignore trailing whitespace, so the upstream sees valid JSON.
-                ctx.keep_request_content_length = true;
-                // Store original Content-Length for padding target
-                if let Some(cl) = upstream_request.headers.get("Content-Length") {
-                    if let Ok(cl_str) = cl.to_str() {
-                        ctx.plugin_ctx
-                            .extensions
-                            .insert("original_content_length".into(), cl_str.to_string());
-                    }
-                }
-            } else {
-                let _ = upstream_request.remove_header("Content-Length");
-                upstream_request.insert_header("Transfer-Encoding", "chunked")?;
-            }
-        }
-
-        // Run plugin chains on upstream request
-        hot.global_chain
-            .run_upstream_request(session, upstream_request, &mut ctx.plugin_ctx)
-            .await?;
-        if let Some(idx) = ctx.route_index {
-            hot.route_chains[idx]
-                .run_upstream_request(session, upstream_request, &mut ctx.plugin_ctx)
-                .await?;
-        }
-
-        // Mark when we hand off to upstream — used to compute overhead
-        ctx.upstream_send_time = Some(std::time::Instant::now());
-
-        // Audit trail: the request was handed to the upstream.
-        self.record_event(EVENT_PROVIDER_REQUEST, ctx, None, None, None, None);
-
-        Ok(())
+        let budget = hot
+            .providers
+            .get(&ctx.provider_name)
+            .and_then(|provider| provider.first_byte_timeout)
+            .unwrap_or(DEFAULT_FIRST_BYTE_TIMEOUT);
+        // `0` disables the deadline for this provider.
+        let budget = if budget.is_zero() { None } else { Some(budget) };
+        ctx.first_byte_budget.set(budget);
     }
 
-    async fn request_body_filter(
+    async fn request_body_filter_inner(
         &self,
         session: &mut Session,
         body: &mut Option<Bytes>,
         end_of_stream: bool,
-        ctx: &mut Self::CTX,
+        ctx: &mut RequestCtx,
     ) -> pingora::Result<()> {
         // A retried request: pingora replays at most 64 KiB of the body. Feed
         // the whole body we already read as the final chunk instead, and drop
@@ -4946,6 +3770,1270 @@ impl ProxyHttp for AiGateway {
         }
 
         Ok(())
+    }
+
+    /// Apply the repairs a **native Responses** request body needs before it
+    /// is forwarded upstream.
+    ///
+    /// Two layers: the generic Responses normalisation (a chat-style nested
+    /// function tool -> the official flat shape) and the provider's own fixes
+    /// (the OpenDesign link answers HTTP 400 `upstream_error` for the
+    /// non-standard `tool_choice: "any"` that codex-cli sends).
+    fn normalize_native_responses_body(provider: &ProviderState, body: &[u8]) -> Vec<u8> {
+        let normalized = maxllm_translate::responses::normalize_responses_request(body);
+        provider
+            .translator
+            .normalize_native_responses_request(&normalized)
+    }
+
+    /// Buffer one request body chunk, keeping the upstream body open until the
+    /// whole body has been read.
+    ///
+    /// Once the final chunk arrives, the `client_request` audit event is
+    /// recorded with the full original body — before any translation rewrites
+    /// `request_body_buf`.
+    fn buffer_request_body_chunk(
+        &self,
+        ctx: &mut RequestCtx,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+    ) {
+        if let Some(data) = body.take() {
+            ctx.request_body_buf.extend_from_slice(&data);
+            if end_of_stream && !ctx.client_request_recorded {
+                ctx.client_request_recorded = true;
+                ctx.client_body = Some(ctx.request_body_buf.clone());
+                self.record_event(
+                    EVENT_CLIENT_REQUEST,
+                    ctx,
+                    None,
+                    None,
+                    None,
+                    ctx.client_body.clone(),
+                );
+            }
+            if !end_of_stream {
+                *body = Some(Bytes::new());
+            }
+        }
+    }
+
+    /// Rewrite a body-level `auto` sentinel to the model of the pool entry the
+    /// request has already landed on.
+    ///
+    /// A route that is not an auto route only reveals the sentinel in the
+    /// request body (`{"model": "auto"}`), and the provider is picked before
+    /// the body is read, so the sentinel cannot influence that first hop. When
+    /// the picked provider is itself a pool member — the session is pinned to
+    /// one from an earlier turn, or the route's own provider is listed in the
+    /// pool — forwarding the literal sentinel makes the upstream answer 404 and
+    /// routes every single turn through a failover to a different member,
+    /// which also throws away the upstream's prompt cache for the whole
+    /// conversation. Rewriting the body to the entry's model keeps the request
+    /// where it already is.
+    ///
+    /// Only chunked requests are rewritten: a Content-Length-framed body whose
+    /// length changes would be truncated by the upstream.
+    async fn adopt_sentinel_model(
+        &self,
+        hot: &HotState,
+        session: &mut Session,
+        ctx: &mut RequestCtx,
+    ) -> pingora::Result<()> {
+        if ctx.request_body_buf.is_empty() || ctx.provider_name.is_empty() {
+            return Ok(());
+        }
+        let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(&ctx.request_body_buf)
+        else {
+            return Ok(());
+        };
+        // The body names the pool: `auto`, `auto_home`, or whatever sentinel
+        // the request carries. A model that is not a pool name is forwarded
+        // untouched.
+        let Some(sentinel) = parsed
+            .get("model")
+            .and_then(|m| m.as_str())
+            .map(str::to_string)
+        else {
+            return Ok(());
+        };
+        let Some(pool) = hot.pool_named(&sentinel) else {
+            return Ok(());
+        };
+        let Some((provider, model)) = pool
+            .entry_for(&ctx.provider_name)
+            .map(|e| (e.provider.clone(), e.model.clone()))
+        else {
+            warn!(
+                provider = %ctx.provider_name,
+                pool = %sentinel,
+                "body names an auto pool, but the selected provider is not one of its members; the sentinel will reach the upstream"
+            );
+            return Ok(());
+        };
+        if let Some(obj) = parsed.as_object_mut() {
+            obj.insert("model".into(), serde_json::Value::String(model.clone()));
+        }
+        if let Ok(bytes) = serde_json::to_vec(&parsed) {
+            ctx.request_body_buf = bytes;
+        }
+        ctx.auto_pool = Some(pool.name.clone());
+        ctx.auto_target = Some((provider, model.clone()));
+        ctx.model = model.clone();
+        Self::enforce_model_allowlist(session, ctx, &model, None).await?;
+        ctx.plugin_ctx.model = model;
+        Ok(())
+    }
+}
+
+/// Extract the model from a Gemini-style request path
+/// (`/v1beta/models/gemini-2.5-flash:generateContent`). Returns `None` when
+/// the path does not carry a model.
+fn model_from_request_path(path: &str) -> Option<String> {
+    let marker = "/models/";
+    let idx = path.find(marker)?;
+    let rest = &path[idx + marker.len()..];
+    let end = rest.find([':', '/', '?']).unwrap_or(rest.len());
+    if end == 0 {
+        None
+    } else {
+        Some(rest[..end].to_string())
+    }
+}
+
+/// Resolve the upstream time budget for a request: a route may declare
+/// `timeout_secs`, which overrides the hard-coded read/write defaults.
+/// Returns `None` when the route does not configure one (or is unmatched).
+fn route_timeout_secs(routes: &[RouteConfig], route_index: Option<usize>) -> Option<Duration> {
+    route_index
+        .and_then(|i| routes.get(i))
+        .and_then(|r| r.timeout_secs)
+        .filter(|secs| *secs > 0)
+        .map(Duration::from_secs)
+}
+
+/// The route's request-level failover budget: how many providers one request
+/// may walk when the current provider fails. Unset (or absent) routes keep
+/// the built-in default, which matches litellm_lb_go's bound.
+/// Whether this request can be sent to another provider at all.
+///
+/// Pingora buffers at most `BODY_BUF_LIMIT` (64 KiB) of the client body for a
+/// retry and silently drops the excess. Once the whole body has been read from
+/// the client, replaying that prefix hands the next upstream an incomplete
+/// body while the client waits for a response — neither side can make
+/// progress, so both sit there until a timeout. That is a hang, not an error,
+/// and it is what a ~100 KB codex request used to do whenever its first
+/// provider answered 404.
+///
+/// So a failover is only started when the body is either still readable from
+/// the client (nothing consumed yet, e.g. a connect failure) or small enough
+/// to be replayed whole.
+fn body_is_replayable(session: &mut Session, ctx: &RequestCtx) -> bool {
+    // The body we already read is re-injected on the retry, so the replay
+    // buffer's truncation does not matter.
+    if ctx.client_body.is_some() {
+        return true;
+    }
+    let truncated = session.as_ref().retry_buffer_truncated();
+    !(truncated && session.as_mut().is_body_done())
+}
+
+fn max_failover_attempts(routes: &[RouteConfig], route_index: Option<usize>) -> u32 {
+    route_index
+        .and_then(|i| routes.get(i))
+        .map(|r| r.max_failover_attempts)
+        .unwrap_or(DEFAULT_MAX_FAILOVER_ATTEMPTS)
+}
+
+/// The route's same-provider retry budget: how many times a transient
+/// upstream failure (HTTP 5xx) may be retried on the SAME provider before
+/// the request moves to the next provider of the fallback chain, plus the
+/// backoff to wait between those retries.
+///
+/// Unset (or absent) routes keep the built-in default: no same-provider
+/// retry at all — a failed attempt walks straight to the fallback chain.
+fn same_provider_retries(routes: &[RouteConfig], route_index: Option<usize>) -> (u32, u64) {
+    route_index
+        .and_then(|i| routes.get(i))
+        .map(|r| (r.num_retries, r.retry_backoff_ms))
+        .unwrap_or((0, DEFAULT_RETRY_BACKOFF_MS))
+}
+
+/// Whether an upstream HTTP status means "this provider failed" rather than
+/// "this request is wrong" — i.e. whether another provider of the pool may
+/// still serve the request.
+///
+/// Mirrors litellm_lb_go's `responsesFailoverAllowed`: quota exhaustion, rate
+/// limits, auth rejections, a missing model and server errors all fail over,
+/// while 400/422 are request faults every upstream would reject the same way.
+///
+/// The pool needs one exception: the requested model is sent to the first
+/// provider of the chain, and a provider that does not carry it answers
+/// 400 (one-api's `invalid params, unknown model`). A provider whose own
+/// default model differs from the requested model is treated as not carrying
+/// it, so the request walks on to a provider that has the model.
+fn should_failover_status(status: u16, ctx: &RequestCtx, provider: &ProviderState) -> bool {
+    match status {
+        // The provider cannot serve this request now or at all: quota
+        // exhausted (429), auth rejected (401/403), model or endpoint
+        // missing (404/405/410), timed out (408), conflicting (409/425),
+        // unaffordable (402).
+        401 | 402 | 403 | 404 | 405 | 408 | 409 | 410 | 425 | 429 => true,
+        // The provider itself failed.
+        500..=599 => true,
+        // The request is wrong — unless this provider simply does not carry
+        // the requested model (its own default differs from the request).
+        400 | 422 => {
+            !ctx.model.is_empty()
+                && provider
+                    .default_model
+                    .as_deref()
+                    .is_some_and(|default_model| default_model != ctx.model)
+        }
+        // 2xx/3xx and anything else: the provider answered.
+        _ => false,
+    }
+}
+
+/// Whether the gateway answers such an upstream status itself.
+///
+/// A quota wall (429), an empty account (402), a credential the provider
+/// rejected (401/403) and a server fault (5xx) are the *provider's* problem:
+/// the client did nothing wrong, and the upstream's own wording ("您的限额将
+/// 在 2026-11-10 22:58:54 重置") says nothing the client can act on. The
+/// gateway answers with its own 503 instead of passing it through.
+///
+/// A rejected request (400/422) and a missing endpoint or model
+/// (404/405/410) stay as they are: they are the client's answer to give, and
+/// the upstream words them best.
+fn gateway_owns_status(status: u16) -> bool {
+    matches!(status, 401 | 402 | 403 | 408 | 409 | 425 | 429) || (500..=599).contains(&status)
+}
+
+/// Whether a 404 error body is the "the model does not exist" rejection of an
+/// OpenAI-compatible upstream (vLLM: "The model `X` does not exist. Valid
+/// aliases: …", one-api: "unknown model") rather than a missing endpoint —
+/// which answers the same status with "not found" and must not be rewritten.
+fn body_reports_unknown_model(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    // Phrasings that alone identify an unknown model — no bare "not found".
+    const STRONG: &[&str] = &[
+        "unknown model",
+        "no such model",
+        "model_not_found",
+        "model not found",
+        "model does not exist",
+        "model doesn't exist",
+        "does not exist. valid aliases",
+        "no model named",
+        "invalid model",
+        "unsupported model",
+        "model is not supported",
+        "model not supported",
+    ];
+    if STRONG.iter().any(|m| lower.contains(m)) {
+        return true;
+    }
+    // Weak phrasings ("does not exist", "not found") also describe a missing
+    // endpoint, so only trust them when the body is explicitly about a model.
+    let mentions_model = lower.contains("model") || lower.contains("模型");
+    const WEAK: &[&str] = &[
+        "does not exist",
+        "doesn't exist",
+        "not exist",
+        "not found",
+        "不存在",
+        "未找到",
+    ];
+    mentions_model && WEAK.iter().any(|m| lower.contains(m))
+}
+
+#[async_trait]
+impl ProxyHttp for AiGateway {
+    type CTX = RequestCtx;
+
+    fn new_ctx(&self) -> Self::CTX {
+        RequestCtx::new()
+    }
+
+    async fn request_filter(
+        &self,
+        session: &mut Session,
+        ctx: &mut Self::CTX,
+    ) -> pingora::Result<bool> {
+        let path = session.req_header().uri.path();
+        // Record it before anything can fail: a session that never reaches the
+        // router still gets its path into the logs and the recorder.
+        if ctx.request_path.is_empty() {
+            ctx.request_path = path.to_string();
+        }
+
+        // Health check endpoint. The body carries enough state for an
+        // operator (or a monitor) to see which pools are starving and which
+        // providers are circuit-open without scraping Prometheus.
+        if path == "/health" || path == "/healthz" {
+            // Fast path: not an application request. Set the flag before the
+            // first `await` — an aborted scrape must not reach `logging`
+            // unmarked (see the guard there).
+            ctx.skip_logging = true;
+            let hot = self.hot.load();
+            let providers_total = hot.providers.len();
+            let mut providers_healthy = 0usize;
+            let mut open_providers: Vec<&str> = Vec::new();
+            let mut half_open_providers: Vec<&str> = Vec::new();
+            for (name, provider) in hot.providers.iter() {
+                // A breaker whose fail window elapsed is *half-open*: it will
+                // be probed by the next request that reaches it. Reporting it
+                // as "open" made /health claim a dozen circuit-open providers
+                // when in fact none were rejecting traffic (2026-11-08: 12 of
+                // the 16 listed were merely awaiting a probe).
+                match provider.circuit_breaker.effective_state() {
+                    crate::circuit_breaker::STATE_CLOSED => providers_healthy += 1,
+                    crate::circuit_breaker::STATE_HALF_OPEN => {
+                        half_open_providers.push(name.as_str())
+                    }
+                    _ => open_providers.push(name.as_str()),
+                }
+            }
+            let mut pools = serde_json::Map::new();
+            let mut degraded = providers_total > 0 && providers_healthy == 0;
+            for pool in &hot.auto_pools {
+                let total = pool.entries.len();
+                let healthy = pool
+                    .entries
+                    .iter()
+                    .filter(|entry| {
+                        hot.providers
+                            .get(&entry.provider)
+                            .map(|p| p.circuit_breaker.effective_state() == 0)
+                            .unwrap_or(false)
+                    })
+                    .count();
+                if total > 0 && healthy == 0 {
+                    degraded = true;
+                }
+                pools.insert(
+                    pool.name.clone(),
+                    serde_json::json!({"healthy": healthy, "total": total}),
+                );
+            }
+            open_providers.sort_unstable();
+            half_open_providers.sort_unstable();
+            let mut health = serde_json::json!({
+                "status": if degraded { "degraded" } else { "ok" },
+                "layer": 2,
+                "version": env!("CARGO_PKG_VERSION"),
+                "providers": {
+                    "healthy": providers_healthy,
+                    "total": providers_total,
+                },
+                "pools": pools,
+                "open_providers": open_providers,
+                "half_open_providers": half_open_providers,
+            });
+            if let Some(id) = build_id() {
+                health["build_id"] = id.into();
+            }
+            let body = serde_json::to_vec(&health)
+                .unwrap_or_else(|_| br#"{"status":"degraded"}"#.to_vec());
+            let content_len = body.len().to_string();
+            let mut resp = ResponseHeader::build(200, Some(2))?;
+            resp.insert_header("Content-Type", "application/json")?;
+            resp.insert_header("Content-Length", &content_len)?;
+            session.write_response_header(Box::new(resp), false).await?;
+            session
+                .write_response_body(Some(Bytes::from(body)), true)
+                .await?;
+            return Ok(true);
+        }
+
+        // Version endpoint — a GET that used to fall through to the POST-only
+        // API guard and answer 405.
+        if path == "/version" {
+            // Fast path: not an application request. Set the flag before the
+            // first `await` — an aborted scrape must not reach `logging`
+            // unmarked (see the guard there).
+            ctx.skip_logging = true;
+            let mut version = serde_json::json!({
+                "layer": 2,
+                "version": env!("CARGO_PKG_VERSION"),
+            });
+            if let Some(id) = build_id() {
+                version["build_id"] = id.into();
+            }
+            let body = serde_json::to_vec(&version).unwrap_or_default();
+            let content_len = body.len().to_string();
+            let mut resp = ResponseHeader::build(200, Some(2))?;
+            resp.insert_header("Content-Type", "application/json")?;
+            resp.insert_header("Content-Length", &content_len)?;
+            session.write_response_header(Box::new(resp), false).await?;
+            session
+                .write_response_body(Some(Bytes::from(body)), true)
+                .await?;
+            return Ok(true);
+        }
+
+        // Load hot state snapshot for this request
+        let hot = self.hot.load();
+
+        // /v1/models endpoint — OpenAI-compatible model list (fast path)
+        if path == "/v1/models" {
+            // Fast path: not an application request. Set the flag before the
+            // first `await` — an aborted scrape must not reach `logging`
+            // unmarked (see the guard there).
+            ctx.skip_logging = true;
+            let body_bytes = hot.models_response.clone();
+            let content_len = body_bytes.len().to_string();
+            let mut resp = ResponseHeader::build(200, Some(2))?;
+            resp.insert_header("Content-Type", "application/json")?;
+            resp.insert_header("Content-Length", &content_len)?;
+            session.write_response_header(Box::new(resp), false).await?;
+            session.write_response_body(Some(body_bytes), true).await?;
+            return Ok(true);
+        }
+
+        // Metrics endpoint (bypasses plugins). The scrape is not an
+        // application request: it is not counted in the active-request
+        // gauge, and the exposition must not include the scrape itself —
+        // otherwise the gauge could never read 0 while it is being scraped.
+        if path == "/metrics" && hot.metrics_enabled {
+            // Fast path: not an application request. Set the flag before the
+            // first `await` — an aborted scrape must not reach `logging`
+            // unmarked (see the guard there).
+            ctx.skip_logging = true;
+            // The exposition names every provider, model, key and price in the
+            // deployment, so it is served to loopback scrapers only unless the
+            // operator opts in. Nothing below the route layer is reached here,
+            // so this check is the whole authorisation story for the endpoint.
+            let client_ip = session
+                .client_addr()
+                .and_then(|addr| addr.as_inet().map(|sock| sock.ip()));
+            if !metrics_visible_to(hot.metrics_allow_remote, client_ip) {
+                return Self::send_error_response(
+                    session,
+                    403,
+                    "metrics is loopback-only; set [metrics] allow_remote = true to expose it",
+                )
+                .await;
+            }
+            // The breaker gauge is otherwise only written on transitions, so
+            // a provider whose fail window elapsed kept reading OPEN until a
+            // request happened to touch it. Evaluate the effective state at
+            // scrape time (read-only: no probe slot is consumed).
+            for (name, provider) in hot.providers.iter() {
+                METRICS
+                    .circuit_breaker_state
+                    .with_label_values(&[name])
+                    .set(provider.circuit_breaker.effective_state() as i64);
+            }
+            // The in-flight gauge is derived from the counter the
+            // least-connections router reads, so it can never drift.
+            for (provider, count) in crate::provider_stats::inflight_counts() {
+                METRICS
+                    .provider_inflight_requests
+                    .with_label_values(&[&provider])
+                    .set(count as i64);
+            }
+            let body = METRICS.encode();
+            let content_len = body.len().to_string();
+            let mut resp = ResponseHeader::build(200, Some(2))?;
+            resp.insert_header("Content-Type", "text/plain; version=0.0.4")?;
+            resp.insert_header("Content-Length", &content_len)?;
+            session.write_response_header(Box::new(resp), false).await?;
+            session
+                .write_response_body(Some(Bytes::from(body)), true)
+                .await?;
+            return Ok(true);
+        }
+
+        METRICS.active_requests.inc();
+        // Paired with the decrement in `logging`: the hook must only give back
+        // the slot this request took.
+        ctx.active_request_counted = true;
+
+        // Own the path for later use (after the borrow above is done)
+        let path = path.to_string();
+
+        // Reject non-POST methods on API routes (health/metrics/models already handled above)
+        let method = session.req_header().method.clone();
+        if method != http::method::Method::POST
+            && !path.starts_with("/admin/")
+            && path != "/v1/models"
+        {
+            METRICS.active_requests.dec();
+            ctx.skip_logging = true;
+            return Self::send_error_response(
+                session,
+                405,
+                &format!("Method {} not allowed. Use POST.", method),
+            )
+            .await;
+        }
+
+        // Admin API endpoints
+        if path.starts_with("/admin/") {
+            let handled = self.handle_admin_request(session, &path).await?;
+            // The admin handler answers the request itself and already
+            // decremented the active-request gauge — the logging hook must
+            // not decrement it a second time.
+            ctx.skip_logging = true;
+            return Ok(handled);
+        }
+
+        // Extract client IP for plugins
+        if let Some(addr) = session.client_addr() {
+            if let Some(sock) = addr.as_inet() {
+                ctx.plugin_ctx.client_ip = Some(sock.ip().to_string());
+            }
+        }
+
+        // ── Virtual-key authentication ──
+        // When the admin module is enabled, a bearer token that resolves to
+        // a virtual key created through the admin API is validated against
+        // the key store here (active, unexpired, within budget) and its key
+        // id is remembered so the logging hook can record spend against it.
+        // The `key_auth` plugin defers to this check via the
+        // `virtual_key_auth` extension marker, so static config keys keep
+        // working unchanged and keys that are neither static nor virtual
+        // still hit the plugin's 401.
+        if let Some(enforcer) = &self.budget_enforcer {
+            let auth = session
+                .req_header()
+                .headers
+                .get("Authorization")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            let token = auth.strip_prefix("Bearer ").unwrap_or(auth);
+            if token.starts_with("sk-maxllm-") {
+                match maxllm_admin::keys::validate_key(enforcer.store().as_ref(), token) {
+                    Ok(Some(mut key)) => {
+                        // Roll an expired budget window forward so stale
+                        // spend from a previous window does not block the key.
+                        if let Err(e) = enforcer.reset_key_budget_if_expired(&mut key) {
+                            warn!(error = %e, "Failed to reset expired budget window");
+                        }
+                        match enforcer.check_budget(&key) {
+                            Ok(()) => {
+                                // Per-key rate limits: the RPM sliding
+                                // window is consumed here; the TPM window is
+                                // peeked (tokens are recorded when the
+                                // response completes) and an in-flight slot
+                                // is taken for the concurrency limit.
+                                // The checks are lazy: a key that is
+                                // already over its RPM limit is not charged
+                                // for a TPM peek or a concurrency slot.
+                                let denied = self
+                                    .key_rate_limiter
+                                    .check_request(&key.id, key.rpm_limit)
+                                    .err()
+                                    .map(|_| "rate limit exceeded (requests per minute)")
+                                    .or_else(|| {
+                                        self.key_rate_limiter
+                                            .check_tokens(&key.id, key.tpm_limit)
+                                            .err()
+                                            .map(|_| "rate limit exceeded (tokens per minute)")
+                                    })
+                                    .or_else(|| {
+                                        self.key_rate_limiter
+                                            .acquire(&key.id, key.max_parallel_requests)
+                                            .err()
+                                            .map(|_| "too many parallel requests")
+                                    });
+                                if let Some(reason) = denied {
+                                    METRICS.active_requests.dec();
+                                    ctx.skip_logging = true;
+                                    return Self::send_error_response(session, 429, reason).await;
+                                }
+                                ctx.key_in_flight =
+                                    Some(crate::key_rate_limit::KeyInFlightGuard::new(
+                                        Arc::clone(&self.key_rate_limiter),
+                                        key.id.clone(),
+                                    ));
+                                ctx.plugin_ctx.client_id = Some(key.id.clone());
+                                ctx.plugin_ctx
+                                    .extensions
+                                    .insert("virtual_key_auth".into(), "1".into());
+                                ctx.virtual_key_id = Some(key.id.clone());
+                                ctx.virtual_key_allowed_models = key.allowed_models.clone();
+                            }
+                            Err(e) => {
+                                METRICS.active_requests.dec();
+                                ctx.skip_logging = true;
+                                return Self::send_error_response(
+                                    session,
+                                    e.http_status(),
+                                    &e.to_string(),
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        // Not a virtual key — fall through to the plugin
+                        // chain (a static config key or an unknown token).
+                    }
+                    Err(maxllm_admin::keys::KeyError::Revoked) => {
+                        METRICS.active_requests.dec();
+                        ctx.skip_logging = true;
+                        return Self::send_error_response(session, 401, "API key revoked").await;
+                    }
+                    Err(maxllm_admin::keys::KeyError::Expired) => {
+                        METRICS.active_requests.dec();
+                        ctx.skip_logging = true;
+                        return Self::send_error_response(session, 401, "API key expired").await;
+                    }
+                    Err(maxllm_admin::keys::KeyError::BudgetExceeded) => {
+                        METRICS.active_requests.dec();
+                        ctx.skip_logging = true;
+                        return Self::send_error_response(session, 402, "budget exceeded").await;
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Virtual-key validation failed");
+                        METRICS.active_requests.dec();
+                        ctx.skip_logging = true;
+                        return Self::send_error_response(session, 500, "key validation error")
+                            .await;
+                    }
+                }
+            }
+        }
+
+        // Run global plugin chain (auth, request_id, ip_restriction, etc.)
+        if let Some(resp) = hot
+            .global_chain
+            .run_request(session, &mut ctx.plugin_ctx)
+            .await?
+        {
+            METRICS.active_requests.dec();
+            ctx.skip_logging = true;
+            resp.send(session).await?;
+            return Ok(true);
+        }
+
+        // Route matching
+        let route_index = match Self::match_route(&hot, &path) {
+            Some(idx) => idx,
+            None => {
+                METRICS.active_requests.dec();
+                ctx.skip_logging = true;
+                return Self::send_error_response(
+                    session,
+                    404,
+                    &format!("No route matches path: {path}"),
+                )
+                .await;
+            }
+        };
+
+        ctx.route_index = Some(route_index);
+        ctx.plugin_ctx.route_path = hot.routes[route_index].path.clone();
+        let route = &hot.routes[route_index];
+        ctx.endpoint_type = route.endpoint_type;
+
+        // `/v1/responses` is a prefix route on purpose: a client points its
+        // base URL at `/v1/responses/<provider-or-pool>` and appends
+        // `/responses`. The same prefix match silently swallowed retired
+        // provider names (`/v1/responses/one_api_*`) and served them from the
+        // generic pool. Reject a segment that names neither a provider nor a
+        // pool, and say which names are valid.
+        if let Some(segment) = Self::unknown_responses_subroute(&hot, route, &path) {
+            METRICS.active_requests.dec();
+            ctx.skip_logging = true;
+            return Self::send_error_response(
+                session,
+                404,
+                &format!(
+                    "unknown provider or pool '{segment}' in {path}; use /v1/responses/<provider>, /v1/responses/auto or /v1/responses/auto_home"
+                ),
+            )
+            .await;
+        }
+
+        // The segment named a real provider but no explicit route matched it,
+        // so the request is sitting on the pooled `/v1/responses` route. Pin
+        // it: the caller asked for that provider, not for the pool.
+        if let Some(pin) = Self::responses_subroute_pin(&hot, route, &path) {
+            ctx.plugin_ctx.route_path = format!("/v1/responses/{pin}");
+            ctx.path_pinned_provider = Some(pin);
+        }
+
+        // For passthrough, extract the path suffix after the route prefix
+        if route.endpoint_type == EndpointType::Passthrough {
+            let suffix = &path[route.path.len()..];
+            ctx.passthrough_path = Some(if suffix.is_empty() || suffix == "/" {
+                "/".to_string()
+            } else if !suffix.starts_with('/') {
+                format!("/{suffix}")
+            } else {
+                suffix.to_string()
+            });
+        }
+
+        // Store route-specific guardrail scope
+        if !route.guardrails.is_empty() {
+            ctx.route_guardrails = Some(route.guardrails.clone());
+        }
+
+        // Run route-specific plugin chain (rate_limit, cors, etc.)
+        if let Some(resp) = hot.route_chains[route_index]
+            .run_request(session, &mut ctx.plugin_ctx)
+            .await?
+        {
+            METRICS.active_requests.dec();
+            ctx.skip_logging = true;
+            resp.send(session).await?;
+            return Ok(true);
+        }
+
+        // Capture the request identity for the recorder and session-sticky.
+        ctx.request_method = session.req_header().method.to_string();
+        ctx.request_path = path.clone();
+        // A synthetic health probe is served normally but kept out of every
+        // production signal: metrics, request logs and breaker accounting.
+        ctx.probe_request = session.req_header().headers.get("x-maxllm-probe").is_some();
+
+        // Session-sticky: capture the session identity from the request
+        // headers. codex-cli sends `session-id`, Claude Code sends
+        // `X-Session-ID` / `X-Conversation-ID`; the body fallback is applied
+        // later in request_body_filter.
+        ctx.session_id = crate::session_sticky::resolve_from_headers(&session.req_header().headers);
+
+        // Select provider (with circuit breaker check and routing strategy)
+        let _provider = match self.select_provider(&hot, route, ctx) {
+            Some(p) => {
+                // The request is in flight for this provider — the
+                // least-connections strategy counts it.
+                crate::provider_stats::acquire(&ctx.provider_name);
+                p
+            }
+            None => {
+                METRICS.active_requests.dec();
+                ctx.skip_logging = true;
+                return Self::send_error_response(
+                    session,
+                    503,
+                    &self.unavailable_reason(&hot, route, ctx),
+                )
+                .await;
+            }
+        };
+
+        // ── Bedrock SigV4 path ──
+        // Bedrock authenticates with AWS SigV4, whose signature covers the
+        // SHA-256 of the translated request payload. The exact bytes must be
+        // known before the request headers are written. Pingora's proxy
+        // pipeline streams body chunks after the headers have been sent, so
+        // the payload hash cannot be embedded in the Authorization header
+        // there. Bedrock requests are therefore read, translated, signed and
+        // sent via reqwest in `handle_bedrock_request` (which buffers the
+        // full body), and the response is translated back before returning.
+        if let Some(provider) = hot.providers.get(&ctx.provider_name) {
+            if provider.kind == maxllm_config::ProviderKind::Bedrock {
+                self.handle_bedrock_request(session, ctx, provider).await?;
+                return Ok(true);
+            }
+        }
+
+        // Sync plugin ctx with request ctx
+        ctx.plugin_ctx.provider_name = ctx.provider_name.clone();
+
+        // The `client_request` audit event is recorded by the body filter,
+        // where the full request body is known — recording it here would
+        // duplicate the event without the body.
+
+        Ok(false)
+    }
+
+    /// The cell that carries the first-byte deadline of this request.
+    ///
+    /// The proxy reads the upstream's response while the request body is
+    /// still being read, so a deadline that depends on the body — "the
+    /// first byte must arrive within N seconds, but only for a streaming
+    /// request" — cannot be known when the upstream request is written. The
+    /// gateway decides it in the request body filter and the proxy picks the
+    /// decision up from this cell.
+    fn first_byte_budget(&self, ctx: &mut Self::CTX) -> Option<pingora::proxy::FirstByteBudget> {
+        Some(ctx.first_byte_budget.clone())
+    }
+
+    async fn upstream_peer(
+        &self,
+        _session: &mut Session,
+        ctx: &mut Self::CTX,
+    ) -> pingora::Result<Box<HttpPeer>> {
+        // Resolve the upstream hostname here instead of letting
+        // `HttpPeer::new` do it: pingora's constructor calls
+        // `to_socket_addrs().unwrap()` internally and PANICS the worker
+        // thread when DNS fails (e.g. a corp-only host reached from a
+        // non-corp network), leaving the client with a dropped connection
+        // instead of a 502. Look the address up asynchronously and surface a
+        // clean error. Passing a resolved `SocketAddr` to `HttpPeer::new`
+        // skips the fallible lookup entirely.
+        //
+        // A DNS failure means this provider is unreachable *before* the
+        // connect phase, so it would bypass `fail_to_connect`'s failover.
+        // Treat it like a connect failure: count it against the breaker,
+        // switch to the next pool/fallback provider, and resolve again —
+        // bounded by the same failover budget.
+        let addr = loop {
+            let hot = self.hot.load();
+            let provider = match hot.providers.get(&ctx.provider_name) {
+                Some(p) => p,
+                None => {
+                    warn!(provider = %ctx.provider_name, "provider not found in upstream_peer (config may have been reloaded)");
+                    return Err(pingora::Error::explain(
+                        pingora::ErrorType::HTTPStatus(502),
+                        format!("provider '{}' no longer exists", ctx.provider_name),
+                    ));
+                }
+            };
+            // Clone what the lookup needs: the provider borrow must not
+            // cross the await point. `to_socket_addrs` accepts (String, u16).
+            let host = provider.host.clone();
+            let port = provider.port;
+            let resolved = match tokio::net::lookup_host((host.clone(), port)).await {
+                Ok(mut addrs) => addrs.next(),
+                Err(_) => None,
+            };
+            match resolved {
+                Some(a) => break a,
+                None => {
+                    if !self.try_dns_failover(ctx).await {
+                        return Err(pingora::Error::explain(
+                            pingora::ErrorType::HTTPStatus(502),
+                            format!("DNS resolution failed for '{}'", host),
+                        ));
+                    }
+                }
+            }
+        };
+        let hot = self.hot.load();
+        let provider = match hot.providers.get(&ctx.provider_name) {
+            Some(p) => p,
+            None => {
+                return Err(pingora::Error::explain(
+                    pingora::ErrorType::HTTPStatus(502),
+                    format!("provider '{}' no longer exists", ctx.provider_name),
+                ));
+            }
+        };
+        let mut peer = HttpPeer::new(addr, provider.tls, provider.sni.clone());
+        peer.options.connection_timeout = Some(provider.connect_timeout);
+        peer.options.total_connection_timeout = provider.total_connect_timeout;
+        // A route may declare its own upstream time budget (`timeout_secs`).
+        // Honour it instead of silently ignoring the setting, otherwise a
+        // route configured for a slow upstream is still cut off by the
+        // hard-coded defaults below. Unset (or zero) keeps the defaults.
+        let route_timeout = route_timeout_secs(&hot.routes, ctx.route_index);
+        // The provider's own stall budget wins: an upstream that accepts the
+        // connection and then says nothing must not hold the client for the
+        // route's much longer timeout. The route's timeout is the fallback.
+        peer.options.read_timeout = Some(
+            provider
+                .read_timeout
+                .or(route_timeout)
+                .unwrap_or(DEFAULT_READ_TIMEOUT),
+        );
+        peer.options.write_timeout = Some(route_timeout.unwrap_or(Duration::from_secs(30)));
+
+        Ok(Box::new(peer))
+    }
+
+    async fn upstream_request_filter(
+        &self,
+        session: &mut Session,
+        upstream_request: &mut RequestHeader,
+        ctx: &mut Self::CTX,
+    ) -> pingora::Result<()> {
+        // A same-provider retry carries a backoff to wait before the next
+        // attempt, so a transient upstream error is not hammered again
+        // immediately. Consumed here — before the request is (re)sent — and
+        // cleared, so only the retried attempt waits.
+        if let Some(backoff_ms) = ctx.pending_retry_backoff_ms.take() {
+            if backoff_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+            }
+        }
+        let hot = self.hot.load();
+        let provider = match hot.providers.get(&ctx.provider_name) {
+            Some(p) => p,
+            None => {
+                warn!(provider = %ctx.provider_name, "provider not found in upstream_request_filter (config may have been reloaded)");
+                return Err(pingora::Error::explain(
+                    pingora::ErrorType::HTTPStatus(502),
+                    format!("provider '{}' no longer exists", ctx.provider_name),
+                ));
+            }
+        };
+
+        // Set upstream path based on endpoint type
+        let path = match ctx.endpoint_type {
+            EndpointType::Responses => {
+                if ctx.native_responses {
+                    // The provider speaks the Responses contract natively: the
+                    // request is forwarded unchanged to its own /responses path.
+                    provider
+                        .responses_path
+                        .clone()
+                        .unwrap_or_else(|| provider.translator.upstream_path().to_string())
+                } else if provider.kind == ProviderKind::Gemini {
+                    // Responses is translated into chat completions for the
+                    // upstream call, so it uses the provider's chat path.
+                    let model = provider
+                        .default_model
+                        .as_deref()
+                        .unwrap_or("gemini-2.5-flash");
+                    format!(
+                        "/v1beta/models/{}:generateContent?key={}",
+                        model, provider.api_key
+                    )
+                } else {
+                    provider.translator.upstream_path().to_string()
+                }
+            }
+            EndpointType::Passthrough => {
+                // Use the suffix path captured from the client request
+                ctx.passthrough_path
+                    .clone()
+                    .unwrap_or_else(|| "/".to_string())
+            }
+            EndpointType::Native => {
+                // Use the original client request path (already in provider format).
+                // For Gemini, append API key as query param.
+                let original = session.req_header().uri.path().to_string();
+                if provider.kind == ProviderKind::Gemini {
+                    format!("{}?key={}", original, provider.api_key)
+                } else {
+                    native_upstream_path(&original, provider.translator.upstream_path())
+                }
+            }
+            EndpointType::Embeddings => {
+                // Embeddings endpoint: use the embeddings path for each provider
+                if provider.kind == ProviderKind::Gemini {
+                    let model = provider
+                        .default_model
+                        .as_deref()
+                        .unwrap_or("text-embedding-004");
+                    format!(
+                        "/v1beta/models/{}:embedContent?key={}",
+                        model, provider.api_key
+                    )
+                } else if provider.kind == ProviderKind::Cohere {
+                    "/v2/embed".to_string()
+                } else {
+                    // OpenAI and OpenAI-compatible providers
+                    "/v1/embeddings".to_string()
+                }
+            }
+            _ => {
+                // Normal (chat completions): use translator's upstream path
+                if provider.kind == ProviderKind::Gemini {
+                    let model = provider
+                        .default_model
+                        .as_deref()
+                        .unwrap_or("gemini-2.5-flash");
+                    // Always use generateContent (non-streaming endpoint).
+                    // If client requested streaming, the gateway will convert
+                    // the JSON response to SSE in upstream_response_body_filter.
+                    format!(
+                        "/v1beta/models/{}:generateContent?key={}",
+                        model, provider.api_key
+                    )
+                } else {
+                    provider.translator.upstream_path().to_string()
+                }
+            }
+        };
+        upstream_request.set_uri(path.parse().expect("valid path"));
+
+        // Remove downstream auth header — providers use their own auth
+        let _ = upstream_request.remove_header("Authorization");
+
+        // Remove Accept-Encoding to prevent upstream from gzip-compressing the response.
+        // The gateway needs raw bytes to translate provider responses (e.g. Gemini → OpenAI).
+        // Without this, compressed responses skip translation and leak native format to clients.
+        if ctx.endpoint_type != EndpointType::Passthrough {
+            let _ = upstream_request.remove_header("Accept-Encoding");
+        }
+
+        // Set provider-specific headers.
+        //
+        // `Native` / `Passthrough` forward the client body byte-for-byte, so the
+        // body's framing headers must stay the client's own. The translators all
+        // hardcode `Content-Type: application/json`, which silently rewrote a
+        // multipart upload (`/v1/audio/transcriptions`) into "application/json"
+        // while the body stayed multipart — vLLM then parsed the form as JSON and
+        // answered 400 `body.file: Field required` (2026-11-10, ASR via gateway).
+        // Keep the client's Content-Type whenever it sent one; only fill in the
+        // translator default when the client left it out.
+        let keep_client_content_type = matches!(
+            ctx.endpoint_type,
+            EndpointType::Native | EndpointType::Passthrough
+        );
+        for (key, value) in provider.translator.upstream_headers(&provider.api_key) {
+            if keep_client_content_type
+                && key.eq_ignore_ascii_case("content-type")
+                && upstream_request.headers.get("Content-Type").is_some()
+            {
+                continue;
+            }
+            upstream_request.insert_header(key, &value)?;
+        }
+
+        // Set Host header
+        upstream_request.insert_header("Host", &provider.host)?;
+
+        // opencode.ai requires an `x-opencode-session` header on every request
+        // for upstream routing / prompt-cache affinity; without it the
+        // upstream rejects the call with 400 MissingSessionID. The opencode
+        // CLI always sends it (and Pingora forwards client headers verbatim);
+        // third-party clients often don't, so one is injected.
+        //
+        // A header that is PRESENT but EMPTY is treated exactly like a
+        // missing one: the upstream rejects an empty value with the same
+        // 400 MissingSessionID (verified live), and a client whose session
+        // template rendered to "" still sends the header. Only a non-blank
+        // client value is kept verbatim — and every injected source below is
+        // held to the same rule, so a present-but-empty affinity falls through
+        // to the next source instead of short-circuiting the lookup.
+        let client_session = upstream_request
+            .headers
+            .get(maxllm_translate::opencode::SESSION_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        if provider.kind == ProviderKind::OpenCode {
+            // The source matters as much as the value: opencode.ai keys its
+            // prompt cache on this header, so a per-request value makes every
+            // turn a cold start. Measured on both opencode channels with one
+            // repeated 2911-token prompt: no affinity header → 0 cached tokens
+            // on both rounds; a fixed id → 2816/2911 (96.7%) on the second.
+            //
+            // Priority: the client's own header (it already decided what its
+            // conversation is called) → an explicit affinity header → the
+            // gateway's session identity → a fresh UUID. `ctx.session_id` is
+            // resolved from the request headers in `request_filter`, so it is
+            // known here, and it is the very id session-sticky pins on —
+            // reusing it keeps the upstream conversation warm exactly when the
+            // gateway keeps the request on the same provider.
+            //
+            // The body-carried spellings (`prompt_cache_key`,
+            // `client_metadata.*`, `metadata.user_id`) are *not* available
+            // here: pingora writes the upstream request header before it reads
+            // the downstream body. They are also redundant in practice — across
+            // every recorded request the body never produced a session id the
+            // headers had not already produced.
+            let (affinity_id, source) = match client_session {
+                Some(owned) => (owned, "client"),
+                None => {
+                    let affinity_header = ["x-session-affinity", "x-opencode-session-id"]
+                        .iter()
+                        .filter_map(|name| session.req_header().headers.get(*name))
+                        .filter_map(|v| v.to_str().ok())
+                        .map(|s| s.trim().to_string())
+                        .find(|s| !s.is_empty());
+                    if let Some(id) = affinity_header {
+                        (id, "affinity_header")
+                    } else if let Some(id) = ctx
+                        .session_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                    {
+                        (id, "session")
+                    } else {
+                        (uuid::Uuid::new_v4().to_string(), "generated")
+                    }
+                }
+            };
+            METRICS
+                .opencode_affinity_source_total
+                .with_label_values(&[source])
+                .inc();
+            if source != "client" {
+                upstream_request
+                    .insert_header(maxllm_translate::opencode::SESSION_HEADER, &affinity_id)?;
+            }
+        }
+
+        // The Cloudflare edge of opencode.ai and commandcode.ai bans requests
+        // whose User-Agent looks like a script / HTTP-client fingerprint (e.g.
+        // `Python-urllib/3.11`) with HTTP 403 "error code: 1010" (browser
+        // signature banned). Pingora forwards the client's User-Agent
+        // verbatim, so an SDK client would otherwise be banned outright.
+        // Inject a safe, generic UA unless the client already sent one that
+        // is not a known script fingerprint (curl / browser UAs are verified
+        // allowed by both upstreams).
+        if matches!(
+            provider.kind,
+            ProviderKind::OpenCode | ProviderKind::CommandCode
+        ) {
+            let ua = upstream_request
+                .headers
+                .get("User-Agent")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_ascii_lowercase());
+            let needs_injection = match &ua {
+                None => true,
+                Some(s) => is_script_like_user_agent(s),
+            };
+            if needs_injection {
+                upstream_request.insert_header("User-Agent", SAFE_UPSTREAM_UA)?;
+            }
+        }
+
+        // Body framing strategy:
+        // - Passthrough endpoints: keep original Content-Length (body forwarded as-is)
+        // - OpenAI/Azure (body-passthrough translators): keep original Content-Length
+        //   because OpenAI/Cloudflare REJECTS Transfer-Encoding: chunked with 400.
+        //   The body flows through request_body_filter without modification.
+        // - Other translators (Gemini, Anthropic, etc.): remove Content-Length
+        //   and use chunked encoding since body size changes after translation.
+        if ctx.endpoint_type == EndpointType::Passthrough {
+            // Keep original Content-Length
+        } else {
+            // The request body is forwarded verbatim (its size must not change)
+            // when the upstream already speaks the request's contract: a
+            // native Responses upstream, or a chat-body passthrough to an
+            // openai-like upstream. A Responses request destined for a chat-only
+            // upstream must be rewritten into chat completions — it is never
+            // verbatim, even when that upstream is openai-like.
+            let is_native_responses =
+                ctx.endpoint_type == EndpointType::Responses && ctx.native_responses;
+            let is_responses_to_chat =
+                ctx.endpoint_type == EndpointType::Responses && !ctx.native_responses;
+            let openai_style = provider.translator.name() == "openai"
+                || provider.translator.name() == "azure_openai";
+            // A route that rewrites the request body's model field — the auto
+            // sentinel resolution, or a model substitution after a 400
+            // "unknown model" — changes the body's size, so the request must
+            // travel chunked: never verbatim passthrough. Without this the
+            // retry re-enters the `keep_request_content_length` branch, which
+            // forwards the body untouched and the substitution never reaches
+            // the upstream (2026-11-08: native-Responses providers answered
+            // the same 400 twice while `ctx.model` already showed the new
+            // name).
+            let is_auto_route = ctx.auto_target.is_some()
+                || ctx.model_override.is_some()
+                || hot
+                    .routes
+                    .get(ctx.route_index.unwrap_or(usize::MAX))
+                    .map(|r| r.auto_model)
+                    .unwrap_or(false);
+            // A provider whose upstream rejects part of the Responses
+            // contract repairs the body before forwarding it (the OpenDesign
+            // link answers 400 for the non-standard `tool_choice: "any"`).
+            // A repaired body is a different size, so it cannot keep the
+            // client's Content-Length framing — it travels chunked, like any
+            // other body the gateway rewrites.
+            let repairs_native_body =
+                is_native_responses && provider.translator.repairs_native_responses_body();
+            // The provider was picked before the body was read, so a pool
+            // sentinel (`{"model": "auto"}`) can only be seen later, in
+            // request_body_filter. A body kept byte-verbatim cannot be
+            // rewritten there (changing its length would truncate it), and the
+            // literal sentinel reaches the upstream — which answers 404/400 and
+            // costs a failover plus the conversation's prompt cache on every
+            // turn. When the provider serves an auto pool, frame the body
+            // chunked like the auto route already does, so the sentinel can be
+            // resolved to this entry's model.
+            let provider_serves_a_pool = hot
+                .auto_pools
+                .iter()
+                .any(|pool| pool.entry_for(&ctx.provider_name).is_some());
+            let may_carry_pool_sentinel =
+                ctx.endpoint_type == EndpointType::Responses && provider_serves_a_pool;
+            // A Responses body rewritten into chat completions has an
+            // unpredictable size (the chat form can be larger than the
+            // Responses form), so it travels chunked instead of keeping the
+            // original Content-Length — which would truncate a larger body.
+            let verbatim = !is_auto_route
+                && !may_carry_pool_sentinel
+                && ((is_native_responses && !repairs_native_body)
+                    || (openai_style && !is_responses_to_chat));
+
+            let compaction_enabled = ctx
+                .plugin_ctx
+                .extensions
+                .get("auto_compact")
+                .map(|v| v.as_str())
+                == Some("1");
+            if verbatim && !compaction_enabled {
+                // Mark as body-passthrough so request_body_filter lets chunks flow
+                ctx.keep_request_content_length = true;
+                // Keep original Content-Length header (don't remove, don't set chunked).
+                // A native Responses body may be normalised (nested function
+                // tools -> flat) in request_body_filter; remember the original
+                // Content-Length so the rewritten body can be padded to match.
+                if is_native_responses {
+                    if let Some(cl) = upstream_request.headers.get("Content-Length") {
+                        if let Ok(cl_str) = cl.to_str() {
+                            ctx.plugin_ctx
+                                .extensions
+                                .insert("original_content_length".into(), cl_str.to_string());
+                        }
+                    }
+                }
+            } else if verbatim && compaction_enabled {
+                // Compaction will modify the body but OpenAI/Cloudflare rejects
+                // Transfer-Encoding: chunked. Strategy: keep the ORIGINAL
+                // Content-Length, then in request_body_filter, pad the compacted
+                // body with spaces to match the original size. JSON parsers
+                // ignore trailing whitespace, so the upstream sees valid JSON.
+                ctx.keep_request_content_length = true;
+                // Store original Content-Length for padding target
+                if let Some(cl) = upstream_request.headers.get("Content-Length") {
+                    if let Ok(cl_str) = cl.to_str() {
+                        ctx.plugin_ctx
+                            .extensions
+                            .insert("original_content_length".into(), cl_str.to_string());
+                    }
+                }
+            } else {
+                let _ = upstream_request.remove_header("Content-Length");
+                upstream_request.insert_header("Transfer-Encoding", "chunked")?;
+            }
+        }
+
+        // Run plugin chains on upstream request
+        hot.global_chain
+            .run_upstream_request(session, upstream_request, &mut ctx.plugin_ctx)
+            .await?;
+        if let Some(idx) = ctx.route_index {
+            hot.route_chains[idx]
+                .run_upstream_request(session, upstream_request, &mut ctx.plugin_ctx)
+                .await?;
+        }
+
+        // Mark when we hand off to upstream — used to compute overhead
+        ctx.upstream_send_time = Some(std::time::Instant::now());
+
+        // Audit trail: the request was handed to the upstream.
+        self.record_event(EVENT_PROVIDER_REQUEST, ctx, None, None, None, None);
+
+        Ok(())
+    }
+
+    async fn request_body_filter(
+        &self,
+        session: &mut Session,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+        ctx: &mut Self::CTX,
+    ) -> pingora::Result<()> {
+        let result = self
+            .request_body_filter_inner(session, body, end_of_stream, ctx)
+            .await;
+        // The first-byte deadline can only be decided once the request body
+        // has been read: that is when it is known whether the answer
+        // arrives as a stream (whose first byte comes quickly) or as one
+        // document (whose first byte is the whole answer). The proxy waits
+        // for this decision before it reads the upstream's response.
+        if end_of_stream {
+            self.decide_first_byte_budget(ctx);
+        }
+        result
     }
 
     /// The upstream answered with a status line — before anything is written
@@ -9275,6 +9363,7 @@ mod failover_policy_tests {
             connect_timeout: Duration::from_secs(10),
             total_connect_timeout: None,
             read_timeout: None,
+            first_byte_timeout: None,
             utc_offset_minutes: 0,
         }
     }

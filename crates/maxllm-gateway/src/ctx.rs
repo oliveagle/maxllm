@@ -260,6 +260,17 @@ pub struct RequestCtx {
     /// Set once `replay_body` has been re-injected: the chunks that follow are
     /// the replay buffer's truncated prefix and are dropped.
     pub replay_injected: bool,
+    /// The **first-byte deadline** of this request.
+    ///
+    /// The upstream must produce its first byte within this budget, or the
+    /// attempt is given up on and another pool member is asked. The budget
+    /// can only be decided once the request body has been read — that is
+    /// when it is known whether the answer arrives as a stream (whose first
+    /// byte comes quickly) or as one document (whose first byte is the whole
+    /// answer) — and the upstream request is written before that. The proxy
+    /// therefore waits for the decision in this cell before it reads the
+    /// upstream's response.
+    pub first_byte_budget: pingora::proxy::FirstByteBudget,
     /// Whether the translated stream already carried its protocol terminal
     /// event (`response.completed` / `[DONE]`). A stream that ends without one
     /// was cut off upstream; the gateway appends an error event and books the
@@ -368,6 +379,7 @@ impl RequestCtx {
             upstream_responded: false,
             replay_body: None,
             replay_injected: false,
+            first_byte_budget: pingora::proxy::FirstByteBudget::new(),
             stream_terminal_seen: false,
             stream_scan_tail: Vec::new(),
             stream_truncated: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),

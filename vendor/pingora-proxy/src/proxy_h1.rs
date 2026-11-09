@@ -20,6 +20,21 @@ use crate::proxy_cache::{range_filter::RangeBodyFilter, ServeFromCache};
 use crate::proxy_common::*;
 use pingora_cache::CachePhase;
 use pingora_core::protocols::http::custom::CUSTOM_MESSAGE_QUEUE_SIZE;
+use tokio::time::Instant;
+
+/// Wait for the caller's first-byte deadline decision.
+///
+/// (maxllm local change, see vendor/README.md.) The caller decides the
+/// deadline once it has read the request body; the proxy cannot read the
+/// upstream's response before that decision is made, because a read that is
+/// already under way must not be cancelled (a partially read response header
+/// would be lost). `None` means "no deadline".
+async fn wait_first_byte_budget(budget: Option<&FirstByteBudget>) -> Option<Duration> {
+    match budget {
+        Some(budget) => budget.wait().await,
+        None => None,
+    }
+}
 
 impl<SV, C> HttpProxy<SV, C>
 where
@@ -81,6 +96,13 @@ where
             }
         }
 
+        // (maxllm local change, see vendor/README.md) The first-byte
+        // deadline. The caller decides the deadline once it has read the
+        // request body — that is when it knows whether the request is a
+        // streaming one — so the decision travels through a cell that the
+        // upstream half of the proxy picks up before it reads the response.
+        let first_byte_budget = self.inner.first_byte_budget(ctx);
+
         session.upstream_compression.request_filter(&req);
 
         debug!("Sending header to upstream {:?}", req);
@@ -111,7 +133,12 @@ where
                 ctx,
                 &mut downstream_custom_message_writer
             ),
-            self.proxy_handle_upstream(client_session, tx_upstream, rx_downstream),
+            self.proxy_handle_upstream(
+                client_session,
+                tx_upstream,
+                rx_downstream,
+                first_byte_budget,
+            ),
         );
 
         if let Some(custom_session) = session.downstream_session.as_custom_mut() {
@@ -129,6 +156,32 @@ where
         match ret {
             Ok((downstream_can_reuse, _upstream)) => (downstream_can_reuse, true, None),
             Err(e) => (false, false, Some(e)),
+        }
+    }
+
+    /// Read the next upstream response task, bounded by the first-byte
+    /// deadline when one is set.
+    ///
+    /// (maxllm local change, see vendor/README.md.) The deadline is the
+    /// caller's: pingora's `read_timeout` is a per-read budget, so an
+    /// upstream that sends its headers only when it has an answer would hold
+    /// the client for the whole response budget. The error is a
+    /// `ReadTimedout`, which the caller reads as "this member is not
+    /// answering" and turns into a failover to the next candidate.
+    async fn read_response_task(
+        client_session: &mut HttpSessionV1,
+        deadline: Option<Instant>,
+    ) -> Result<HttpTask> {
+        match deadline {
+            Some(at) => match tokio::time::timeout_at(at, client_session.read_response_task()).await
+            {
+                Ok(res) => res,
+                Err(_) => Err(Error::explain(
+                    ReadTimedout,
+                    format!("no upstream byte within the first-byte deadline {at:?}"),
+                )),
+            },
+            None => client_session.read_response_task().await,
         }
     }
 
@@ -187,6 +240,7 @@ where
         client_session: &mut HttpSessionV1,
         tx: mpsc::Sender<HttpTask>,
         mut rx: mpsc::Receiver<HttpTask>,
+        first_byte_budget: Option<FirstByteBudget>,
     ) -> Result<()>
     where
         SV: ProxyHttp + Send + Sync,
@@ -196,13 +250,43 @@ where
         let mut response_done = false;
         let mut send_error = None;
         let mut upgraded = false;
+        // (maxllm local change, see vendor/README.md) The first-byte
+        // deadline.
+        //
+        // The caller decides the deadline once it has read the request body
+        // — that is when it knows whether the request is a streaming one —
+        // so the decision is not available when the upstream request is
+        // written. The response is therefore not read until the decision
+        // arrives: a read that is already under way must not be cancelled,
+        // because a partially read response header would be lost.
+        //
+        // The deadline covers the wait for the upstream's first *byte*: the
+        // response header is not the answer, so it stays armed until the
+        // first body chunk arrives. After that the stream may take as long
+        // as it needs — a long answer is not a stuck upstream.
+        let mut waiting_for_budget = first_byte_budget.is_some();
+        let mut first_byte_deadline: Option<Instant> = None;
 
         /* duplex mode, wait for either to complete */
         while !request_done || !response_done {
             tokio::select! {
-                res = client_session.read_response_task(), if !response_done => {
+                // The deadline decision. The request body keeps flowing to
+                // the upstream while it is waited for: the body filter must
+                // never block on a full pipe.
+                decided = wait_first_byte_budget(first_byte_budget.as_ref()), if waiting_for_budget => {
+                    first_byte_deadline = decided.map(|budget| Instant::now() + budget);
+                    waiting_for_budget = false;
+                },
+
+                res = Self::read_response_task(client_session, first_byte_deadline), if !response_done && !waiting_for_budget => {
                     match res {
                         Ok(task) => {
+                            // The response header is not the answer: the
+                            // deadline stays armed until the first body chunk
+                            // arrives.
+                            if matches!(task, HttpTask::Body(..) | HttpTask::UpgradedBody(..)) {
+                                first_byte_deadline = None;
+                            }
                             response_done = task.is_end();
                             if !upgraded && client_session.was_upgraded() {
                                 // upgrade can only happen once
@@ -242,6 +326,18 @@ where
                     match send_body_to1(client_session, body).await {
                         Ok(send_done) => {
                             request_done = send_done;
+                            // The request body is complete, so the caller has
+                            // decided the deadline (it decides when the body
+                            // ends). Take that decision instead of waiting
+                            // for it.
+                            if request_done && waiting_for_budget {
+                                first_byte_deadline = first_byte_budget
+                                    .as_ref()
+                                    .and_then(|budget| budget.get())
+                                    .flatten()
+                                    .map(|budget| Instant::now() + budget);
+                                waiting_for_budget = false;
+                            }
                             // An upgraded request is terminated when either side is done
                             if request_done && client_session.was_upgraded() {
                                 response_done = true;

@@ -445,6 +445,24 @@ pub struct ProviderConfig {
     /// Unset means the route's timeout, as before.
     #[serde(default)]
     pub read_timeout_secs: Option<u64>,
+    /// How long the gateway waits for the upstream's **first** byte, in
+    /// seconds.
+    ///
+    /// The stall budget above is per read: an upstream that keeps sending
+    /// something may hold the client for as long as the route's timeout. But
+    /// an upstream that accepts the request and then says nothing — or sends
+    /// its headers only when it has an answer — is *slow to start*, and the
+    /// client waits for nothing. The pool has nine other members that could
+    /// answer in two seconds, so the request is moved on instead of waiting
+    /// out the stall budget.
+    ///
+    /// Only streaming requests are bounded this way: for a non-streaming
+    /// request the upstream sends its headers when the answer is *ready*, so
+    /// the first byte is the answer and the route's own timeout governs it.
+    ///
+    /// `0` disables the deadline. Unset means the built-in default (30 s).
+    #[serde(default)]
+    pub first_byte_timeout_secs: Option<u64>,
     /// Fixed UTC offset used to interpret **zone-less** reset timestamps in
     /// upstream rate-limit messages, e.g. Zhipu's
     /// `您的限额将在 2026-11-10 22:58:54 重置` (Beijing time, but written
@@ -1159,6 +1177,37 @@ read_timeout_secs = 45
 "#;
         let config = Config::parse(toml).unwrap();
         assert_eq!(config.providers["opencode"].read_timeout_secs, Some(45));
+    }
+
+    #[test]
+    fn test_first_byte_timeout_defaults_to_unset_and_is_parsed() {
+        let toml = r#"
+[server]
+listen = "0.0.0.0:8080"
+
+[providers.openai]
+kind = "openai"
+base_url = "https://api.openai.com"
+api_key = "sk-test"
+"#;
+        let config = Config::parse(toml).unwrap();
+        assert_eq!(config.providers["openai"].first_byte_timeout_secs, None);
+
+        let toml = r#"
+[server]
+listen = "0.0.0.0:8080"
+
+[providers.opencode]
+kind = "opencode"
+base_url = "https://opencode.ai"
+api_key = "sk-test"
+first_byte_timeout_secs = 20
+"#;
+        let config = Config::parse(toml).unwrap();
+        assert_eq!(
+            config.providers["opencode"].first_byte_timeout_secs,
+            Some(20)
+        );
     }
 
     #[test]

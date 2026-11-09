@@ -276,6 +276,20 @@ pub trait ProxyHttp {
         )
     }
 
+    /// The cell that carries the **first-byte deadline** of this request.
+    ///
+    /// (maxllm local change — see vendor/README.md.) The proxy reads the
+    /// upstream's response while the request body is still being read, so a
+    /// deadline that depends on the body — "the first byte must arrive
+    /// within N seconds, but only for a streaming request" — cannot be
+    /// known when the upstream request is written. The caller decides it in
+    /// the request body filter and the proxy picks it up from this cell.
+    ///
+    /// `None` (the default) means the proxy applies no first-byte deadline.
+    fn first_byte_budget(&self, _ctx: &mut Self::CTX) -> Option<FirstByteBudget> {
+        None
+    }
+
     /// Modify the request before it is sent to the upstream
     ///
     /// Unlike [Self::request_filter()], this filter allows to change the request headers to send
