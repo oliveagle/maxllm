@@ -10345,6 +10345,149 @@ async fn test_quota_429_fails_over_with_a_large_body() {
     );
 }
 
+/// A half-open member that answers a *deterministic* rejection must give its
+/// probe slot back when the request fails over.
+///
+/// The slot belongs to the request, not to the provider: a failure the breaker
+/// counts (5xx, connect error, 429) takes the slot back by itself, but a
+/// deterministic rejection (401/403/404/425) fails over without booking any
+/// outcome — so the slot stayed busy and the member was unusable. A
+/// half-open provider whose probe slot is busy answers "circuit open" to
+/// every later request until the staleness reaper takes the slot (two fail
+/// windows), which takes a *healthy* member out of the rotation.
+const PROBE_SLOT_FALLBACK_CONFIG: &str = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.primary]
+kind = "openai_compat"
+base_url = "{MOCK_URL}"
+upstream_path = "/v1/chat/completions"
+api_key = "fake-key"
+native_responses = true
+responses_path = "/v1/responses"
+max_fails = 1
+fail_timeout_secs = 1
+
+[providers.backup]
+kind = "openai_compat"
+base_url = "{FALLBACK_URL}"
+upstream_path = "/v1/chat/completions"
+api_key = "fake-key"
+native_responses = true
+responses_path = "/v1/responses"
+
+[[routes]]
+path = "/v1/responses"
+provider = "primary"
+fallback = ["backup"]
+strategy = "fallback"
+endpoint_type = "responses"
+max_failover_attempts = 3
+"#;
+
+#[tokio::test]
+async fn test_a_deterministic_rejection_returns_the_half_open_probe_slot() {
+    let primary = MockServer::start().await;
+    // 1) the trip: one 5xx opens the circuit (max_fails = 1).
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500))
+        .up_to_n_times(1)
+        .mount(&primary)
+        .await;
+    // 2) the probe: a deterministic rejection. It fails over, but it books
+    //    no breaker outcome — only the request can return the slot.
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(401)
+                .set_body_string(r#"{"error":{"message":"invalid api key"}}"#)
+                .insert_header("content-type", "application/json"),
+        )
+        .up_to_n_times(1)
+        .mount(&primary)
+        .await;
+    // 3) the next probe must reach the member again.
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from-primary")))
+        .mount(&primary)
+        .await;
+
+    let backup = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from-backup")))
+        .mount(&backup)
+        .await;
+
+    let gw =
+        TestGateway::start_with_fallback(PROBE_SLOT_FALLBACK_CONFIG, &primary.uri(), &backup.uri())
+            .await;
+
+    let body = json!({"model": "gpt-4o", "input": "ping"});
+
+    // 1) trip the breaker: the request is served by the backup.
+    let resp = client()
+        .post(gw.url("/v1/responses"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&body)
+        .send()
+        .await
+        .expect("request completes");
+    assert_eq!(
+        resp.status(),
+        200,
+        "the backup must serve the tripped member"
+    );
+
+    // The fail window has to elapse: until then the member is open, and only
+    // after it the next request probes it.
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+
+    // 2) the probe is rejected deterministically and the request fails over.
+    let resp = client()
+        .post(gw.url("/v1/responses"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&body)
+        .send()
+        .await
+        .expect("request completes");
+    assert_eq!(
+        resp.status(),
+        200,
+        "the backup must serve the rejected probe"
+    );
+
+    // 3) the member is up and its slot is free again: the next request must
+    //    probe it, not skip it for a slot it no longer holds.
+    let resp = client()
+        .post(gw.url("/v1/responses"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&body)
+        .send()
+        .await
+        .expect("request completes");
+    assert_eq!(resp.status(), 200);
+    let text = resp.text().await.unwrap_or_default();
+    assert!(
+        text.contains("from-primary"),
+        "the half-open member must be probeable again right after a failover: {text}"
+    );
+    let served = primary.received_requests().await.unwrap_or_default();
+    assert_eq!(
+        served.len(),
+        3,
+        "the member must have served the probe and the request after it"
+    );
+}
+
 /// The same, on a provider that does NOT speak the Responses contract
 /// natively: the body is translated, so the gateway forwards it with its
 /// original framing. The failover must still happen — the client's context
