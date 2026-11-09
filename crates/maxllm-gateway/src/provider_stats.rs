@@ -326,8 +326,16 @@ pub fn record_total_latency(provider: &str, latency_ms: f64, warm: bool, tokens_
             .speed_refreshed_at
             .is_none_or(|at| now.duration_since(at) >= SPEED_MEMORY_REFRESH_INTERVAL);
     if refresh {
-        stats.speed_refreshed_at = Some(now);
         if let Some(rate) = decode_rate_of(&stats.samples, now) {
+            // Only a *successful* estimate starts the interval. An attempt
+            // that came up short (too few qualifying samples) must not burn
+            // it: the next sample then tries again at once. Otherwise a
+            // member whose traffic arrives in bursts is remembered never —
+            // the first attempt lands before the pool has four qualifying
+            // samples, and every later sample falls inside the interval it
+            // spent. Measured on NAS 2026-11-09: `deepseek` answered six
+            // qualifying turns in 50 s and was remembered *not at all*.
+            stats.speed_refreshed_at = Some(now);
             let samples = stats.samples.len() as u64;
             let mut speed = LAST_SPEED.write().unwrap_or_else(|e| e.into_inner());
             speed.insert(
@@ -950,6 +958,36 @@ mod tests {
         );
         forget("speed-memory");
         assert!(known_decode_rate_ms_per_1k("speed-memory").is_none());
+    }
+
+    /// A member whose traffic arrives in bursts is remembered too.
+    ///
+    /// The refresh interval is there to keep the median from being
+    /// recomputed on every request — but an attempt that came up short (too
+    /// few qualifying samples yet) must not *start* that interval, or the
+    /// samples that would have qualified are all inside it. Measured on NAS
+    /// 2026-11-09: `deepseek` answered six qualifying turns in 50 s and the
+    /// pool remembered nothing at all — the first attempt landed before the
+    /// fourth qualifying sample, and every later turn fell inside the
+    /// interval that attempt spent.
+    #[test]
+    fn a_bursty_member_is_remembered_too() {
+        forget("speed-bursty");
+        // Two cold turns (a cold prefill says nothing about the speed) and
+        // then four warm ones: the first refresh attempt lands on the
+        // fourth sample, when only two samples qualify.
+        for _ in 0..2 {
+            record_total_latency("speed-bursty", 20_000.0, false, 1_000);
+        }
+        for _ in 0..4 {
+            record_total_latency("speed-bursty", 20_000.0, true, 1_000);
+        }
+        assert_eq!(
+            known_decode_rate_ms_per_1k("speed-bursty"),
+            Some(20_000.0),
+            "a member measured in bursts must be remembered"
+        );
+        forget("speed-bursty");
     }
 
     /// A member the pool never measured has no remembered speed — and it
