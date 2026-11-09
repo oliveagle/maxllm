@@ -53,6 +53,49 @@ const DECODE_RATE_WINDOW: Duration = TOTAL_LATENCY_RETENTION;
 /// samples go first; reaching this within the window needs a rate no route
 /// here sustains, so in practice the window is what prunes.
 const TOTAL_LATENCY_MAX_SAMPLES: usize = 1024;
+
+/// How long the pool remembers how fast a member was.
+///
+/// A provider's speed is a slow property: it does not change between two
+/// requests the way a cache ratio does. The *samples* behind the estimate
+/// age out (an hour), and so does the estimate's own window — so a member
+/// that goes quiet is suddenly *unmeasured*, and the rotation weighs it like
+/// a brand-new account. That is how a member the pool had already measured
+/// as slow got its traffic back on NAS: `xiaomi` (2.5-3.5x slower than the
+/// tier) took two of twelve new sessions within half an hour of its
+/// evidence expiring — and a restart wiped the evidence entirely, so a
+/// deploy handed the slowest member the same share as the fastest.
+///
+/// The remembered rate is what the *rotation* weighs a member by. It is not
+/// what evicts a warm session: that decision needs fresh evidence, because a
+/// stale verdict would throw away a live upstream cache.
+const SPEED_MEMORY_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How often the remembered rate is refreshed while a member is active.
+///
+/// Frequent enough that a member which got faster re-earns its share
+/// quickly, rare enough that the median is not recomputed per request.
+const SPEED_MEMORY_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+
+/// What the pool remembers about one member's speed.
+#[derive(Debug, Clone, Copy)]
+struct SpeedMemory {
+    /// Milliseconds per 1 000 output tokens.
+    ms_per_1k: f64,
+    /// How many samples the estimate is built on.
+    samples: u64,
+    /// When the estimate was taken.
+    measured_at: Instant,
+}
+
+/// The last speed estimate the pool computed for each provider.
+///
+/// Unlike the samples it is built on, this does not age out with the
+/// window: it is refreshed every [`SPEED_MEMORY_REFRESH_INTERVAL`] while
+/// the provider is serving, and read afterwards for as long as
+/// [`SPEED_MEMORY_TTL`] allows.
+static LAST_SPEED: Lazy<RwLock<AHashMap<String, SpeedMemory>>> =
+    Lazy::new(|| RwLock::new(AHashMap::new()));
 /// How many windowed samples must accumulate with no warm one before the
 /// cold latencies are used as the estimate.
 ///
@@ -75,6 +118,8 @@ struct TotalLatencyStats {
     /// whole-exchange duration says as much about how much the client asked
     /// to generate as about how fast the provider is.
     samples: VecDeque<(Instant, f64, bool, u64)>,
+    /// When the pool's memory of this provider's speed was last refreshed.
+    speed_refreshed_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -269,6 +314,72 @@ pub fn record_total_latency(provider: &str, latency_ms: f64, warm: bool, tokens_
     while stats.samples.len() > TOTAL_LATENCY_MAX_SAMPLES {
         stats.samples.pop_front();
     }
+    // Keep the pool's *memory* of this provider's speed alive while it is
+    // serving: the samples behind the estimate age out, the estimate itself
+    // must not — otherwise an idle member becomes indistinguishable from a
+    // brand-new one and the rotation hands it the same share as the fastest.
+    // The estimate needs enough samples to exist at all; until then there is
+    // nothing to remember, and the next sample tries again.
+    let have_estimate = stats.samples.len() >= DECODE_RATE_MIN_SAMPLES;
+    let refresh = have_estimate
+        && stats
+            .speed_refreshed_at
+            .is_none_or(|at| now.duration_since(at) >= SPEED_MEMORY_REFRESH_INTERVAL);
+    if refresh {
+        stats.speed_refreshed_at = Some(now);
+        if let Some(rate) = decode_rate_of(&stats.samples, now) {
+            let samples = stats.samples.len() as u64;
+            let mut speed = LAST_SPEED.write().unwrap_or_else(|e| e.into_inner());
+            speed.insert(
+                provider.to_string(),
+                SpeedMemory {
+                    ms_per_1k: rate,
+                    samples,
+                    measured_at: now,
+                },
+            );
+        }
+    }
+}
+
+/// The provider's speed as the pool *remembers* it.
+///
+/// Unlike [`decode_rate_ms_per_1k`], this does not need a fresh sample: it
+/// is the last estimate the pool computed while the provider was serving,
+/// valid for [`SPEED_MEMORY_TTL`]. `None` means the provider was never
+/// measured — that is a different thing from "measured, and idle since",
+/// and the two must not be treated the same.
+pub fn known_decode_rate_ms_per_1k(provider: &str) -> Option<f64> {
+    let map = LAST_SPEED.read().unwrap_or_else(|e| e.into_inner());
+    let memory = map.get(provider)?;
+    if memory.measured_at.elapsed() > SPEED_MEMORY_TTL {
+        return None;
+    }
+    Some(memory.ms_per_1k)
+}
+
+/// Seed the remembered speed of one provider from the store.
+///
+/// The estimate comes back *aged*: a speed measured yesterday describes the
+/// provider as it was yesterday. It is still better than no estimate at all
+/// — a provider the pool already measured as slow must not be handed the
+/// fastest member's share just because it went quiet.
+pub fn restore_speed_memory(provider: &str, ms_per_1k: f64, samples: u64, age_secs: u64) {
+    if !(ms_per_1k.is_finite() && ms_per_1k > 0.0) || samples == 0 {
+        return;
+    }
+    if age_secs > SPEED_MEMORY_TTL.as_secs() {
+        return;
+    }
+    let now = Instant::now();
+    let mut map = LAST_SPEED.write().unwrap_or_else(|e| e.into_inner());
+    map.entry(provider.to_string()).or_insert(SpeedMemory {
+        ms_per_1k,
+        samples,
+        measured_at: now
+            .checked_sub(Duration::from_secs(age_secs))
+            .unwrap_or(now),
+    });
 }
 
 /// The provider's speed, measured in milliseconds per 1 000 output tokens.
@@ -288,9 +399,16 @@ pub fn record_total_latency(provider: &str, latency_ms: f64, warm: bool, tokens_
 pub fn decode_rate_ms_per_1k(provider: &str) -> Option<f64> {
     let map = TOTAL_LATENCY.read().unwrap_or_else(|e| e.into_inner());
     let stats = map.get(provider)?;
-    let now = Instant::now();
-    let mut rates: Vec<f64> = stats
-        .samples
+    decode_rate_of(&stats.samples, Instant::now())
+}
+
+/// The decode rate of a sample set: milliseconds per 1 000 output tokens.
+///
+/// Only warm turns count (a cold turn's prefill dominates its duration) and
+/// only answers long enough to be mostly decoding (a 40-token answer says
+/// more about the round trip than about the provider).
+fn decode_rate_of(samples: &VecDeque<(Instant, f64, bool, u64)>, now: Instant) -> Option<f64> {
+    let mut rates: Vec<f64> = samples
         .iter()
         .filter(|(at, _, warm, tokens_out)| {
             *warm
@@ -421,6 +539,13 @@ pub struct ProviderStatsSnapshot {
     pub cache_age_secs: u64,
     /// The whole-exchange latency window.
     pub total_latency: Vec<LatencySample>,
+    /// The remembered speed (milliseconds per 1 000 output tokens); `None`
+    /// when the provider was never measured.
+    pub speed_ms_per_1k: Option<f64>,
+    /// How many samples the remembered speed is built on.
+    pub speed_samples: u64,
+    /// How long ago the remembered speed was taken.
+    pub speed_age_secs: u64,
 }
 
 /// A snapshot of every provider's routing evidence.
@@ -437,7 +562,9 @@ pub fn snapshot() -> Vec<ProviderStatsSnapshot> {
     let cache = CACHE_RATIO.read().unwrap_or_else(|e| e.into_inner());
     let latency = TOTAL_LATENCY.read().unwrap_or_else(|e| e.into_inner());
 
-    let mut out: Vec<ProviderStatsSnapshot> = Vec::with_capacity(cache.len() + latency.len());
+    let speed = LAST_SPEED.read().unwrap_or_else(|e| e.into_inner());
+    let mut out: Vec<ProviderStatsSnapshot> =
+        Vec::with_capacity(cache.len() + latency.len() + speed.len());
     for (provider, stats) in cache.iter() {
         out.push(ProviderStatsSnapshot {
             provider: provider.clone(),
@@ -445,6 +572,7 @@ pub fn snapshot() -> Vec<ProviderStatsSnapshot> {
             cache_samples: stats.samples,
             cache_age_secs: now.duration_since(stats.last_seen).as_secs(),
             total_latency: latency_samples(&latency, provider, now),
+            ..speed_snapshot(&speed, provider, now)
         });
     }
     for provider in latency.keys() {
@@ -457,9 +585,56 @@ pub fn snapshot() -> Vec<ProviderStatsSnapshot> {
             cache_samples: 0,
             cache_age_secs: 0,
             total_latency: latency_samples(&latency, provider, now),
+            ..speed_snapshot(&speed, provider, now)
+        });
+    }
+    // A provider that only has a *remembered* speed still knows something
+    // the pool must not forget: it was measured, and the measurement is
+    // what keeps it from being handed the fastest member's share.
+    for provider in speed.keys() {
+        if cache.contains_key(provider) || latency.contains_key(provider) {
+            continue;
+        }
+        out.push(ProviderStatsSnapshot {
+            provider: provider.clone(),
+            cache_ratio: None,
+            cache_samples: 0,
+            cache_age_secs: 0,
+            total_latency: Vec::new(),
+            ..speed_snapshot(&speed, provider, now)
         });
     }
     out
+}
+
+/// The remembered speed of one provider, as a snapshot fragment.
+fn speed_snapshot(
+    speed: &AHashMap<String, SpeedMemory>,
+    provider: &str,
+    now: Instant,
+) -> ProviderStatsSnapshot {
+    match speed.get(provider) {
+        Some(memory) => ProviderStatsSnapshot {
+            provider: provider.to_string(),
+            cache_ratio: None,
+            cache_samples: 0,
+            cache_age_secs: 0,
+            total_latency: Vec::new(),
+            speed_ms_per_1k: Some(memory.ms_per_1k),
+            speed_samples: memory.samples,
+            speed_age_secs: now.duration_since(memory.measured_at).as_secs(),
+        },
+        None => ProviderStatsSnapshot {
+            provider: provider.to_string(),
+            cache_ratio: None,
+            cache_samples: 0,
+            cache_age_secs: 0,
+            total_latency: Vec::new(),
+            speed_ms_per_1k: None,
+            speed_samples: 0,
+            speed_age_secs: 0,
+        },
+    }
 }
 
 /// The fresh latency samples of one provider, as ages.
@@ -539,6 +714,20 @@ pub fn restore(snapshot: &ProviderStatsSnapshot) -> bool {
         }
     }
 
+    // The remembered speed. Unlike the two windows above this one is *not*
+    // dropped when it is old: it is the pool's memory of a slow property,
+    // and a restart must not hand the slowest member the fastest member's
+    // share (measured on NAS: a deploy wiped `xiaomi`'s evidence and it
+    // took two of twelve new sessions within the half hour that followed).
+    if let Some(rate) = snapshot.speed_ms_per_1k {
+        restore_speed_memory(
+            &snapshot.provider,
+            rate,
+            snapshot.speed_samples,
+            snapshot.speed_age_secs,
+        );
+    }
+
     applied
 }
 
@@ -554,6 +743,10 @@ pub(crate) fn forget(provider: &str) {
         .unwrap_or_else(|e| e.into_inner())
         .remove(provider);
     TOTAL_LATENCY
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(provider);
+    LAST_SPEED
         .write()
         .unwrap_or_else(|e| e.into_inner())
         .remove(provider);
@@ -575,6 +768,26 @@ pub(crate) fn expire_total_latency_evidence(provider: &str) {
         return;
     };
     let aged = Instant::now() - TOTAL_LATENCY_WINDOW - Duration::from_secs(1);
+    for (at, _, _, _) in stats.samples.iter_mut() {
+        *at = aged;
+    }
+}
+
+/// Test-only: age `provider`'s samples past the decode-rate window, the way
+/// an hour of silence would.
+///
+/// The window's promise is that a verdict never outlives its evidence; the
+/// pool's *memory* of a slow property is the one thing that does outlive it,
+/// because forgetting it would hand the slowest member the fastest member's
+/// share. Proving that needs time to pass, so the test moves this one
+/// provider's timestamps instead of sleeping.
+#[cfg(test)]
+pub(crate) fn expire_decode_rate_evidence(provider: &str) {
+    let mut map = TOTAL_LATENCY.write().unwrap_or_else(|e| e.into_inner());
+    let Some(stats) = map.get_mut(provider) else {
+        return;
+    };
+    let aged = Instant::now() - DECODE_RATE_WINDOW - Duration::from_secs(1);
     for (at, _, _, _) in stats.samples.iter_mut() {
         *at = aged;
     }
@@ -701,6 +914,90 @@ mod tests {
         // history must not blend into the new reading.
         record_total_latency("lat-stale-1", 3_000.0, true, 4096);
         assert_eq!(total_latency_ms("lat-stale-1"), Some(3_000.0));
+    }
+
+    /// The pool remembers a member's speed after the samples behind it age
+    /// out.
+    ///
+    /// A provider's speed is a slow property. The samples behind the estimate
+    /// are kept for an hour, and so is the estimate's own window — so a
+    /// member that goes quiet is suddenly *unmeasured*, and the rotation
+    /// weighs it like a brand-new account. Measured on NAS: `xiaomi`, 2.5-3.5x
+    /// slower than the tier, took two of twelve new sessions within half an
+    /// hour of its evidence expiring.
+    #[test]
+    fn the_remembered_speed_outlives_its_samples() {
+        forget("speed-memory");
+        for _ in 0..8 {
+            record_total_latency("speed-memory", 20_000.0, true, 1_000);
+        }
+        assert_eq!(
+            known_decode_rate_ms_per_1k("speed-memory"),
+            Some(20_000.0),
+            "the pool must remember what it measured"
+        );
+        // An hour of silence: the fresh estimate is gone ...
+        expire_decode_rate_evidence("speed-memory");
+        assert!(
+            decode_rate_ms_per_1k("speed-memory").is_none(),
+            "the fresh estimate must be gone"
+        );
+        // ... but what the pool measured is not.
+        assert_eq!(
+            known_decode_rate_ms_per_1k("speed-memory"),
+            Some(20_000.0),
+            "a member the pool measured as slow must not be re-measured from scratch"
+        );
+        forget("speed-memory");
+        assert!(known_decode_rate_ms_per_1k("speed-memory").is_none());
+    }
+
+    /// A member the pool never measured has no remembered speed — and it
+    /// must be given traffic to be measured, so the rotation treats it as
+    /// unmeasured, not as slow.
+    #[test]
+    fn a_never_measured_member_has_no_remembered_speed() {
+        forget("speed-never");
+        assert!(known_decode_rate_ms_per_1k("speed-never").is_none());
+        assert!(decode_rate_ms_per_1k("speed-never").is_none());
+    }
+
+    /// The remembered speed survives a restart: it comes back from the store,
+    /// aged, and still counts. A memory too old to describe the provider is
+    /// dropped instead.
+    #[test]
+    fn the_remembered_speed_comes_back_from_the_store() {
+        forget("speed-restored");
+        restore_speed_memory("speed-restored", 20_000.0, 12, 60);
+        assert_eq!(
+            known_decode_rate_ms_per_1k("speed-restored"),
+            Some(20_000.0)
+        );
+        forget("speed-stale");
+        restore_speed_memory("speed-stale", 20_000.0, 12, 30 * 24 * 3600);
+        assert!(
+            known_decode_rate_ms_per_1k("speed-stale").is_none(),
+            "a memory older than its lifetime must not describe the provider"
+        );
+        forget("speed-restored");
+    }
+
+    /// The snapshot carries the remembered speed, so the store can persist
+    /// it: a provider that only has a remembered speed still has a row.
+    #[test]
+    fn the_snapshot_carries_the_remembered_speed() {
+        forget("speed-snapshot");
+        for _ in 0..8 {
+            record_total_latency("speed-snapshot", 20_000.0, true, 1_000);
+        }
+        expire_decode_rate_evidence("speed-snapshot");
+        let snapshot = snapshot()
+            .into_iter()
+            .find(|s| s.provider == "speed-snapshot")
+            .expect("the provider has evidence");
+        assert_eq!(snapshot.speed_ms_per_1k, Some(20_000.0));
+        assert!(snapshot.speed_samples >= 4);
+        forget("speed-snapshot");
     }
 
     /// The first turn of a conversation is a full-prefix prefill. Judging a
@@ -830,6 +1127,9 @@ mod tests {
             cache_samples: 99,
             cache_age_secs: 1,
             total_latency: Vec::new(),
+            speed_ms_per_1k: None,
+            speed_samples: 0,
+            speed_age_secs: 0,
         };
         assert!(!restore(&aged));
         let ratio = cache_ratio("persist-fresh").expect("measured");

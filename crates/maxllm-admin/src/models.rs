@@ -269,6 +269,19 @@ pub struct ProviderStatsStateRow {
     /// The whole-exchange latency window, as a JSON array of
     /// `{"age_secs":N,"latency_ms":F,"warm":B}` samples.
     pub total_latency: String,
+    /// The remembered speed of the provider (milliseconds per 1 000 output
+    /// tokens). `None` when the provider was never measured.
+    ///
+    /// Speed is a slow property: the samples behind it age out, and so does
+    /// the estimate's window. Without this column a restart — or an hour of
+    /// silence — would make a member the pool had already measured as slow
+    /// indistinguishable from a brand-new account, and the rotation would
+    /// hand it the same share as the fastest member.
+    pub speed_ms_per_1k: Option<f64>,
+    /// How many samples the remembered speed is built on.
+    pub speed_samples: u64,
+    /// How long ago the remembered speed was taken.
+    pub speed_age_secs: u64,
     pub updated_at: DateTime<Utc>,
 }
 

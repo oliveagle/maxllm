@@ -1066,7 +1066,7 @@ fn auto_pool_speed_factor(provider: &str, best_ms_per_1k: Option<f64>) -> f64 {
     let Some(best) = best_ms_per_1k else {
         return 1.0;
     };
-    let Some(rate) = crate::provider_stats::decode_rate_ms_per_1k(provider) else {
+    let Some(rate) = auto_pool_member_rate(provider) else {
         return 1.0;
     };
     let ratio = rate / best;
@@ -1081,6 +1081,23 @@ fn auto_pool_speed_factor(provider: &str, best_ms_per_1k: Option<f64>) -> f64 {
     } else {
         0.5
     }
+}
+
+/// How fast a member of the pool is, in milliseconds per 1 000 output tokens.
+///
+/// Fresh evidence first; the pool's *memory* of it second. A member that
+/// was measured and then went quiet keeps its verdict — the samples behind
+/// the estimate age out, and a member the pool already measured as slow
+/// must not be handed the fastest member's share just because it stopped
+/// serving (measured on NAS: `xiaomi`, 2.5-3.5x slower than the tier, took
+/// two of twelve new sessions within half an hour of its evidence expiring,
+/// and a deploy wiped the evidence entirely).
+///
+/// A member that was *never* measured stays unmeasured: the rotation is
+/// what measures it, so it must be given traffic to measure.
+fn auto_pool_member_rate(provider: &str) -> Option<f64> {
+    crate::provider_stats::decode_rate_ms_per_1k(provider)
+        .or_else(|| crate::provider_stats::known_decode_rate_ms_per_1k(provider))
 }
 
 /// The cache ratio at which a member of the pool counts as "keeps the
@@ -1346,7 +1363,7 @@ fn auto_pool_cache_order<'a>(rotation: &[&'a AutoPoolEntry]) -> Vec<&'a AutoPool
     // more of the rotation's slots.
     let best_rate = rotation
         .iter()
-        .filter_map(|e| crate::provider_stats::decode_rate_ms_per_1k(&e.provider))
+        .filter_map(|e| auto_pool_member_rate(&e.provider))
         .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let weights: Vec<u32> = rotation
         .iter()
@@ -1484,6 +1501,9 @@ fn provider_stats_row(
         cache_samples: snapshot.cache_samples,
         cache_age_secs: snapshot.cache_age_secs,
         total_latency,
+        speed_ms_per_1k: snapshot.speed_ms_per_1k,
+        speed_samples: snapshot.speed_samples,
+        speed_age_secs: snapshot.speed_age_secs,
         updated_at: chrono::Utc::now(),
     })
 }
@@ -1500,6 +1520,9 @@ fn provider_stats_snapshot_from_row(
         cache_samples: row.cache_samples,
         cache_age_secs: row.cache_age_secs,
         total_latency,
+        speed_ms_per_1k: row.speed_ms_per_1k,
+        speed_samples: row.speed_samples,
+        speed_age_secs: row.speed_age_secs,
     })
 }
 
@@ -9853,6 +9876,77 @@ mod auto_pool_latency_tests {
         assert!(
             fast > slow,
             "the fast member must earn more slots, got {fast} vs {slow}"
+        );
+        assert!(
+            slow >= 1,
+            "a slow member keeps its slot: the pool needs it for overflow"
+        );
+    }
+
+    /// A member the pool already measured as slow keeps that verdict after
+    /// its samples age out.
+    ///
+    /// The samples behind the estimate are kept for an hour, and so is the
+    /// estimate's window — so a member that goes quiet becomes *unmeasured*,
+    /// and the rotation weighs it like a brand-new account. Measured on NAS:
+    /// `xiaomi`, 2.5-3.5x slower than the tier, took two of twelve new
+    /// sessions within half an hour of its evidence expiring; a deploy wiped
+    /// the evidence entirely and did it again.
+    #[test]
+    fn the_speed_factor_uses_the_remembered_rate() {
+        for _ in 0..5 {
+            crate::provider_stats::record_total_latency("mem-slow", 20_000.0, true, 1_000);
+        }
+        // The member goes quiet: its fresh estimate is gone ...
+        crate::provider_stats::expire_decode_rate_evidence("mem-slow");
+        assert!(
+            crate::provider_stats::decode_rate_ms_per_1k("mem-slow").is_none(),
+            "the fresh estimate must be gone"
+        );
+        // ... but the pool still knows it is slow.
+        let factor = auto_pool_speed_factor("mem-slow", Some(5_000.0));
+        assert!(
+            factor < 1.0,
+            "a member the pool measured as slow must not be handed the fastest member's share, got {factor}"
+        );
+        // A member that was never measured is untouched: the rotation is what
+        // measures it, so it must be given traffic.
+        assert_eq!(
+            auto_pool_speed_factor("mem-never", Some(5_000.0)),
+            1.0,
+            "an unmeasured member is not a slow one"
+        );
+    }
+
+    /// The same, one level up: the *rotation* gives the known-slow member
+    /// fewer slots than the fast one, even though the slow member's samples
+    /// have aged out.
+    #[test]
+    fn a_known_slow_member_keeps_its_smaller_share() {
+        for _ in 0..5 {
+            crate::provider_stats::record_total_latency("share-mem-fast", 5_000.0, true, 1_000);
+            crate::provider_stats::record_total_latency("share-mem-slow", 20_000.0, true, 1_000);
+        }
+        for _ in 0..3 {
+            crate::provider_stats::record_cache_ratio("share-mem-fast", 1_800, 2_000);
+            crate::provider_stats::record_cache_ratio("share-mem-slow", 1_800, 2_000);
+        }
+        // The slow member goes quiet.
+        crate::provider_stats::expire_decode_rate_evidence("share-mem-slow");
+        let pool = pool_with_names(true, &["share-mem-fast", "share-mem-slow"]);
+        let healthy: Vec<&AutoPoolEntry> = pool.entries.iter().collect();
+        let order = auto_pool_cache_order(&healthy);
+        let fast = order
+            .iter()
+            .filter(|e| e.provider == "share-mem-fast")
+            .count();
+        let slow = order
+            .iter()
+            .filter(|e| e.provider == "share-mem-slow")
+            .count();
+        assert!(
+            slow * 2 <= fast,
+            "a member known to be slow must keep a clearly smaller share, got {fast} vs {slow}"
         );
         assert!(
             slow >= 1,

@@ -170,6 +170,9 @@ impl SqliteStore {
                 cache_samples INTEGER NOT NULL DEFAULT 0,
                 cache_age_secs INTEGER NOT NULL DEFAULT 0,
                 total_latency TEXT NOT NULL DEFAULT '[]',
+                speed_ms_per_1k REAL,
+                speed_samples INTEGER NOT NULL DEFAULT 0,
+                speed_age_secs INTEGER NOT NULL DEFAULT 0,
                 updated_at TEXT NOT NULL
             );
 
@@ -192,6 +195,40 @@ impl SqliteStore {
         )
         .map_err(|e| StoreError::Internal(format!("failed to create tables: {e}")))?;
         Self::migrate_request_log_columns(&conn)?;
+        Self::migrate_provider_stats_columns(&conn)?;
+        Ok(())
+    }
+
+    /// Add the routing-evidence columns a newer gateway writes.
+    ///
+    /// The remembered speed of a provider has to survive the process: a
+    /// restart must not make the pool forget which member it had already
+    /// measured as slow. Idempotent: a column is added only when
+    /// `pragma table_info` does not list it yet.
+    fn migrate_provider_stats_columns(conn: &Connection) -> Result<(), StoreError> {
+        let existing: Vec<String> = {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(provider_stats_state)")
+                .map_err(|e| StoreError::Internal(e.to_string()))?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(|e| StoreError::Internal(e.to_string()))?;
+            rows.filter_map(|row| row.ok()).collect()
+        };
+        for (column, ddl) in [
+            ("speed_ms_per_1k", "REAL"),
+            ("speed_samples", "INTEGER NOT NULL DEFAULT 0"),
+            ("speed_age_secs", "INTEGER NOT NULL DEFAULT 0"),
+        ] {
+            if existing.iter().any(|name| name == column) {
+                continue;
+            }
+            conn.execute(
+                &format!("ALTER TABLE provider_stats_state ADD COLUMN {column} {ddl}"),
+                [],
+            )
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        }
         Ok(())
     }
 
@@ -804,13 +841,17 @@ impl AdminStore for SqliteStore {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         conn.execute(
             "INSERT INTO provider_stats_state (
-                provider, cache_ratio, cache_samples, cache_age_secs, total_latency, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                provider, cache_ratio, cache_samples, cache_age_secs, total_latency,
+                speed_ms_per_1k, speed_samples, speed_age_secs, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
             ON CONFLICT(provider) DO UPDATE SET
                 cache_ratio = excluded.cache_ratio,
                 cache_samples = excluded.cache_samples,
                 cache_age_secs = excluded.cache_age_secs,
                 total_latency = excluded.total_latency,
+                speed_ms_per_1k = excluded.speed_ms_per_1k,
+                speed_samples = excluded.speed_samples,
+                speed_age_secs = excluded.speed_age_secs,
                 updated_at = excluded.updated_at",
             params![
                 row.provider,
@@ -818,6 +859,9 @@ impl AdminStore for SqliteStore {
                 row.cache_samples as i64,
                 row.cache_age_secs as i64,
                 row.total_latency,
+                row.speed_ms_per_1k,
+                row.speed_samples as i64,
+                row.speed_age_secs as i64,
                 row.updated_at.to_rfc3339(),
             ],
         )
@@ -829,7 +873,8 @@ impl AdminStore for SqliteStore {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let mut stmt = conn
             .prepare(
-                "SELECT provider, cache_ratio, cache_samples, cache_age_secs, total_latency, updated_at
+                "SELECT provider, cache_ratio, cache_samples, cache_age_secs, total_latency,
+                        speed_ms_per_1k, speed_samples, speed_age_secs, updated_at
                  FROM provider_stats_state",
             )
             .map_err(|e| StoreError::Internal(e.to_string()))?;
@@ -840,6 +885,9 @@ impl AdminStore for SqliteStore {
                 let cache_samples: i64 = row.get("cache_samples")?;
                 let cache_age_secs: i64 = row.get("cache_age_secs")?;
                 let total_latency: String = row.get("total_latency")?;
+                let speed_ms_per_1k: Option<f64> = row.get("speed_ms_per_1k")?;
+                let speed_samples: i64 = row.get("speed_samples")?;
+                let speed_age_secs: i64 = row.get("speed_age_secs")?;
                 let updated_at: String = row.get("updated_at")?;
                 Ok(ProviderStatsStateRow {
                     provider,
@@ -847,6 +895,9 @@ impl AdminStore for SqliteStore {
                     cache_samples: cache_samples.max(0) as u64,
                     cache_age_secs: cache_age_secs.max(0) as u64,
                     total_latency,
+                    speed_ms_per_1k: speed_ms_per_1k.filter(|v| v.is_finite() && *v > 0.0),
+                    speed_samples: speed_samples.max(0) as u64,
+                    speed_age_secs: speed_age_secs.max(0) as u64,
                     updated_at: chrono::DateTime::parse_from_rfc3339(&updated_at)
                         .map(|dt| dt.with_timezone(&chrono::Utc))
                         .unwrap_or_else(|_| chrono::Utc::now()),
@@ -1109,7 +1160,8 @@ fn select_provider_stats_row(
     provider: &str,
 ) -> Result<Option<ProviderStatsStateRow>, StoreError> {
     conn.query_row(
-        "SELECT provider, cache_ratio, cache_samples, cache_age_secs, total_latency, updated_at
+        "SELECT provider, cache_ratio, cache_samples, cache_age_secs, total_latency,
+                speed_ms_per_1k, speed_samples, speed_age_secs, updated_at
          FROM provider_stats_state WHERE provider = ?1",
         params![provider],
         |row| {
@@ -1118,6 +1170,9 @@ fn select_provider_stats_row(
             let cache_samples: i64 = row.get("cache_samples")?;
             let cache_age_secs: i64 = row.get("cache_age_secs")?;
             let total_latency: String = row.get("total_latency")?;
+            let speed_ms_per_1k: Option<f64> = row.get("speed_ms_per_1k")?;
+            let speed_samples: i64 = row.get("speed_samples")?;
+            let speed_age_secs: i64 = row.get("speed_age_secs")?;
             let updated_at: String = row.get("updated_at")?;
             Ok(ProviderStatsStateRow {
                 provider,
@@ -1125,6 +1180,9 @@ fn select_provider_stats_row(
                 cache_samples: cache_samples.max(0) as u64,
                 cache_age_secs: cache_age_secs.max(0) as u64,
                 total_latency,
+                speed_ms_per_1k: speed_ms_per_1k.filter(|v| v.is_finite() && *v > 0.0),
+                speed_samples: speed_samples.max(0) as u64,
+                speed_age_secs: speed_age_secs.max(0) as u64,
                 updated_at: chrono::DateTime::parse_from_rfc3339(&updated_at)
                     .map(|dt| dt.with_timezone(&chrono::Utc))
                     .unwrap_or_else(|_| chrono::Utc::now()),
@@ -1580,6 +1638,9 @@ mod tests {
             cache_samples: 42,
             cache_age_secs: 17,
             total_latency: r#"[{"age_secs":12,"latency_ms":4210.5,"warm":true}]"#.into(),
+            speed_ms_per_1k: Some(6_119.0),
+            speed_samples: 31,
+            speed_age_secs: 9,
             updated_at: Utc::now(),
         };
         store.save_provider_stats_state(row.clone()).unwrap();
@@ -1600,9 +1661,71 @@ mod tests {
         assert_eq!(rows[0].cache_samples, 43);
         assert_eq!(rows[0].cache_age_secs, 17);
         assert!(rows[0].total_latency.contains("4210.5"));
+        // The remembered speed has to survive the store as well: a restart
+        // must not make the pool forget which member it measured as slow.
+        assert_eq!(rows[0].speed_ms_per_1k, Some(6_119.0));
+        assert_eq!(rows[0].speed_samples, 31);
+        assert_eq!(rows[0].speed_age_secs, 9);
 
         store.delete_provider_stats_state("OA-VOLC-1").unwrap();
         assert!(store.load_provider_stats_states().unwrap().is_empty());
+    }
+
+    /// A database written before the pool learned to remember speed has no
+    /// speed columns. Opening it must add them in place: `CREATE TABLE IF
+    /// NOT EXISTS` never alters an existing table, so without the migration
+    /// every save of the remembered speed would fail with "table
+    /// provider_stats_state has no column named speed_ms_per_1k" — and the
+    /// pool would forget the speed it had learned, on every restart, forever.
+    #[test]
+    fn an_old_database_gains_the_speed_columns_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("maxllm.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE provider_stats_state (
+                    provider TEXT PRIMARY KEY,
+                    cache_ratio REAL NOT NULL DEFAULT 0,
+                    cache_samples INTEGER NOT NULL DEFAULT 0,
+                    cache_age_secs INTEGER NOT NULL DEFAULT 0,
+                    total_latency TEXT NOT NULL DEFAULT '[]',
+                    updated_at TEXT NOT NULL
+                );
+                INSERT INTO provider_stats_state
+                    (provider, cache_ratio, cache_samples, cache_age_secs, total_latency, updated_at)
+                VALUES ('OA-VOLC-1', 0.5, 3, 4, '[]', '2026-11-09T00:00:00+00:00');",
+            )
+            .unwrap();
+        }
+
+        let store = SqliteStore::open(&path).unwrap();
+
+        // The legacy row survives the upgrade, and it is simply *unmeasured*.
+        let rows = store.load_provider_stats_states().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].provider, "OA-VOLC-1");
+        assert_eq!(rows[0].speed_ms_per_1k, None);
+        assert_eq!(rows[0].speed_samples, 0);
+
+        // And the new columns are writable: the pool may now remember.
+        store
+            .save_provider_stats_state(ProviderStatsStateRow {
+                provider: "OA-VOLC-1".into(),
+                cache_ratio: 0.5,
+                cache_samples: 3,
+                cache_age_secs: 4,
+                total_latency: "[]".into(),
+                speed_ms_per_1k: Some(6_119.0),
+                speed_samples: 31,
+                speed_age_secs: 9,
+                updated_at: Utc::now(),
+            })
+            .unwrap();
+        let rows = store.load_provider_stats_states().unwrap();
+        assert_eq!(rows[0].speed_ms_per_1k, Some(6_119.0));
+        assert_eq!(rows[0].speed_samples, 31);
+        assert_eq!(rows[0].speed_age_secs, 9);
     }
 
     /// A rename must carry the evidence with it: a row left under the old
@@ -1618,6 +1741,9 @@ mod tests {
                 cache_samples: 7,
                 cache_age_secs: 3,
                 total_latency: "[]".into(),
+                speed_ms_per_1k: None,
+                speed_samples: 0,
+                speed_age_secs: 0,
                 updated_at: Utc::now(),
             })
             .unwrap();
