@@ -11136,3 +11136,156 @@ provider = "mock_openai"
         "the breaker report needs the master key"
     );
 }
+
+/// Native-Responses provider that declares the ark prefill repair explicitly.
+/// `base_url` points at the mock, so the repair can only come from the named
+/// config field — the host sniff is exercised by the no-flag control below.
+const ARK_REPAIR_NATIVE_RESPONSES_CONFIG: &str = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[metrics]
+enabled = true
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.mock_ark]
+kind = "openai_compat"
+base_url = "{MOCK_URL}"
+upstream_path = "/api/coding/v3/chat/completions"
+responses_path = "/api/coding/v3/responses"
+native_responses = true
+native_responses_repair = "ark_trailing_assistant"
+api_key = "fake-key"
+
+[[routes]]
+path = "/v1/responses"
+provider = "mock_ark"
+endpoint_type = "responses"
+"#;
+
+/// Same provider without the repair declaration and with a non-ark host: the
+/// body must reach the upstream byte-for-byte (no trailing-turn surgery).
+const PLAIN_NATIVE_RESPONSES_CONFIG: &str = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[metrics]
+enabled = true
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.mock_plain]
+kind = "openai_compat"
+base_url = "{MOCK_URL}"
+upstream_path = "/api/coding/v3/chat/completions"
+responses_path = "/api/coding/v3/responses"
+native_responses = true
+api_key = "fake-key"
+
+[[routes]]
+path = "/v1/responses"
+provider = "mock_plain"
+endpoint_type = "responses"
+"#;
+
+fn trailing_assistant_input() -> Value {
+    json!([
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "summarise"}]},
+        {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "draft"}]}
+    ])
+}
+
+async fn native_responses_upstream_reply(mock: &MockServer) {
+    let upstream_body = json!({
+        "id": "resp_ark",
+        "object": "response",
+        "status": "completed",
+        "model": "deepseek-v4-flash",
+        "output": [],
+        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+    });
+    Mock::given(method("POST"))
+        .and(path("/api/coding/v3/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(upstream_body))
+        .expect(1)
+        .mount(mock)
+        .await;
+}
+
+#[tokio::test]
+async fn test_ark_native_responses_drops_trailing_assistant_text_turn() {
+    let mock = MockServer::start().await;
+    native_responses_upstream_reply(&mock).await;
+
+    let gw = TestGateway::start(ARK_REPAIR_NATIVE_RESPONSES_CONFIG, &mock.uri()).await;
+    let request_body = json!({
+        "model": "deepseek-v4-flash",
+        "input": trailing_assistant_input(),
+        "stream": false
+    });
+
+    let resp = client()
+        .post(gw.url("/v1/responses"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&request_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let requests = mock.received_requests().await.unwrap();
+    let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let input = sent["input"].as_array().expect("input must stay an array");
+    assert_eq!(
+        input.len(),
+        1,
+        "the trailing assistant text turn must be dropped, got {input:?}"
+    );
+    assert_eq!(input[0]["role"], "user");
+}
+
+#[tokio::test]
+async fn test_plain_native_responses_keeps_trailing_assistant_text_turn() {
+    let mock = MockServer::start().await;
+    native_responses_upstream_reply(&mock).await;
+
+    let gw = TestGateway::start(PLAIN_NATIVE_RESPONSES_CONFIG, &mock.uri()).await;
+    let request_body = json!({
+        "model": "deepseek-v4-flash",
+        "input": trailing_assistant_input(),
+        "stream": false
+    });
+
+    let resp = client()
+        .post(gw.url("/v1/responses"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&request_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let requests = mock.received_requests().await.unwrap();
+    let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let input = sent["input"].as_array().expect("input must stay an array");
+    assert_eq!(
+        input.len(),
+        2,
+        "a non-ark provider must receive the body untouched"
+    );
+}
