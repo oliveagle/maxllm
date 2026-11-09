@@ -1819,6 +1819,90 @@ volc_t_1 100、xiaomi 98、volc_1 43），`maxllm_session_affinity_hits_total 85
 `metrics is loopback-only; set [metrics] allow_remote = true`），要在 NAS 上
 `ssh … 'curl -s 127.0.0.1:3795/metrics'` 才看得到；本机节点没有这个限制。
 
+### 15.9 「不是要 auto rotate 么」：11:15 那次为什么没转（2026-11-09 14:0x–14:3x CST）
+
+三件事叠在一起，缺一件都不会让智谱的原文落到客户端面前。
+
+**第一层：那一轮没有可轮换的候选。** 智谱是那个模型在池子里**唯一**能服务的
+provider（`/v1/responses/zhipu_1` 这条路由连 `fallback` 都是空的），所以
+"rotate"当时是**有机制、没目标**。
+
+**第二层：请求落在入口 primary —— VPS 上那台还没升级的 0.3.10。** 三条实测：
+
+- `GET http://10.126.126.199:18081/health` → `"version":"0.3.10"`（NAS 与本机都是 0.3.12）；
+- NAS 与 oleFedora01 的 `request_logs` 在 `2026-11-09T03:15Z`（= 11:15 CST）
+  **一条 zhipu 记录都没有** —— 那次请求既没落在 NAS，也没落在本机，只可能在 VPS 上；
+- VPS 的 `/admin/breakers` 返回 404（老二进制没有这个端点）—— 它**不认
+  `[quota_parking]`、不参加跨节点熔断共享**，所以 NAS 在 11-08 22:06 就学到的
+  智谱周墙（`force_open_until = 2026-11-10T22:58:54+08:00`，与报错里的重置时刻
+  一字不差）它并不知道。11:15:04 它照发请求，于是自己撞上智谱的周墙。
+
+**第三层：0.3.10 不"拥有自己的错误"。** `own_the_error`（401/402/403/408/409/425/
+429/5xx → 503 + `Retry-After` + `X-MaxLLM-Upstream-Status`，上游 body 永不下发）是
+`64540cd` 引入的，**在 v0.3.10 之后**才有。所以老网关把上游 429 的 body 原样交给
+客户端，客户端读到的就是"我被限流了，等 2026-11-10 22:58:54"，而不是"这个 provider
+的配额墙了，换一个"。已升级的两台现在会这么回答（NAS 实测）：
+
+```
+POST http://10.126.126.6:3795/v1/responses/zhipu_1  →  503
+{"error":{"code":503,"message":"no provider available: zhipu_1=circuit open (quota force-open) …","type":"gateway_error"}}
+```
+
+**轮换本身是活的**（NAS 0.3.12 实测计数器）：
+`maxllm_fallbacks_total{from_provider="kimi",to_provider="volc_1"}=1`、
+`{from_provider="open_design",to_provider="volc_1"}=1`、
+`maxllm_http_failovers_total{from_provider="kimi",status="429",to_provider="volc_1"}=1`。
+大 body 也不会卡死：270 KB 的请求打 `/v1/responses/auto_home`（池里多数成员已下线）
+返回 200，说明**整个请求体被完整重放**（`067320a`，v0.3.10 就已包含）。
+
+#### 15.9.1 入口 nginx：主节点 5xx 时不会切备份（已修，待 VPS root 部署）
+
+`ops/machines/vm_tecent_cloud_01/maxllm/nginx-maxllm-ha.conf` 里**根本没有
+`proxy_next_upstream`** —— nginx 的默认只有 `error timeout`，**502/503/504 不会
+切到备份**。于是老节点回 503（配额墙/池空）时，即使 NAS 好好的，客户端照样拿到
+503。补丁（ops 仓库 `bdac746d`）：
+
+```nginx
+proxy_next_upstream error timeout http_502 http_503 http_504 non_idempotent;
+proxy_next_upstream_tries 3;
+```
+
+`non_idempotent` 不能省：LLM 全是 POST，nginx 默认**不会**把已经发到上游的
+非幂等请求再发给下一个上游 —— 没有它，这条规则对 LLM 流量等于没写。
+
+生效需要 VPS root（本会话没有凭据）：
+
+```bash
+REMOTE=root@10.126.126.199 \
+  ~/.agents/ops/machines/vm_tecent_cloud_01/maxllm/deploy-nginx.sh
+```
+
+在此之前，客户端 base_url 直指 NAS `http://10.126.126.6:3795/v1` 或本机
+`http://10.126.126.20:3795/v1` 比挂 :18081 稳（用户的 4 台客户端
+192.168.2.165/.106/.83/.198 本来就直连 NAS）。
+
+#### 15.9.2 探针不再吃订阅配额（`c2f4d0d`）
+
+`maxllm-pool-health.timer` 每 5 分钟给每个池成员发一次真实请求 —— 这是真实请求、
+真实订阅额度：2026-11-09 它占了 NAS **全部上游请求的 21%**（约 250 发/小时），
+其中 270 发打向**早就知道是墙**的成员（kimi 429 ×152、open_design 402 ×118）。
+而探针流量被网关排除在 `request_logs` 与 `/metrics` 之外，**这笔浪费一直不可见**。
+
+现在只问"还值得问"的问题（NAS 实测一轮）：
+
+| 成员状态 | 判定 | 依据 | 探不探 |
+|---|---|---|---|
+| 网关已停放（熔断开着且有未来截止时刻） | `WALL` | `GET /admin/breakers` | 不探（volc_2 / zhipu_1 / kimi） |
+| 最近真的服务过流量 | `SERVED` | **网关自己的账本** `request_logs` | 不探（8 个成员） |
+| 上次探针吃到配额错误 | `QUOTA` | 探针自己的退避（每轮翻倍） | 暂时不探（open_design） |
+
+"服务过流量"必须读**账本**而不是指标计数器：计数器在网关重启后从 0 开始，
+会让每个成员都看起来"从没被用过"，退避就会失灵。账本（`request_logs`）是网关
+自己的记录，重启也在。
+
+实测：订阅成员的探针从 **12 发/轮降到 0**（只剩本地 GPU 盒子与 1 个 metered
+成员被探），一轮省 10–12 发上游请求。
+
 ## 附录 A：复现与口径
 
 ```sh
