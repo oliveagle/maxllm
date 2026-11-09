@@ -2297,6 +2297,104 @@ if p.circuit_breaker.state() == crate::circuit_breaker::STATE_HALF_OPEN {
 **`51cd3cb6dd98993f`**（`bcebb86`），两台 **0.3.12** + `active` + `NRestarts=0` +
 auto 池 9/12 可用，sha 一致。
 
+### 15.15 首字节 deadline：上游"接了请求但不开口"要在 30 s 内换人（`feat/capacity-resilience`）
+
+**症状（生产证据）。** 2026-11-09 17:0x 前后，NAS 的 recordings 里有三条请求
+`ttft_ms` = 95.9 s / 124.9 s / 127.8 s，两条以
+`Downstream ConnectionClosed … Prematurely before response body is complete` 收尾
+—— **客户端先放弃了**（客户端的耐心大约 120 s），网关的 failover 恰好在 125 s 落地，
+晚了 5 s。
+
+**根因（读 recorder 的事件序列，不是猜）。** 这三条的完整序列是：
+
+```
+t+0.0s   provider_request → opencode_go_1 / opencode_go_2
+t+120.3s error: Upstream ReadTimedout … while reading response headers   ← 上游一个字节都没给
+t+120.3s provider_request → volc_1                                     ← failover 换人
+t+124.6s provider_response 200 (volc_1)                                ← 4.6 s 就答了
+t+125.1s client_response: Downstream ConnectionClosed                   ← 客户端 120 s 的耐心已尽
+```
+
+三个事实：
+
+1. **慢的不是网关，是上游"不开口"**：`while reading response headers` —— 请求送到了，
+   上游 120 s 一个响应头都没回。
+2. **failover 本身是好的**：换到 volc_1 后 **4.6 s** 就答了。问题是它**落地太晚**。
+3. **落地太晚的原因是"停顿预算"太长**：这两个 provider 没配 `read_timeout_secs`，
+   于是 `provider.read_timeout.or(route_timeout).unwrap_or(DEFAULT_READ_TIMEOUT)`
+   取到了**路由的 120 s** —— 正好等于客户端的耐心，所以 failover 永远来不及。
+
+**为什么不能用"更小的 read timeout"代替。** `read_timeout` 是**每次读**的预算，
+它管的是"上游中途哑了"；把它调小到 30 s 会把**长思考的流**（两个 chunk 之间停 40 s）
+也一起砍掉。首字节 deadline 管的是**开始**：上游一旦开口，后面流多久都行。
+
+**24 h 分布（决定阈值用）。** NAS 24 h 共 29 316 条：
+
+| 分位 | p50 | p90 | p99 | max |
+|---|---|---|---|---|
+| TTFT | 1.9 s | 5.2 s | 14.4 s | 130 s |
+
+慢尾（ttft > 30 s）只有 **87 条（0.3 %）**，而且**与上下文大小无关**（0–25 k 与
+200 k–250 k 两个桶的 p50 分别是 1.1 s 和 2.1 s）—— 说明慢尾**不是"大上下文 prefill 慢"**，
+而是**上游真的停住了**；而池子里别的成员 p50 只要 1.9 s（prompt cache 让 prefill 几乎免费），
+换人几乎总是更快。按 provider 拆，"上游 45 s 不开口"的 23 条里 **opencode_go_1 占 10 条、
+opencode_go_2 占 6 条**。
+
+**修法。** 每个 provider 一个 `first_byte_timeout_secs`（默认 30 s，`0` = 关闭）：
+上游必须在 30 s 内交出**第一个字节**，否则这次尝试作废、failover 换下一个成员，
+并把这次失败记进熔断器（那个成员会被 circuit open 踢出轮换）。
+
+**只在流式请求上生效。** 流式请求的首字节是**第一个 token**（正常成员 1.9 s）；
+非流式请求的首字节是**整个答案**，用 30 s 去卡它会把合法的长生成砍掉。判定"是不是流式"
+只能在**读完请求体之后**（body 里的 `stream`），而上游请求头是在读 body **之前**写出去的
+—— 两者的时序对不上。
+
+**所以判定结果用一个 cell 传递**（`vendor/pingora-proxy/src/first_byte.rs`）：
+
+* `ProxyHttp::first_byte_budget()` 把 cell 交给 proxy；默认 `None` = 不设 deadline。
+* 网关在 request body filter 读完 body 后决定：流式 → `Some(30 s)`，非流式 → `None`。
+* proxy 的上游循环**先等这个决定**再开始读响应 —— 已经在读的那次读不能被打断，
+  否则**读了一半的响应头会丢**。等待期间请求体照常流向上游（body filter 不能被堵死）。
+* 决定到了才给**第一次读**套上超时；**响应头不算答案**，所以 deadline 一直挂到
+  **第一个 body chunk** 到达为止，之后流多久都不管。超时按 `ReadTimedout` 上报 ——
+  网关把它当成"这个成员不会答"，照常 failover + 记熔断。
+
+**测试（去掉修复即红）。**
+
+| 测试 | 断言 |
+|---|---|
+| `test_first_byte_deadline_cuts_a_slow_start_and_fails_over` | provider `first_byte_timeout_secs = 1`、`read_timeout_secs = 60`，上游 5 s 才开口 → **~1 s 内 failover** 到 backup 并 200；去掉修复则等到 5 s 才回（provider 仍是 slow） |
+| `test_first_byte_deadline_does_not_cut_a_non_streaming_answer` | 同样 1 s deadline，但**非流式**请求、上游 2.5 s 才答 → **不被砍**，答案来自 slow（不发生 failover） |
+| `test_first_byte_timeout_defaults_to_unset_and_is_parsed` | 配置：`first_byte_timeout_secs` 未设 = `None`，写了 = `Some(20)` |
+
+**门禁。** `cargo fmt --all -- --check` 干净；`cargo clippy --all-targets -- -D warnings`
+退出码 0；`cargo test --workspace` **931 passed / 0 failed**（基线 928 + 本节 3 个新测试）。
+
+**部署。** commit `2fe7820`（代码）+ 本节（文档），`scripts/deploy_maxllm.sh nas && … fedora`
+从 `/tmp/mx-capacity` 这棵工作树出发（**不要**从主工作区发），musl static-pie 守卫通过：
+
+| 节点 | sha256[:16] | version | health | systemd | NRestarts |
+|---|---|---|---|---|---|
+| oleNas01 | `96081d90f961bcb1` | 0.3.12 | 200 | active | 0 |
+| oleFedora01 | `96081d90f961bcb1` | 0.3.12 | 200 | active | 0 |
+
+两台 sha 一致。落地后二进制的 strings 里有 `no upstream byte within the first-byte deadline`
+和 `first_byte_timeout_secs`（说明新代码真的在跑）。冒烟：`/v1/responses/auto` 流式请求
+两台都是 **200**，TTFT 0.50 s（NAS）/ 0.47 s（Fedora）。**配置不用动** —— 未设
+`first_byte_timeout_secs` 就是默认 30 s；重启后的熔断状态：17 closed / 12 half-open /
+3 open（`volc_1`、`volc_2` 至 2026-11-27、`zhipu_1` 至 2026-11-10 22:58:54 +08:00 —— 
+正是智谱周墙）。
+
+**上线后的观测口径。** 注意口径：deadline 是**每个上游尝试** 30 s，failover 换人之后
+客户端还要再等换手的那一次，所以客户端看到的 TTFT 落在 **30 s + 接手成员的 TTFT**
+（≈ 32–35 s），而不是掉到 0。因此看的是：
+
+* **客户端 TTFT > 60 s 的条数应当掉到 0**（原来最坏 130 s）；
+* 被 deadline 换掉的那一次尝试会以 `X-MaxLLM-Fallback-From` 出现在日志里（被换掉的是
+  provider，不是客户端）；
+* `maxllm_requests_total{status=~"5.."}` **不应上涨** —— 换人成功时客户端仍然是 200，
+  这正是本节的目的（原来客户端等不到就自己断了）。
+
 ## 附录 A：复现与口径
 
 ```sh
