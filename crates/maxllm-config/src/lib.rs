@@ -271,6 +271,8 @@ impl Default for SessionStickyConfig {
             enabled: false,
             timeout_secs: default_session_timeout_secs(),
             max_entries: default_session_max_entries(),
+            body_affinity: false,
+            body_affinity_max_bytes: default_session_body_affinity_max_bytes(),
         }
     }
 }
@@ -286,6 +288,27 @@ pub struct SessionStickyConfig {
     /// Max number of session entries kept in memory (LRU eviction on overflow).
     #[serde(default = "default_session_max_entries")]
     pub max_entries: usize,
+    /// Resolve the session identity from the **request body** when the
+    /// client sends no session header.
+    ///
+    /// The header spellings (`session-id`, `thread-id`, `X-Session-ID`, ...)
+    /// are the obvious source, but a proxy in front of the gateway (one-api
+    /// is one) drops them: the request reaches the gateway with no session
+    /// identity at all, and every turn of a conversation is then free to land
+    /// on a different account. The identity also lives in the body —
+    /// codex sends `prompt_cache_key` and `client_metadata.session_id` —
+    /// and the body survives every proxy.
+    ///
+    /// Reading the body costs one buffered copy of the request and delays
+    /// the upstream call by the time it takes to receive it, which is why
+    /// it is opt-in.
+    #[serde(default = "default_false")]
+    pub body_affinity: bool,
+    /// Largest request body that is buffered for the body affinity, in
+    /// bytes. A bigger body is left alone (no affinity) rather than being
+    /// held in memory.
+    #[serde(default = "default_session_body_affinity_max_bytes")]
+    pub body_affinity_max_bytes: usize,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -684,6 +707,12 @@ fn default_session_max_entries() -> usize {
     10_000
 }
 
+/// 8 MiB: an agent request with a 1M-token context is ~4 MB, so the cap
+/// has to be well above that to keep the affinity for the big ones too.
+fn default_session_body_affinity_max_bytes() -> usize {
+    8 * 1024 * 1024
+}
+
 fn default_recording_dir() -> String {
     "./recordings".to_string()
 }
@@ -933,6 +962,52 @@ fn expand_env_vars(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The body affinity is opt-in: a config that does not ask for it keeps
+    /// the old behaviour (headers only), and the size cap has a usable
+    /// default when only the switch is set.
+    #[test]
+    fn session_body_affinity_defaults_off_but_caps_at_8mib() {
+        let cfg: Config = toml::from_str(
+            r#"
+[server]
+listen = "0.0.0.0:1"
+
+[providers.mock]
+kind = "openai"
+base_url = "http://127.0.0.1:1"
+api_key = "k"
+
+[session_sticky]
+enabled = true
+"#,
+        )
+        .expect("config parses");
+        let sticky = cfg.session_sticky.expect("session_sticky");
+        assert!(!sticky.body_affinity, "body affinity is opt-in");
+        assert_eq!(sticky.body_affinity_max_bytes, 8 * 1024 * 1024);
+
+        let cfg: Config = toml::from_str(
+            r#"
+[server]
+listen = "0.0.0.0:1"
+
+[providers.mock]
+kind = "openai"
+base_url = "http://127.0.0.1:1"
+api_key = "k"
+
+[session_sticky]
+enabled = true
+body_affinity = true
+body_affinity_max_bytes = 1048576
+"#,
+        )
+        .expect("config parses");
+        let sticky = cfg.session_sticky.expect("session_sticky");
+        assert!(sticky.body_affinity);
+        assert_eq!(sticky.body_affinity_max_bytes, 1024 * 1024);
+    }
 
     #[test]
     fn utc_offset_shapes_parse() {

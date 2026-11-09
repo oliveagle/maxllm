@@ -158,6 +158,13 @@ pub struct RequestCtx {
     pub attempted_providers: Vec<String>,
     /// Session identity for session-sticky routing (from headers and/or body).
     pub session_id: Option<String>,
+    /// The request body, read in `request_filter` before the provider was
+    /// picked, so the session identity could be resolved from it.
+    ///
+    /// The body is re-injected by the body filter as the request's single
+    /// chunk, so the upstream sees exactly the bytes the client sent. It is
+    /// `None` again once the body filter has taken it.
+    pub prefetched_body: Option<bytes::Bytes>,
     /// Whether this request *continues* a conversation the provider has
     /// already served — i.e. the session was pinned to this provider and the
     /// pin was honoured.
@@ -358,6 +365,7 @@ impl RequestCtx {
             pending_retry_backoff_ms: None,
             attempted_providers: Vec::new(),
             session_id: None,
+            prefetched_body: None,
             session_continuation: false,
             request_uuid: uuid::Uuid::now_v7().to_string(),
             ttft_ms: None,
