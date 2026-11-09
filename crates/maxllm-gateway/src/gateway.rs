@@ -340,6 +340,10 @@ pub struct HotState {
     /// rotates over. Entries whose provider is missing from the config are
     /// dropped at build time, so a pool can only contain usable providers.
     pub auto_pools: Vec<AutoPoolState>,
+    /// This node's friendly name (the `MAXLLM_NODE_ID` override, or the
+    /// hostname). It travels with the machine, never with the config file —
+    /// see [`AiGateway::instance_id`] for the identity the peers use.
+    pub node_name: String,
 }
 
 /// One resolved rotation pool: the sentinel model clients send plus its
@@ -432,6 +436,10 @@ pub struct AiGateway {
     /// Hot-reloadable state, atomically swappable via ArcSwap.
     /// Wrapped in Arc so a clone can be shared with the file watcher thread.
     pub hot: Arc<arc_swap::ArcSwap<HotState>>,
+    /// This instance's identity, unique per running gateway (not per
+    /// machine). The cross-node sync uses it to recognise the peer that is
+    /// really itself.
+    pub instance_id: String,
     /// Budget enforcer for per-key budget tracking.
     #[allow(dead_code)]
     pub budget_enforcer: Option<Arc<maxllm_admin::BudgetEnforcer>>,
@@ -972,7 +980,46 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
         guardrail_engine,
         models_response,
         auto_pools,
+        node_name: node_name_of(),
     })
+}
+
+/// This node's friendly name: the environment, or the hostname.
+///
+/// The identity deliberately does **not** live in the pool config. The config
+/// is *copied* from node to node (see `scripts/sync_config.sh`), so an id in
+/// the file would belong to the node the copy came from: two nodes would
+/// believe they are the same node, and the cross-node sharing would stop
+/// without a trace. The env file is node-local, so the identity travels with
+/// the machine and never with the config.
+fn node_name_of() -> String {
+    if let Ok(id) = std::env::var("MAXLLM_NODE_ID") {
+        let id = id.trim();
+        if !id.is_empty() {
+            return id.to_string();
+        }
+    }
+    default_node_id()
+}
+
+/// The hostname, used when the config does not name the node.
+///
+/// `HOSTNAME` is set by the shell and by systemd; the kernel keeps the same
+/// value in `/proc/sys/kernel/hostname` for the cases where it is not.
+fn default_node_id() -> String {
+    if let Ok(host) = std::env::var("HOSTNAME") {
+        let host = host.trim();
+        if !host.is_empty() {
+            return host.to_string();
+        }
+    }
+    if let Ok(host) = std::fs::read_to_string("/proc/sys/kernel/hostname") {
+        let host = host.trim();
+        if !host.is_empty() {
+            return host.to_string();
+        }
+    }
+    "unknown".to_string()
 }
 
 /// Round-robin counter for the auto pool (shared across auto routes).
@@ -1594,9 +1641,30 @@ fn persist_provider_stats(hot: &Arc<arc_swap::ArcSwap<HotState>>, api: &maxllm_a
     }
 }
 
+/// A counter that makes every gateway instance in this process unique.
+static INSTANCE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The identity of one gateway *instance*.
+///
+/// The peer list is the same on every node — that is what makes a config
+/// file copyable from node to node — so a node inevitably polls itself. The
+/// identity tells the sync that the peer it just fetched is this very
+/// gateway, so it stops talking to itself: a self-adopted failure open
+/// would re-open a provider that is half-open and probing, and the provider
+/// would never be given another chance.
+///
+/// It is per *instance*, not per machine: two gateways can share a host (a
+/// canary next to the live one, a test pair), and they are two nodes as far
+/// as the cluster is concerned.
+fn new_instance_id(node_name: &str) -> String {
+    let n = INSTANCE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{}-{}-{}", node_name, std::process::id(), n)
+}
+
 impl AiGateway {
     pub fn new(config: &Config) -> Result<Self, Box<dyn std::error::Error>> {
         let hot_state = build_hot_state(config)?;
+        let instance_id = new_instance_id(&hot_state.node_name);
 
         // Initialize admin API if configured
         let mut budget_enforcer: Option<Arc<maxllm_admin::BudgetEnforcer>> = None;
@@ -1901,6 +1969,7 @@ impl AiGateway {
                     sync.interval_secs,
                     sync.auth_token.clone(),
                     sync.share_failures,
+                    instance_id.clone(),
                 ));
                 info!(
                     peers = ?sync.peers,
@@ -1912,6 +1981,7 @@ impl AiGateway {
 
         Ok(Self {
             hot,
+            instance_id,
             budget_enforcer,
             key_rate_limiter: Arc::new(crate::key_rate_limit::KeyRateLimiter::new()),
             admin_api,
@@ -4113,6 +4183,7 @@ impl ProxyHttp for AiGateway {
             let body = serde_json::to_vec(&serde_json::json!({
                 "status": if degraded { "degraded" } else { "ok" },
                 "version": env!("CARGO_PKG_VERSION"),
+                "node_name": hot.node_name,
                 "providers": {
                     "healthy": providers_healthy,
                     "total": providers_total,
@@ -7928,7 +7999,14 @@ impl AiGateway {
                 .unwrap_or_default()
                 .cmp(b["provider"].as_str().unwrap_or_default())
         });
-        serde_json::json!({ "breakers": breakers })
+        serde_json::json!({
+            "breakers": breakers,
+            // The name of the node, for a human reading the report.
+            "node_name": hot.node_name,
+            // The identity of *this instance*: a peer that reports it is this
+            // gateway, and the sync skips it instead of talking to itself.
+            "instance_id": self.instance_id,
+        })
     }
 
     /// Park a provider until a known instant.
@@ -9711,6 +9789,7 @@ mod fallback_model_carrying_tests {
         let hot_state = build_hot_state(&config).unwrap();
         AiGateway {
             hot: Arc::new(arc_swap::ArcSwap::from_pointee(hot_state)),
+            instance_id: "test-instance".to_string(),
             budget_enforcer: None,
             key_rate_limiter: Arc::new(crate::key_rate_limit::KeyRateLimiter::new()),
             admin_api: None,
