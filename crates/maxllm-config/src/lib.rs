@@ -141,6 +141,17 @@ pub struct BreakerSyncConfig {
     /// secret is stored in the file itself.
     #[serde(default)]
     pub auth_token: Option<String>,
+    /// Whether a peer's *failure-driven* open is adopted too.
+    ///
+    /// A provider that keeps failing on one node is dead for the cluster as
+    /// long as every node keeps it in rotation. Sharing the open makes the
+    /// learning event happen once instead of once per node — the local
+    /// circuit opens for the local fail window and then probes, so the
+    /// provider earns its place back on local evidence. A provider that
+    /// answers successfully here inside the fail window is kept: the local
+    /// success is fresher than the peer's failure count.
+    #[serde(default = "default_true")]
+    pub share_failures: bool,
 }
 
 fn default_breaker_sync_interval() -> u64 {

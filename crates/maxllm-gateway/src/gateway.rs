@@ -1910,6 +1910,7 @@ impl AiGateway {
                     sync.peers.clone(),
                     sync.interval_secs,
                     sync.auth_token.clone(),
+                    sync.share_failures,
                 ));
                 info!(
                     peers = ?sync.peers,
@@ -9882,7 +9883,10 @@ api_key = "sk-c"
         );
         let gw = gateway(&toml);
         let ctx = ctx_on(0, "mimo-v2.6-flash", "primary");
-        assert!(gw.has_usable_fallback(&ctx), "the carrier member is a usable fallback");
+        assert!(
+            gw.has_usable_fallback(&ctx),
+            "the carrier member is a usable fallback"
+        );
 
         // The same route with only the dead-end as fallback: the peek must
         // stay true — that member's 400/404 is exactly what triggers the
@@ -9902,7 +9906,6 @@ api_key = "sk-c"
         );
     }
 }
-
 
 #[cfg(test)]
 mod auth_plugin_wiring_tests {

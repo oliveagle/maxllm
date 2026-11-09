@@ -11323,6 +11323,136 @@ endpoint_type = "responses"
     let _ = child_b.kill();
 }
 
+/// A provider that keeps failing on one node is dead for the cluster, not
+/// for that node alone.
+///
+/// The node that never sent traffic to it cannot know that: it keeps
+/// picking the member and keeps paying a failed attempt per request. The
+/// peer that saw the failures tells it, and the second node stops asking.
+#[tokio::test]
+async fn test_a_failure_learned_on_one_node_is_adopted_by_the_peer() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("upstream is down"))
+        .mount(&mock)
+        .await;
+
+    let port_a = portpicker::pick_unused_port().expect("free port");
+    let port_b = portpicker::pick_unused_port().expect("free port");
+
+    let config = |port: u16, peer: u16| {
+        format!(
+            r#"
+[server]
+listen = "127.0.0.1:{port}"
+threads = 1
+
+[admin]
+master_key = "test-master-key"
+enabled = true
+
+[breaker_sync]
+enabled = true
+interval_secs = 1
+peers = ["http://127.0.0.1:{peer}"]
+auth_token = "test-master-key"
+
+[providers.dead]
+kind = "openai_compat"
+base_url = "{mock}"
+upstream_path = "/v1/chat/completions"
+api_key = "fake-key"
+native_responses = true
+responses_path = "/v1/responses"
+utc_offset_minutes = 480
+max_fails = 3
+fail_timeout_secs = 60
+
+[[routes]]
+path = "/v1/responses"
+provider = "dead"
+strategy = "fallback"
+endpoint_type = "responses"
+"#,
+            port = port,
+            peer = peer,
+            mock = mock.uri()
+        )
+    };
+
+    let (mut child_a, _cfg_a) = spawn_gateway_on(&config(port_a, port_b), port_a).await;
+    let (mut child_b, _cfg_b) = spawn_gateway_on(&config(port_b, port_a), port_b).await;
+
+    let body = json!({"model": "gpt-4o", "input": "hi"});
+
+    // Node A learns the failure: three consecutive 5xx answers put the
+    // provider out of rotation there.
+    for _ in 0..3 {
+        let resp = client()
+            .post(format!("http://127.0.0.1:{port_a}/v1/responses"))
+            .json(&body)
+            .send()
+            .await
+            .expect("request completes");
+        assert_eq!(
+            resp.status(),
+            503,
+            "the upstream 5xx becomes the gateway's own 503"
+        );
+    }
+    let calls_after_a = mock.received_requests().await.unwrap_or_default().len();
+    assert_eq!(calls_after_a, 3, "node A asked the provider three times");
+
+    // Node B adopts the failure: the peer that never sent traffic to the
+    // provider stops picking a dead member.
+    let mut adopted = false;
+    for _ in 0..40 {
+        let report: Value = client()
+            .get(format!("http://127.0.0.1:{port_b}/admin/breakers"))
+            .bearer_auth("test-master-key")
+            .send()
+            .await
+            .expect("the breaker report answers")
+            .json()
+            .await
+            .expect("the report is JSON");
+        let dead = report["breakers"]
+            .as_array()
+            .and_then(|b| b.iter().find(|e| e["provider"] == "dead").cloned());
+        if let Some(dead) = dead {
+            // An open *without* a deadline: a quota wall carries one, a
+            // failure-driven open does not.
+            if dead["state_name"] == "open" && dead["force_open_until"].as_u64() == Some(0) {
+                adopted = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(adopted, "node B must adopt node A's failure-driven open");
+
+    // …and must not ask the provider again.
+    let resp = client()
+        .post(format!("http://127.0.0.1:{port_b}/v1/responses"))
+        .json(&body)
+        .send()
+        .await
+        .expect("request completes");
+    assert_eq!(
+        resp.status(),
+        503,
+        "the peer answers with the gateway's own error"
+    );
+    let calls_after_b = mock.received_requests().await.unwrap_or_default().len();
+    assert_eq!(
+        calls_after_b, calls_after_a,
+        "the peer must not spend a request on a provider it knows is failing"
+    );
+
+    let _ = child_a.kill();
+    let _ = child_b.kill();
+}
+
 /// An operator's release reaches the peers.
 ///
 /// A topped-up account must not stay parked on the other nodes: the release
