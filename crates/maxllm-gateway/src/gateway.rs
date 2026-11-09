@@ -1145,6 +1145,69 @@ fn auto_pool_pin_escapable(pinned_ms: f64, median: f64) -> bool {
         && pinned_ms > AUTO_POOL_PIN_ESCAPE_FLOOR_MS
 }
 
+/// Whether a *sticky pin* may be abandoned for speed.
+///
+/// Two questions, and the order matters. First: is the member *slow*? Then:
+/// is the wait bad enough to be worth throwing the session away?
+///
+/// The first question must be answered without the client's workload. A
+/// whole-exchange duration says as much about how much the client asked the
+/// model to generate as about how fast the member is — measured on NAS
+/// (2026-11-09), the two signals disagreed completely: `opencode_go_2` had
+/// the best whole-exchange median (4 101 ms) and the worst decode rate of
+/// the cloud members (13 950 ms/1k ≈ 72 tok/s), while `ollama_local` looked
+/// ordinary (5 555 ms) and was the fastest (6 119 ms/1k ≈ 163 tok/s).
+///
+/// So the duration is only allowed to convict when the generation cannot be
+/// blamed for it:
+///
+/// * the member's decode rate is known — it is judged on that, and the
+///   duration is only the trigger that lets the verdict be looked at;
+/// * the member has no decode rate yet — it is judged on the duration of
+///   its *short* answers, which cannot be inflated by a long generation
+///   (see `provider_stats::unattributable_latency_ms`);
+/// * neither — the member is unmeasured, and *no evidence of slowness* is
+///   not evidence of slowness. The rotation is what measures it.
+///
+/// The duration alone did condemn a pin once, and it cost a cache. On
+/// 2026-11-09 06:00:05Z the tier median was 5 249 ms (three members, one
+/// sample each, right after a restart) and `minimax` — whose upstream served
+/// 99.5 % of the input from its prompt cache — had a single 13 250 ms
+/// sample for a 1 879-token answer. That is `13 250 > 5 249 x 1.5` and
+/// `13 250 > 10 000`, so the pin was abandoned, the session was handed to
+/// another member 1.7 s later, and the upstream prompt cache the
+/// conversation was built on was thrown away. The answer was long, so the
+/// duration measured the client's request, not the member — and the member
+/// had no decode evidence yet, so it had not been proven slow at all.
+fn auto_pool_pin_is_slow(
+    name: &str,
+    cohort_median: Option<f64>,
+    decode_median: Option<f64>,
+) -> bool {
+    let Some(median) = cohort_median else {
+        return false;
+    };
+    // The speed is known: judge the member on it. The duration is only the
+    // trigger — a fast member keeps its sessions even when one turn was
+    // slow (that was the client's workload).
+    if crate::provider_stats::decode_rate_ms_per_1k(name).is_some() {
+        let Some(ms) = crate::provider_stats::total_latency_ms(name) else {
+            return false;
+        };
+        if !auto_pool_pin_escapable(ms, median) {
+            return false;
+        }
+        return auto_pool_decode_is_slow(name, decode_median);
+    }
+    // The speed is not known. The member may still be convicted on duration,
+    // but only by a duration that the generation cannot explain: a short
+    // answer's duration is the member's own. A member whose answers were all
+    // long has told us nothing about its speed, and its sessions stay put.
+    let Some(ms) = crate::provider_stats::unattributable_latency_ms(name) else {
+        return false;
+    };
+    auto_pool_pin_escapable(ms, median)
+}
 /// The low-latency cohort of `healthy` for one rotation: every entry whose
 /// whole-exchange median is within [`auto_pool_cohort_ceiling`] of the tier's
 /// median, plus every entry that has no *current* measurement — never
@@ -1983,26 +2046,8 @@ impl AiGateway {
         };
         // The decode rate of the tier, as the second opinion on "slow".
         let decode_median = auto_pool_decode_median(&healthy);
-        let pin_is_slow = |name: &str| -> bool {
-            let Some(median) = cohort_median else {
-                return false;
-            };
-            let Some(ms) = crate::provider_stats::total_latency_ms(name) else {
-                return false;
-            };
-            if !auto_pool_pin_escapable(ms, median) {
-                return false;
-            }
-            // A whole-exchange duration also says how much the client asked
-            // to generate. When the provider's *speed* is known and it is
-            // fine, the long duration is the client's workload, not a slow
-            // provider — and abandoning a warm session for it would throw
-            // away the upstream prompt cache for nothing.
-            match crate::provider_stats::decode_rate_ms_per_1k(name) {
-                Some(_) => auto_pool_decode_is_slow(name, decode_median),
-                None => true,
-            }
-        };
+        let pin_is_slow =
+            |name: &str| -> bool { auto_pool_pin_is_slow(name, cohort_median, decode_median) };
 
         // 1. Session-sticky within the preferred tier: a session pinned to a
         //    pool provider keeps using it (a different key loses upstream
@@ -10139,6 +10184,85 @@ mod auto_pool_latency_tests {
         // An unmeasured tier never escapes (median 0 is handled by the
         // caller returning `None`, but the predicate itself stays strict).
         assert!(!auto_pool_pin_escapable(1_000.0, 0.0));
+    }
+
+    /// The incident of 2026-11-09 06:00:05Z, as a rule.
+    ///
+    /// The tier median was 5 249 ms — three members, one sample each, right
+    /// after a restart — and `minimax` had a single 13 250 ms sample. That is
+    /// over the floor and over 1.5x the median, so the duration gate opened.
+    /// The verdict gate has nothing to work with: one sample is not a decode
+    /// rate, and the upstream had been serving 99.5 % of the input from its
+    /// prompt cache. The pin must survive.
+    ///
+    /// The sample is a 1 879-token answer, and that is the point: a long
+    /// answer's duration measures what the client asked for, so it may not
+    /// condemn anybody.
+    #[test]
+    fn a_single_slow_sample_after_a_restart_keeps_the_pin() {
+        crate::provider_stats::record_total_latency("pin-incident", 13_250.0, true, 1_879);
+        assert!(
+            !auto_pool_pin_is_slow("pin-incident", Some(5_249.0), Some(5_000.0)),
+            "one slow long answer on an unmeasured member is not a slow member"
+        );
+    }
+
+    /// A *short* answer cannot hide behind its length: when the generation
+    /// cannot be blamed for the wait, the wait is the member's own. A member
+    /// that answers short requests slowly loses its sessions.
+    #[test]
+    fn a_slow_short_answer_loses_the_pin() {
+        for _ in 0..5 {
+            crate::provider_stats::record_total_latency("pin-short-slow", 13_250.0, true, 100);
+        }
+        assert!(
+            auto_pool_pin_is_slow("pin-short-slow", Some(5_249.0), Some(5_000.0)),
+            "13.25 s for 100 tokens is 132 500 ms/1k — the member is slow"
+        );
+    }
+
+    /// A slow turn on a member that is fast per token is the client's
+    /// workload: the pin stays.
+    #[test]
+    fn a_slow_turn_on_a_fast_member_keeps_the_pin() {
+        for _ in 0..5 {
+            crate::provider_stats::record_total_latency(
+                "pin-fast-per-token",
+                13_250.0,
+                true,
+                8_000,
+            );
+        }
+        assert!(
+            !auto_pool_pin_is_slow("pin-fast-per-token", Some(5_249.0), Some(5_000.0)),
+            "13.25 s for 8000 tokens is 1 656 ms/1k — the member is fast"
+        );
+    }
+
+    /// A member that really is slow per token loses its pin, even when the
+    /// whole-exchange duration is the only thing that looks slow.
+    #[test]
+    fn a_slow_per_token_member_loses_its_pin() {
+        for _ in 0..5 {
+            crate::provider_stats::record_total_latency("pin-slow-per-token", 13_250.0, true, 256);
+        }
+        assert!(
+            auto_pool_pin_is_slow("pin-slow-per-token", Some(5_249.0), Some(5_000.0)),
+            "51 758 ms/1k is slow whatever the duration says"
+        );
+    }
+
+    /// The escape needs the duration gate too: a member that is slow per
+    /// token but answers fast in absolute terms keeps its session.
+    #[test]
+    fn a_fast_turn_on_a_slow_per_token_member_keeps_the_pin() {
+        for _ in 0..5 {
+            crate::provider_stats::record_total_latency("pin-short-but-slow", 2_000.0, true, 256);
+        }
+        assert!(
+            !auto_pool_pin_is_slow("pin-short-but-slow", Some(5_249.0), Some(5_000.0)),
+            "2 s is not a painful turn, whatever the per-token rate says"
+        );
     }
 
     #[test]

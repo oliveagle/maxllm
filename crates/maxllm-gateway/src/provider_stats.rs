@@ -352,6 +352,42 @@ pub fn total_latency_ms(provider: &str) -> Option<f64> {
     Some(readings[readings.len() / 2])
 }
 
+/// The median whole-exchange duration over the member's recent turns that
+/// produced too few output tokens for a per-token rate to be meaningful.
+///
+/// A long answer dominates the duration with its generation, so the member
+/// looks slow because the client asked for a lot. A *short* answer cannot do
+/// that, and a warm one rules out the other suspect — a cold prefill of the
+/// whole context. What is left is the member's own latency: the queue, the
+/// round trip, the thinking time. That is the only duration evidence allowed
+/// to condemn a member.
+///
+/// Measured on NAS (2026-11-09), every slow sample of the 06:00 window was a
+/// long answer: `minimax` 13 250 ms for 1 879 output tokens, `volc_1`
+/// 23 696 ms for 1 189, `volc_t_1` 19 179 ms for 1 589, `xiaomi` 28 500 ms
+/// for 880. Those durations said what the client asked for, not how fast the
+/// member is.
+pub fn unattributable_latency_ms(provider: &str) -> Option<f64> {
+    let map = TOTAL_LATENCY.read().unwrap_or_else(|e| e.into_inner());
+    let stats = map.get(provider)?;
+    let now = Instant::now();
+    let mut readings: Vec<f64> = stats
+        .samples
+        .iter()
+        .filter(|(at, _, warm, tokens_out)| {
+            *warm
+                && *tokens_out < DECODE_RATE_MIN_OUTPUT_TOKENS
+                && now.duration_since(*at) <= TOTAL_LATENCY_WINDOW
+        })
+        .map(|(_, ms, _, _)| *ms)
+        .collect();
+    if readings.is_empty() {
+        return None;
+    }
+    readings.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    Some(readings[readings.len() / 2])
+}
+
 /// One whole-exchange latency sample, as it crosses the process boundary.
 ///
 /// The in-memory sample carries an [`Instant`], which means nothing in
@@ -849,6 +885,57 @@ mod tests {
         }
         assert_eq!(decode_rate_ms_per_1k("decode-cold"), None);
         forget("decode-cold");
+    }
+
+    /// The duration of a *long* answer says what the client asked for, so it
+    /// may not convict a member. This is the shape of the 2026-11-09 06:00
+    /// sample that cost a warm session its upstream prompt cache: 13 250 ms
+    /// for a 1 879-token answer.
+    #[test]
+    fn a_long_answer_is_not_unattributable_evidence() {
+        forget("unattr-long");
+        record_total_latency("unattr-long", 13_250.0, true, 1_879);
+        assert_eq!(unattributable_latency_ms("unattr-long"), None);
+        forget("unattr-long");
+    }
+
+    /// A *short* answer cannot hide behind its length: the wait is the
+    /// member's own, and the duration may convict it.
+    #[test]
+    fn a_short_answer_is_unattributable_evidence() {
+        forget("unattr-short");
+        for _ in 0..5 {
+            record_total_latency("unattr-short", 13_250.0, true, 100);
+        }
+        assert_eq!(unattributable_latency_ms("unattr-short"), Some(13_250.0));
+        forget("unattr-short");
+    }
+
+    /// A cold turn's prefill dominates its duration — the other suspect
+    /// besides the generation. It is not evidence either.
+    #[test]
+    fn a_cold_short_answer_is_not_unattributable_evidence() {
+        forget("unattr-cold");
+        for _ in 0..5 {
+            record_total_latency("unattr-cold", 13_250.0, false, 100);
+        }
+        assert_eq!(unattributable_latency_ms("unattr-cold"), None);
+        forget("unattr-cold");
+    }
+
+    /// Long and short answers are judged separately: the median of the
+    /// *short* ones is the only duration that may convict.
+    #[test]
+    fn the_unattributable_median_ignores_the_long_answers() {
+        forget("unattr-mixed");
+        record_total_latency("unattr-mixed", 60_000.0, true, 4_000);
+        record_total_latency("unattr-mixed", 4_000.0, true, 50);
+        record_total_latency("unattr-mixed", 5_000.0, true, 50);
+        record_total_latency("unattr-mixed", 6_000.0, true, 50);
+        // The 60 s turn is a long answer: it is not evidence, and it must
+        // not enter the median either.
+        assert_eq!(unattributable_latency_ms("unattr-mixed"), Some(5_000.0));
+        forget("unattr-mixed");
     }
 
     #[test]
