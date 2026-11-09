@@ -5047,6 +5047,98 @@ async fn test_500_without_a_quota_body_fails_over_as_an_ordinary_failure() {
     assert_eq!(state, Some(0.0), "the breaker must stay closed (0)");
 }
 
+/// A quota wall's only regular visitor is the health probe (real rotation
+/// skips open circuits). A probe that reads a quota message — here a 500
+/// wearing MiniMax's Token Plan body — must re-park the member on the
+/// cooldown ladder. Without this, the wall decays to half-open between real
+/// hits, the failover it triggers answers 200, and pool_health misreports
+/// the member as served while burning one upstream round trip per round.
+#[tokio::test]
+async fn test_a_probe_parks_a_500_quota_wall() {
+    let primary = MockServer::start().await;
+    let fallback = MockServer::start().await;
+    let laya = MockServer::start().await;
+
+    // MiniMax's real answer: 500 with the quota phrasing, no reset instant.
+    let body = json!({
+        "error": {
+            "code": "server_error",
+            "message": "已达到 Token Plan 用量上限：请升级 Token Plan 套餐或购买积分补充用量。 (2056)"
+        }
+    });
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500).set_body_json(body))
+        .expect(1)
+        .mount(&primary)
+        .await;
+
+    // No reset instant: laya classifies it as a rate limit without a chosen
+    // instant → the provider parks on the cooldown ladder.
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "answers": {
+                "is_rate_limit": { "type": "noul", "noul": 0.9 }
+            }
+        })))
+        .expect(1)
+        .mount(&laya)
+        .await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from fallback")))
+        .expect(1)
+        .mount(&fallback)
+        .await;
+
+    let gw = TestGateway::start_with_fallback_and_laya(
+        RATE_LIMIT_LEARNING_CONFIG,
+        &primary.uri(),
+        &fallback.uri(),
+        &laya.uri(),
+    )
+    .await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .header("X-MaxLLM-Probe", "1")
+        .json(&chat_body("deepseek-v4.1-flash", "hi"))
+        .send()
+        .await
+        .unwrap();
+
+    // The probe fails over to the fallback, but its observation parks the
+    // quota wall: one quota open and the breaker open after a single probe.
+    assert_eq!(
+        resp.status(),
+        200,
+        "the probe must fail over to the fallback"
+    );
+    assert_eq!(resp.headers().get("X-MaxLLM-Provider").unwrap(), "fallback");
+
+    let primary_reqs = primary.received_requests().await.unwrap();
+    assert_eq!(primary_reqs.len(), 1, "the probe reached the primary once");
+
+    let quota_opens = metric_sample(
+        &gw,
+        "maxllm_circuit_breaker_quota_opens_total{provider=\"primary\"}",
+    )
+    .await;
+    assert_eq!(
+        quota_opens,
+        Some(1.0),
+        "a probe reading a quota wall must count one quota open"
+    );
+    let state = metric_sample(&gw, "maxllm_circuit_breaker_state{provider=\"primary\"}").await;
+    assert_eq!(
+        state,
+        Some(1.0),
+        "the probe must leave the breaker open (1)"
+    );
+}
+
 // --- per-provider `utc_offset` (zone-less reset timestamps) ---------------
 
 /// Render the wall-clock timestamp `hours` ahead of now, in the zone-less
