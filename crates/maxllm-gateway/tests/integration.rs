@@ -156,6 +156,192 @@ fn chat_body(model: &str, content: &str) -> Value {
 }
 
 // ---------------------------------------------------------------------------
+// Body affinity — the session identity that survives a proxy
+// ---------------------------------------------------------------------------
+
+/// The session identity can live only in the request body.
+///
+/// codex sends `prompt_cache_key` and `client_metadata.session_id` in the
+/// body, and a proxy in front of the gateway (one-api is the usual one)
+/// drops the session headers on the way. The body survives every proxy — so
+/// the body is what the sticky router has to read, and it has to read it
+/// *before* the provider is picked.
+const BODY_AFFINITY_CONFIG: &str = r#"
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[providers.mock]
+kind = "openai"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+
+[providers.pool_a]
+kind = "openai"
+base_url = "{POOL_A_URL}"
+api_key = "fake-key"
+
+[providers.pool_b]
+kind = "openai"
+base_url = "{POOL_B_URL}"
+api_key = "fake-key"
+
+[auto_model]
+enabled = true
+name = "auto"
+
+[[auto_model.pool]]
+provider = "pool_a"
+model = "model-a"
+
+[[auto_model.pool]]
+provider = "pool_b"
+model = "model-b"
+
+[session_sticky]
+enabled = true
+timeout_secs = 3600
+max_entries = 100
+body_affinity = true
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "mock"
+auto_model = true
+session_sticky = true
+"#;
+
+/// A conversation whose identity is only in the body stays on one member —
+/// and the body the member receives is the body the client sent.
+#[tokio::test]
+async fn test_body_affinity_pins_a_session_that_only_carries_its_id_in_the_body() {
+    let mock = MockServer::start().await;
+    let a = MockServer::start().await;
+    let b = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("unused")))
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("a")))
+        .mount(&a)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("b")))
+        .mount(&b)
+        .await;
+
+    let (mut child, base, _cfg) =
+        spawn_gateway_with_pool(BODY_AFFINITY_CONFIG, [&mock.uri(), &a.uri(), &b.uri()]).await;
+    let c = client();
+
+    // Six turns of one conversation. The identity is in the body only — no
+    // session header, the way a request through one-api arrives.
+    for turn in 0..6 {
+        let body = json!({
+            "model": "auto",
+            "messages": [{"role": "user", "content": format!("turn {turn}")}],
+            "prompt_cache_key": "conv-body-1",
+        });
+        let resp = c
+            .post(format!("{base}/v1/chat/completions"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    let a_reqs = a.received_requests().await.unwrap_or_default();
+    let b_reqs = b.received_requests().await.unwrap_or_default();
+    let mock_reqs = mock.received_requests().await.unwrap_or_default().len();
+
+    assert_eq!(
+        a_reqs.len() + b_reqs.len(),
+        6,
+        "every request is served by the pool"
+    );
+    assert_eq!(mock_reqs, 0, "the route's own provider is not used");
+    assert!(
+        a_reqs.len() == 6 || b_reqs.len() == 6,
+        "the conversation stays on one member: a={} b={}",
+        a_reqs.len(),
+        b_reqs.len()
+    );
+
+    // The prefetched body is re-injected unchanged: the member sees the
+    // whole request, not a truncated one.
+    let served = if a_reqs.is_empty() { &b_reqs } else { &a_reqs };
+    let last: Value = serde_json::from_slice(&served[served.len() - 1].body).expect("json body");
+    assert_eq!(last["prompt_cache_key"], "conv-body-1");
+    let messages = last["messages"].as_array().expect("messages");
+    assert_eq!(
+        messages[messages.len() - 1]["content"],
+        "turn 5",
+        "the body the member received is the body the client sent"
+    );
+
+    child.kill().ok();
+    child.wait().ok();
+}
+
+/// Without the body affinity the identity in the body changes nothing: the
+/// rotation is free to hand every turn to another member. The switch is
+/// opt-in, so the default keeps the old behaviour.
+#[tokio::test]
+async fn test_without_body_affinity_a_body_only_session_is_not_pinned() {
+    let mock = MockServer::start().await;
+    let a = MockServer::start().await;
+    let b = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("unused")))
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("a")))
+        .mount(&a)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("b")))
+        .mount(&b)
+        .await;
+
+    let config = BODY_AFFINITY_CONFIG.replace("body_affinity = true", "body_affinity = false");
+    let (mut child, base, _cfg) =
+        spawn_gateway_with_pool(&config, [&mock.uri(), &a.uri(), &b.uri()]).await;
+    let c = client();
+
+    for turn in 0..6 {
+        let body = json!({
+            "model": "auto",
+            "messages": [{"role": "user", "content": format!("turn {turn}")}],
+            "prompt_cache_key": "conv-body-1",
+        });
+        let resp = c
+            .post(format!("{base}/v1/chat/completions"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    let a_reqs = a.received_requests().await.unwrap_or_default().len();
+    let b_reqs = b.received_requests().await.unwrap_or_default().len();
+
+    assert_eq!(a_reqs + b_reqs, 6);
+    assert!(
+        a_reqs > 0 && b_reqs > 0,
+        "without the affinity the rotation spreads the conversation: a={a_reqs} b={b_reqs}"
+    );
+
+    child.kill().ok();
+    child.wait().ok();
+}
+
+// ---------------------------------------------------------------------------
 // Configs
 // ---------------------------------------------------------------------------
 

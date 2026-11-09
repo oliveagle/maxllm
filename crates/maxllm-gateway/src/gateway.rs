@@ -350,6 +350,12 @@ pub struct HotState {
     /// Global session-sticky switch (the `[session_sticky]` section). A route
     /// also has to opt in with `session_sticky = true`.
     pub session_sticky_enabled: bool,
+    /// Resolve the session identity from the request body when the client
+    /// sends no session header (a proxy in front of the gateway may drop
+    /// the headers; the body survives it).
+    pub session_body_affinity: bool,
+    /// Largest body that is buffered for the body affinity, in bytes.
+    pub session_body_affinity_max_bytes: usize,
     pub metrics_enabled: bool,
     pub metrics_allow_remote: bool,
     pub global_chain: PluginChain,
@@ -993,6 +999,16 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
             .as_ref()
             .map(|c| c.enabled)
             .unwrap_or(false),
+        session_body_affinity: config
+            .session_sticky
+            .as_ref()
+            .map(|c| c.body_affinity)
+            .unwrap_or(false),
+        session_body_affinity_max_bytes: config
+            .session_sticky
+            .as_ref()
+            .map(|c| c.body_affinity_max_bytes)
+            .unwrap_or(0),
         routes: config.routes.clone(),
         metrics_enabled: config.metrics.enabled,
         metrics_allow_remote: config.metrics.allow_remote,
@@ -1229,6 +1245,18 @@ const AUTO_POOL_CACHE_WEIGHT_SCALE: u32 = 9;
 /// The median of the recent whole-exchange samples (time-to-last-byte, not
 /// TTFB) across `healthy`, or `None` when nothing in the tier has been
 /// measured inside the evidence window.
+/// The `Content-Length` of the downstream request, when it has one.
+///
+/// A body without a length (chunked, HTTP/2) cannot be prefetched: the
+/// bytes already read could not be handed back if the body turned out to
+/// be larger than the cap.
+fn content_length_of(session: &Session) -> Option<usize> {
+    session
+        .get_header("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<usize>().ok())
+}
+
 fn auto_pool_cohort_median(healthy: &[&AutoPoolEntry]) -> Option<f64> {
     let mut measured: Vec<f64> = Vec::with_capacity(healthy.len());
     for e in healthy.iter() {
@@ -1685,6 +1713,92 @@ fn new_instance_id(node_name: &str) -> String {
 }
 
 impl AiGateway {
+    /// Read the request body so the session identity can be resolved from it
+    /// *before* the provider is picked.
+    ///
+    /// The identity in the body (`prompt_cache_key`,
+    /// `client_metadata.session_id`, `metadata.user_id`) is the one that
+    /// survives a proxy: one-api — the gateway's usual front door — strips
+    /// the session headers, so without this the sticky router never sees a
+    /// session and every turn of a conversation is free to land on another
+    /// account (no upstream prompt cache, no shared context).
+    ///
+    /// The body is buffered in `ctx.prefetched_body` and re-injected by the
+    /// body filter as the request's single chunk, so the upstream sees
+    /// exactly the bytes the client sent. Only a body that can be sized
+    /// upfront is prefetched: a chunked body could be larger than the cap,
+    /// and the bytes already read could not be handed back to the client.
+    async fn prefetch_body_for_affinity(
+        &self,
+        session: &mut Session,
+        ctx: &mut RequestCtx,
+        hot: &HotState,
+    ) {
+        let method = ctx.request_method.as_str();
+        if !matches!(method, "POST" | "PUT" | "PATCH") {
+            return;
+        }
+        let cap = hot.session_body_affinity_max_bytes;
+        if cap == 0 {
+            return;
+        }
+        let Some(len) = content_length_of(session) else {
+            return;
+        };
+        if len == 0 || len > cap {
+            return;
+        }
+        let mut buf: Vec<u8> = Vec::with_capacity(len);
+        loop {
+            match session.as_downstream_mut().read_request_body().await {
+                Ok(Some(chunk)) => {
+                    if buf.len() + chunk.len() > cap {
+                        // The body announced a length within the cap, so this
+                        // cannot happen with a well-behaved client. Keep what
+                        // was read: a truncated body fails at the upstream
+                        // with a clear error, a lost body would hang.
+                        warn!(
+                            provider = %ctx.provider_name,
+                            bytes = buf.len(),
+                            cap,
+                            "body affinity: body grew past the cap"
+                        );
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk);
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    warn!(error = %e, "body affinity: reading the request body failed");
+                    return;
+                }
+            }
+        }
+        if buf.is_empty() {
+            return;
+        }
+        let body = bytes::Bytes::from(buf);
+        // The identity is resolved from the body *before* the provider is
+        // picked — this is the whole point of the prefetch.
+        if let Some(session_id) = crate::session_sticky::resolve_from_body(&body) {
+            ctx.session_id = Some(session_id);
+        }
+        // The body also names the model. When it names a pool sentinel
+        // (`auto`, `auto_home`), entering the pool here saves a whole round
+        // trip: without it the request goes to the route's own provider
+        // first, takes its 404, and only then walks into the pool — with a
+        // full-body replay for the second attempt.
+        if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&body) {
+            if let Some(model) = parsed.get("model").and_then(|m| m.as_str()) {
+                if hot.pool_named(model).is_some() {
+                    ctx.model = model.to_string();
+                    ctx.plugin_ctx.model = model.to_string();
+                }
+            }
+        }
+        ctx.prefetched_body = Some(body);
+    }
+
     pub fn new(config: &Config) -> Result<Self, Box<dyn std::error::Error>> {
         let hot_state = build_hot_state(config)?;
         let instance_id = new_instance_id(&hot_state.node_name);
@@ -3074,7 +3188,7 @@ impl AiGateway {
             *body = None;
             return Ok(());
         }
-        let end_of_stream = match ctx.replay_body.take() {
+        let mut end_of_stream = match ctx.replay_body.take() {
             Some(original) => {
                 ctx.replay_injected = true;
                 *body = Some(Bytes::from(original));
@@ -3083,13 +3197,32 @@ impl AiGateway {
             None => end_of_stream,
         };
 
+        // ── Prefetched body (body affinity) ──
+        // The body was read in request_filter so the session identity could
+        // be resolved *before* the provider was picked. The proxy has
+        // nothing left to forward (the body was consumed), so it is
+        // re-injected here as the request's single chunk: the upstream sees
+        // exactly the bytes the client sent.
+        if ctx.prefetched_body.is_some() {
+            let prefetched = ctx.prefetched_body.take();
+            let proxy_has_body = body.as_ref().is_some_and(|b| !b.is_empty());
+            if proxy_has_body {
+                // The proxy still holds a copy of the body (its retry
+                // buffer): that copy is authoritative — injecting the
+                // prefetched one would send the body twice.
+            } else {
+                *body = prefetched;
+                end_of_stream = true;
+            }
+        }
+
         // Session-sticky: the session identity may also live in the request
         // body (`metadata.user_id`, `client_metadata.session_id`,
-        // `prompt_cache_key`). The provider was already picked by
-        // `select_provider` in request_filter, so a body-only session id can
-        // never influence routing — it is resolved here only so the recorder
-        // and the session-binding table carry the right id. Runs before the
-        // passthrough shortcut so every buffered body is scanned.
+        // `prompt_cache_key`). When the body was prefetched for the
+        // affinity, the identity was already resolved before the provider
+        // was picked; this is the fallback for the routes that do not
+        // prefetch — it only reaches the recorder and the session-binding
+        // table there, never the routing.
         if ctx.session_id.is_none() && end_of_stream && !ctx.request_body_buf.is_empty() {
             ctx.session_id = crate::session_sticky::resolve_from_body(&ctx.request_body_buf);
         }
@@ -4583,6 +4716,21 @@ impl ProxyHttp for AiGateway {
         // `X-Session-ID` / `X-Conversation-ID`; the body fallback is applied
         // later in request_body_filter.
         ctx.session_id = crate::session_sticky::resolve_from_headers(&session.req_header().headers);
+
+        // ── Body affinity ──
+        // The session identity can live only in the request body: codex
+        // sends `prompt_cache_key` and `client_metadata.session_id`, and a
+        // proxy in front of the gateway (one-api) drops the session
+        // headers on the way. The provider is picked here — before the
+        // body filter runs — so the body is read now and re-injected by the
+        // body filter as the request's single chunk.
+        if route.session_sticky
+            && hot.session_sticky_enabled
+            && ctx.session_id.is_none()
+            && hot.session_body_affinity
+        {
+            self.prefetch_body_for_affinity(session, ctx, &hot).await;
+        }
 
         // Select provider (with circuit breaker check and routing strategy)
         let _provider = match self.select_provider(&hot, route, ctx) {
