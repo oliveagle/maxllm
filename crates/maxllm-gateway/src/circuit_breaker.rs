@@ -28,6 +28,22 @@ pub const STATE_HALF_OPEN: u8 = 2;
 /// rotation — while a top-up is picked up well inside a working session.
 pub const PAYMENT_REQUIRED_COOLDOWN_MS: u64 = 10 * 60 * 1000;
 
+/// The cooldown ladder for a quota wall whose reset instant is unknown.
+///
+/// A wall that lasts a week ("you have reached your weekly usage limit")
+/// must not be re-probed every five minutes: each probe costs a request
+/// and a round trip, and — with a pool of a dozen members — a member that
+/// is dead for a week eats its share of the traffic. The ladder starts at
+/// the resolver's default cooldown and grows with every unanswered wall,
+/// up to a day.
+const QUOTA_COOLDOWN_LADDER_MS: [u64; 5] = [
+    5 * 60 * 1000,     // 5 min
+    15 * 60 * 1000,    // 15 min
+    60 * 60 * 1000,    // 1 h
+    6 * 60 * 60 * 1000, // 6 h
+    24 * 60 * 60 * 1000, // 24 h
+];
+
 /// Lock-free circuit breaker using atomic counters.
 ///
 /// Three states (mirroring litellm_lb_go's breaker):
@@ -74,6 +90,10 @@ pub struct CircuitBreaker {
     state_transitions: AtomicU64,
     /// Force-opens caused by HTTP 429 (quota exhaustion).
     quota_opens: AtomicU64,
+    /// How often this provider answered a quota wall whose reset instant
+    /// stayed unknown — the rung of the cooldown ladder (see
+    /// [`QUOTA_COOLDOWN_LADDER_MS`]).
+    quota_cooldown_level: AtomicU32,
     /// Start of the current stream-health window (ms epoch; 0 = none yet).
     stream_window_start_ms: AtomicU64,
     /// Streams whose completeness was determined inside the window.
@@ -137,6 +157,7 @@ impl CircuitBreaker {
             force_open_until_ms: AtomicU64::new(0),
             state_transitions: AtomicU64::new(0),
             quota_opens: AtomicU64::new(0),
+            quota_cooldown_level: AtomicU32::new(0),
             stream_window_start_ms: AtomicU64::new(0),
             stream_judged: AtomicU32::new(0),
             stream_bad: AtomicU32::new(0),
@@ -326,6 +347,9 @@ impl CircuitBreaker {
         if reset_at_ms <= now {
             return; // already reset; nothing to force-open
         }
+        // The wall has a known end: the ladder starts over when it is
+        // answered again.
+        self.quota_cooldown_level.store(0, Ordering::Relaxed);
         self.force_open_until_ms
             .store(reset_at_ms, Ordering::Relaxed);
         self.state.store(STATE_OPEN, Ordering::Relaxed);
@@ -390,6 +414,48 @@ impl CircuitBreaker {
         self.pending_probes.store(0, Ordering::Relaxed);
         self.last_probe_admit_ms.store(0, Ordering::Relaxed);
         self.state.store(STATE_CLOSED, Ordering::Relaxed);
+    }
+
+    /// Record a quota wall whose reset instant stayed unknown.
+    ///
+    /// The provider is parked for the current rung of the cooldown ladder
+    /// ([`QUOTA_COOLDOWN_LADDER_MS`]), and the next rung is armed: a wall
+    /// that is still there in five minutes is a wall that lasts longer
+    /// than five minutes, and re-probing it every five minutes wastes a
+    /// request and a round trip per probe.
+    ///
+    /// `base_cooldown_ms` is the resolver's default cooldown — the first
+    /// rung of the ladder is at least that long.
+    pub fn record_quota_unknown(&self, base_cooldown_ms: u64) -> u64 {
+        let now = now_ms();
+        let level = self.quota_cooldown_level.load(Ordering::Relaxed) as usize;
+        let rung = QUOTA_COOLDOWN_LADDER_MS
+            .get(level)
+            .copied()
+            .unwrap_or(*QUOTA_COOLDOWN_LADDER_MS.last().unwrap());
+        let cooldown = rung.max(base_cooldown_ms);
+        self.quota_cooldown_level.store(
+            (level + 1).min(QUOTA_COOLDOWN_LADDER_MS.len() - 1) as u32,
+            Ordering::Relaxed,
+        );
+        self.force_open_until_ms
+            .store(now + cooldown, Ordering::Relaxed);
+        self.state.store(STATE_OPEN, Ordering::Relaxed);
+        self.failures.store(self.max_fails, Ordering::Relaxed);
+        self.pending_probes.store(0, Ordering::Relaxed);
+        self.last_probe_admit_ms.store(0, Ordering::Relaxed);
+        self.quota_opens.fetch_add(1, Ordering::Relaxed);
+        self.state_transitions.fetch_add(1, Ordering::Relaxed);
+        cooldown
+    }
+
+    /// How long the provider is parked for the quota wall it last answered.
+    pub fn quota_cooldown_ms(&self) -> u64 {
+        let level = self.quota_cooldown_level.load(Ordering::Relaxed) as usize;
+        QUOTA_COOLDOWN_LADDER_MS
+            .get(level)
+            .copied()
+            .unwrap_or(*QUOTA_COOLDOWN_LADDER_MS.last().unwrap())
     }
 
     /// Record a failure. Increments failure count and updates timestamp.
@@ -523,6 +589,8 @@ impl CircuitBreaker {
     }
 
     pub fn record_success(&self) {
+        // The provider answered: the wall is over, the ladder starts over.
+        self.quota_cooldown_level.store(0, Ordering::Relaxed);
         match self.state.load(Ordering::Relaxed) {
             STATE_HALF_OPEN => {
                 // The probe finished: return its slot (clamped, because the
@@ -683,6 +751,44 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A quota wall whose reset instant stays unknown must not be re-probed
+    /// every five minutes: the cooldown grows with every unanswered wall.
+    #[test]
+    fn test_the_quota_cooldown_grows_while_the_wall_stays() {
+        let cb = CircuitBreaker::new(3, 60);
+        let base = 5 * 60 * 1000;
+
+        let first = cb.record_quota_unknown(base);
+        assert_eq!(first, base, "the first wall uses the base cooldown");
+        let second = cb.record_quota_unknown(base);
+        assert!(second > first, "the second wall waits longer: {second} > {first}");
+        let third = cb.record_quota_unknown(base);
+        assert!(third > second, "the third wall waits longer still");
+
+        // A success ends the ladder: the provider is back, the next unknown
+        // wall starts at the base cooldown again.
+        cb.record_success();
+        assert_eq!(cb.quota_cooldown_ms(), base);
+    }
+
+    /// A known reset instant ends the ladder as well — the provider comes
+    /// back at a known moment.
+    #[test]
+    fn test_a_known_reset_ends_the_cooldown_ladder() {
+        let cb = CircuitBreaker::new(3, 60);
+        let base = 5 * 60 * 1000;
+        cb.record_quota_unknown(base);
+        cb.record_quota_unknown(base);
+        assert!(cb.quota_cooldown_ms() > base);
+
+        cb.record_quota_until(crate::rate_limit::now_ms() + 60_000);
+        assert_eq!(
+            cb.quota_cooldown_ms(),
+            base,
+            "a wall with a known end starts the ladder over"
+        );
+    }
 
     #[test]
     fn test_starts_closed() {
