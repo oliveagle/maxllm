@@ -38,6 +38,27 @@ pub struct OpenAICompatTranslator {
     provider_name: String,
     upstream_path: String,
     auth_style: AuthStyle,
+    native_responses_repair: NativeResponsesRepair,
+}
+
+/// A repair a provider needs on its **native Responses** request body before
+/// the gateway forwards it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeResponsesRepair {
+    /// Forward the body verbatim (the default).
+    None,
+    /// Drop trailing assistant text turns.
+    ///
+    /// Volcengine Ark's Responses prefill validation rejects an `input` list
+    /// whose last item is an assistant text turn, answering
+    /// `400 {"code":"MissingParameter","param":"partial", …}` — a misleading
+    /// error, because `partial` is not a request parameter (adding
+    /// `{"partial":true}` changes nothing). Codex remote compaction ends its
+    /// input exactly that way, so a long session 400s on every compaction.
+    /// Dropping the trailing text turn restores the last user turn as the
+    /// prefill anchor; mid-history assistant turns and tool turns are left
+    /// alone.
+    ArkTrailingAssistantText,
 }
 
 impl OpenAICompatTranslator {
@@ -50,7 +71,14 @@ impl OpenAICompatTranslator {
             provider_name: provider_name.into(),
             upstream_path: upstream_path.into(),
             auth_style,
+            native_responses_repair: NativeResponsesRepair::None,
         }
+    }
+
+    /// Opt this provider into a native-Responses body repair.
+    pub fn with_native_responses_repair(mut self, repair: NativeResponsesRepair) -> Self {
+        self.native_responses_repair = repair;
+        self
     }
 
     /// Pre-configured translator for Groq.
@@ -147,6 +175,19 @@ impl ProviderTranslator for OpenAICompatTranslator {
         &self.upstream_path
     }
 
+    fn normalize_native_responses_request(&self, body: &[u8]) -> Vec<u8> {
+        match self.native_responses_repair {
+            NativeResponsesRepair::None => body.to_vec(),
+            NativeResponsesRepair::ArkTrailingAssistantText => {
+                drop_trailing_assistant_text_turns(body)
+            }
+        }
+    }
+
+    fn repairs_native_responses_body(&self) -> bool {
+        self.native_responses_repair != NativeResponsesRepair::None
+    }
+
     fn upstream_headers(&self, api_key: &str) -> Vec<(String, String)> {
         let mut headers = vec![("Content-Type".to_string(), "application/json".to_string())];
         match &self.auth_style {
@@ -172,6 +213,68 @@ impl StreamTranslator for OpenAICompatPassthroughStream {
     fn process_chunk(&mut self, data: &[u8], _end_of_stream: bool) -> Vec<u8> {
         data.to_vec()
     }
+}
+
+/// Remove trailing assistant text turns from a native Responses `input` list.
+///
+/// Returns the input bytes unchanged when the body is not JSON, when `input`
+/// is absent or not an array (the plain-string prompt form), when the last
+/// item is not an assistant text turn, or when dropping would empty the list
+/// (the upstream would then reject an empty input, a worse failure than the
+/// one being repaired).
+pub fn drop_trailing_assistant_text_turns(body: &[u8]) -> Vec<u8> {
+    let Ok(mut root) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return body.to_vec();
+    };
+    let Some(obj) = root.as_object_mut() else {
+        return body.to_vec();
+    };
+    let Some(items) = obj.get_mut("input").and_then(|v| v.as_array_mut()) else {
+        return body.to_vec();
+    };
+    let original_len = items.len();
+    while items.last().map(is_assistant_text_message).unwrap_or(false) {
+        items.pop();
+    }
+    if items.len() == original_len || items.is_empty() {
+        return body.to_vec();
+    }
+    serde_json::to_vec(&root).unwrap_or_else(|_| body.to_vec())
+}
+
+/// Whether one Responses input item is an assistant message whose content is
+/// text-only (a plain string, or an array of text parts). `function_call`,
+/// `function_call_output`, `reasoning`, and messages carrying a non-text part
+/// are not text turns and must not be dropped.
+fn is_assistant_text_message(item: &serde_json::Value) -> bool {
+    let Some(obj) = item.as_object() else {
+        return false;
+    };
+    let msg_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    let role = obj.get("role").and_then(|v| v.as_str()).unwrap_or("");
+    if role != "assistant" || (!msg_type.is_empty() && msg_type != "message") {
+        return false;
+    }
+    let Some(content) = obj.get("content") else {
+        // An assistant message with no content at all is still rejected by
+        // ark (as `input.content.text`); dropping it loses nothing.
+        return true;
+    };
+    if content.is_null() {
+        return true;
+    }
+    if content.is_string() {
+        return true;
+    }
+    let Some(parts) = content.as_array() else {
+        return false;
+    };
+    parts.iter().all(|part| {
+        matches!(
+            part.get("type").and_then(|v| v.as_str()),
+            Some("output_text" | "input_text" | "text")
+        )
+    })
 }
 
 #[cfg(test)]
@@ -259,5 +362,95 @@ mod tests {
         let t = OpenAICompatTranslator::mistral();
         let result = t.translate_request(body, None).unwrap();
         assert!(result.is_streaming);
+    }
+
+    fn ark() -> OpenAICompatTranslator {
+        OpenAICompatTranslator::new(
+            "volc_1",
+            "/api/coding/v3/chat/completions",
+            AuthStyle::Bearer,
+        )
+        .with_native_responses_repair(NativeResponsesRepair::ArkTrailingAssistantText)
+    }
+
+    fn input_of(body: &[u8]) -> serde_json::Value {
+        let parsed: serde_json::Value = serde_json::from_slice(body).unwrap();
+        parsed["input"].clone()
+    }
+
+    #[test]
+    fn test_ark_repair_drops_trailing_assistant_text_turn() {
+        let body = br#"{"model":"m","input":[
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"summarise"}]},
+            {"type":"message","role":"assistant","content":[{"type":"output_text","text":"draft"}]}
+        ]}"#;
+        let t = ark();
+        assert!(t.repairs_native_responses_body());
+        let out = t.normalize_native_responses_request(body);
+        let input = input_of(&out);
+        assert_eq!(input.as_array().unwrap().len(), 1);
+        assert_eq!(input[0]["role"], "user");
+    }
+
+    #[test]
+    fn test_ark_repair_drops_string_form_assistant_turn() {
+        let body = br#"{"model":"m","input":[
+            {"type":"message","role":"user","content":"go"},
+            {"type":"message","role":"assistant","content":"draft"}
+        ]}"#;
+        let out = ark().normalize_native_responses_request(body);
+        assert_eq!(input_of(&out).as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_ark_repair_is_noop_for_mid_history_assistant_turn() {
+        let body = br#"{"model":"m","input":[
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"go"}]},
+            {"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"again"}]}
+        ]}"#;
+        let out = ark().normalize_native_responses_request(body);
+        assert_eq!(out, body.to_vec());
+    }
+
+    #[test]
+    fn test_ark_repair_is_noop_for_trailing_tool_result() {
+        let body = br#"{"model":"m","input":[
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"go"}]},
+            {"type":"function_call","call_id":"c1","name":"shell","arguments":"{}"},
+            {"type":"function_call_output","call_id":"c1","output":"ok"}
+        ]}"#;
+        let out = ark().normalize_native_responses_request(body);
+        assert_eq!(out, body.to_vec());
+    }
+
+    #[test]
+    fn test_ark_repair_is_noop_for_non_text_assistant_part() {
+        let body = br#"{"model":"m","input":[
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"go"}]},
+            {"type":"message","role":"assistant","content":[{"type":"refusal","refusal":"no"}]}
+        ]}"#;
+        let out = ark().normalize_native_responses_request(body);
+        assert_eq!(out, body.to_vec());
+    }
+
+    #[test]
+    fn test_ark_repair_never_empties_the_input_list() {
+        let body = br#"{"model":"m","input":[
+            {"type":"message","role":"assistant","content":[{"type":"output_text","text":"hi"}]}
+        ]}"#;
+        let out = ark().normalize_native_responses_request(body);
+        assert_eq!(out, body.to_vec());
+    }
+
+    #[test]
+    fn test_default_translator_leaves_native_body_verbatim() {
+        let body = br#"{"model":"m","input":[
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"go"}]},
+            {"type":"message","role":"assistant","content":[{"type":"output_text","text":"hi"}]}
+        ]}"#;
+        let t = OpenAICompatTranslator::deepseek();
+        assert!(!t.repairs_native_responses_body());
+        assert_eq!(t.normalize_native_responses_request(body), body.to_vec());
     }
 }
