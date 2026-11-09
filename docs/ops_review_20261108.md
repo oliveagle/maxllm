@@ -2159,6 +2159,97 @@ opencode_go_1 opencode_go_2`）、`ollama_local` **45 s**（实测挂过 124 s�
 - 探针失败不计入熔断；`auto_home` 池 14 个成员里 11~14 个常死。
 - `open_design` 还没配 `read_timeout_secs`（脚本没匹配到那段配置）。
 
+### 15.13 池子不该忘记自己学到的速度（`29ba313` + `a762389`，2026-11-09 16:21 / 16:38 CST 部署）
+
+**缺陷。** 轮换按"每 token 速度"给成员分槽（`auto_pool_speed_factor`），但速度的证
+据有两个都会归零的窗口：样本窗口 **1 h**（`DECODE_RATE_WINDOW`），而持久化只存
+**10 min** 的 `total_latency`（`TOTAL_LATENCY_WINDOW`）。⇒ 成员安静一会儿、或网关重
+启一次，就从"被测过的慢成员"变回"没测过的新成员"，拿到和最快成员**一样的份额**。
+
+**今天早些时候的实测（NAS，修复前）。** 一次部署（重启）把速度证据全清零，紧跟着
+12 个全新会话铺到 7 个可用成员：`volc_1`×3、`opencode_go_2`×2、`xiaomi`×2、
+`ollama_local`×2、`volc_t_1`×1、`minimax`×1、`opencode_go_1`×1 —— `xiaomi` 吃到 2 个，
+和最快成员同份额，尽管它比全池**慢 2.5~3.5 倍**（27 792 ms/1k ≈ 36 tok/s，对全池中位
+10 575）。这就是"池子把自己的学习成果忘了"：慢成员重新拿到快成员的份额，端到端延迟
+跟着回退。
+
+**修法（三层）。**
+
+1. **记忆**（`LAST_SPEED`）：每个成员最后一次被测到的速度（ms/1k）+ 样本数 + 测量时刻。
+   成员持续服务时每 **30 s** 刷新一次（`SPEED_MEMORY_REFRESH_INTERVAL`），有效期
+   **24 h**（`SPEED_MEMORY_TTL`）。样本会老，**结论不该跟着老**。
+2. **持久化**：`provider_stats_state` 加 3 列（`speed_ms_per_1k` / `speed_samples` /
+   `speed_age_secs`）。老库**就地迁移** —— `CREATE TABLE IF NOT EXISTS` 永远不会改
+   已存在的表，所以光改建表语句不够，必须 `ALTER TABLE ADD COLUMN`（照抄
+   `migrate_request_log_columns` 的写法），否则每存一次都报
+   "no column named speed_ms_per_1k"。
+3. **只用于轮换权重**（便宜决策）。逃逸与"钉住会话要不要换人"仍要**新鲜证据**（贵决
+   策）：拿一条过期的判决去扔掉一个还热着的 prompt cache，代价比多给慢成员一两个槽大得多。
+   "**从没测过**"仍然是 `None` —— 新加进池子的账号照样拿流量被测量（用户还要往池子里
+   加账号，这条路不能堵死）。
+
+**本节自己也踩了一个坑，是生产测出来的，不是想出来的。** 第一版把"刷新间隔"记在
+**尝试**上而不是**成功**上：成员凑不够 4 条合格样本时，第一次尝试落空，却把 30 s 的
+间隔用掉了，于是后面真正够格的样本全落在间隔里 —— 成员**永远不被记住**。NAS 实测：
+`deepseek` 在 50 s 内答了 6 次合格回合（warm + ≥256 输出 token），池子**一个数都没记
+住**（`speed_ms_per_1k = NULL`），它于是被当成新成员。修法：只有**算出了**速度才开
+始计时；落空的尝试下一次立刻重试。回归测试 `a_bursty_member_is_remembered_too`
+（去掉修复即红）。
+
+**测试。**
+
+| 测试 | 断言 |
+|---|---|
+| `the_remembered_speed_outlives_its_samples` | 证据过期后记忆仍在；`forget()` 后消失 |
+| `a_never_measured_member_has_no_remembered_speed` | 没测过的成员仍是无记忆（要被测量） |
+| `the_remembered_speed_comes_back_from_the_store` | 记忆能从库里回来（带年龄），超过 24 h 的丢弃 |
+| `the_snapshot_carries_the_remembered_speed` | 只有记忆的成员也有快照行（能落库） |
+| `a_bursty_member_is_remembered_too` | 突发流量的成员也被记住（**去掉修复即红**） |
+| `an_old_database_gains_the_speed_columns_in_place` | 旧库就地迁移出 3 列，老行不丢 |
+| `the_speed_factor_uses_the_remembered_rate` | 轮换因子用记忆速率；未测成员仍是 1.0 |
+| `a_known_slow_member_keeps_its_smaller_share` | 慢成员的槽位明显少于快成员（**去掉修复即红**） |
+
+**NAS 生产实测（`10.126.126.6`）。**
+
+| 观察 | 数值 |
+|---|---|
+| 迁移 | 部署后 `provider_stats_state` 立刻出现 3 列，老行原样保留（`speed_ms_per_1k = NULL` = 未测过） |
+| 记忆跨重启 | 16:38 重启后 `opencode_go_1` 仍是 **10 297.0 ms/1k / 81 样本** —— 值与样本数都是**记忆里的**；重算的话会用恢复回来的 10 min 窗口（34 条），不是 81 条 |
+| 记忆比证据活得久 | `opencode_go_1` 的记忆 age 173 s，而它最后一条新证据是 156 s 前 —— 证据停了，记忆没停 |
+| **证据归零，记忆还在** | `deepseek` 安静下来后逐分钟观测：合格新样本 9 → 4 → 1 → **0**，记忆 9 888.0 ms/1k 的 age 一路 19 s → 322 s → 625 s → **747 s** 仍在（16:51–16:52 CST）。旧版本这里会是 `NULL` —— 池子会把它当新成员，给它和最快成员一样的份额 |
+| 修 bug 前后同一成员 | `deepseek` 同样的 6 次合格回合：修复前 `NULL`，修复后 **9 887.8 ms/1k / 7 样本** |
+| 现存记忆（16:52 CST 快照） | `deepseek` 9 888 / `opencode_go_2` 10 081 / `opencode_go_1` 10 600 / `volc_t_1` 14 545 ms/1k |
+| 速度谱系 | 最快的 `deepseek` 9 888，最慢的 `volc_t_1` 14 545 —— 慢 **1.47 倍** → 轮换因子 **0.75 vs 1.25**（慢成员拿 8/51 的槽，快成员拿 13/51） |
+
+**部署与门禁。**
+
+- NAS `10.126.126.6` 与 oleFedora01 `10.126.126.20`：**sha `cf217b39f6043add`**（`a762389`），
+  musl static-pie，两台 `0.3.12` + `active` + `/health` 200 + `NRestarts=0`，两台 sha 一致。
+- 门禁：`cargo fmt` / `cargo clippy --all-targets -- -D warnings` / `cargo test --workspace`
+  （**927 passed, 0 failed**）。
+
+**仍然未解决（已量化）。**
+
+- **入口 VPS 仍是 0.3.10**：新的墙（配额、熔断、记忆）在 VPS 上一样不生效 ——
+  `/admin/breakers` 404、不认 `[quota_parking]`、没有 `own_the_error`。需要 root：
+  ```bash
+  REMOTE=root@10.126.126.199 SOURCE=oliveagle@10.126.126.6 \
+    ~/.agents/ops/machines/vm_tecent_cloud_01/maxllm/deploy.sh
+  REMOTE=root@10.126.126.199 \
+    ~/.agents/ops/machines/vm_tecent_cloud_01/maxllm/deploy-nginx.sh
+  ```
+- **记忆只管轮换，不管逃逸**：一个慢成员安静之后仍会回到快队列里（它必须回来才能被
+  重新测量），只是拿到的槽位少了。真正的"逃逸"判据仍要新鲜证据。
+- **采样门槛**：速度证据要求 **warm + ≥256 输出 token + 4 条**。短答案的成员（agent
+  循环里大量 2 token 的应答）永远进不了速度谱系，只能靠 `total_latency` 判。
+- `volc_1` 现在被配额墙停放到 18:10（`force_open_until` = 2026-11-09T10:10:09Z），它回来后会被重新
+  测量 —— 这正是本节要保住的场景。
+- **入口的 `/admin/breakers` 回答的不是 VPS 自己**：`:18081/admin/breakers` 返回的 32 条断路器状态
+  与 NAS 的**逐条相同**（`zhipu_1` 的 force-open 时刻一致）—— 说明 nginx 的 upstream 链把这个路径
+  交给了 NAS，而不是 VPS 的 0.3.10。所以入口这条路也拿不到 VPS 的墙，VPS 还是得升级。
+- 其余未解决项见 §15.12.6（body session id 死代码、TTFB 首字节 deadline、半开成员占槽、
+  探针失败不计入熔断、`auto_home` 常死成员、`open_design` 未配 `read_timeout_secs`）。
+
 ## 附录 A：复现与口径
 
 ```sh
