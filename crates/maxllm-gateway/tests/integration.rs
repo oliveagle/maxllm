@@ -5188,6 +5188,14 @@ const CACHE_POOL_CONFIG: &str = r#"
 listen = "127.0.0.1:{PORT}"
 threads = 1
 
+# The cache measurement only works on a *continuation*: a session that comes
+# back to the member that already served its first turn. So the pool has to
+# pin the session, and the route has to opt into that.
+[session_sticky]
+enabled = true
+timeout_secs = 3600
+max_entries = 100
+
 [providers.mock]
 kind = "openai"
 base_url = "{MOCK_URL}"
@@ -5219,6 +5227,7 @@ model = "model-b"
 path = "/v1/chat/completions"
 provider = "mock"
 auto_model = true
+session_sticky = true
 "#;
 
 /// The pool must send the traffic where the conversation stays warm.
@@ -5227,6 +5236,11 @@ auto_model = true
 /// — in prefill and in latency — so it earns less of the rotation than a
 /// member that serves the context from its prompt cache. It still keeps a
 /// slot: the pool has to keep measuring the members it has.
+///
+/// The traffic is a set of conversations, each with several turns: the cache
+/// ratio is measured on the turns that *continue* a conversation (the first
+/// turn of a conversation is cold by nature), so the pool only learns which
+/// member keeps a conversation warm once a conversation has come back.
 #[tokio::test]
 async fn test_auto_pool_prefers_the_member_that_keeps_the_conversation_warm() {
     let mock = MockServer::start().await;
@@ -5257,14 +5271,18 @@ async fn test_auto_pool_prefers_the_member_that_keeps_the_conversation_warm() {
         spawn_gateway_with_pool(CACHE_POOL_CONFIG, [&mock.uri(), &warm.uri(), &cold.uri()]).await;
     let c = client();
 
-    for _ in 0..30 {
-        let resp = c
-            .post(format!("{base}/v1/chat/completions"))
-            .json(&chat_body("auto", "hi"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
+    // Twelve conversations of three turns each.
+    for s in 0..12 {
+        for _ in 0..3 {
+            let resp = c
+                .post(format!("{base}/v1/chat/completions"))
+                .header("session-id", format!("conv-{s}"))
+                .json(&chat_body("auto", "hi"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
+        }
     }
 
     let warm_reqs = warm.received_requests().await.unwrap_or_default().len();
@@ -5273,12 +5291,12 @@ async fn test_auto_pool_prefers_the_member_that_keeps_the_conversation_warm() {
 
     assert_eq!(
         warm_reqs + cold_reqs,
-        30,
+        36,
         "every request is served by the pool"
     );
     assert_eq!(mock_reqs, 0, "the route's own provider is not used");
     assert!(
-        warm_reqs > cold_reqs * 3,
+        warm_reqs > cold_reqs * 2,
         "the member that keeps the conversation warm must earn the traffic: \
          warm={warm_reqs} cold={cold_reqs}"
     );
@@ -5295,9 +5313,9 @@ async fn test_auto_pool_prefers_the_member_that_keeps_the_conversation_warm() {
 /// every turn has nothing to lose by moving: there is no cache to keep. The
 /// session moves to a member that serves it warm.
 ///
-/// The move is only allowed once the member has served enough turns for its
-/// ratio to be a verdict rather than a guess, and only when some member of
-/// the pool is clearly warm — otherwise the pin stays.
+/// The move is only allowed once the member has served enough *continuing*
+/// turns for its ratio to be a verdict rather than a guess, and only when
+/// some member of the pool is clearly warm — otherwise the pin stays.
 #[tokio::test]
 async fn test_a_session_pinned_to_a_cold_member_moves_to_a_warm_one() {
     let mock = MockServer::start().await;
@@ -5322,54 +5340,40 @@ async fn test_a_session_pinned_to_a_cold_member_moves_to_a_warm_one() {
         .mount(&cold)
         .await;
 
-    let config = format!(
-        "[session_sticky]\nenabled = true\ntimeout_secs = 3600\nmax_entries = 100\n{}",
-        CACHE_POOL_CONFIG
-    );
     let (mut child, base, _cfg) =
-        spawn_gateway_with_pool(&config, [&mock.uri(), &warm.uri(), &cold.uri()]).await;
+        spawn_gateway_with_pool(CACHE_POOL_CONFIG, [&mock.uri(), &warm.uri(), &cold.uri()]).await;
     let c = client();
 
-    // Find a session that lands on the cold member. The rotation keeps the
-    // cold member's slot at the head of every cycle, so a handful of
-    // attempts is enough to hit it.
-    let mut cold_session: Option<String> = None;
-    for i in 0..12 {
-        let sid = format!("escape-{i}");
-        let resp = c
-            .post(format!("{base}/v1/chat/completions"))
-            .header("session-id", &sid)
-            .json(&chat_body("auto", "hi"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let body: Value = resp.json().await.unwrap();
-        if body["choices"][0]["message"]["content"] == json!("cold") {
-            cold_session = Some(sid);
-            break;
-        }
-    }
-    let cold_session = cold_session.expect("no session landed on the cold member");
-
-    // The session stays on the cold member until the evidence is a verdict:
-    // one cold turn is not a reason to move a live conversation.
+    // Conversations of several turns: the member that serves the first turn
+    // of a conversation has not had a chance to keep a cache yet, so the
+    // pool only learns what it is worth from the turns that come back.
     let mut moved = false;
-    for _ in 0..5 {
-        let resp = c
-            .post(format!("{base}/v1/chat/completions"))
-            .header("session-id", &cold_session)
-            .json(&chat_body("auto", "hi"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let body: Value = resp.json().await.unwrap();
-        if body["choices"][0]["message"]["content"] == json!("warm") {
-            moved = true;
+    for s in 0..16 {
+        let mut served_cold = false;
+        for _ in 0..4 {
+            let resp = c
+                .post(format!("{base}/v1/chat/completions"))
+                .header("session-id", format!("escape-{s}"))
+                .json(&chat_body("auto", "hi"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
+            let body: Value = resp.json().await.unwrap();
+            let served = body["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap_or("");
+            if served == "cold" {
+                served_cold = true;
+            } else if served_cold {
+                moved = true;
+            }
+        }
+        if moved {
             break;
         }
     }
+
     assert!(
         moved,
         "a session pinned to a member that caches nothing must move to a member \
@@ -7253,7 +7257,7 @@ async fn test_least_connections_skips_the_busy_provider() {
     let a = MockServer::start().await;
     let b = MockServer::start().await;
 
-    // Provider "a" holds the matching request for 400 ms; everything else
+    // Provider "a" holds the matching request for 2 s; everything else
     // answers instantly. wiremock tries mocks in registration order (the
     // first mounted mock wins), so the specific matcher is mounted first.
     Mock::given(method("POST"))
@@ -7262,7 +7266,7 @@ async fn test_least_connections_skips_the_busy_provider() {
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(openai_response("held"))
-                .set_delay(Duration::from_millis(400)),
+                .set_delay(Duration::from_millis(2000)),
         )
         .mount(&a)
         .await;
@@ -7294,8 +7298,41 @@ async fn test_least_connections_skips_the_busy_provider() {
                 .unwrap()
         })
     };
-    // Give the gateway time to select the provider and count the request.
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    // Wait until the gateway has actually counted the request as in flight.
+    // A fixed sleep is a race: under a loaded test suite the gateway may not
+    // have selected the provider yet, and the second request would then be
+    // routed to "a" as well. The gauge is the condition the router reads,
+    // so wait for the gauge.
+    let mut counted = false;
+    for _ in 0..500 {
+        let text = c
+            .get(gw.url("/metrics"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let busy = text
+            .lines()
+            .find(|l| {
+                l.starts_with("maxllm_provider_inflight_requests") && l.contains("provider=\"a\"")
+            })
+            .and_then(|l| {
+                l.rsplit_once(' ')
+                    .map(|(_, v)| v.trim().parse::<f64>().unwrap_or(0.0))
+            })
+            .unwrap_or(0.0);
+        if busy >= 1.0 {
+            counted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        counted,
+        "the gateway never counted the request as in flight"
+    );
 
     // While "a" is busy, the second request must route to the idle "b".
     let resp = c

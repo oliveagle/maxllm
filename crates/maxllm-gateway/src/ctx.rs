@@ -158,6 +158,19 @@ pub struct RequestCtx {
     pub attempted_providers: Vec<String>,
     /// Session identity for session-sticky routing (from headers and/or body).
     pub session_id: Option<String>,
+    /// Whether this request *continues* a conversation the provider has
+    /// already served — i.e. the session was pinned to this provider and the
+    /// pin was honoured.
+    ///
+    /// This is what makes the prompt-cache measurement meaningful. The first
+    /// turn of a conversation is cold by nature (the upstream has never seen
+    /// the prefix), so a provider that caches perfectly still reports a miss
+    /// on it. Measuring the cache ratio over *every* request therefore
+    /// convicts a brand-new account of being a bad cache before it has had
+    /// the chance to keep one — and the pool would then starve it of the
+    /// very sessions that would fill that cache. Only a continuation could
+    /// have hit the cache, so only a continuation is evidence.
+    pub session_continuation: bool,
     /// Per-request UUID, used to correlate recording events of one exchange.
     pub request_uuid: String,
     /// Time-to-first-token (ms) for streaming responses, set when the first
@@ -334,6 +347,7 @@ impl RequestCtx {
             pending_retry_backoff_ms: None,
             attempted_providers: Vec::new(),
             session_id: None,
+            session_continuation: false,
             request_uuid: uuid::Uuid::now_v7().to_string(),
             ttft_ms: None,
             request_method: String::new(),
