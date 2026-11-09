@@ -15,6 +15,7 @@
 
 use ahash::AHashMap;
 use once_cell::sync::Lazy;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
@@ -290,6 +291,169 @@ pub fn total_latency_ms(provider: &str) -> Option<f64> {
     Some(readings[readings.len() / 2])
 }
 
+/// One whole-exchange latency sample, as it crosses the process boundary.
+///
+/// The in-memory sample carries an [`Instant`], which means nothing in
+/// another process: on the wire it becomes an *age*, and the age is what the
+/// restored sample is turned back into.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LatencySample {
+    /// How long ago the sample was taken.
+    pub age_secs: u64,
+    /// The whole-exchange duration, in milliseconds.
+    pub latency_ms: f64,
+    /// Whether the upstream served at least half of the input from its cache.
+    pub warm: bool,
+}
+
+/// The routing evidence for one provider, as it crosses the process boundary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderStatsSnapshot {
+    pub provider: String,
+    /// The cached share of the input; `None` when the provider is unmeasured.
+    pub cache_ratio: Option<f64>,
+    /// How many exchanges the ratio is built on.
+    pub cache_samples: u64,
+    /// How long ago the newest cache observation was taken.
+    pub cache_age_secs: u64,
+    /// The whole-exchange latency window.
+    pub total_latency: Vec<LatencySample>,
+}
+
+/// A snapshot of every provider's routing evidence.
+///
+/// The evidence is what the auto pool knows about its members: how much of
+/// the input a provider serves from its prompt cache, and how long a whole
+/// exchange takes on it. It lives in process memory, so a restart makes the
+/// pool *relearn blind* — measured on 2026-11-09, a restart took the cache
+/// ratio from 99.0% to 76.7% within one minute, because the sessions moved
+/// and the upstream caches went cold. A snapshot is what makes a restart
+/// invisible.
+pub fn snapshot() -> Vec<ProviderStatsSnapshot> {
+    let now = Instant::now();
+    let cache = CACHE_RATIO.read().unwrap_or_else(|e| e.into_inner());
+    let latency = TOTAL_LATENCY.read().unwrap_or_else(|e| e.into_inner());
+
+    let mut out: Vec<ProviderStatsSnapshot> = Vec::with_capacity(cache.len() + latency.len());
+    for (provider, stats) in cache.iter() {
+        out.push(ProviderStatsSnapshot {
+            provider: provider.clone(),
+            cache_ratio: (stats.samples > 0).then_some(stats.ewma),
+            cache_samples: stats.samples,
+            cache_age_secs: now.duration_since(stats.last_seen).as_secs(),
+            total_latency: latency_samples(&latency, provider, now),
+        });
+    }
+    for provider in latency.keys() {
+        if cache.contains_key(provider) {
+            continue;
+        }
+        out.push(ProviderStatsSnapshot {
+            provider: provider.clone(),
+            cache_ratio: None,
+            cache_samples: 0,
+            cache_age_secs: 0,
+            total_latency: latency_samples(&latency, provider, now),
+        });
+    }
+    out
+}
+
+/// The fresh latency samples of one provider, as ages.
+fn latency_samples(
+    map: &AHashMap<String, TotalLatencyStats>,
+    provider: &str,
+    now: Instant,
+) -> Vec<LatencySample> {
+    let Some(stats) = map.get(provider) else {
+        return Vec::new();
+    };
+    stats
+        .samples
+        .iter()
+        .filter(|(at, _, _)| now.duration_since(*at) <= TOTAL_LATENCY_WINDOW)
+        .map(|(at, latency_ms, warm)| LatencySample {
+            age_secs: now.duration_since(*at).as_secs(),
+            latency_ms: *latency_ms,
+            warm: *warm,
+        })
+        .collect()
+}
+
+/// Restore one provider's routing evidence.
+///
+/// The evidence comes back **aged**: a sample that fell out of its window
+/// while the process was down is not evidence any more, and a provider
+/// without fresh evidence is *unmeasured* — the state the rotation admits —
+/// rather than judged on a measurement that no longer describes it.
+/// Restoring a stale verdict would be worse than losing it: the pool would
+/// keep excluding a provider on the strength of a reading that expired.
+///
+/// Returns whether anything was applied.
+pub fn restore(snapshot: &ProviderStatsSnapshot) -> bool {
+    let now = Instant::now();
+    let mut applied = false;
+
+    // The cache evidence.
+    if let Some(ratio) = snapshot.cache_ratio.filter(|_| snapshot.cache_samples > 0) {
+        let age = Duration::from_secs(snapshot.cache_age_secs);
+        if age <= CACHE_RATIO_WINDOW {
+            let mut map = CACHE_RATIO.write().unwrap_or_else(|e| e.into_inner());
+            let stats = map.entry(snapshot.provider.clone()).or_default();
+            // Fresh in-process evidence always wins: a restore never
+            // overwrites what this process measured itself.
+            if stats.samples == 0 {
+                stats.ewma = ratio.clamp(0.0, 1.0);
+                stats.samples = snapshot.cache_samples;
+                stats.last_seen = now.checked_sub(age).unwrap_or(now);
+                applied = true;
+            }
+        }
+    }
+
+    // The latency window.
+    let samples: Vec<(Instant, f64, bool)> = snapshot
+        .total_latency
+        .iter()
+        .map(|s| {
+            (
+                now.checked_sub(Duration::from_secs(s.age_secs))
+                    .unwrap_or(now),
+                s.latency_ms,
+                s.warm,
+            )
+        })
+        .filter(|(at, _, _)| now.duration_since(*at) <= TOTAL_LATENCY_WINDOW)
+        .collect();
+    if !samples.is_empty() {
+        let mut map = TOTAL_LATENCY.write().unwrap_or_else(|e| e.into_inner());
+        let stats = map.entry(snapshot.provider.clone()).or_default();
+        if stats.samples.is_empty() {
+            stats.samples.extend(samples);
+            applied = true;
+        }
+    }
+
+    applied
+}
+
+/// Test-only: forget one provider's evidence.
+///
+/// One provider at a time: the store is process-global and the tests run
+/// beside each other, so clearing the whole map would take the other tests'
+/// evidence with it.
+#[cfg(test)]
+pub(crate) fn forget(provider: &str) {
+    CACHE_RATIO
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(provider);
+    TOTAL_LATENCY
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(provider);
+}
+
 /// Test-only: age `provider`'s samples past [`TOTAL_LATENCY_WINDOW`], the way
 /// ten minutes of silence would.
 ///
@@ -486,6 +650,86 @@ mod tests {
     #[test]
     fn latency_unknown_provider_is_none() {
         assert_eq!(latency_ms("lat-never-seen"), None);
+    }
+
+    /// The routing evidence is the pool's memory of its members. If it does
+    /// not survive the process, every restart makes the pool relearn blind:
+    /// the sessions move, the caches go cold, and the cache ratio collapses
+    /// (measured: 99.0% -> 76.7% within a minute of a restart on NAS).
+    #[test]
+    fn the_routing_evidence_survives_a_restart() {
+        forget("persist-1");
+        record_cache_ratio("persist-1", 1800, 2000); // 90% of the input cached
+        record_total_latency("persist-1", 4_000.0, true);
+
+        let snap = snapshot();
+        let one = snap
+            .iter()
+            .find(|s| s.provider == "persist-1")
+            .expect("the provider is in the snapshot")
+            .clone();
+        assert!(one.cache_ratio.is_some());
+        assert_eq!(one.cache_samples, 1);
+        assert_eq!(one.total_latency.len(), 1);
+
+        // The process dies: the evidence is gone from memory ...
+        forget("persist-1");
+        assert_eq!(cache_ratio("persist-1"), None);
+        assert_eq!(total_latency_ms("persist-1"), None);
+
+        // ... and comes back from the snapshot.
+        assert!(restore(&one));
+        let ratio = cache_ratio("persist-1").expect("restored");
+        assert!(
+            (ratio - 0.9).abs() < 1e-6,
+            "the restored ratio must be the measured one, got {ratio}"
+        );
+        assert_eq!(total_latency_ms("persist-1"), Some(4_000.0));
+        forget("persist-1");
+    }
+
+    /// Evidence that fell out of its window while the process was down is not
+    /// evidence any more. Restoring it would make the pool exclude a provider
+    /// on the strength of a reading that no longer describes it.
+    #[test]
+    fn stale_evidence_is_not_restored() {
+        forget("persist-stale");
+        record_cache_ratio("persist-stale", 100, 2000);
+        record_total_latency("persist-stale", 30_000.0, false);
+
+        let mut aged = snapshot()
+            .into_iter()
+            .find(|s| s.provider == "persist-stale")
+            .expect("the provider is in the snapshot");
+        aged.cache_age_secs = CACHE_RATIO_WINDOW.as_secs() + 60;
+        aged.total_latency[0].age_secs = TOTAL_LATENCY_WINDOW.as_secs() + 60;
+
+        forget("persist-stale");
+        assert!(
+            !restore(&aged),
+            "evidence outside its window must not be restored"
+        );
+        assert_eq!(cache_ratio("persist-stale"), None);
+        assert_eq!(total_latency_ms("persist-stale"), None);
+        forget("persist-stale");
+    }
+
+    /// A restore never overwrites what this process measured itself.
+    #[test]
+    fn a_restore_does_not_overwrite_fresh_evidence() {
+        forget("persist-fresh");
+        record_cache_ratio("persist-fresh", 1_000, 2_000); // 50%
+        let aged = ProviderStatsSnapshot {
+            provider: "persist-fresh".into(),
+            cache_ratio: Some(0.99),
+            cache_samples: 99,
+            cache_age_secs: 1,
+            total_latency: Vec::new(),
+        };
+        assert!(!restore(&aged));
+        let ratio = cache_ratio("persist-fresh").expect("measured");
+        assert!((ratio - 0.5).abs() < 1e-6, "got {ratio}");
+        forget("persist-fresh");
     }
 
     #[test]

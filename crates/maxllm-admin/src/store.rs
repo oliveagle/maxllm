@@ -80,6 +80,21 @@ pub trait AdminStore: Send + Sync {
     /// a stale force-open deadline on a dead name is indistinguishable from a
     /// live one when somebody reads the table).
     fn delete_circuit_breaker_state(&self, provider: &str) -> Result<(), StoreError>;
+    /// Persist one provider's routing evidence (upsert).
+    ///
+    /// The evidence is the pool's memory of a provider: how much of the input
+    /// it serves from its prompt cache, and how long a whole exchange takes
+    /// on it. It is persisted so a restart does not blind the pool — see
+    /// [`ProviderStatsStateRow`].
+    fn save_provider_stats_state(&self, row: ProviderStatsStateRow) -> Result<(), StoreError>;
+    /// Load every persisted routing-evidence row (used on startup).
+    fn load_provider_stats_states(&self) -> Result<Vec<ProviderStatsStateRow>, StoreError>;
+    /// Drop a provider's persisted routing evidence.
+    ///
+    /// Startup restore calls this for rows whose provider no longer exists in
+    /// the config, so a renamed provider does not leave a row behind that
+    /// nobody can explain.
+    fn delete_provider_stats_state(&self, provider: &str) -> Result<(), StoreError>;
     /// Persist a session → provider affinity binding (upsert).
     fn save_session_binding(&self, session_id: &str, provider: &str) -> Result<(), StoreError>;
     /// Load every persisted session binding (used on startup).
@@ -130,6 +145,8 @@ pub struct InMemoryStore {
     request_logs: RwLock<Vec<RequestLog>>,
     /// Circuit-breaker state per provider.
     circuit_breakers: RwLock<HashMap<String, CircuitBreakerStateRow>>,
+    /// Routing evidence (cache ratio, latency window) per provider.
+    provider_stats: RwLock<HashMap<String, ProviderStatsStateRow>>,
     /// Session → provider affinity bindings.
     session_bindings: RwLock<HashMap<String, String>>,
     /// Learned rate-limit message patterns keyed by shape fingerprint.
@@ -145,6 +162,7 @@ impl InMemoryStore {
             spend_logs: RwLock::new(Vec::new()),
             request_logs: RwLock::new(Vec::new()),
             circuit_breakers: RwLock::new(HashMap::new()),
+            provider_stats: RwLock::new(HashMap::new()),
             session_bindings: RwLock::new(HashMap::new()),
             rate_limit_patterns: RwLock::new(HashMap::new()),
         }
@@ -414,6 +432,32 @@ impl AdminStore for InMemoryStore {
         Ok(())
     }
 
+    fn save_provider_stats_state(&self, row: ProviderStatsStateRow) -> Result<(), StoreError> {
+        let mut map = self
+            .provider_stats
+            .write()
+            .map_err(|_| StoreError::LockPoisoned)?;
+        map.insert(row.provider.clone(), row);
+        Ok(())
+    }
+
+    fn load_provider_stats_states(&self) -> Result<Vec<ProviderStatsStateRow>, StoreError> {
+        let map = self
+            .provider_stats
+            .read()
+            .map_err(|_| StoreError::LockPoisoned)?;
+        Ok(map.values().cloned().collect())
+    }
+
+    fn delete_provider_stats_state(&self, provider: &str) -> Result<(), StoreError> {
+        let mut map = self
+            .provider_stats
+            .write()
+            .map_err(|_| StoreError::LockPoisoned)?;
+        map.remove(provider);
+        Ok(())
+    }
+
     fn save_session_binding(&self, session_id: &str, provider: &str) -> Result<(), StoreError> {
         let mut map = self
             .session_bindings
@@ -484,6 +528,20 @@ impl AdminStore for InMemoryStore {
                     *provider = to.to_string();
                     report.sessions_moved += 1;
                 }
+            }
+        }
+        // The routing evidence follows the name too: a rename that left the
+        // evidence behind would make the new name *unmeasured* (and therefore
+        // admitted into the rotation) while the old name's verdict sits in a
+        // row nobody reads.
+        {
+            let mut map = self
+                .provider_stats
+                .write()
+                .map_err(|_| StoreError::LockPoisoned)?;
+            if let Some(mut row) = map.remove(from) {
+                row.provider = to.to_string();
+                map.insert(to.to_string(), row);
             }
         }
         Ok(report)

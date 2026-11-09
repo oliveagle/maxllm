@@ -170,6 +170,29 @@ impl AdminApi {
         self.store.delete_circuit_breaker_state(provider)
     }
 
+    /// Persist one provider's routing evidence (upsert).
+    pub fn save_provider_stats_state(
+        &self,
+        row: ProviderStatsStateRow,
+    ) -> Result<(), crate::store::StoreError> {
+        self.store.save_provider_stats_state(row)
+    }
+
+    /// Load every persisted routing-evidence row (startup restore).
+    pub fn load_provider_stats_states(
+        &self,
+    ) -> Result<Vec<ProviderStatsStateRow>, crate::store::StoreError> {
+        self.store.load_provider_stats_states()
+    }
+
+    /// Drop a provider's persisted routing evidence (provider removed/renamed).
+    pub fn delete_provider_stats_state(
+        &self,
+        provider: &str,
+    ) -> Result<(), crate::store::StoreError> {
+        self.store.delete_provider_stats_state(provider)
+    }
+
     /// Persist a session → provider affinity binding (upsert).
     pub fn save_session_binding(
         &self,

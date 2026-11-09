@@ -164,6 +164,15 @@ impl SqliteStore {
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS provider_stats_state (
+                provider TEXT PRIMARY KEY,
+                cache_ratio REAL NOT NULL DEFAULT 0,
+                cache_samples INTEGER NOT NULL DEFAULT 0,
+                cache_age_secs INTEGER NOT NULL DEFAULT 0,
+                total_latency TEXT NOT NULL DEFAULT '[]',
+                updated_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS session_bindings (
                 session_id TEXT PRIMARY KEY,
                 provider TEXT NOT NULL,
@@ -791,6 +800,74 @@ impl AdminStore for SqliteStore {
         Ok(rows)
     }
 
+    fn save_provider_stats_state(&self, row: ProviderStatsStateRow) -> Result<(), StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        conn.execute(
+            "INSERT INTO provider_stats_state (
+                provider, cache_ratio, cache_samples, cache_age_secs, total_latency, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            ON CONFLICT(provider) DO UPDATE SET
+                cache_ratio = excluded.cache_ratio,
+                cache_samples = excluded.cache_samples,
+                cache_age_secs = excluded.cache_age_secs,
+                total_latency = excluded.total_latency,
+                updated_at = excluded.updated_at",
+            params![
+                row.provider,
+                row.cache_ratio,
+                row.cache_samples as i64,
+                row.cache_age_secs as i64,
+                row.total_latency,
+                row.updated_at.to_rfc3339(),
+            ],
+        )
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
+    fn load_provider_stats_states(&self) -> Result<Vec<ProviderStatsStateRow>, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT provider, cache_ratio, cache_samples, cache_age_secs, total_latency, updated_at
+                 FROM provider_stats_state",
+            )
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| {
+                let provider: String = row.get("provider")?;
+                let cache_ratio: f64 = row.get("cache_ratio")?;
+                let cache_samples: i64 = row.get("cache_samples")?;
+                let cache_age_secs: i64 = row.get("cache_age_secs")?;
+                let total_latency: String = row.get("total_latency")?;
+                let updated_at: String = row.get("updated_at")?;
+                Ok(ProviderStatsStateRow {
+                    provider,
+                    cache_ratio: cache_ratio.clamp(0.0, 1.0),
+                    cache_samples: cache_samples.max(0) as u64,
+                    cache_age_secs: cache_age_secs.max(0) as u64,
+                    total_latency,
+                    updated_at: chrono::DateTime::parse_from_rfc3339(&updated_at)
+                        .map(|dt| dt.with_timezone(&chrono::Utc))
+                        .unwrap_or_else(|_| chrono::Utc::now()),
+                })
+            })
+            .map_err(|e| StoreError::Internal(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(rows)
+    }
+
+    fn delete_provider_stats_state(&self, provider: &str) -> Result<(), StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        conn.execute(
+            "DELETE FROM provider_stats_state WHERE provider = ?1",
+            params![provider],
+        )
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(())
+    }
+
     fn save_session_binding(&self, session_id: &str, provider: &str) -> Result<(), StoreError> {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         conn.execute(
@@ -964,6 +1041,23 @@ impl AdminStore for SqliteStore {
             .map_err(|e| StoreError::Internal(e.to_string()))?;
         report.sessions_moved = moved;
 
+        // The routing evidence follows the name: a rename that left the
+        // evidence behind would make the new name *unmeasured* (and therefore
+        // admitted into the rotation) while the old name's verdict sits in a
+        // row nobody reads.
+        if select_provider_stats_row(&tx, from)?.is_some() {
+            tx.execute(
+                "DELETE FROM provider_stats_state WHERE provider = ?1",
+                params![to],
+            )
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+            tx.execute(
+                "UPDATE provider_stats_state SET provider = ?1, updated_at = ?2 WHERE provider = ?3",
+                params![to, chrono::Utc::now().to_rfc3339(), from],
+            )
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        }
+
         tx.commit()
             .map_err(|e| StoreError::Internal(e.to_string()))?;
         Ok(report)
@@ -999,6 +1093,38 @@ fn select_breaker_row(
                 successes_half_open: successes_half_open.max(0) as u32,
                 transitions: transitions.max(0) as u64,
                 quota_opens: quota_opens.max(0) as u64,
+                updated_at: chrono::DateTime::parse_from_rfc3339(&updated_at)
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .unwrap_or_else(|_| chrono::Utc::now()),
+            })
+        },
+    )
+    .optional()
+    .map_err(|e| StoreError::Internal(e.to_string()))
+}
+
+/// Read one routing-evidence row, or `None` when the provider has none.
+fn select_provider_stats_row(
+    conn: &Connection,
+    provider: &str,
+) -> Result<Option<ProviderStatsStateRow>, StoreError> {
+    conn.query_row(
+        "SELECT provider, cache_ratio, cache_samples, cache_age_secs, total_latency, updated_at
+         FROM provider_stats_state WHERE provider = ?1",
+        params![provider],
+        |row| {
+            let provider: String = row.get("provider")?;
+            let cache_ratio: f64 = row.get("cache_ratio")?;
+            let cache_samples: i64 = row.get("cache_samples")?;
+            let cache_age_secs: i64 = row.get("cache_age_secs")?;
+            let total_latency: String = row.get("total_latency")?;
+            let updated_at: String = row.get("updated_at")?;
+            Ok(ProviderStatsStateRow {
+                provider,
+                cache_ratio: cache_ratio.clamp(0.0, 1.0),
+                cache_samples: cache_samples.max(0) as u64,
+                cache_age_secs: cache_age_secs.max(0) as u64,
+                total_latency,
                 updated_at: chrono::DateTime::parse_from_rfc3339(&updated_at)
                     .map(|dt| dt.with_timezone(&chrono::Utc))
                     .unwrap_or_else(|_| chrono::Utc::now()),
@@ -1439,6 +1565,69 @@ mod tests {
         let rows = store.load_circuit_breaker_states().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].provider, "OA-VOLC-1");
+    }
+
+    /// The routing evidence has to survive the process, or every restart makes
+    /// the pool relearn blind (the cache ratio collapses from 99% to 77%
+    /// within a minute of a bounce).
+    #[test]
+    fn provider_stats_state_round_trip() {
+        let store = SqliteStore::in_memory().unwrap();
+
+        let row = ProviderStatsStateRow {
+            provider: "OA-VOLC-1".into(),
+            cache_ratio: 0.93,
+            cache_samples: 42,
+            cache_age_secs: 17,
+            total_latency: r#"[{"age_secs":12,"latency_ms":4210.5,"warm":true}]"#.into(),
+            updated_at: Utc::now(),
+        };
+        store.save_provider_stats_state(row.clone()).unwrap();
+
+        // Upsert replaces the row.
+        store
+            .save_provider_stats_state(ProviderStatsStateRow {
+                cache_ratio: 0.71,
+                cache_samples: 43,
+                ..row.clone()
+            })
+            .unwrap();
+
+        let rows = store.load_provider_stats_states().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].provider, "OA-VOLC-1");
+        assert!((rows[0].cache_ratio - 0.71).abs() < 1e-9);
+        assert_eq!(rows[0].cache_samples, 43);
+        assert_eq!(rows[0].cache_age_secs, 17);
+        assert!(rows[0].total_latency.contains("4210.5"));
+
+        store.delete_provider_stats_state("OA-VOLC-1").unwrap();
+        assert!(store.load_provider_stats_states().unwrap().is_empty());
+    }
+
+    /// A rename must carry the evidence with it: a row left under the old
+    /// name makes the new name *unmeasured* (and therefore admitted into the
+    /// rotation) while the old name's verdict sits in a row nobody reads.
+    #[test]
+    fn a_rename_carries_the_routing_evidence() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .save_provider_stats_state(ProviderStatsStateRow {
+                provider: "old-name".into(),
+                cache_ratio: 0.88,
+                cache_samples: 7,
+                cache_age_secs: 3,
+                total_latency: "[]".into(),
+                updated_at: Utc::now(),
+            })
+            .unwrap();
+
+        store.rename_provider("old-name", "new-name").unwrap();
+
+        let rows = store.load_provider_stats_states().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].provider, "new-name");
+        assert!((rows[0].cache_ratio - 0.88).abs() < 1e-9);
     }
 
     #[test]

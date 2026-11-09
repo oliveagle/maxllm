@@ -242,6 +242,36 @@ impl CircuitBreakerStateRow {
     }
 }
 
+/// Persisted routing evidence for one provider.
+///
+/// The auto pool's two verdicts — the share of the input a provider serves
+/// from its prompt cache, and how long a whole exchange takes on it — live
+/// in process memory only. A restart therefore makes the pool *relearn
+/// blind*: the sessions move, the upstream caches go cold, and the measured
+/// cache ratio falls from 99% to 77% within a minute of every bounce — the
+/// very bounce that was supposed to be invisible.
+///
+/// These rows carry the evidence across the bounce, **aged** rather than
+/// reset: a verdict older than the window it was measured in is restored as
+/// no verdict at all, so a restored provider that has been silent for an
+/// hour is *unmeasured* (and therefore admitted by the rotation) instead of
+/// being judged on evidence that no longer exists.
+#[derive(Debug, Clone)]
+pub struct ProviderStatsStateRow {
+    pub provider: String,
+    /// The cached share of the input (0.0-1.0). Meaningless when
+    /// `cache_samples` is 0 — the provider is then *unmeasured*, not cold.
+    pub cache_ratio: f64,
+    /// How many exchanges the ratio is built on.
+    pub cache_samples: u64,
+    /// How long ago (in seconds) the newest cache observation was taken.
+    pub cache_age_secs: u64,
+    /// The whole-exchange latency window, as a JSON array of
+    /// `{"age_secs":N,"latency_ms":F,"warm":B}` samples.
+    pub total_latency: String,
+    pub updated_at: DateTime<Utc>,
+}
+
 /// Outcome of a provider rename.
 ///
 /// A provider rename in the config used to strand the old name's resilience

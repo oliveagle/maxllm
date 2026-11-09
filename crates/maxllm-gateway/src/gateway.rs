@@ -31,7 +31,7 @@ use maxllm_translate::{ProviderTranslator, StreamTranslator, TranslatedRequest};
 use pingora::http::ResponseHeader;
 use pingora::prelude::*;
 use pingora::proxy::{FailToProxy, ProxyHttp, Session};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -1280,6 +1280,97 @@ fn auto_pool_warm_target<'a>(
     best.map(|(entry, _, _)| entry)
 }
 
+/// How often the routing evidence is written to the store.
+///
+/// The evidence's own window is ten minutes, so half a minute of exposure
+/// costs nothing and bounds the loss of a hard kill to half a minute of
+/// measurements.
+const PROVIDER_STATS_PERSIST_INTERVAL_SECS: u64 = 30;
+
+/// Turn the in-memory routing evidence into the row the store keeps.
+fn provider_stats_row(
+    snapshot: &crate::provider_stats::ProviderStatsSnapshot,
+) -> Option<maxllm_admin::ProviderStatsStateRow> {
+    let total_latency = serde_json::to_string(&snapshot.total_latency).ok()?;
+    Some(maxllm_admin::ProviderStatsStateRow {
+        provider: snapshot.provider.clone(),
+        cache_ratio: snapshot.cache_ratio.unwrap_or(0.0),
+        cache_samples: snapshot.cache_samples,
+        cache_age_secs: snapshot.cache_age_secs,
+        total_latency,
+        updated_at: chrono::Utc::now(),
+    })
+}
+
+/// Turn a stored row back into the in-memory shape of the evidence.
+fn provider_stats_snapshot_from_row(
+    row: &maxllm_admin::ProviderStatsStateRow,
+) -> Option<crate::provider_stats::ProviderStatsSnapshot> {
+    let total_latency: Vec<crate::provider_stats::LatencySample> =
+        serde_json::from_str(&row.total_latency).unwrap_or_default();
+    Some(crate::provider_stats::ProviderStatsSnapshot {
+        provider: row.provider.clone(),
+        cache_ratio: (row.cache_samples > 0).then_some(row.cache_ratio),
+        cache_samples: row.cache_samples,
+        cache_age_secs: row.cache_age_secs,
+        total_latency,
+    })
+}
+
+/// Persist the routing evidence on a timer.
+///
+/// The evidence is what the auto pool knows about its members; without this
+/// it dies with the process, and every restart makes the pool relearn blind:
+/// the sessions move, the upstream caches go cold, and the measured cache
+/// ratio collapses until the pool has measured everything again.
+fn spawn_provider_stats_persister(
+    hot: Arc<arc_swap::ArcSwap<HotState>>,
+    admin_api: Option<Arc<maxllm_admin::AdminApi>>,
+    interval_secs: u64,
+) {
+    let Some(api) = admin_api else {
+        return;
+    };
+    // A dedicated thread: the store is blocking (SQLite), and the gateway is
+    // built before pingora starts its runtime, so there is no reactor to
+    // spawn this onto.
+    let _ = std::thread::Builder::new()
+        .name("maxllm-provider-stats".to_string())
+        .spawn(move || loop {
+            std::thread::sleep(Duration::from_secs(interval_secs.clamp(5, 3600)));
+            persist_provider_stats(&hot, &api);
+        })
+        .expect("spawn the provider stats persister thread");
+}
+
+/// Write the current evidence, and drop the rows of providers that left.
+fn persist_provider_stats(hot: &Arc<arc_swap::ArcSwap<HotState>>, api: &maxllm_admin::AdminApi) {
+    let known: HashSet<String> = hot.load().providers.keys().cloned().collect();
+    for snapshot in crate::provider_stats::snapshot() {
+        if !known.contains(&snapshot.provider) {
+            continue;
+        }
+        let Some(row) = provider_stats_row(&snapshot) else {
+            continue;
+        };
+        if let Err(e) = api.save_provider_stats_state(row) {
+            warn!(
+                provider = %snapshot.provider,
+                error = %e,
+                "failed to persist the provider routing evidence"
+            );
+        }
+    }
+    // A provider that left the config must not leave its verdict behind.
+    if let Ok(rows) = api.load_provider_stats_states() {
+        for row in rows {
+            if !known.contains(&row.provider) {
+                let _ = api.delete_provider_stats_state(&row.provider);
+            }
+        }
+    }
+}
+
 impl AiGateway {
     pub fn new(config: &Config) -> Result<Self, Box<dyn std::error::Error>> {
         let hot_state = build_hot_state(config)?;
@@ -1446,6 +1537,63 @@ impl AiGateway {
                 }
                 Err(e) => warn!(error = %e, "Failed to restore session bindings"),
             }
+
+            // The routing evidence — the cache ratio and the latency window —
+            // is the pool's memory of its members. It lives in process
+            // memory, so without this a restart makes the pool *relearn
+            // blind*: measured on 2026-11-09, a restart took the cache ratio
+            // from 99.0% to 76.7% within one minute, because the sessions
+            // moved and the upstream caches went cold. The evidence comes
+            // back *aged* — what fell out of its window while the process was
+            // down is not evidence any more.
+            match admin_api.load_provider_stats_states() {
+                Ok(rows) => {
+                    let mut restored = 0usize;
+                    let mut pruned = 0usize;
+                    for row in rows {
+                        // A provider that left the config must not leave its
+                        // verdict behind: the row would outlive the name it
+                        // describes, and the next startup prunes it anyway.
+                        if !hot_state.providers.contains_key(&row.provider) {
+                            match admin_api.delete_provider_stats_state(&row.provider) {
+                                Ok(()) => pruned += 1,
+                                Err(e) => warn!(
+                                    provider = %row.provider,
+                                    error = %e,
+                                    "Failed to prune the routing evidence of an unknown provider"
+                                ),
+                            }
+                            continue;
+                        }
+                        let Some(snapshot) = provider_stats_snapshot_from_row(&row) else {
+                            continue;
+                        };
+                        if crate::provider_stats::restore(&snapshot) {
+                            // Re-publish the gauge, so a restarted process
+                            // shows the restored cache ratio before the next
+                            // request: the number the operator watches is the
+                            // number the pool acts on.
+                            if let Some(ratio) = crate::provider_stats::cache_ratio(&row.provider) {
+                                METRICS
+                                    .provider_cache_ratio
+                                    .with_label_values(&[&row.provider])
+                                    .set((ratio * 100.0).round() as i64);
+                            }
+                            restored += 1;
+                        }
+                    }
+                    if restored > 0 {
+                        info!(count = restored, "Restored the provider routing evidence");
+                    }
+                    if pruned > 0 {
+                        info!(
+                            count = pruned,
+                            "Pruned routing-evidence rows for providers no longer in the config"
+                        );
+                    }
+                }
+                Err(e) => warn!(error = %e, "Failed to restore the provider routing evidence"),
+            }
         }
 
         // Optional JSONL recorder.
@@ -1488,6 +1636,21 @@ impl AiGateway {
         }
 
         let hot = Arc::new(arc_swap::ArcSwap::from_pointee(hot_state));
+
+        // The routing evidence is persisted on a timer. Only a durable store
+        // can carry it across a restart — an in-memory one dies with the
+        // process anyway.
+        if config
+            .admin
+            .as_ref()
+            .is_some_and(|a| a.enabled && a.db_path.is_some())
+        {
+            spawn_provider_stats_persister(
+                Arc::clone(&hot),
+                admin_api.clone(),
+                PROVIDER_STATS_PERSIST_INTERVAL_SECS,
+            );
+        }
 
         // The operator's parked providers (a known quota wall) are applied
         // before the first request: the gateway must not spend one request
