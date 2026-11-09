@@ -1732,15 +1732,17 @@ impl AiGateway {
                         // serves it warm.
                         let cold = auto_pool_pin_is_cold(&pinned_name, &healthy);
                         if cold {
-                            METRICS
-                                .session_affinity_cold_escapes_total
-                                .with_label_values(&[&pinned_name])
-                                .inc();
                             // Straight to a member that keeps the
                             // conversation warm: back to the rotation and
                             // the session would be handed the cold member
                             // it just left.
                             chosen = auto_pool_warm_target(&healthy, &admits);
+                            if chosen.is_some() {
+                                METRICS
+                                    .session_affinity_cold_escapes_total
+                                    .with_label_values(&[&pinned_name])
+                                    .inc();
+                            }
                         } else {
                             chosen = healthy.iter().copied().find(|e| {
                                 e.provider == pinned_name && admits(e) && !pin_is_slow(&e.provider)
