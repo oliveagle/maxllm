@@ -1123,11 +1123,20 @@ fn auto_pool_rotation<'a>(
 /// `None` when the member has not been measured: it is neither warm nor
 /// cold, and it must not be judged before it has served a turn.
 fn auto_pool_cache_weight(provider: &str) -> Option<u32> {
-    crate::provider_stats::cache_evidence(provider).map(|ev| {
-        AUTO_POOL_CACHE_WEIGHT_FLOOR
-            + (ev.ratio * AUTO_POOL_CACHE_WEIGHT_SCALE as f64)
-                .round()
-                .clamp(0.0, AUTO_POOL_CACHE_WEIGHT_SCALE as f64) as u32
+    crate::provider_stats::cache_evidence(provider).and_then(|ev| {
+        // Too thin to judge: the member is *unmeasured*, not cold. A member
+        // that has kept no cache yet has not had the chance to keep one —
+        // it has to be given the sessions that would fill it before its
+        // ratio says anything about it.
+        if ev.samples < AUTO_POOL_CACHE_MIN_SAMPLES {
+            return None;
+        }
+        Some(
+            AUTO_POOL_CACHE_WEIGHT_FLOOR
+                + (ev.ratio * AUTO_POOL_CACHE_WEIGHT_SCALE as f64)
+                    .round()
+                    .clamp(0.0, AUTO_POOL_CACHE_WEIGHT_SCALE as f64) as u32,
+        )
     })
 }
 
@@ -1238,7 +1247,7 @@ fn auto_pool_warm_target<'a>(
         let Some(ev) = crate::provider_stats::cache_evidence(&entry.provider) else {
             continue;
         };
-        if ev.ratio < AUTO_POOL_CACHE_WARM_RATIO {
+        if ev.samples < AUTO_POOL_CACHE_MIN_SAMPLES || ev.ratio < AUTO_POOL_CACHE_WARM_RATIO {
             continue;
         }
         let inflight = crate::provider_stats::inflight(&entry.provider);
@@ -1737,6 +1746,13 @@ impl AiGateway {
                             chosen = healthy.iter().copied().find(|e| {
                                 e.provider == pinned_name && admits(e) && !pin_is_slow(&e.provider)
                             });
+                            // The session continues on the provider it was
+                            // already talking to: this turn *could* have hit
+                            // the upstream's prompt cache, so it is evidence
+                            // about that cache.
+                            if chosen.is_some() {
+                                ctx.session_continuation = true;
+                            }
                         }
                         // Pinned provider unavailable (open circuit, no
                         // longer in the pool, only in a lower billing tier,
@@ -1877,6 +1893,10 @@ impl AiGateway {
                                 METRICS.session_affinity_hits_total.inc();
                                 ctx.provider_name = pinned_name.clone();
                                 ctx.fallback_used = pinned_name != route.provider;
+                                // The session continues on the provider it was
+                                // already talking to — see
+                                // `RequestCtx::session_continuation`.
+                                ctx.session_continuation = true;
                                 // The client asked for the sentinel while its
                                 // base URL points at a route whose chain
                                 // happens to contain auto-pool members. The
@@ -6500,11 +6520,19 @@ impl ProxyHttp for AiGateway {
             // conversation warm from one that re-reads the whole context
             // every turn: the two look alike on a short request and very
             // unlike on a long one.
-            crate::provider_stats::record_cache_ratio(
-                &ctx.provider_name,
-                ctx.cached_tokens_in,
-                ctx.tokens_in,
-            );
+            //
+            // Only a *continuation* counts. The first turn of a conversation
+            // is cold by nature — the upstream has never seen that prefix —
+            // so counting it would convict every new account of being a bad
+            // cache before it had the chance to keep one, and the pool
+            // would starve it of the very sessions that would fill it.
+            if ctx.session_continuation {
+                crate::provider_stats::record_cache_ratio(
+                    &ctx.provider_name,
+                    ctx.cached_tokens_in,
+                    ctx.tokens_in,
+                );
+            }
             if let Some(ratio) = crate::provider_stats::cache_ratio(&ctx.provider_name) {
                 METRICS
                     .provider_cache_ratio
@@ -6879,6 +6907,10 @@ impl AiGateway {
     fn switch_to_fallback(&self, ctx: &mut RequestCtx) -> Option<(String, String)> {
         let (name, fallback) = self.next_fallback_provider(ctx)?;
         let failed_provider = ctx.provider_name.clone();
+        // The new provider has never seen this conversation's prefix, so
+        // whatever it answers about the prompt cache says nothing about its
+        // cache. The continuation is broken here.
+        ctx.session_continuation = false;
         ctx.failover_count += 1;
         // The new provider starts with a fresh same-provider retry budget.
         ctx.provider_retry_count = 0;
@@ -9343,13 +9375,42 @@ mod auto_pool_latency_tests {
         assert!(names.contains(&"cohort-e"));
     }
 
+    /// Too little evidence is not a verdict.
+    ///
+    /// A member that has served one or two turns is *unmeasured*, not cold:
+    /// judging it now would convict a brand-new account of being a bad cache
+    /// before it ever had the chance to keep one — and the pool would then
+    /// starve it of the very sessions that would fill that cache. The member
+    /// has to be given the sessions first; only then does its ratio say
+    /// something about it.
+    #[test]
+    fn thin_evidence_is_not_a_verdict() {
+        crate::provider_stats::record_cache_ratio("thin-new", 20, 2000);
+        assert!(
+            auto_pool_cache_weight("thin-new").is_none(),
+            "one sample is a guess, not a verdict"
+        );
+        crate::provider_stats::record_cache_ratio("thin-new", 20, 2000);
+        assert!(
+            auto_pool_cache_weight("thin-new").is_none(),
+            "two samples are a guess, not a verdict"
+        );
+        crate::provider_stats::record_cache_ratio("thin-new", 20, 2000);
+        assert!(
+            auto_pool_cache_weight("thin-new").is_some(),
+            "three samples are enough to judge"
+        );
+    }
+
     /// A member that keeps the conversation's prefix cache warm earns more
     /// of the rotation than one that re-reads the whole context every turn.
     #[test]
     fn a_warm_member_earns_more_slots_than_a_cold_one() {
-        crate::provider_stats::record_cache_ratio("slots-warm", 1800, 2000);
-        crate::provider_stats::record_cache_ratio("slots-mid", 1000, 2000);
-        crate::provider_stats::record_cache_ratio("slots-cold", 20, 2000);
+        for _ in 0..3 {
+            crate::provider_stats::record_cache_ratio("slots-warm", 1800, 2000);
+            crate::provider_stats::record_cache_ratio("slots-mid", 1000, 2000);
+            crate::provider_stats::record_cache_ratio("slots-cold", 20, 2000);
+        }
         let pool = pool_with_names(true, &["slots-warm", "slots-mid", "slots-cold"]);
         let healthy: Vec<&AutoPoolEntry> = pool.entries.iter().collect();
         let slots = auto_pool_cache_order(&healthy);
@@ -9375,7 +9436,9 @@ mod auto_pool_latency_tests {
     #[test]
     fn the_weighted_order_still_rotates() {
         for name in ["order-a", "order-b", "order-c"] {
-            crate::provider_stats::record_cache_ratio(name, 1000, 2000);
+            for _ in 0..3 {
+                crate::provider_stats::record_cache_ratio(name, 1000, 2000);
+            }
         }
         let pool = pool_with_names(true, &["order-a", "order-b", "order-c"]);
         let healthy: Vec<&AutoPoolEntry> = pool.entries.iter().collect();
@@ -9403,8 +9466,10 @@ mod auto_pool_latency_tests {
     /// the members it has.
     #[test]
     fn the_weighted_order_serves_the_warm_member_most() {
-        crate::provider_stats::record_cache_ratio("share2-warm", 1800, 2000);
-        crate::provider_stats::record_cache_ratio("share2-cold", 20, 2000);
+        for _ in 0..3 {
+            crate::provider_stats::record_cache_ratio("share2-warm", 1800, 2000);
+            crate::provider_stats::record_cache_ratio("share2-cold", 20, 2000);
+        }
         let pool = pool_with_names(true, &["share2-warm", "share2-cold"]);
         let healthy: Vec<&AutoPoolEntry> = pool.entries.iter().collect();
         let slots = auto_pool_cache_order(&healthy);
@@ -9422,8 +9487,10 @@ mod auto_pool_latency_tests {
     /// the rotation, because the rotation is what measures it.
     #[test]
     fn an_unmeasured_member_keeps_a_share_of_the_rotation() {
-        crate::provider_stats::record_cache_ratio("share-warm", 1800, 2000);
-        crate::provider_stats::record_cache_ratio("share-cold", 20, 2000);
+        for _ in 0..3 {
+            crate::provider_stats::record_cache_ratio("share-warm", 1800, 2000);
+            crate::provider_stats::record_cache_ratio("share-cold", 20, 2000);
+        }
         let pool = pool_with_names(true, &["share-warm", "share-cold", "share-new"]);
         let healthy: Vec<&AutoPoolEntry> = pool.entries.iter().collect();
         let slots = auto_pool_cache_order(&healthy);
@@ -9445,8 +9512,10 @@ mod auto_pool_latency_tests {
     /// that never escapes.
     #[test]
     fn the_escape_lands_on_a_warm_member() {
-        crate::provider_stats::record_cache_ratio("target-cold", 20, 2000);
-        crate::provider_stats::record_cache_ratio("target-warm", 1800, 2000);
+        for _ in 0..3 {
+            crate::provider_stats::record_cache_ratio("target-cold", 20, 2000);
+            crate::provider_stats::record_cache_ratio("target-warm", 1800, 2000);
+        }
         let pool = pool_with_names(true, &["target-cold", "target-warm"]);
         let healthy: Vec<&AutoPoolEntry> = pool.entries.iter().collect();
         let admits = |_: &AutoPoolEntry| true;
@@ -9463,8 +9532,10 @@ mod auto_pool_latency_tests {
     /// closed circuit.
     #[test]
     fn the_escape_skips_a_member_that_cannot_take_traffic() {
-        crate::provider_stats::record_cache_ratio("busy-warm", 1800, 2000);
-        crate::provider_stats::record_cache_ratio("busy-cold", 20, 2000);
+        for _ in 0..3 {
+            crate::provider_stats::record_cache_ratio("busy-warm", 1800, 2000);
+            crate::provider_stats::record_cache_ratio("busy-cold", 20, 2000);
+        }
         let pool = pool_with_names(true, &["busy-warm", "busy-cold"]);
         let healthy: Vec<&AutoPoolEntry> = pool.entries.iter().collect();
         let admits = |e: &AutoPoolEntry| e.provider != "busy-warm";
