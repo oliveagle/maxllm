@@ -11907,6 +11907,133 @@ provider = "mock_openai"
     assert_eq!(health["node_name"].as_str(), Some(node_name));
 }
 
+/// The pool report is a live capacity view: every member with its breaker
+/// state and the utilization (closed members / total) an operator watches
+/// while adding accounts.
+#[tokio::test]
+async fn test_the_pool_report_lists_members_and_utilization() {
+    let a = MockServer::start().await;
+    let b = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("a")))
+        .mount(&a)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("b")))
+        .mount(&b)
+        .await;
+
+    let config = r#"
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[admin]
+master_key = "test-master-key"
+enabled = true
+
+[providers.pool_a]
+kind = "openai"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+
+[providers.pool_b]
+kind = "openai"
+base_url = "{FALLBACK_URL}"
+api_key = "fake-key"
+
+[auto_model]
+enabled = true
+name = "auto"
+
+[[auto_model.pool]]
+provider = "pool_a"
+model = "model-a"
+
+[[auto_model.pool]]
+provider = "pool_b"
+model = "model-b"
+
+[[routes]]
+path = "/v1/responses/auto"
+provider = "pool_a"
+auto_model = true
+"#;
+    let gw = TestGateway::start_with_fallback(config, &a.uri(), &b.uri()).await;
+    let c = client();
+
+    let report: Value = c
+        .get(gw.url("/admin/pool"))
+        .bearer_auth("test-master-key")
+        .send()
+        .await
+        .expect("the report answers")
+        .json()
+        .await
+        .expect("the report is JSON");
+    assert_eq!(
+        report["providers"]["healthy"], 2,
+        "both providers start closed"
+    );
+    let pool = &report["pools"]["auto"];
+    assert_eq!(pool["total"], 2);
+    assert_eq!(pool["closed"], 2);
+    assert_eq!(pool["utilization"], 1.0, "nothing is parked yet");
+    let members = pool["members"].as_array().expect("members is a list");
+    assert_eq!(members.len(), 2);
+    let names: Vec<&str> = members
+        .iter()
+        .map(|m| m["provider"].as_str().expect("member names the provider"))
+        .collect();
+    assert!(names.contains(&"pool_a"));
+    assert!(names.contains(&"pool_b"));
+    for m in members {
+        assert_eq!(m["state_name"], "closed");
+        assert!(m["force_open_until_iso"].is_null());
+    }
+
+    // Park one member: utilization halves and the member reads as open.
+    let _: Value = c
+        .post(gw.url("/admin/breakers/force-open"))
+        .bearer_auth("test-master-key")
+        .json(&json!({"provider": "pool_a", "until": "2099-01-01T00:00:00Z"}))
+        .send()
+        .await
+        .expect("the park answers")
+        .json()
+        .await
+        .expect("the park is JSON");
+
+    let report: Value = c
+        .get(gw.url("/admin/pool"))
+        .bearer_auth("test-master-key")
+        .send()
+        .await
+        .expect("the report answers")
+        .json()
+        .await
+        .expect("the report is JSON");
+    let pool = &report["pools"]["auto"];
+    assert_eq!(pool["closed"], 1);
+    assert_eq!(pool["open"], 1);
+    assert_eq!(pool["utilization"], 0.5);
+    let a_entry = pool["members"]
+        .as_array()
+        .and_then(|m| m.iter().find(|e| e["provider"] == "pool_a"))
+        .expect("pool_a is listed");
+    assert_eq!(a_entry["state_name"], "open");
+    assert!(a_entry["force_open_until_iso"].is_string());
+
+    // A wrong key is refused.
+    let resp = c
+        .get(gw.url("/admin/pool"))
+        .bearer_auth("wrong-key")
+        .send()
+        .await
+        .expect("the request completes");
+    assert_eq!(resp.status(), 401, "the pool report needs the master key");
+}
+
 /// The operator's park / unpark, and the live breaker report.
 #[tokio::test]
 async fn test_the_breaker_endpoints_park_and_release_a_provider() {
