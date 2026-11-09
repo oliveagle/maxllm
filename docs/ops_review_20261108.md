@@ -1808,6 +1808,17 @@ REMOTE=root@10.126.126.199 SOURCE=oliveagle@10.126.126.6 \
 在此之前，客户端若能直连，**把 base_url 指到 NAS（10.126.126.6:3795）或本机
 （10.126.126.20:3795）** 比挂在 :18081 上更稳。
 
+**上线核验（NAS，0.3.12 部署后）**：`maxllm_provider_cache_ratio` 现在**真的按续轮
+量到了值**（minimax 98、ollama_local 97、opencode_go_1 99、opencode_go_2 98、
+volc_t_1 100、xiaomi 98、volc_1 43），`maxllm_session_affinity_hits_total 85` /
+`misses 8` / `size 117`（钉子真的在生效），`maxllm_session_affinity_cold_escapes_total
+{volc_1}=1`（volc_1 只有 43%，有一个会话从它身上迁走了）。最近 10 分钟 161 发、
+缓存命中 91.3%、平均 9.7 s。
+
+注意：**NAS 的 `/metrics` 是 loopback-only**（远程访问回 403
+`metrics is loopback-only; set [metrics] allow_remote = true`），要在 NAS 上
+`ssh … 'curl -s 127.0.0.1:3795/metrics'` 才看得到；本机节点没有这个限制。
+
 ## 附录 A：复现与口径
 
 ```sh
