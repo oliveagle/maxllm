@@ -3061,9 +3061,11 @@ impl AiGateway {
 
         // Session-sticky: the session identity may also live in the request
         // body (`metadata.user_id`, `client_metadata.session_id`,
-        // `prompt_cache_key`). Only buffered bodies are inspected — the
-        // header path already covers codex-cli and Claude Code. Runs before
-        // the passthrough shortcut so every buffered body is scanned.
+        // `prompt_cache_key`). The provider was already picked by
+        // `select_provider` in request_filter, so a body-only session id can
+        // never influence routing — it is resolved here only so the recorder
+        // and the session-binding table carry the right id. Runs before the
+        // passthrough shortcut so every buffered body is scanned.
         if ctx.session_id.is_none() && end_of_stream && !ctx.request_body_buf.is_empty() {
             ctx.session_id = crate::session_sticky::resolve_from_body(&ctx.request_body_buf);
         }

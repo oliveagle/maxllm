@@ -21,11 +21,12 @@
 //!   by Claude Code and the OpenAI clients that mimic it.
 //! - `session-id` / `thread-id` — the spelling codex-cli sends; its thread id
 //!   carries the same conversation id as its session id.
-//! - body `metadata.user_id` — the Claude Code per-conversation user id.
-//! - body `client_metadata.session_id` / `client_metadata.thread_id` — the
-//!   bag codex-cli adds to the request body.
-//! - body `prompt_cache_key` — the Responses field clients keep stable for
-//!   the whole conversation.
+//!
+//! Session identity comes from the request headers only. The provider has to
+//! be picked before the request body is read, so a body-only session id
+//! (`metadata.user_id`, `client_metadata.session_id`, `prompt_cache_key`)
+//! never reaches the sticky lookup — `resolve_from_body` exists for the
+//! recorder, not for routing (see §15.11 of docs/ops_review_20261108.md).
 //!
 //! The checks run most-explicit first and the first non-empty value wins, so
 //! a client that sends several identifiers never ends up with two bindings for

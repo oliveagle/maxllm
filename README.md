@@ -916,9 +916,12 @@ litellm_lb_go):
 |---|---|
 | Header | `X-Session-ID`, `X-Conversation-ID` (Anthropic style, Claude Code) |
 | Header | `session-id`, `thread-id` (codex-cli) |
-| Body | `metadata.user_id` (Claude Code) |
-| Body | `client_metadata.session_id` / `client_metadata.thread_id` (codex-cli) |
-| Body | `prompt_cache_key` (OpenAI Responses) |
+
+Session identity is resolved from the request **headers** only. The body
+spellings (`metadata.user_id`, `client_metadata.session_id`,
+`prompt_cache_key`) are not consulted for routing: the provider has to be
+picked before the body is read, so a body-only session id never reaches the
+sticky lookup (see `resolve_from_body` — kept only for the recorder).
 
 Two switches must both be on: the global `[session_sticky]` section and the
 route-level `session_sticky = true`. The binding is written only after the
