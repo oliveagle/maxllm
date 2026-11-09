@@ -78,6 +78,7 @@ use pingora_error::{Error, ErrorSource, ErrorType::*, OrErr, Result};
 
 const TASK_BUFFER_SIZE: usize = 4;
 
+mod first_byte;
 mod proxy_cache;
 mod proxy_common;
 mod proxy_custom;
@@ -88,6 +89,8 @@ mod proxy_trait;
 pub mod subrequest;
 
 use subrequest::{BodyMode, Ctx as SubrequestCtx};
+
+pub use first_byte::FirstByteBudget;
 
 pub use proxy_cache::range_filter::{range_header_filter, MultiRangeInfo, RangeType};
 pub use proxy_purge::PurgeStatus;

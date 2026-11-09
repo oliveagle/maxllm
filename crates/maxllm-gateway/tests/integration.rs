@@ -6402,6 +6402,214 @@ max_failover_attempts = 1
     assert_eq!(backup_reqs.len(), 1);
 }
 
+/// The **first-byte deadline**: an upstream that takes the request and does
+/// not produce its first byte in time is given up on, and the request walks
+/// on to the next member of the pool.
+///
+/// The stall budget (`read_timeout_secs`) is a *per read* budget and says
+/// nothing about how long the upstream may take to start answering; when it
+/// is generous, a member that accepts the request and then goes quiet holds
+/// the client for the whole budget — long after the client gave up. The
+/// first-byte deadline is the budget for the start only: once the upstream
+/// produces its first byte the stream may take as long as it needs.
+#[tokio::test]
+async fn test_first_byte_deadline_cuts_a_slow_start_and_fails_over() {
+    let slow = MockServer::start().await;
+    let backup = MockServer::start().await;
+
+    let chat_sse = concat!(
+        "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    // The upstream accepts the request and answers five seconds later.
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(chat_sse, "text/event-stream")
+                .set_delay(Duration::from_secs(5)),
+        )
+        .mount(&slow)
+        .await;
+
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(chat_sse, "text/event-stream"),
+        )
+        .mount(&backup)
+        .await;
+
+    let config = r#"
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[metrics]
+enabled = true
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.slow]
+kind = "openai_compat"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+# The stall budget is generous on purpose: the read timeout must not be what
+# saves the request, the first-byte deadline must.
+read_timeout_secs = 60
+first_byte_timeout_secs = 1
+
+[providers.backup]
+kind = "openai_compat"
+base_url = "{FALLBACK_URL}"
+api_key = "fake-key"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "slow"
+fallback = ["backup"]
+strategy = "fallback"
+max_failover_attempts = 1
+"#;
+
+    let gw = TestGateway::start_with_fallback(config, &slow.uri(), &backup.uri()).await;
+    let c = client();
+
+    let started = std::time::Instant::now();
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&json!({
+            "model": "model-x",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+
+    assert_eq!(resp.status(), 200, "the slow member must fail over");
+    assert_eq!(resp.headers().get("X-MaxLLM-Provider").unwrap(), "backup");
+    assert_eq!(
+        resp.headers().get("X-MaxLLM-Fallback-From").unwrap(),
+        "slow"
+    );
+
+    // The deadline cut the wait for the first byte: the client got the
+    // backup member's answer long before the slow one would have replied.
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "the first-byte deadline did not cut the slow start: {elapsed:?}"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(900),
+        "the deadline fired earlier than it should have: {elapsed:?}"
+    );
+
+    let slow_reqs = slow.received_requests().await.unwrap();
+    assert_eq!(slow_reqs.len(), 1);
+    let backup_reqs = backup.received_requests().await.unwrap();
+    assert_eq!(backup_reqs.len(), 1);
+}
+
+/// The first-byte deadline is a budget for the **start** of the answer, so
+/// it only applies to a streaming request: there the first byte is the first
+/// token, which a healthy member produces in a couple of seconds. A
+/// non-streaming request gets its answer in one piece — its first byte is
+/// the whole answer — and the route's own timeout governs it.
+#[tokio::test]
+async fn test_first_byte_deadline_does_not_cut_a_non_streaming_answer() {
+    let slow = MockServer::start().await;
+    let backup = MockServer::start().await;
+
+    // The upstream answers after two and a half seconds — well past the
+    // first-byte deadline, but it is the whole answer.
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(openai_response("slow but complete"))
+                .set_delay(Duration::from_millis(2500)),
+        )
+        .mount(&slow)
+        .await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from backup")))
+        .mount(&backup)
+        .await;
+
+    let config = r#"
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[metrics]
+enabled = true
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.slow]
+kind = "openai_compat"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+read_timeout_secs = 60
+first_byte_timeout_secs = 1
+
+[providers.backup]
+kind = "openai_compat"
+base_url = "{FALLBACK_URL}"
+api_key = "fake-key"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "slow"
+fallback = ["backup"]
+strategy = "fallback"
+max_failover_attempts = 1
+"#;
+
+    let gw = TestGateway::start_with_fallback(config, &slow.uri(), &backup.uri()).await;
+    let c = client();
+
+    let started = std::time::Instant::now();
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&chat_body("model-x", "hi"))
+        .send()
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+
+    assert_eq!(resp.status(), 200);
+    // The answer came from the slow member: the deadline did not fire.
+    assert_eq!(resp.headers().get("X-MaxLLM-Provider").unwrap(), "slow");
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["choices"][0]["message"]["content"],
+        "slow but complete"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(2000),
+        "the non-streaming answer was cut short: {elapsed:?}"
+    );
+
+    let backup_reqs = backup.received_requests().await.unwrap();
+    assert_eq!(backup_reqs.len(), 0, "the backup must not be asked");
+}
+
 /// A client that selects the `auto` model on a route that does **not**
 /// declare `auto_model = true` (a model-picker switch without moving the base
 /// URL onto the auto route) must still rotate: the sentinel is a rotation
