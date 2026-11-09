@@ -90,6 +90,121 @@ static TOTAL_LATENCY: Lazy<RwLock<AHashMap<String, TotalLatencyStats>>> =
 
 static INFLIGHT: Lazy<RwLock<AHashMap<String, u64>>> = Lazy::new(|| RwLock::new(AHashMap::new()));
 
+/// How long one cache observation stays evidence for the auto pool.
+///
+/// The same window the latency evidence uses: a verdict that outlives its
+/// evidence is a permanent verdict, and the pool must be able to re-measure
+/// a provider that starts caching again (a vendor that turned prefix caching
+/// on, a key that moved to a warm tier).
+const CACHE_RATIO_WINDOW: Duration = Duration::from_secs(10 * 60);
+
+/// The smallest input whose cache ratio is worth believing.
+///
+/// A 20-token request either hits the cache or does not, and that says
+/// nothing about how the provider treats the long conversations the pool
+/// actually serves. Only a request big enough to have a prefix worth
+/// caching is evidence.
+const CACHE_RATIO_MIN_INPUT_TOKENS: u64 = 1024;
+
+/// Smoothing for the cache ratio. The newest observation weighs 30%.
+const CACHE_RATIO_ALPHA: f64 = 0.3;
+
+#[derive(Debug, Clone, Copy)]
+struct CacheRatioStats {
+    /// The share of the input the upstream served from its prompt cache,
+    /// exponentially weighted.
+    ewma: f64,
+    samples: u64,
+    last_seen: Instant,
+}
+
+impl Default for CacheRatioStats {
+    fn default() -> Self {
+        CacheRatioStats {
+            ewma: 0.0,
+            samples: 0,
+            last_seen: Instant::now(),
+        }
+    }
+}
+
+static CACHE_RATIO: Lazy<RwLock<AHashMap<String, CacheRatioStats>>> =
+    Lazy::new(|| RwLock::new(AHashMap::new()));
+
+/// Record how much of one exchange's input the upstream served from its
+/// prompt cache.
+///
+/// This is the signal that separates a provider that *keeps* a conversation
+/// warm from one that re-reads the whole context every turn. The two look
+/// the same on latency once the conversation is short, and very different on
+/// a long one: a provider with no prefix cache bills and waits for the full
+/// prefill every single turn.
+pub fn record_cache_ratio(provider: &str, cached_tokens: u64, tokens_in: u64) {
+    if tokens_in < CACHE_RATIO_MIN_INPUT_TOKENS {
+        return;
+    }
+    let ratio = (cached_tokens as f64 / tokens_in as f64).clamp(0.0, 1.0);
+    let mut map = CACHE_RATIO.write().unwrap_or_else(|e| e.into_inner());
+    let stats = map.entry(provider.to_string()).or_default();
+    stats.ewma = if stats.samples == 0 {
+        ratio
+    } else {
+        CACHE_RATIO_ALPHA * ratio + (1.0 - CACHE_RATIO_ALPHA) * stats.ewma
+    };
+    stats.samples += 1;
+    stats.last_seen = Instant::now();
+}
+
+/// The cache evidence for one provider.
+#[derive(Debug, Clone, Copy)]
+pub struct CacheEvidence {
+    /// The share of the input the upstream served from its prompt cache.
+    pub ratio: f64,
+    /// How many exchanges the ratio is built on.
+    ///
+    /// A ratio built on one observation is a guess: the pool reads it as
+    /// evidence for the *rotation* (a member is not written off after a
+    /// single cold turn), but never as a verdict on a session that is
+    /// already pinned to it.
+    pub samples: u64,
+}
+
+/// The cache evidence for `provider`, or `None` when there is none fresh.
+///
+/// `None` means *unmeasured*, not *cold*: a provider that has not been
+/// measured is not judged, so a new member of the pool is admitted and
+/// measured instead of being written off before it has served a turn.
+pub fn cache_evidence(provider: &str) -> Option<CacheEvidence> {
+    let map = CACHE_RATIO.read().unwrap_or_else(|e| e.into_inner());
+    let stats = map.get(provider)?;
+    if stats.samples == 0 {
+        return None;
+    }
+    if stats.last_seen.elapsed() > CACHE_RATIO_WINDOW {
+        return None;
+    }
+    Some(CacheEvidence {
+        ratio: stats.ewma,
+        samples: stats.samples,
+    })
+}
+
+/// The share of the input `provider` served from its prompt cache (0.0-1.0),
+/// or `None` when there is no fresh evidence.
+pub fn cache_ratio(provider: &str) -> Option<f64> {
+    cache_evidence(provider).map(|ev| ev.ratio)
+}
+
+/// Test-only: age `provider`'s cache evidence past [`CACHE_RATIO_WINDOW`].
+#[cfg(test)]
+pub(crate) fn expire_cache_ratio_evidence(provider: &str) {
+    let mut map = CACHE_RATIO.write().unwrap_or_else(|e| e.into_inner());
+    let Some(stats) = map.get_mut(provider) else {
+        return;
+    };
+    stats.last_seen = Instant::now() - CACHE_RATIO_WINDOW - Duration::from_secs(1);
+}
+
 /// Record one successful upstream attempt's latency for `provider`.
 ///
 /// Only successful attempts count: a provider that fails fast must not look
