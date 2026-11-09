@@ -982,6 +982,83 @@ const AUTO_POOL_PIN_ESCAPE_FLOOR_MS: f64 = 10_000.0;
 /// and can rejoin the fast cohort.
 const AUTO_POOL_EXPLORE_EVERY: u64 = 50;
 
+/// The decode-rate bar, absolute: a member slower than this — in
+/// milliseconds per 1 000 output tokens — is slow whatever the rest of the
+/// tier looks like. 12 000 ms/1k is about 83 tokens/s.
+const AUTO_POOL_DECODE_FLOOR_MS_PER_1K: f64 = 12_000.0;
+
+/// The relative decode-rate bar: a member is slow when it is this much
+/// slower than the tier's *median* decode rate.
+///
+/// The median, not the fastest member: the fastest member of a tier is
+/// often an outlier, and a bar drawn from an outlier would cut the tier
+/// down to a handful of members — which is the opposite of what a pool is
+/// for. The absolute floor above is what catches a tier that is slow all
+/// by itself.
+const AUTO_POOL_DECODE_MULTIPLIER: f64 = 1.8;
+
+/// The tier's median decode rate (ms per 1 000 output tokens), over the
+/// members that have been measured.
+fn auto_pool_decode_median(healthy: &[&AutoPoolEntry]) -> Option<f64> {
+    let mut measured: Vec<f64> = healthy
+        .iter()
+        .filter_map(|e| crate::provider_stats::decode_rate_ms_per_1k(&e.provider))
+        .collect();
+    if measured.is_empty() {
+        return None;
+    }
+    measured.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    Some(measured[measured.len() / 2])
+}
+
+/// Whether a member is slow in the *workload-independent* sense: it needs
+/// too long per output token, either against the tier's median or against
+/// the absolute floor.
+///
+/// A member with no decode evidence is not judged: it has not been measured
+/// yet, and the rotation is what measures it.
+fn auto_pool_decode_is_slow(provider: &str, tier_median: Option<f64>) -> bool {
+    let Some(rate) = crate::provider_stats::decode_rate_ms_per_1k(provider) else {
+        return false;
+    };
+    let bar = match tier_median {
+        Some(median) => {
+            (median * AUTO_POOL_DECODE_MULTIPLIER).max(AUTO_POOL_DECODE_FLOOR_MS_PER_1K)
+        }
+        None => AUTO_POOL_DECODE_FLOOR_MS_PER_1K,
+    };
+    rate > bar
+}
+
+/// How much a member's rotation slots are scaled by its decode speed.
+///
+/// The rotation decides where a request with *no* upstream cache to lose
+/// goes, so it should go to the member that will answer fastest — not to
+/// whichever member happened to serve the shortest requests. The factor is
+/// relative to the fastest measured member of the rotation, and it never
+/// zeroes a member out: a slow member still has to be there to absorb the
+/// load when the fast ones are busy.
+fn auto_pool_speed_factor(provider: &str, best_ms_per_1k: Option<f64>) -> f64 {
+    let Some(best) = best_ms_per_1k else {
+        return 1.0;
+    };
+    let Some(rate) = crate::provider_stats::decode_rate_ms_per_1k(provider) else {
+        return 1.0;
+    };
+    let ratio = rate / best;
+    if ratio <= 0.8 {
+        1.5
+    } else if ratio <= 1.0 {
+        1.25
+    } else if ratio <= 1.3 {
+        1.0
+    } else if ratio <= 1.8 {
+        0.75
+    } else {
+        0.5
+    }
+}
+
 /// The cache ratio at which a member of the pool counts as "keeps the
 /// conversation warm" — the upstream serves most of the input from its
 /// prompt cache instead of re-reading it.
@@ -1073,15 +1150,25 @@ fn auto_pool_fast_cohort<'a>(healthy: &[&'a AutoPoolEntry]) -> Vec<&'a AutoPoolE
         return healthy.to_vec();
     };
     let ceiling = auto_pool_cohort_ceiling(median);
+    // The workload-independent speed, as a second opinion on the same
+    // question. The whole-exchange median cannot tell a fast provider from
+    // one that happened to serve short requests (measured on NAS
+    // 2026-11-09: `opencode_go_2` had the best median and the worst decode
+    // rate of the cloud members, `ollama_local` looked ordinary and was the
+    // fastest), so a member that is slow per token is skipped even when its
+    // durations look fine.
+    let decode_median = auto_pool_decode_median(healthy);
     let cohort: Vec<&'a AutoPoolEntry> = healthy
         .iter()
         .copied()
-        .filter(
-            |e| match crate::provider_stats::total_latency_ms(&e.provider) {
-                Some(ms) => ms <= ceiling,
-                None => true,
-            },
-        )
+        .filter(|e| {
+            if let Some(ms) = crate::provider_stats::total_latency_ms(&e.provider) {
+                if ms > ceiling {
+                    return false;
+                }
+            }
+            !auto_pool_decode_is_slow(&e.provider, decode_median)
+        })
         .collect();
     if cohort.is_empty() {
         healthy.to_vec()
@@ -1167,9 +1254,20 @@ fn auto_pool_cache_order<'a>(rotation: &[&'a AutoPoolEntry]) -> Vec<&'a AutoPool
     } else {
         (measured.iter().sum::<u32>() / measured.len() as u32).max(AUTO_POOL_CACHE_WEIGHT_FLOOR)
     };
+    // The fastest measured member of the rotation sets the scale for the
+    // speed factor: a member that answers twice as fast per token earns
+    // more of the rotation's slots.
+    let best_rate = rotation
+        .iter()
+        .filter_map(|e| crate::provider_stats::decode_rate_ms_per_1k(&e.provider))
+        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let weights: Vec<u32> = rotation
         .iter()
-        .map(|e| auto_pool_cache_weight(&e.provider).unwrap_or(fallback))
+        .map(|e| {
+            let base = auto_pool_cache_weight(&e.provider).unwrap_or(fallback);
+            let factor = auto_pool_speed_factor(&e.provider, best_rate);
+            ((base as f64 * factor).round() as u32).max(AUTO_POOL_CACHE_WEIGHT_FLOOR)
+        })
         .collect();
     let total: u32 = weights.iter().sum();
     if total == 0 {
@@ -1569,6 +1667,14 @@ impl AiGateway {
                                     .with_label_values(&[&row.provider])
                                     .set((ratio * 100.0).round() as i64);
                             }
+                            if let Some(rate) =
+                                crate::provider_stats::decode_rate_ms_per_1k(&row.provider)
+                            {
+                                METRICS
+                                    .provider_decode_ms_per_1k
+                                    .with_label_values(&[&row.provider])
+                                    .set(rate.round() as i64);
+                            }
                             restored += 1;
                         }
                     }
@@ -1865,12 +1971,27 @@ impl AiGateway {
         } else {
             None
         };
+        // The decode rate of the tier, as the second opinion on "slow".
+        let decode_median = auto_pool_decode_median(&healthy);
         let pin_is_slow = |name: &str| -> bool {
             let Some(median) = cohort_median else {
                 return false;
             };
-            crate::provider_stats::total_latency_ms(name)
-                .is_some_and(|ms| auto_pool_pin_escapable(ms, median))
+            let Some(ms) = crate::provider_stats::total_latency_ms(name) else {
+                return false;
+            };
+            if !auto_pool_pin_escapable(ms, median) {
+                return false;
+            }
+            // A whole-exchange duration also says how much the client asked
+            // to generate. When the provider's *speed* is known and it is
+            // fine, the long duration is the client's workload, not a slow
+            // provider — and abandoning a warm session for it would throw
+            // away the upstream prompt cache for nothing.
+            match crate::provider_stats::decode_rate_ms_per_1k(name) {
+                Some(_) => auto_pool_decode_is_slow(name, decode_median),
+                None => true,
+            }
         };
 
         // 1. Session-sticky within the preferred tier: a session pinned to a
@@ -6677,6 +6798,7 @@ impl ProxyHttp for AiGateway {
                 &ctx.provider_name,
                 latency_ms as f64,
                 warm,
+                ctx.tokens_out,
             );
             // How much of the input the upstream served from its prompt
             // cache. This is what tells a provider that *keeps* a
@@ -6701,6 +6823,15 @@ impl ProxyHttp for AiGateway {
                     .provider_cache_ratio
                     .with_label_values(&[&ctx.provider_name])
                     .set((ratio * 100.0).round() as i64);
+            }
+            // The provider's speed with the client's workload divided out.
+            // The whole-exchange median above cannot tell a fast provider
+            // from one that happened to serve short requests; this can.
+            if let Some(rate) = crate::provider_stats::decode_rate_ms_per_1k(&ctx.provider_name) {
+                METRICS
+                    .provider_decode_ms_per_1k
+                    .with_label_values(&[&ctx.provider_name])
+                    .set(rate.round() as i64);
             }
         }
 
@@ -9515,10 +9646,10 @@ mod auto_pool_latency_tests {
         // fast-a/b ~1-2s, mid-c ~6s, slow-d ~30s: the median is ~6s, the
         // ceiling is min(max(6*1.5, 5s), max(10s, 6s)) = 9s, so only slow-d
         // is excluded.
-        crate::provider_stats::record_total_latency("cohort-a", 1000.0, true);
-        crate::provider_stats::record_total_latency("cohort-b", 2000.0, true);
-        crate::provider_stats::record_total_latency("cohort-c", 6000.0, true);
-        crate::provider_stats::record_total_latency("cohort-d", 30000.0, true);
+        crate::provider_stats::record_total_latency("cohort-a", 1000.0, true, 4096);
+        crate::provider_stats::record_total_latency("cohort-b", 2000.0, true, 4096);
+        crate::provider_stats::record_total_latency("cohort-c", 6000.0, true, 4096);
+        crate::provider_stats::record_total_latency("cohort-d", 30000.0, true, 4096);
         let pool = pool_with_names(
             true,
             &["cohort-a", "cohort-b", "cohort-c", "cohort-d", "cohort-e"],
@@ -9536,6 +9667,63 @@ mod auto_pool_latency_tests {
         // Unmeasured entries are kept (they have not been proven slow, and the
         // rotation is what produces their first measurement).
         assert!(names.contains(&"cohort-e"));
+    }
+
+    /// A member that is slow *per token* is skipped even when its
+    /// whole-exchange median looks fine.
+    ///
+    /// The duration alone cannot tell a fast provider from one that happened
+    /// to serve short requests. Here `speed-slow` answers in the same 4 s as
+    /// `speed-mid`, but it produces 256 tokens where `speed-mid` produces
+    /// 800 — so it needs 15 625 ms per 1 000 tokens against 5 000. The
+    /// workload-independent rate is what convicts it.
+    #[test]
+    fn a_member_slow_per_token_is_skipped_even_with_a_good_median() {
+        // Five samples: the decode rate needs enough of them to be evidence.
+        for _ in 0..5 {
+            crate::provider_stats::record_total_latency("speed-fast", 2_000.0, true, 2_000);
+            crate::provider_stats::record_total_latency("speed-mid", 4_000.0, true, 800);
+            crate::provider_stats::record_total_latency("speed-slow", 4_000.0, true, 256);
+        }
+        let pool = pool_with_names(true, &["speed-fast", "speed-mid", "speed-slow"]);
+        let healthy: Vec<&AutoPoolEntry> = pool.entries.iter().collect();
+        let cohort = auto_pool_fast_cohort(&healthy);
+        let names: Vec<&str> = cohort.iter().map(|e| e.provider.as_str()).collect();
+        assert!(names.contains(&"speed-fast"));
+        assert!(names.contains(&"speed-mid"));
+        assert!(
+            !names.contains(&"speed-slow"),
+            "15.6 s per 1k tokens against a 5 s median must be excluded, got {names:?}"
+        );
+    }
+
+    /// The fastest member earns more of the rotation's slots: a request with
+    /// no upstream cache to lose should go where it will be answered fastest.
+    #[test]
+    fn the_fastest_member_earns_more_slots() {
+        for _ in 0..5 {
+            crate::provider_stats::record_total_latency("slot-fast", 2_000.0, true, 2_000);
+            crate::provider_stats::record_total_latency("slot-slow", 4_000.0, true, 256);
+        }
+        // Both keep the conversation warm, so the slots come from the cache
+        // weight and the speed factor decides how they are scaled.
+        for _ in 0..3 {
+            crate::provider_stats::record_cache_ratio("slot-fast", 1_800, 2_000);
+            crate::provider_stats::record_cache_ratio("slot-slow", 1_800, 2_000);
+        }
+        let pool = pool_with_names(true, &["slot-fast", "slot-slow"]);
+        let healthy: Vec<&AutoPoolEntry> = pool.entries.iter().collect();
+        let order = auto_pool_cache_order(&healthy);
+        let fast = order.iter().filter(|e| e.provider == "slot-fast").count();
+        let slow = order.iter().filter(|e| e.provider == "slot-slow").count();
+        assert!(
+            fast > slow,
+            "the fast member must earn more slots, got {fast} vs {slow}"
+        );
+        assert!(
+            slow >= 1,
+            "a slow member keeps its slot: the pool needs it for overflow"
+        );
     }
 
     /// Too little evidence is not a verdict.
@@ -9793,10 +9981,10 @@ mod auto_pool_latency_tests {
     #[test]
     fn cohort_readmits_a_provider_whose_evidence_aged_out() {
         // Same shape as the exclusion test above: 30 s against a ~2 s tier.
-        crate::provider_stats::record_total_latency("expiry-a", 1_000.0, true);
-        crate::provider_stats::record_total_latency("expiry-b", 2_000.0, true);
-        crate::provider_stats::record_total_latency("expiry-c", 6_000.0, true);
-        crate::provider_stats::record_total_latency("expiry-d", 30_000.0, true);
+        crate::provider_stats::record_total_latency("expiry-a", 1_000.0, true, 4096);
+        crate::provider_stats::record_total_latency("expiry-b", 2_000.0, true, 4096);
+        crate::provider_stats::record_total_latency("expiry-c", 6_000.0, true, 4096);
+        crate::provider_stats::record_total_latency("expiry-d", 30_000.0, true, 4096);
         let pool = pool_with_names(true, &["expiry-a", "expiry-b", "expiry-c", "expiry-d"]);
         fn cohort_names(pool: &AutoPoolState) -> Vec<&str> {
             let healthy: Vec<&AutoPoolEntry> = pool.entries.iter().collect();
@@ -9854,10 +10042,10 @@ mod auto_pool_latency_tests {
         // A uniformly-fast cluster (all < 5s) must not be cut in half by the
         // absolute floor: ceiling = min(max(median*1.5, 5s), max(10s, median))
         // >= 5s covers all.
-        crate::provider_stats::record_total_latency("cluster-a", 900.0, true);
-        crate::provider_stats::record_total_latency("cluster-b", 1100.0, true);
-        crate::provider_stats::record_total_latency("cluster-c", 1300.0, true);
-        crate::provider_stats::record_total_latency("cluster-d", 1700.0, true);
+        crate::provider_stats::record_total_latency("cluster-a", 900.0, true, 4096);
+        crate::provider_stats::record_total_latency("cluster-b", 1100.0, true, 4096);
+        crate::provider_stats::record_total_latency("cluster-c", 1300.0, true, 4096);
+        crate::provider_stats::record_total_latency("cluster-d", 1700.0, true, 4096);
         let pool = pool_with_names(
             true,
             &[
@@ -9932,10 +10120,10 @@ mod auto_pool_latency_tests {
 
     #[test]
     fn rotation_counts_the_skipped_provider() {
-        crate::provider_stats::record_total_latency("skip-a", 1000.0, true);
-        crate::provider_stats::record_total_latency("skip-b", 2000.0, true);
-        crate::provider_stats::record_total_latency("skip-c", 6000.0, true);
-        crate::provider_stats::record_total_latency("skip-d", 30000.0, true);
+        crate::provider_stats::record_total_latency("skip-a", 1000.0, true, 4096);
+        crate::provider_stats::record_total_latency("skip-b", 2000.0, true, 4096);
+        crate::provider_stats::record_total_latency("skip-c", 6000.0, true, 4096);
+        crate::provider_stats::record_total_latency("skip-d", 30000.0, true, 4096);
         let pool = pool_with_names(true, &["skip-a", "skip-b", "skip-c", "skip-d", "skip-e"]);
         let healthy: Vec<&AutoPoolEntry> = pool.entries.iter().collect();
         let before = METRICS

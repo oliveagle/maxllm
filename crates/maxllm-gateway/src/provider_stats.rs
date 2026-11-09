@@ -37,11 +37,22 @@ const EWMA_ALPHA: f64 = 0.3;
 /// reports as *unmeasured* again — which the rotation admits, and which is
 /// exactly what produces the next measurement.
 const TOTAL_LATENCY_WINDOW: Duration = Duration::from_secs(10 * 60);
+/// How long a sample is *kept*, as opposed to how long it counts as
+/// evidence.
+///
+/// The two are different on purpose. A verdict may only outlive its evidence
+/// by nothing (`TOTAL_LATENCY_WINDOW`), but the samples themselves are kept
+/// for an hour because the decode-rate estimate needs many of them and a
+/// provider's speed is a slow property: it does not change between two
+/// requests the way a cache ratio does.
+const TOTAL_LATENCY_RETENTION: Duration = Duration::from_secs(60 * 60);
+/// The window of the decode-rate estimate: the samples kept for an hour.
+const DECODE_RATE_WINDOW: Duration = TOTAL_LATENCY_RETENTION;
 /// Hard cap on retained samples per provider, independent of the window, so a
 /// provider inside the window cannot grow the map without bound. The oldest
 /// samples go first; reaching this within the window needs a rate no route
 /// here sustains, so in practice the window is what prunes.
-const TOTAL_LATENCY_MAX_SAMPLES: usize = 256;
+const TOTAL_LATENCY_MAX_SAMPLES: usize = 1024;
 /// How many windowed samples must accumulate with no warm one before the
 /// cold latencies are used as the estimate.
 ///
@@ -56,10 +67,14 @@ const TOTAL_LATENCY_COLD_JUDGE_AFTER: usize = 5;
 
 #[derive(Debug, Clone, Default)]
 struct TotalLatencyStats {
-    /// `(recorded_at, whole-exchange ms, warm)`, oldest first. `warm` is the
-    /// fraction of the input the upstream served from its prompt cache, over
-    /// the threshold the caller applied — see [`record_total_latency`].
-    samples: VecDeque<(Instant, f64, bool)>,
+    /// `(recorded_at, whole-exchange ms, warm, output tokens)`, oldest first.
+    /// `warm` is the fraction of the input the upstream served from its
+    /// prompt cache, over the threshold the caller applied — see
+    /// [`record_total_latency`]. The output tokens are what make the
+    /// *workload-independent* speed estimate possible: without them a
+    /// whole-exchange duration says as much about how much the client asked
+    /// to generate as about how fast the provider is.
+    samples: VecDeque<(Instant, f64, bool, u64)>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -106,6 +121,17 @@ const CACHE_RATIO_WINDOW: Duration = Duration::from_secs(10 * 60);
 /// actually serves. Only a request big enough to have a prefix worth
 /// caching is evidence.
 const CACHE_RATIO_MIN_INPUT_TOKENS: u64 = 1024;
+
+/// The smallest answer whose decode time is worth measuring.
+///
+/// A 40-token answer is dominated by the round trip and the prefill; its
+/// "milliseconds per output token" says more about the request than about
+/// the provider.
+const DECODE_RATE_MIN_OUTPUT_TOKENS: u64 = 256;
+
+/// How many such answers a provider needs before its decode rate may be
+/// used for anything.
+const DECODE_RATE_MIN_SAMPLES: usize = 4;
 
 /// Smoothing for the cache ratio. The newest observation weighs 30%.
 const CACHE_RATIO_ALPHA: f64 = 0.3;
@@ -228,21 +254,56 @@ pub fn record_latency(provider: &str, latency_ms: f64) {
 /// its prompt cache. A cold request is dominated by a prefix prefill that the
 /// next turn will not repeat, so it is kept as evidence but ranked behind
 /// warm evidence — see [`total_latency_ms`].
-pub fn record_total_latency(provider: &str, latency_ms: f64, warm: bool) {
+pub fn record_total_latency(provider: &str, latency_ms: f64, warm: bool, tokens_out: u64) {
     let mut map = TOTAL_LATENCY.write().unwrap_or_else(|e| e.into_inner());
     let stats = map.entry(provider.to_string()).or_default();
     let now = Instant::now();
-    stats.samples.push_back((now, latency_ms, warm));
+    stats.samples.push_back((now, latency_ms, warm, tokens_out));
     while stats
         .samples
         .front()
-        .is_some_and(|(at, _, _)| now.duration_since(*at) > TOTAL_LATENCY_WINDOW)
+        .is_some_and(|(at, _, _, _)| now.duration_since(*at) > TOTAL_LATENCY_RETENTION)
     {
         stats.samples.pop_front();
     }
     while stats.samples.len() > TOTAL_LATENCY_MAX_SAMPLES {
         stats.samples.pop_front();
     }
+}
+
+/// The provider's speed, measured in milliseconds per 1 000 output tokens.
+///
+/// This is the *workload-independent* speed: a whole-exchange duration says
+/// as much about how much the client asked to generate as about how fast the
+/// provider is, so a provider that happened to serve short requests used to
+/// look like the fastest member of the pool. Measured on NAS (2026-11-09),
+/// the two signals disagreed completely: `opencode_go_2` had the best
+/// whole-exchange median (4 101 ms) and the worst decode rate of the cloud
+/// members (13 950 ms/1k ≈ 72 tok/s), while `ollama_local` looked ordinary
+/// (5 555 ms) and was in fact the fastest (6 119 ms/1k ≈ 163 tok/s).
+///
+/// Only warm turns count (a cold turn's prefill dominates its duration) and
+/// only answers long enough to be mostly decoding (a 40-token answer says
+/// more about the round trip than about the provider).
+pub fn decode_rate_ms_per_1k(provider: &str) -> Option<f64> {
+    let map = TOTAL_LATENCY.read().unwrap_or_else(|e| e.into_inner());
+    let stats = map.get(provider)?;
+    let now = Instant::now();
+    let mut rates: Vec<f64> = stats
+        .samples
+        .iter()
+        .filter(|(at, _, warm, tokens_out)| {
+            *warm
+                && *tokens_out >= DECODE_RATE_MIN_OUTPUT_TOKENS
+                && now.duration_since(*at) <= DECODE_RATE_WINDOW
+        })
+        .map(|(_, latency_ms, _, tokens_out)| latency_ms * 1000.0 / *tokens_out as f64)
+        .collect();
+    if rates.len() < DECODE_RATE_MIN_SAMPLES {
+        return None;
+    }
+    rates.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    Some(rates[rates.len() / 2])
 }
 
 /// The median whole-exchange latency (ms) among the samples `provider`
@@ -270,8 +331,8 @@ pub fn total_latency_ms(provider: &str) -> Option<f64> {
     let fresh: Vec<(f64, bool)> = stats
         .samples
         .iter()
-        .filter(|(at, _, _)| now.duration_since(*at) <= TOTAL_LATENCY_WINDOW)
-        .map(|(_, ms, warm)| (*ms, *warm))
+        .filter(|(at, _, _, _)| now.duration_since(*at) <= TOTAL_LATENCY_WINDOW)
+        .map(|(_, ms, warm, _)| (*ms, *warm))
         .collect();
     if fresh.is_empty() {
         return None;
@@ -304,6 +365,12 @@ pub struct LatencySample {
     pub latency_ms: f64,
     /// Whether the upstream served at least half of the input from its cache.
     pub warm: bool,
+    /// How many tokens the provider generated.
+    ///
+    /// `default` keeps the rows written before this field existed readable:
+    /// their samples simply do not count towards the decode rate.
+    #[serde(default)]
+    pub tokens_out: u64,
 }
 
 /// The routing evidence for one provider, as it crosses the process boundary.
@@ -371,11 +438,12 @@ fn latency_samples(
     stats
         .samples
         .iter()
-        .filter(|(at, _, _)| now.duration_since(*at) <= TOTAL_LATENCY_WINDOW)
-        .map(|(at, latency_ms, warm)| LatencySample {
+        .filter(|(at, _, _, _)| now.duration_since(*at) <= TOTAL_LATENCY_WINDOW)
+        .map(|(at, latency_ms, warm, tokens_out)| LatencySample {
             age_secs: now.duration_since(*at).as_secs(),
             latency_ms: *latency_ms,
             warm: *warm,
+            tokens_out: *tokens_out,
         })
         .collect()
 }
@@ -412,7 +480,7 @@ pub fn restore(snapshot: &ProviderStatsSnapshot) -> bool {
     }
 
     // The latency window.
-    let samples: Vec<(Instant, f64, bool)> = snapshot
+    let samples: Vec<(Instant, f64, bool, u64)> = snapshot
         .total_latency
         .iter()
         .map(|s| {
@@ -421,9 +489,10 @@ pub fn restore(snapshot: &ProviderStatsSnapshot) -> bool {
                     .unwrap_or(now),
                 s.latency_ms,
                 s.warm,
+                s.tokens_out,
             )
         })
-        .filter(|(at, _, _)| now.duration_since(*at) <= TOTAL_LATENCY_WINDOW)
+        .filter(|(at, _, _, _)| now.duration_since(*at) <= TOTAL_LATENCY_WINDOW)
         .collect();
     if !samples.is_empty() {
         let mut map = TOTAL_LATENCY.write().unwrap_or_else(|e| e.into_inner());
@@ -470,7 +539,7 @@ pub(crate) fn expire_total_latency_evidence(provider: &str) {
         return;
     };
     let aged = Instant::now() - TOTAL_LATENCY_WINDOW - Duration::from_secs(1);
-    for (at, _, _) in stats.samples.iter_mut() {
+    for (at, _, _, _) in stats.samples.iter_mut() {
         *at = aged;
     }
 }
@@ -538,12 +607,12 @@ mod tests {
     fn total_latency_is_the_median_of_what_was_recorded() {
         // A fast first byte (100 ms) with a slow generation (200 ms): the
         // whole-exchange signal is the exchange, not the first byte.
-        record_total_latency("lat-total-1", 100.0, true);
+        record_total_latency("lat-total-1", 100.0, true, 4096);
         assert_eq!(total_latency_ms("lat-total-1"), Some(100.0));
-        record_total_latency("lat-total-1", 200.0, true);
+        record_total_latency("lat-total-1", 200.0, true, 4096);
         // Two samples: the upper middle one. Never below either endpoint.
         assert_eq!(total_latency_ms("lat-total-1"), Some(200.0));
-        record_total_latency("lat-total-1", 150.0, true);
+        record_total_latency("lat-total-1", 150.0, true, 4096);
         assert_eq!(total_latency_ms("lat-total-1"), Some(150.0));
     }
 
@@ -559,10 +628,10 @@ mod tests {
     #[test]
     fn one_outlier_does_not_move_the_total_latency_estimate() {
         for ms in [4_000.0, 4_200.0, 3_800.0, 4_100.0] {
-            record_total_latency("lat-outlier-1", ms, true);
+            record_total_latency("lat-outlier-1", ms, true, 4096);
         }
         assert_eq!(total_latency_ms("lat-outlier-1"), Some(4_100.0));
-        record_total_latency("lat-outlier-1", 90_000.0, true);
+        record_total_latency("lat-outlier-1", 90_000.0, true, 4096);
         let after = total_latency_ms("lat-outlier-1").unwrap();
         assert!(
             after < 10_000.0,
@@ -578,12 +647,12 @@ mod tests {
     /// forever while it receives no traffic that could ever revise it.
     #[test]
     fn stale_total_latency_samples_stop_being_evidence() {
-        record_total_latency("lat-stale-1", 5_000.0, true);
+        record_total_latency("lat-stale-1", 5_000.0, true, 4096);
         assert_eq!(total_latency_ms("lat-stale-1"), Some(5_000.0));
         {
             let mut map = TOTAL_LATENCY.write().unwrap_or_else(|e| e.into_inner());
             let stats = map.get_mut("lat-stale-1").expect("recorded above");
-            for (at, _, _) in stats.samples.iter_mut() {
+            for (at, _, _, _) in stats.samples.iter_mut() {
                 *at = Instant::now() - TOTAL_LATENCY_WINDOW - Duration::from_secs(1);
             }
         }
@@ -594,7 +663,7 @@ mod tests {
         );
         // ... and the next exchange re-measures it from scratch: the old
         // history must not blend into the new reading.
-        record_total_latency("lat-stale-1", 3_000.0, true);
+        record_total_latency("lat-stale-1", 3_000.0, true, 4096);
         assert_eq!(total_latency_ms("lat-stale-1"), Some(3_000.0));
     }
 
@@ -605,8 +674,8 @@ mod tests {
     #[test]
     fn cold_samples_never_outweigh_warm_evidence() {
         // A cold 40 s prefill arrives after a warm 4 s turn.
-        record_total_latency("lat-cold-1", 4_000.0, true);
-        record_total_latency("lat-cold-1", 40_000.0, false);
+        record_total_latency("lat-cold-1", 4_000.0, true, 4096);
+        record_total_latency("lat-cold-1", 40_000.0, false, 4096);
         assert_eq!(
             total_latency_ms("lat-cold-1"),
             Some(4_000.0),
@@ -614,7 +683,7 @@ mod tests {
         );
         // More cold samples still do not move it while warm evidence exists.
         for _ in 0..8 {
-            record_total_latency("lat-cold-1", 40_000.0, false);
+            record_total_latency("lat-cold-1", 40_000.0, false, 4096);
         }
         assert_eq!(total_latency_ms("lat-cold-1"), Some(4_000.0));
     }
@@ -625,14 +694,14 @@ mod tests {
     #[test]
     fn a_provider_with_only_cold_samples_is_still_measured() {
         for _ in 0..TOTAL_LATENCY_COLD_JUDGE_AFTER - 1 {
-            record_total_latency("lat-cold-2", 30_000.0, false);
+            record_total_latency("lat-cold-2", 30_000.0, false, 4096);
         }
         assert_eq!(
             total_latency_ms("lat-cold-2"),
             None,
             "too little evidence to judge"
         );
-        record_total_latency("lat-cold-2", 30_000.0, false);
+        record_total_latency("lat-cold-2", 30_000.0, false, 4096);
         assert_eq!(total_latency_ms("lat-cold-2"), Some(30_000.0));
     }
 
@@ -660,7 +729,7 @@ mod tests {
     fn the_routing_evidence_survives_a_restart() {
         forget("persist-1");
         record_cache_ratio("persist-1", 1800, 2000); // 90% of the input cached
-        record_total_latency("persist-1", 4_000.0, true);
+        record_total_latency("persist-1", 4_000.0, true, 4096);
 
         let snap = snapshot();
         let one = snap
@@ -695,7 +764,7 @@ mod tests {
     fn stale_evidence_is_not_restored() {
         forget("persist-stale");
         record_cache_ratio("persist-stale", 100, 2000);
-        record_total_latency("persist-stale", 30_000.0, false);
+        record_total_latency("persist-stale", 30_000.0, false, 4096);
 
         let mut aged = snapshot()
             .into_iter()
@@ -730,6 +799,56 @@ mod tests {
         let ratio = cache_ratio("persist-fresh").expect("measured");
         assert!((ratio - 0.5).abs() < 1e-6, "got {ratio}");
         forget("persist-fresh");
+    }
+
+    /// The speed estimate must not be fooled by the client's workload: two
+    /// providers can have the *same* whole-exchange median while one of them
+    /// answers eight times as fast per token. Measured on NAS 2026-11-09:
+    /// `opencode_go_2` had the best median (4 101 ms) and the worst decode
+    /// rate of the cloud members (13 950 ms/1k), `ollama_local` looked
+    /// ordinary (5 555 ms) and was the fastest (6 119 ms/1k).
+    #[test]
+    fn the_decode_rate_sees_the_speed_not_the_workload() {
+        forget("decode-fast");
+        forget("decode-slow");
+        for _ in 0..5 {
+            record_total_latency("decode-fast", 10_000.0, true, 8_000);
+            record_total_latency("decode-slow", 10_000.0, true, 1_000);
+        }
+        // The duration is the same for both — the old signal could not tell
+        // them apart.
+        assert_eq!(total_latency_ms("decode-fast"), Some(10_000.0));
+        assert_eq!(total_latency_ms("decode-slow"), Some(10_000.0));
+        let fast = decode_rate_ms_per_1k("decode-fast").expect("measured");
+        let slow = decode_rate_ms_per_1k("decode-slow").expect("measured");
+        assert!((fast - 1_250.0).abs() < 1e-6, "got {fast}");
+        assert!((slow - 10_000.0).abs() < 1e-6, "got {slow}");
+        forget("decode-fast");
+        forget("decode-slow");
+    }
+
+    /// A short answer is mostly round trip and prefill: it says nothing
+    /// about how fast the provider decodes.
+    #[test]
+    fn a_short_answer_is_not_evidence_of_the_speed() {
+        forget("decode-short");
+        for _ in 0..5 {
+            record_total_latency("decode-short", 500.0, true, 10);
+        }
+        assert_eq!(decode_rate_ms_per_1k("decode-short"), None);
+        forget("decode-short");
+    }
+
+    /// A cold turn's prefill dominates its duration, so it is not evidence
+    /// of the provider's decode speed.
+    #[test]
+    fn a_cold_turn_is_not_evidence_of_the_speed() {
+        forget("decode-cold");
+        for _ in 0..5 {
+            record_total_latency("decode-cold", 40_000.0, false, 4_000);
+        }
+        assert_eq!(decode_rate_ms_per_1k("decode-cold"), None);
+        forget("decode-cold");
     }
 
     #[test]

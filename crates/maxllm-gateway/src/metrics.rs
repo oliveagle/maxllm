@@ -47,6 +47,9 @@ pub struct GatewayMetrics {
     /// The share of the input each provider served from its prompt cache
     /// (percent), as the pool sees it.
     pub provider_cache_ratio: IntGaugeVec,
+    /// How long each provider took per 1 000 output tokens (ms) — the
+    /// provider's speed with the client's workload divided out.
+    pub provider_decode_ms_per_1k: IntGaugeVec,
     pub session_affinity_evictions_total: IntCounter,
     pub session_affinity_size: IntGauge,
     /// Circuit breaker state per provider: 0=closed, 1=open, 2=half-open.
@@ -248,6 +251,18 @@ impl GatewayMetrics {
         .expect("metric");
         registry
             .register(Box::new(provider_cache_ratio.clone()))
+            .expect("register");
+
+        let provider_decode_ms_per_1k = IntGaugeVec::new(
+            Opts::new(
+                "maxllm_provider_decode_ms_per_1k",
+                "Milliseconds each provider took per 1000 output tokens (lower is faster)",
+            ),
+            &["provider"],
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(provider_decode_ms_per_1k.clone()))
             .expect("register");
 
         let session_affinity_evictions_total = IntCounter::new(
@@ -487,6 +502,7 @@ impl GatewayMetrics {
             session_affinity_misses_total,
             session_affinity_cold_escapes_total,
             provider_cache_ratio,
+            provider_decode_ms_per_1k,
             session_affinity_evictions_total,
             session_affinity_size,
             circuit_breaker_state,
