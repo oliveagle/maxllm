@@ -1953,6 +1953,97 @@ oleFedora01 的 `provider_stats_state` 目前 **0 行**：它自 06:07Z 起没�
 落盘这份证据，也没有 `own_the_error`；在它升级之前，客户端应直指 NAS
 `http://10.126.126.6:3795/v1` 或本机 `http://10.126.126.20:3795/v1`。
 
+### 15.11 速度判据的收口：一次慢的**长**答案，不该换掉一个 99% 命中的会话（`d2a29dc`，2026-11-09 15:35 CST 部署）
+
+**先说结论：轮换没有坏。** 「auto rotate」一直活着（12 个并发探针实测：
+opencode_go_2 73 次 / volc_1 35 次 / opencode_go_1 23 次 / xiaomi、ollama_local、
+minimax 各 3 次 / volc_t_1 2 次；池 12 成员 = 11 订阅 + 1 计费，3 个撞配额墙，
+7~8 个健康）。但**93 % 的流量是钉住会话**（07:00Z 起 358 个请求，
+`session_affinity_hits_total=365`、miss 仅 24）—— 轮换只管新会话和探针。
+所以「某个 provider 看起来没被轮到」多数时候是**它只服务于几条老会话**，
+不是被权重饿死。
+
+**真正把会话赶走的是「速度逃逸」。** 会话粘在 minimax 上（上游缓存命中 99.5 %），
+2026-11-09 06:00:03.745Z（0.3.12 部署后 15 秒）它恢复后第一个样本
+`latency_ms=13250`；同刻 tier 中位数 = 5249（`opencode_go_1` 05:59:55 的样本，
+三个成员各一个样本）。判据 `auto_pool_pin_escapable(13250, 5249)`：
+`13250 > 5249×1.5` ✓ 且 `13250 > 10000` ✓ → **摘钉**。
+**1.7 秒后**（06:00:05.417）该会话转给 `volc_1` → **上游 prompt cache 被丢掉**。
+minimax 全程健康：04:14:11 一次 502 之后再无失败日志
+（`last_failure_at=04:14:10.938`），行 `updated_at=06:34:09` 只是最后一次请求落盘。
+
+> 之前的怀疑「14:57 那次部署后 4 个会话迁走」是**时间窗对错了**：迁移实际发生在
+> **06:00–06:02Z（14:00–14:02 CST）**，即 0.3.12 部署（05:59:49Z）之后，不是 14:57 那次。
+> 用「≤06:45Z vs ≤07:25Z」比较把整个上午都算了进去。
+
+**根因：时长被当成了速度。** 06:00 窗口里每一个「慢」样本都是**长答案**：
+
+| provider | 完整往返 | 输出 token | 每 1k token | 慢的是谁 |
+|---|---|---|---|---|
+| minimax | 13 250 ms | 1 879 | 7 051 ms | 客户端要得多 |
+| volc_1 | 23 696 ms | 1 189 | 19 930 ms | 客户端要得多 |
+| volc_t_1 | 19 179 ms | 1 589 | 12 070 ms | 客户端要得多 |
+| xiaomi | 28 500 ms | 880 | 32 386 ms | 客户端要得多 |
+
+整程时长和每 token 速率在 NAS 上**完全对不上**：
+
+| provider | 整程中位数（看起来最快） | 每 1k token（真实速度） |
+|---|---|---|
+| opencode_go_2 | 4 101 ms（最好） | 13 950 ms/1k ≈ 72 tok/s（云端最慢） |
+| ollama_local | 5 555 ms（普通） | 6 119 ms/1k ≈ 163 tok/s（最快） |
+| xiaomi | 16 028 ms | 30 634 ms/1k |
+
+**修法：时长只有在生成量无法背锅时才允许定罪。**
+
+1. **有速率证据** → 用 `auto_pool_decode_is_slow`（`38e85ad` 已有）：整程时长只当
+   「触发器」，判决看每 token 速率。
+2. **无速率证据**（答案太短测不出速率）→ 只有当
+   `provider_stats::unattributable_latency_ms(provider)` 存在时才用时长定罪。
+   这个新函数取窗口内 **warm 且 `tokens_out < 256`** 的样本中位时长 ——
+   **短答案的时长里没有生成量可背锅，warm 又排除了另一个嫌疑（冷启动重读全文的
+   prefill）**，剩下的才是成员自己的时延。
+3. **两者皆无** → 不摘钉。*没有证据表明它慢，不等于它慢*；轮换本身就是用来测量它的。
+
+于是 06:00 那个样本（1 879 token ≥ 256 ⇒ 不可归因 ⇒ 无速率证据 ⇒ 不摘钉）被保住，
+而集成测试里那个只回 5 token 的慢 mock（短且 warm ⇒ 可归因 ⇒ 时长定罪）行为不变，
+`test_auto_pool_escapes_a_pin_that_is_slow_enough` **无需改动即通过**。
+
+**自我强化的饥饿（解释了为什么 minimax / ollama_local / xiaomi / volc_t_1 没有
+`provider_stats_state` 行）：** 没有会话钉住 → 没有续话样本 → `cache_evidence=None`
+→ 只拿保底权重 → 继续饿。opencode_go_1/2/volc_1 有 98~99 % 是因为它们一直在
+被钉住的会话供着。
+
+**顺带挖出来的坑：body 里的 session id 是死代码。** `select_provider` 在
+`gateway.rs:3511` 调用，而 body 的 session id 在 `:4017` 才解析，所有
+`buffer_request_body_chunk` 调用都在 **≥:4029** —— `ctx.request_body_buf` 在
+4017 **恒为空**，`resolve_from_body` 是死代码。文档里写的
+`metadata.user_id` / `client_metadata.session_id` / `prompt_cache_key`
+**三种写法全部无效**。实测：只带 body 的 4 个请求 → **4 个不同 provider**
+（minimax→xiaomi→volc_1→opencode_go_1），session_id 列为空；只带请求头的 4 个
+→ 全在 volc_t_1。真实客户端的 id 来自**请求头**
+（`x-session-id` / `x-conversation-id` / `session-id` / `thread-id`），所以它们的
+钉住是生效的。
+
+**改动与部署。**
+
+- `crates/maxllm-gateway/src/provider_stats.rs`：新增 `unattributable_latency_ms`
+  （warm + `tokens_out < 256` 的中位时长）+ 4 个单元测试；
+- `crates/maxllm-gateway/src/gateway.rs`：`auto_pool_pin_is_slow` 提成自由函数并按上面
+  三档重写 + 5 个单元测试（未测量留、长答案留、短答案走、每 token 慢走、快回合留）；
+- 门禁：`cargo fmt` / `cargo test --workspace`（913 passed, 0 failed）/
+  `cargo clippy --all-targets -- -D warnings` 全绿；
+- 部署：NAS `10.126.126.6` 与 oleFedora01 `10.126.126.20`，sha `d98cba34cfbc6e2f`
+  （`d2a29dc`），musl static-pie，两台 `active` + `/health` 200。
+
+**还没解决的（已量化，未做）：**
+
+- 入口 VPS 仍是 0.3.10（需 root，见 §15.6/§15.9.1）；
+- **body 里的 session id 是死代码** —— 要么在选路前缓冲 body，要么把文档里那三种
+  写法删掉；
+- per-provider 读超时（ollama_local 有 124 s 挂起）；
+- 半开成员仍占轮换槽；探针失败不计入熔断；
+- `auto_home` 池 14 个成员里 11 个常死。
+
 ## 附录 A：复现与口径
 
 ```sh
