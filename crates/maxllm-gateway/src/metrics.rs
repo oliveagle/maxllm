@@ -118,6 +118,13 @@ pub struct GatewayMetrics {
     /// `/health` scrape is the common case) and must not be booked as
     /// status-0 provider failures.
     pub unrouted_sessions_total: IntCounter,
+    /// Configuration hot-reloads that were applied.
+    pub config_reloads_total: IntCounter,
+    /// Configuration hot-reloads that could not be applied — the file did not
+    /// parse, or the new configuration did not build. The gateway keeps
+    /// running the previous configuration, so an operator who added a pool
+    /// member and sees this counter has a member that is *not* in the pool.
+    pub config_reload_failures_total: IntCounter,
 }
 
 impl GatewayMetrics {
@@ -165,6 +172,25 @@ impl GatewayMetrics {
             IntGauge::new("maxllm_active_requests", "Currently active requests").expect("metric");
         registry
             .register(Box::new(active_requests.clone()))
+            .expect("register");
+
+        let config_reloads_total = IntCounter::new(
+            "maxllm_config_reloads_total",
+            "Configuration hot-reloads applied",
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(config_reloads_total.clone()))
+            .expect("register");
+
+        let config_reload_failures_total = IntCounter::new(
+            "maxllm_config_reload_failures_total",
+            "Configuration hot-reloads that could not be applied (the gateway \
+             kept running the previous configuration)",
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(config_reload_failures_total.clone()))
             .expect("register");
 
         let fallbacks_total = IntCounterVec::new(
@@ -516,6 +542,8 @@ impl GatewayMetrics {
             recording_redactions_total,
             cached_input_tokens_total,
             unrouted_sessions_total,
+            config_reloads_total,
+            config_reload_failures_total,
         }
     }
 
