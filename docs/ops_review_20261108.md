@@ -3044,3 +3044,25 @@ clippy `-D warnings` 干净。现场复测：minimax 直连 responses 仍 500+�
 
 **卡点照旧（:18081 入口漏，第三轮）**：需要 root@10.126.126.199 跑
 `one-api/deploy-nginx.sh` + `maxllm/deploy.sh`；此前客户端直连 NAS / Fedora。
+
+**跟进（ef01cde，2026-11-10 00:1x）**：探针补上"停车"权限 —— body 阶段对配额类判决
+（QuotaUntil/QuotaUnknown）不再把探针排除在外：配额墙的常客只有探针（真实轮换会跳过
+开路的成员），探针读到配额措辞就必须把成员重新停回梯子，否则墙在两次真实命中之间衰减
+成半开、每轮被探一次、且探针触发的 failover 答 200 —— 墙被误报为 SERVED 还白烧上游
+往返。普通失败仍然对探针豁免（探针不能因瞬态错误跳闸断路器）。这与 header 阶段 429
+路径一致（该路径本就允许探针按 header 声明的时间点 force-open）。
+
+**现场复核（2026-11-10 00:1x）**：minimax 的 Token Plan 墙已恢复 —— 直连
+`api.minimaxi.com/v1/responses`（含 2000 词输入）现在 200 正常出 token，探针报
+`ok 200`。因此本轮无法对"500 配额墙"做线上实景验收，机制由 2 个集成测试证明
+（500+配额体 → 恰一次 quota open + 断路器 open；真 500 → 普通失败 + 断路器 closed）
++ 探针停车测试（探针读 500+配额体 → quota open + open）。墙复发时（用户会继续加账号，
+墙会来）行为即上述。
+
+**部署事故（教训）**：`cd repo && setsid nohup scripts/deploy.sh fedora &` 的 `&` 会把
+整条 `cd && deploy` 后台化，前台 shell 仍在原 cwd —— fedora 那次从
+`/home/oliveagle/repos/github.com/oliveagle/maxllm`（另一会话的 worktree）构建并部署了
+0.3.10 的二进制。已用绝对路径 `/tmp/mx-capacity/scripts/deploy_maxllm.sh fedora` 重部署
+修正。共享 CARGO_TARGET_DIR 被错误 worktree（vendor 的 pingora 不同）污染导致编译错，
+改用 `CARGO_TARGET_DIR=/tmp/mx-fresh-target` 隔离重编译。NAS + Fedora 现均 0.3.13、
+`/admin/pool` 200、open 集 {kimi, volc_2, volc_t_1, zhipu_1}，minimax 半开→健康。
