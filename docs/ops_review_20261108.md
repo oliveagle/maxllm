@@ -2430,6 +2430,53 @@ opencode_go_2 占 6 条**。
 容量账上，`auto_home` 现在实际只有 **3/14** 可用；真正在扛客户端流量的是
 `auto` 池（订阅池，12 个成员，**10/12** 可用 —— 停放着 `volc_2` 和 `zhipu_1`）。
 
+
+### 15.17 入口数据面仍跑着 0.3.10：同一路径、同一症状，量给齐了（2026-11-09 18:2x CST 实测）
+
+§15.5/§15.9 已经推断"VPS 上的网关还是旧二进制"。本轮把**数据面**也钉死了——
+不是推断，是同一请求、同一时刻、三个端点的对照实验：
+
+| 端点 | `/health` 版本 | `POST /v1/responses/kimi`（配额已墙的成员） |
+|---|---|---|
+| 入口 nginx `10.126.126.199:18081` | **0.3.10** | **429 + Kimi 上游原文**（`X-MaxLLM-Provider: kimi`） |
+| VPS 直连 `10.126.126.199:3795` | **0.3.10** | 503 `no provider available: kimi=circuit open (quota force-open)` |
+| NAS `10.126.126.6:3795` | **0.3.12**（sha `96081d90f961bcb1`） | 503（同上，`own_the_error` 生效） |
+
+同一条请求：入口回 429 原文（老网关行为），NAS 回 503（新行为）⇒ **nginx 的
+`maxllm_ha` primary（VPS 本机 :3795）就是客户端的数据面**，NAS/Fedora 只是
+`backup`。第一次探测把 kimi 熔断打 open 了，所以直连 :3795 的第二次探测回 503——
+是同一个 0.3.10 进程先漏 429、后把配额墙记进自己的 breaker。`/admin/*` 被 nginx
+转给 NAS 这件事不改变数据面走向（§15.9 已注明别把 :18081 当 VPS 状态源）。
+
+**这个入口还在真实服务流量**（VPS `/admin/logs?limit=200`：~7 发/分，
+`client_ip` 全是 `10.126.126.199` = nginx 的 socket peer；NAS 同时段 ~10 发/分，
+client_ip 是 192.168.2.165/.106）。所以约 **四成的客户端流量仍由旧二进制服务**：
+
+| 观测（各取最近 100 行 / 200 行 admin logs） | 入口 VPS 0.3.10 | NAS 0.3.12 |
+|---|---|---|
+| 延迟 p50 / p90 / max（ms） | **10 513 / 26 027 / 43 493** | **7 885 / 29 424 / 58 152** |
+| 成员集中度 | **minimax 64%**（老池子无缓存加权） | opencode_go_2 42% / volc_t_1 36% / opencode_go_1 22% |
+| `cached_tokens` 列 | **没有**（0.3.10 不记账） | 有，97.3% 命中（99/100 行 warm） |
+
+老节点没有缓存加权 ⇒ 60% 流量压在一个订阅账号上（该账号配额被更快烧完）；
+没有 `own_the_error` ⇒ 上游 429/5xx 原文漏给客户端（kimi 约 1%、以及 11:15 智谱
+那一单）；没有首字节 deadline ⇒ 上游"接了不开口"要等 120 s 才换人。三台里只有这台
+还是旧行为，且正好是**入口**。
+
+**升级仍是同一件事、同一个 root 门禁**（本会话无 VPS 凭据，第 5 次）：
+
+```bash
+# 在 NAS 上执行（SOURCE 拉 NAS 的 0.3.12 二进制 + 配置 + dotvault 渲染密钥）：
+REMOTE=root@10.126.126.199 SOURCE=oliveagle@10.126.126.6 \
+  ~/.agents/ops/machines/vm_tecent_cloud_01/maxllm/deploy.sh
+# nginx 入口（proxy_next_upstream 已就绪，需 root reload）：
+REMOTE=root@10.126.126.199 \
+  ~/.agents/ops/machines/vm_tecent_cloud_01/maxllm/deploy-nginx.sh
+```
+
+升级前，指向 :18081 的客户端仍会拿到上游原文错误；临时兜底是把 base_url 直指
+NAS `http://10.126.126.6:3795/v1`（NAS/Fedora 均为 0.3.12，`breaker_sync` 双向）。
+
 ## 附录 A：复现与口径
 
 ```sh
