@@ -1632,8 +1632,8 @@ POST /v1/responses/kimi  → 503
 
 | 节点 | 地址 | 网关 | 熔断共享 |
 |---|---|---|---|
-| oleFedora01（本机） | 10.126.126.20 / 192.168.2.137 / 192.168.2.198 : 3795 | 0.3.11 / `c5b655a9efdd0d48` | ✅ 与 NAS 双向 |
-| oleNas01 | 192.168.2.190 / 10.126.126.6 : 3795 | 0.3.11 / `c5b655a9efdd0d48` | ✅ 与本机双向 |
+| oleFedora01（本机） | 10.126.126.20 / 192.168.2.137 / 192.168.2.198 : 3795 | 0.3.12 / `b127ad9921b4b9d2` | ✅ 与 NAS 双向 |
+| oleNas01 | 192.168.2.190 / 10.126.126.6 : 3795 | 0.3.12 / `b127ad9921b4b9d2` | ✅ 与本机双向 |
 | 腾讯云 VPS | 10.126.126.199 : 3795（nginx : 18081） | **旧版本**（无 `/admin/breakers`） | ❌ 孤立 |
 
 实测证据：
@@ -1647,7 +1647,7 @@ POST /v1/responses/kimi  → 503
 ### 15.6 待办：VPS 节点升级（需运维在本机执行）
 
 ```bash
-# 1) 上传（静态 musl，sha256[:16]=c5b655a9efdd0d48）
+# 1) 上传（静态 musl，sha256[:16]=b127ad9921b4b9d2）
 scp ~/.cache/mx-gate-target/x86_64-unknown-linux-musl/release/maxllm-server \
     root@10.126.126.199:/opt/maxllm/bin/maxllm-server.new
 # 2) 切换 + 重启
@@ -1728,6 +1728,61 @@ NAS 上 `/v1/responses/auto` 的 24 h 数据（25161 发）里，两件事混在
 **回归**：`test_auto_pool_prefers_the_member_that_keeps_the_conversation_warm`、
 `test_a_session_pinned_to_a_cold_member_moves_to_a_warm_one`（集成），
 外加 7 个单测（权重、交错、未测量成员、迁移落点、门槛、证据过期）。
+
+### 15.8 缓存口径的补丁：新账号的第一轮不是判决（`b0f7e85` → 0.3.12，2026-11-09 13:56 CST 部署）
+
+§15.7 的量法有个洞：**它把每一轮请求都算进了缓存比**。但一轮对话的**第一轮
+天然是冷的** —— 上游从没见过这个前缀，它不可能命中。于是：
+
+* 新加进池子的账号，第一轮就被判成「不缓存」；
+* 权重把它压到保底 1 份；
+* 它的会话因此被迁走 → 它再也没机会拿到能填缓存的会话；
+* 它的样本永远攒不够 → 永远翻不了身。
+
+**自我强化的降级螺旋**，而且恰好打在「我要往池子里加更多账号和 provider」这个
+计划上。修法三条：
+
+1. `RequestCtx::session_continuation`：只有**会话被钉住且钉住被兑现**的那一轮
+   才算 continuation（`ctx.rs`）。`switch_to_fallback` 会把它清掉 —— failover
+   目标从没见过这个前缀，它关于缓存的回答不算证据。
+2. `record_cache_ratio` **只在 continuation 上调用**；输入 < 1024 token 仍然不计入。
+3. **少于 3 个样本不是判决**：`auto_pool_cache_weight` 返回 `None`（「未测量」
+   = 平均权重），`auto_pool_warm_target` 也不许把会话迁到一个还judge不了的成员上。
+   没量过的成员要先拿到会话，才谈得上被评价。
+
+两个缓存回归测试因此改写成**对话**（12 会话 × 3 轮、16 会话 × 4 轮），并且路由
+必须显式 `session_sticky = true` —— 没有钉子就没有 continuation，没有 continuation
+就没有证据。（原来那版没开钉子，所以一条缓存样本都没采到，池子永远均匀轮换，
+测试看到的是 18/18。）
+
+另外把 `test_least_connections_skips_the_busy_provider` 的 80 ms 固定 sleep 换成
+「等 in-flight gauge 真的变成 1」——固定 sleep 是在跟测试机抢 CPU，整套跑的时候
+它会红。
+
+**部署**：NAS → oleFedora01，**0.3.12 / sha256[:16]=`b127ad9921b4b9d2`**
+（musl static-pie，`scripts/deploy_maxllm.sh` 自带守卫/备份/健康检查/自动回滚）。
+两台 `/health` 200、NRestarts=0，breaker 视图一致（zhipu_1、volc_2 两道墙共享）。
+
+**顺带修掉的运维事故（回答「oleNas01 的 maxllm 挂了？」）**：今天 09:41:54 起，
+NAS 的 `maxllm.service` 进了 **GLIBC_2.38 崩溃循环**（一个 glibc 构建被误拷上
+NAS，systemd 每 5 秒重启一次，到 11:13:51 才被 musl 构建替换掉，restart counter
+从 1 数到 1031）。业务流量当时由一个手工拉起的进程顶着，所以客户端没全断，
+但**systemd 已经管不住它** —— 那 92 分钟里机器一旦重启，节点就是彻底空的。
+`scripts/deploy_maxllm.sh` 的 static-pie 守卫就是为这次事故写的。
+
+**另一处状态回退（本轮发现并修复）**：13:33 有一次部署把本机节点换成了
+**billing-tier 分支的旧构建**（0.3.10，`strings` 里没有 `maxllm_provider_cache_ratio` /
+`breaker_sync` / `quota_parking`，`/admin/breakers` 直接 `{"error":"not found"}`）——
+备机没有熔断共享、没有配额停放、没有缓存加权。本轮已随 0.3.12 一起覆盖回
+`b127ad9921b4b9d2`。**部署脚本必须从 `/tmp/mx-capacity` 这棵工作树跑**，
+不要从其它分支的工作树跑。
+
+**拓扑更正（§15.5 的补充）**：`10.126.126.199:18081`（VPS 上的 nginx）现在把
+**数据面转给 NAS** —— 实测一次带唯一标记的 `/v1/responses/auto` 请求，
+落进了 NAS 的 `request_logs`（provider=opencode_go_1，client_ip=192.168.2.198），
+本机 DB 无记录。VPS **自己**的 `:3795` 那个老网关才是孤儿（`/admin/breakers`
+返回 `{"error":"not found"}`，不参加熔断共享）。所以客户端挂在 :18081 上是安全的；
+但**如果有人直接打 VPS 的 :3795**，那份老行为还在（上游原文 429、不共享熔断）。
 
 ## 附录 A：复现与口径
 
