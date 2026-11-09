@@ -1447,6 +1447,68 @@ minimax 93.18（128 发，从冷首发爬坡）/ go_1 71.89（2 发冻结）`，
 不人为喂（§14.11 诚实边界）。journal 自 05:45 部署起 `warning+` 0 条，
 `request_logs` 0 条 status≥400（§14.12 后持续）。
 
+### 14.15 watch 巡检两处 FAIL 的根因与修复（2026-11-09 07:18–08:01 CST）
+
+`maxllm-watch.service`（Fedora 侧每 10 min 巡检 + 一级修复）07:18 / 07:40 两轮
+`infer FAIL 无终止事件`、07:52 轮 `resp FAIL HTTP=000`，07:29 轮更是一次
+`health,auth,infer,resp` 首轮全挂并触发 repair 误重启（graceful drain 35s）。
+逐条查实为 **一假一真 + 一起未复现的连接层事件**：
+
+**① infer「无终止事件」= 巡检脚本 bug（假阳性 ×4，已修）**。脚本取最后一条 `data:` 行
+喂 jq 解析 `.type` / `usage`；而 volc 系上游在 `response.completed` 之后还发一行
+`data: [DONE]`（不是 JSON）→ jq 失败 → `etype= / tokens=0 / text=''` → 落进
+「无终止事件」FAIL 分支。证据闭环：
+
+- 四轮假阳性（06:46 首轮 / 07:18 / 07:30 / 07:40）网关侧全部
+  `request completed provider=volc_t_1 … truncated=false`（07:18 那笔
+  `tokens_in=90 tokens_out=21 fallback=true` = open_design 402 后的重试链，上游完整回了
+  21 token，网关没有少转发）；
+- PASS 轮（06:24 / 06:36 MiniMax、07:07 opencode）的收尾都不带 `[DONE]`；
+- 离线对拍：同一判分逻辑，volc 收尾体（末行 `data: [DONE]`）旧逻辑 `etype` 空 → FAIL，
+  新逻辑取 `^data:\s*\{` 的 JSON 行 → `response.completed tokens=99` → PASS；
+  MiniMax / opencode 两种收尾新旧逻辑均 PASS。
+
+修复 = 只取 JSON 型 data 行（`rg '^data:[[:space:]]*\{'`），FAIL 分支补 `curl_rc=` 与
+`bytes=`。**live 验证**：07:52 轮 infer 落在 volc 路由（`deepseek-v4-flash-ga-260731`，
+收尾带 `[DONE]`）→ PASS `tokens=102`；08:01:34 定时轮再次落在同一路由 → PASS
+`tokens=114`，七项全 OK。
+
+**② resp `HTTP=000` = LAN Ollama box 的 ollama serve 卡死（真故障，已修）**。resp 探针
+pin `deepseek-v4.1-flash:cloud` → 主路 `ollama_local`（`.4:11434`）。现场：
+
+- 网关侧 `request completed provider=ollama_local … tokens=0 latency_ms=60000` 连续 8 笔
+  （23:46:48Z 起；最后一笔成功 23:40:18Z）；
+- 直连该 box：`GET /api/tags` 200 / 2.7 ms，但 `POST /v1/responses` 无论 deepseek 还是
+  kimi 模型都挂满自身 60 s 超时后回 **502**（box journal 逐条 `502 | 60.0s`）；从 box
+  直连 `https://ollama.com` 0.9 s / 200 ⇒ 网络与远端都好，是**进程内代理路径卡死**；
+- 修法：`sudo systemctl restart ollama`（07:56:37 CST）→ 9.6 s 后同请求 200，
+  07:57:04 巡检七项全 PASS。该 box 只有 2 个 cloud 代理模型 + 2 个 embedding
+  （`ollama ps` 无驻留模型），重启零损失。
+
+**③ 07:29 首轮四探针全挂（未复现，观测已补强）**：首轮 `health,auth,infer,resp` 全 FAIL
+且首轮 3 s 内走完（resp 若挂会吃满 60 s ⇒ 排除 ② 的形态），repair 据此误重启了一次网关；
+但同时刻网关在途请求照常完成（23:29:53.661Z 一笔 ollama 807 ms 正常完成）⇒ 疑似客户端到
+网关端口的瞬时连接层抖动，细节已无法回溯。补强：四个 HTTP 探针全部加 `curl_rc=`
+（区分 refused / reset / timeout），并新增 `first_checks` 首轮明细快照字段（repair 复检会
+覆盖探针数组，此前只留 `first_overall/first_failed` 名字、细节全丢）—— 07:57 / 08:01 两轮
+已带上该字段，下次复现即可定性。
+
+巡检脚本：`ops/machines/oleFedora01/systemd/scripts/maxllm_health_check.sh`（ops 仓内
+untracked，本仓不涉及）。08:01:34 定时轮 **七项全 OK**，连续失败计数归零。
+
+### 14.16 volc_1 配额恢复确认 + 缓存续测（2026-11-09 08:02–08:09 CST）
+
+- **volc_1 恢复实锤**：force window 08:07:51 CST（§14.14 订正值）到期后，后台观察器
+  08:09:19 写 `RECOVERED health_open=['open_design','volc_2','zhipu_1']` 并退出 ——
+  `/health` 不再列 volc_1（DB 里 `state=1` 是 breaker 原始枚举，effective 投影已回
+  closed）。恢复后首笔 volc_1 流量等自然请求落池：`request_logs` 最后一笔仍是熔断前
+  22:03:48Z。
+- **缓存长窗**（02:24–08:01 CST，6 523 请求 / 947.8 M input，合计 **97.60%**）：
+  `go_2 98.17 / volc_t_1 97.29 / volc_1 97.17 / xiaomi 96.70 / ollama_local 95.52` ——
+  **有实质流量的五家全部 >95%**；minimax 132 发 93.18%（冷首发爬坡）、go_1 4 发
+  71.87%（分母未长出，窗口内新增 2 发为 0%）仍是仅有的两盏灯，按 §14.11 纪律不喂流量。
+- **watch 归零**：08:01:34 定时轮七项全 OK —— §14.15 修复后的首个定时轮，infer 恰好
+  落在带 `[DONE]` 收尾的 volc 路由上也 PASS。
 
 ---
 
