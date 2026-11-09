@@ -3012,3 +3012,35 @@ avg 32.8s、50-90% 14.6s、99-100% 8.6s —— 4 倍差距，body affinity 钉�
 non_idempotent`）未上线：root@10.126.126.199 七账号全 Permission denied，
 dotvault 无该机凭据、无腾讯云 API secret（TAT 不可用）。在此之前客户端直连
 NAS / Fedora。
+
+### 15.25 500 身上的配额墙：minimax 从"半开抖动"变成"停车在配额梯子上"（v0.3.13, 2026-11-10 00:1x）
+
+**病**：`/admin/pool` 与探针连续两轮看到 minimax 半开抖动（64 次状态翻转），但
+配额停车层从未触发。直连 `api.minimaxi.com/v1/responses` 复现：minimax 的 Token
+Plan 用尽后，`/v1/chat/completions` 答 **429**（`已达到 Token Plan 用量上限…
+(2056)`），而 `/v1/responses` 答 **HTTP 500** `{"error":{"code":"server_error",
+"message":"已达到 Token Plan 用量上限：请升级 Token Plan 套餐或购买积分补充用量。
+(2056)"}}` —— 配额墙穿了一件 500 的外衣。maxllm 只见 500 → 按普通失败记账：
+三次失败开闸一次、半开探针再开再关，成员在池子里打摆子，探针每 5 分钟还白烧一次。
+
+**修（e05b889，NAS + oleFedora01 同 sha 部署）**：
+- header 阶段：`[rate_limit_learning]` 开启时，`status == 500` 与 429 一样推迟到
+  body 阶段做分层判决（learned → body regex → laya），由 body 措辞决定它是配额墙
+  还是普通瞬态失败。header 层仍只认 429（500 上的 Retry-After 是瞬态提示，不是
+  配额重置）。
+- resolver：`resolve` / `resolve_sync` 的 header 层 gate 到 `status == 429`；
+  "无法分类"的兜底改为按状态分叉 —— 429 → `QuotaUnknown`（配额梯子 5m→15m→1h→
+  6h→24h），其余状态 → `OrdinaryFailure`。没有这一条，任何偶发 500 都会被误停进
+  配额梯子。
+- body 阶段日志改为状态感知（`{status} quota force-opened …`），无 failover 路径
+  也执行 `unpin_session`。
+
+**验证**：单测 3 个（配额措辞的 500 → 梯子、无分类的 500 → 普通失败、sync 同
+步）+ 集成 2 个（500+配额 body → 恰一次 quota open 且断路器一次请求即 open；
+真 500 → 无 quota open 且断路器保持 closed）。workspace **959 passed / 0 failed**、
+clippy `-D warnings` 干净。现场复测：minimax 直连 responses 仍 500+配额体；部署后
+探针应把 minimax 报为 WALL/QUOTA（不再每 5 分钟烧请求），`/admin/pool` 应显示
+`force_open_until_iso` 随梯子爬升。
+
+**卡点照旧（:18081 入口漏，第三轮）**：需要 root@10.126.126.199 跑
+`one-api/deploy-nginx.sh` + `maxllm/deploy.sh`；此前客户端直连 NAS / Fedora。
