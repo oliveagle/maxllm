@@ -2936,3 +2936,48 @@ path"。
 `scripts/deploy_maxllm.sh nas|fedora`，自带备份/健康检查/自动回滚），
 `cargo test --workspace` 951 passed / 0 failed，`cargo clippy --all-targets -D warnings`
 干净，`scripts/tests` 29 tests OK。
+
+### 15.23 body affinity 上线（v0.3.13）：会话身份终于在被选路之前读到（2026-11-09 23:2x）
+
+§15.22 的链路修好之后，剩下的第二层问题露出来了：**池子会转，但它每轮都换人**。
+one-api 把 `session-id` / `thread-id` / `x-conversation-id` 这些头全丢掉（实测：
+带这些头打 one-api 零 binding，直连 NAS 每次都落 binding），而真实 Codex 的身份在
+**body** 里（`prompt_cache_key`、`client_metadata.session_id` / `thread_id`）。
+问题是 `select_provider` 在 `request_filter` 里跑，比 `request_body_filter` 读 body 早，
+所以 `resolve_from_body` 一直只喂给了 recorder：会话没有钉住，上游 prefix cache
+也就没有跨轮命中可言（11-07 之后 `session_bindings` 一条新行都没有，238 行全是陈的）。
+
+**改法**（`336bbd8`，v0.3.13）：`request_filter` 在头解析之后、选路之前，对
+POST/PUT/PATCH 预读 body（受 Content-Length 与 `body_affinity_max_bytes`=8 MiB 约束），
+先 `resolve_from_body` 拿到会话身份，再把缓存的 body 作为**唯一**的 end-of-stream
+chunk 交回 body filter（不会重复转发、不会截断）。同一个预读还让 body 里的
+`model` 命中池子哨兵，`auto` 第一次跳就直接进池，不再吃一发 404 再 failover。
+开关是 `[session_sticky] body_affinity = true`（默认 false，回滚只需改回 false）。
+
+**上线**：NAS + oleFedora01 同为 sha `2cef9a4eefdc2024`（musl static-pie，
+`scripts/deploy_maxllm.sh nas|fedora`），NAS 为配置源、Fedora 2 分钟同步；
+`body_affinity = true` 已写进 NAS `~/opt/maxllm/maxllm.toml`（备份
+`maxllm.toml.bak-20261109-232030-body-affinity`），热重载日志
+`Config reloaded successfully (no structural changes)`。门禁：`cargo fmt --check` 干净、
+`cargo clippy --all-targets -D warnings` 干净、`cargo test --workspace` **954 passed /
+0 failed**、`scripts/tests` 29 OK。
+
+**实测**（23:2x，全部真链路）：
+
+- 直连 NAS 带 `prompt_cache_key`：binding 立刻出现，`request_logs.session_id` =
+  那个 key。
+- **经 one-api**（`127.0.0.1:3794`，model=`coding_resps`）带同一个 key：落 Fedora
+  网关，同样是 binding + `session_id` 落库 —— 也就是说"过一层 one-api 之后身份还能
+  钉住"这件事第一次成立了。第一发之所以没成，是因为当时 Fedora 的配置还没同步到
+  `body_affinity`，同步后重测即中。
+- 3 轮同 key 的请求全部落在同一个成员（`opencode_go_1`），没有一轮被轮换带走。
+- 上线后 37 发真实流量：36 发有 cache、`cached_tokens` 4,837,376 / `tokens_in`
+  4,893,755 = **98.9%** 输入命中缓存；`session_bindings` 开始长新行（NAS +6、Fedora +2）。
+- 轮换本身依旧健康：`/v1/responses/auto` 连打 5 发命中 5 个不同 provider
+  （xiaomi → opencode_go_1 → opencode_go_2 → ollama_local → volc_1，其中一发
+  `X-MaxLLM-Fallback-From: open_design`）；点名撞配额墙的 `/v1/responses/zhipu_1`
+  返回网关自己的 503 `circuit open (quota force-open)`，上游 429 原文一步不下发。
+
+**仍未做**（需要 root@VPS，见 §15.22）：`http://10.126.126.199:18081` 入口的 nginx
+上游链里还有那台 0.3.10 老网关，429 不在 `proxy_next_upstream` 里，所以走那个入口
+仍可能把厂商原文交给客户端。客户端在这之前一律直连 NAS / Fedora。
