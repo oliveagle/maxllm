@@ -32,6 +32,8 @@ usage() {
     echo "usage: $0 add <name> <base_url> [opts] | rm <name> | verify <name>"
     echo "  opts: --kind openai_compat|opencode (default openai_compat)"
     echo "        --upstream-path PATH (default /v1/chat/completions)"
+    echo "        --responses-path PATH  only when the Responses route is NOT the chat path's sibling"
+    echo "        --chat-only  upstream speaks chat only; the gateway translates instead"
     echo "        --model MODEL (required; the pool slot's model)"
     echo "        --api-key-env VAR | --key-from-vault NAME (exactly one required)"
     echo "        --pool auto|auto_home (default auto)   --billing subscription|metered (default subscription)"
@@ -46,6 +48,7 @@ BASE_URL=""
 if [ "$ACTION" = "add" ] && [ $# -ge 1 ]; then BASE_URL="$1"; shift; fi
 
 KIND="openai_compat"; UPSTREAM="/v1/chat/completions"; MODEL=""; KEY=""; DRY=0
+RESP_PATH=""; CHAT_ONLY=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --kind) KIND="$2"; shift 2;;
@@ -53,6 +56,8 @@ while [ $# -gt 0 ]; do
         --model) MODEL="$2"; shift 2;;
         --api-key-env) KEY="${!2:-}"; [ -n "$KEY" ] || { echo "ERROR: env $2 is empty/unset" >&2; exit 1; }; shift 2;;
         --key-from-vault) KEY="$(cd "$HOME/.agents" && "$HOME/.local/bin/dotvault" get "$2" 2>/dev/null)" || { echo "ERROR: dotvault '$2' not found" >&2; exit 1; }; shift 2;;
+        --responses-path) RESP_PATH="$2"; shift 2;;
+        --chat-only) CHAT_ONLY=1; shift;;
         --pool) POOL="$2"; shift 2;;
         --billing) BILLING="$2"; shift 2;;
         --dry-run) DRY=1; shift;;
@@ -60,14 +65,43 @@ while [ $# -gt 0 ]; do
     esac
 done
 # ---- build the provider + pool-entry TOML ----
-if [ "$KIND" = "opencode" ]; then
+# The gateway derives the Responses path from the chat path when the config
+# does not name one (`gateway.rs derive_responses_path`:
+# `…/chat/completions` → `…/responses`), and that derivation is authoritative.
+# This script used to write a hardcoded `responses_path = "/v1/responses"`
+# instead. On 2026-11-09 that made a new Ark Coding member 404 on every
+# request: `volc_1_spare` joined the pool but its real Responses route is
+# `/api/coding/v3/responses`, the pool routed it, the upstream answered 404
+# and the gateway immediately failed over — the member could never serve.
+# `--responses-path` is for upstreams whose Responses route is NOT the chat
+# route's sibling (zhipu_1: chat `/api/coding/paas/v4/chat/completions`,
+# responses `/api/v1/responses`).
+# `--chat-only` omits native_responses entirely: the gateway then translates
+# the client's Responses request to chat for this upstream. That is the safe
+# choice for an upstream that only speaks chat (forcing native_responses on a
+# chat-only upstream would POST a Responses body at it).
+derive_responses_path() {
+    local p="${1%/}"
+    case "$p" in
+        ""|"/") echo "";;
+        */chat/completions) echo "${p%/chat/completions}/responses";;
+        */completions)      echo "${p%/completions}/responses";;
+        *)                  echo "/v1/responses";;
+    esac
+}
+if [ "$CHAT_ONLY" = 1 ]; then
+    NATIVE=""
+else
+    DERIVED="$(derive_responses_path "$UPSTREAM")"
+    RP="${RESP_PATH:-$DERIVED}"
+    [ -n "$RP" ] || { echo "ERROR: cannot derive a responses path from --upstream-path '$UPSTREAM'; pass --responses-path" >&2; exit 1; }
     NATIVE="native_responses = true
-responses_path = \"/responses\""
+responses_path = \"$RP\""
+fi
+if [ "$KIND" = "opencode" ]; then
     CONN="connect_timeout_secs = 30
 total_connect_timeout_secs = 60"
 else
-    NATIVE="native_responses = true
-responses_path = \"/v1/responses\""
     CONN=""
 fi
 PROVIDER_BLOCK="# added by add_pool_provider.sh $(date -Is)

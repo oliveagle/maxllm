@@ -40,6 +40,38 @@ def embedded_python(source: str, marker: str) -> str:
     return matches[0]
 
 
+def provider_block_shell() -> str:
+    """The shell that builds PROVIDER_BLOCK: init line .. closing quote.
+
+    Runs the real argument parser and the real derivation, so the tests
+    exercise the behaviour instead of matching a string.
+    """
+    lines = script_text().splitlines()
+    start = next(i for i, l in enumerate(lines) if l.startswith('KIND="openai_compat"; UPSTREAM='))
+    assign = next(i for i, l in enumerate(lines) if l.startswith("PROVIDER_BLOCK="))
+    end = next(i for i in range(assign, len(lines)) if lines[i].strip() == '"')
+    return "\n".join(lines[start : end + 1]) + '\nprintf "%s" "$PROVIDER_BLOCK"\n'
+
+
+def provider_block(*args: str) -> str:
+    script = provider_block_shell()
+    with tempfile.TemporaryDirectory() as tmp:
+        f = Path(tmp) / "block.sh"
+        f.write_text(script, encoding="utf-8")
+        env = {
+            "PATH": "/usr/bin:/bin",
+            "NAME": "acct",
+            "MODEL": "m",
+            "KEY": "sk-test",
+            "POOL": "auto",
+            "BILLING": "subscription",
+        }
+        out = subprocess.run(["bash", str(f), *args], capture_output=True, text=True, env=env)
+    assert out.returncode == 0, out.stderr
+    tomllib.loads(out.stdout)  # a provider block that does not parse is unusable
+    return out.stdout
+
+
 class BillingValueTest(unittest.TestCase):
     def test_only_the_values_the_config_enum_accepts_are_offered(self) -> None:
         source = script_text()
@@ -75,6 +107,58 @@ class BillingValueTest(unittest.TestCase):
         parsed = tomllib.loads(out.stdout)
         self.assertEqual(parsed["auto_model"]["pool"][0]["billing"], "subscription")
         self.assertEqual(parsed["auto_model"]["pool"][0]["provider"], "acct")
+
+
+class ResponsesPathTest(unittest.TestCase):
+    """The Responses path must follow the chat path, not a hardcoded default.
+
+    `volc_1_spare` (2026-11-09) was added with `responses_path =
+    "/v1/responses"` while its upstream path was
+    `/api/coding/v3/chat/completions`: the pool routed to it, the upstream
+    answered 404 and the gateway failed over — the member joined the pool
+    but could never serve a single request.
+    """
+
+    def test_the_responses_path_follows_the_chat_path(self) -> None:
+        block = provider_block("--upstream-path", "/api/coding/v3/chat/completions")
+        self.assertIn('responses_path = "/api/coding/v3/responses"', block)
+        self.assertIn("native_responses = true", block)
+
+    def test_the_openai_default_path_is_derived_not_handed_over_as_a_v1_path(self) -> None:
+        block = provider_block("--upstream-path", "/v1/chat/completions")
+        self.assertIn('responses_path = "/v1/responses"', block)
+
+    def test_a_non_sibling_responses_route_can_be_named(self) -> None:
+        # zhipu_1: chat lives under /api/coding/paas/v4 but responses on /api/v1.
+        block = provider_block(
+            "--upstream-path", "/api/coding/paas/v4/chat/completions",
+            "--responses-path", "/api/v1/responses",
+        )
+        self.assertIn('responses_path = "/api/v1/responses"', block)
+        self.assertNotIn('responses_path = "/api/coding/paas/v4/responses"', block)
+
+    def test_an_opencode_upstream_gets_its_zen_path_not_a_bare_one(self) -> None:
+        block = provider_block(
+            "--kind", "opencode", "--upstream-path", "/zen/go/v1/chat/completions"
+        )
+        self.assertIn('responses_path = "/zen/go/v1/responses"', block)
+        self.assertNotIn('responses_path = "/responses"', block)
+
+    def test_chat_only_omits_native_responses_entirely(self) -> None:
+        # Forcing native_responses on a chat-only upstream would POST a
+        # Responses body at it; --chat-only asks the gateway to translate.
+        block = provider_block("--upstream-path", "/v1/chat/completions", "--chat-only")
+        self.assertNotIn("native_responses", block)
+        self.assertNotIn("responses_path", block)
+
+    def test_the_usage_documents_both_switches(self) -> None:
+        source = script_text()
+        self.assertIn("--responses-path", source)
+        self.assertIn("--chat-only", source)
+
+    def test_a_hardcoded_v1_responses_default_is_not_written_for_a_namespaced_chat_path(self) -> None:
+        block = provider_block("--upstream-path", "/api/coding/v3/chat/completions")
+        self.assertNotIn('responses_path = "/v1/responses"', block)
 
 
 class PoolTableNameTest(unittest.TestCase):
