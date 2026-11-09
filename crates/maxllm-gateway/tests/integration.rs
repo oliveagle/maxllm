@@ -4870,6 +4870,183 @@ async fn test_429_body_rate_limit_fails_over_with_precise_reset() {
     assert_eq!(state, Some(1.0), "the breaker must be open (1)");
 }
 
+/// A quota wall can wear a 500 status instead of a 429: MiniMax's
+/// /v1/responses endpoint answers an exhausted Token Plan with HTTP 500 and
+/// `{"error":{"code":"server_error","message":"已达到 Token Plan 用量上限…"}}`.
+/// Before the fix the gateway booked that as a generic server failure — three
+/// failures opened the breaker for a flat fail timeout, then the half-open
+/// probe re-opened it again, so the provider flapped in and out of the pool
+/// instead of being parked on the quota cooldown ladder. A quota-phrased 500
+/// must be classified exactly like a 429: force-open via the quota ladder.
+#[tokio::test]
+async fn test_500_with_a_quota_body_is_treated_as_a_quota_wall() {
+    let primary = MockServer::start().await;
+    let fallback = MockServer::start().await;
+    let laya = MockServer::start().await;
+
+    // MiniMax's real answer: 500 with the quota phrasing, no reset instant.
+    let body = json!({
+        "error": {
+            "code": "server_error",
+            "message": "已达到 Token Plan 用量上限：请升级 Token Plan 套餐或购买积分补充用量。 (2056)"
+        }
+    });
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500).set_body_json(body))
+        .expect(1)
+        .mount(&primary)
+        .await;
+
+    // No reset instant in the message: laya classifies it (rate limit, no
+    // chosen instant) → the provider parks on the cooldown ladder.
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "answers": {
+                "is_rate_limit": { "type": "noul", "noul": 0.9 }
+            }
+        })))
+        .expect(1)
+        .mount(&laya)
+        .await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from fallback")))
+        .expect(1)
+        .mount(&fallback)
+        .await;
+
+    let gw = TestGateway::start_with_fallback_and_laya(
+        RATE_LIMIT_LEARNING_CONFIG,
+        &primary.uri(),
+        &fallback.uri(),
+        &laya.uri(),
+    )
+    .await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&chat_body("deepseek-v4.1-flash", "hi"))
+        .send()
+        .await
+        .unwrap();
+
+    // The client sees the fallback's answer, not the primary's 500.
+    assert_eq!(
+        resp.status(),
+        200,
+        "the quota 500 must fail over to the fallback"
+    );
+    assert_eq!(resp.headers().get("X-MaxLLM-Provider").unwrap(), "fallback");
+    assert_eq!(
+        resp.headers().get("X-MaxLLM-Fallback-From").unwrap(),
+        "primary"
+    );
+    let answer: Value = resp.json().await.unwrap();
+    assert_eq!(answer["choices"][0]["message"]["content"], "from fallback");
+
+    let primary_reqs = primary.received_requests().await.unwrap();
+    assert_eq!(primary_reqs.len(), 1);
+
+    // Quota classification, not ordinary failure: exactly one quota open and
+    // the breaker open after a single request (an ordinary failure would
+    // need max_fails=3 before the breaker moved).
+    let quota_opens = metric_sample(
+        &gw,
+        "maxllm_circuit_breaker_quota_opens_total{provider=\"primary\"}",
+    )
+    .await;
+    assert_eq!(
+        quota_opens,
+        Some(1.0),
+        "the quota-phrased 500 must count exactly one quota open"
+    );
+    let state = metric_sample(&gw, "maxllm_circuit_breaker_state{provider=\"primary\"}").await;
+    assert_eq!(state, Some(1.0), "the breaker must be open (1)");
+}
+
+/// The flip side of the 500-quota fix: a *genuine* 500 (no quota phrasing)
+/// must stay an ordinary transient failure — fail over, count a normal
+/// failure, never a quota open. Without the status-aware fallback the
+/// resolver's "unclassifiable" default would have parked every flaky 500 on
+/// the quota cooldown ladder.
+#[tokio::test]
+async fn test_500_without_a_quota_body_fails_over_as_an_ordinary_failure() {
+    let primary = MockServer::start().await;
+    let fallback = MockServer::start().await;
+    let laya = MockServer::start().await;
+
+    let body = json!({
+        "error": {
+            "code": "server_error",
+            "message": "internal server error"
+        }
+    });
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500).set_body_json(body))
+        .expect(1)
+        .mount(&primary)
+        .await;
+
+    // No quota/billing phrase: laya classifies it as NOT a rate limit.
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "answers": {
+                "is_rate_limit": { "type": "noul", "noul": 0.1 }
+            }
+        })))
+        .expect(1)
+        .mount(&laya)
+        .await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from fallback")))
+        .expect(1)
+        .mount(&fallback)
+        .await;
+
+    let gw = TestGateway::start_with_fallback_and_laya(
+        RATE_LIMIT_LEARNING_CONFIG,
+        &primary.uri(),
+        &fallback.uri(),
+        &laya.uri(),
+    )
+    .await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&chat_body("deepseek-v4.1-flash", "hi"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200, "a genuine 500 still fails over");
+    assert_eq!(resp.headers().get("X-MaxLLM-Provider").unwrap(), "fallback");
+    assert_eq!(
+        resp.headers().get("X-MaxLLM-Fallback-From").unwrap(),
+        "primary"
+    );
+
+    // Ordinary failure: no quota open, and the breaker stays closed (one
+    // failure is below max_fails=3).
+    let quota_opens = metric_sample(
+        &gw,
+        "maxllm_circuit_breaker_quota_opens_total{provider=\"primary\"}",
+    )
+    .await;
+    assert_eq!(
+        quota_opens, None,
+        "a genuine 500 must not count a quota open"
+    );
+    let state = metric_sample(&gw, "maxllm_circuit_breaker_state{provider=\"primary\"}").await;
+    assert_eq!(state, Some(0.0), "the breaker must stay closed (0)");
+}
+
 // --- per-provider `utc_offset` (zone-less reset timestamps) ---------------
 
 /// Render the wall-clock timestamp `hours` ahead of now, in the zone-less
