@@ -7333,6 +7333,24 @@ impl AiGateway {
         // The in-flight request moves with it: the failed provider is done
         // with this request, the next one carries it now.
         crate::provider_stats::release(&failed_provider);
+        // The failed provider may still be holding the half-open probe slot
+        // this request reserved when it was admitted to it. A failure the
+        // breaker counted (5xx, connect error, 429) took the slot back and
+        // re-opened the circuit — but a deterministic rejection (404 model,
+        // 401/403, 425) fails over *without* booking any outcome, so the
+        // slot stayed busy and the member was unusable: a half-open provider
+        // whose probe slot is busy answers "circuit open" to every later
+        // request until the staleness reaper takes the slot (two fail
+        // windows). A member that is up must not stay unusable because of a
+        // request that has already left it.
+        {
+            let hot = self.hot.load();
+            if let Some(p) = hot.providers.get(&failed_provider) {
+                if p.circuit_breaker.state() == crate::circuit_breaker::STATE_HALF_OPEN {
+                    p.circuit_breaker.release_probe();
+                }
+            }
+        }
         crate::provider_stats::acquire(&name);
         // The fallback may speak a different contract than the provider that
         // just failed — the request path depends on it.
