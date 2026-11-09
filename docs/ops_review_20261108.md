@@ -2523,6 +2523,67 @@ _default`：primary 挂了、fallback 声明不同 default_model、客户端点�
 `cargo clippy --all-targets -D warnings` 干净；`cargo fmt` 干净。部署后该链点名
 mimo 的请求应直接落到 xiaomi，不再先撞五个死胡同。
 
+### 15.19 跨节点共享"失败驱动的熔断"：两个节点对同一个 provider 的判断必须一致（`feat/capacity-resilience`，2026-11-09 晚）
+
+**症状。** 之前只有**配额墙**（`force_open_until`）是跨节点共享的，失败熔断是节点本地的。
+结果是同一个 provider 在两个节点上同时可以有两种判断：NAS 上 `3/14` 健康、Fedora 上
+`11/14`，两边对"谁还活着"的认识不一致。NAS 少的那 11 个是 `auto_home` 池里根本没在跑
+的 GPU 端点（§15.16），Fedora 因为网络路径不同而多看见几个——**同一条流量在两台机器上
+会落到不同的 provider，命中率、延迟、成功率也随之分叉**，而"谁在扛"没人知道。
+
+**修法。** `PeerBreaker` 增加 `failures` 字段，报告里带上对端连续失败计数；轮询时除了
+沿用原来的"采纳对端配额墙"，再走一条**失败开闸**的采纳路径：
+
+- `peer_report_is_failure_open(breaker)`：`state == OPEN && force_open_until == 0 && failures > 0`
+  —— 配额墙自带截止时刻，走它自己的通道；有截止时刻的（运营停放、stream hold）不重复采纳；
+  对端只是 half-open 说明它已经在探测，没有可采纳的东西。
+- `CircuitBreaker::adopt_failure_open()`：把本地 failure 计数拉到 `max_fails` 并把失败
+  时间戳置为当下——**不发明新状态**，仍然由本地状态机接手：本地按自己的 fail window 开闸，
+  之后 half-open 探一次，探活了就回来。**对端的 deadline 不抄**，抄的是"对端那边一直失败"
+  这个事实，窗口长度用本地的。
+- 两个守卫，防止对端的坏消息白白吃掉可用容量：
+  1. **本地有配额墙/停放**（`force_open_until != 0`）→ 不采纳，本地知识优先；
+  2. **本地 60 s 内有过成功**（新增 `last_success_at`，`record_success()` 打点）→ 不采纳，
+     本地成功是比对端失败计数更新的证据；否则"对端到某 provider 的网络路径坏了"会把好
+     provider 从其他节点手里抢走。
+
+**开关。** `[breaker_sync] share_failures`，`#[serde(default = "default_true")]`——默认开，
+可以按节点关掉（只想要配额墙共享的部署保持旧行为）。`gateway.rs` 把配置透传给
+`breaker_sync::spawn()`。
+
+**回归测试（去掉修复即红）。**
+- 单元：`test_a_peer_failure_open_is_adopted`、`test_a_local_success_keeps_the_provider_against_a_peer_failure_open`、
+  `test_a_local_quota_wall_survives_a_peer_failure_open`；`breaker_sync` 里
+  `peer_report_is_failure_open` 三例（失败开闸 / 配额墙不算 / closed 与 half-open 不算）。
+- 集成：`test_a_failure_learned_on_one_node_is_adopted_by_the_peer`——A 端对同一 provider
+  连撞 3 次 500 学到墙 → B 端 15 s 内 `state_name == "open" && force_open_until == 0`，
+  且 B 端不再撞那个 mock。**把 `share_failures` 临时改成 false，同一个测试当场变红**
+  （证明它真的覆盖了开关，而不是恒真）。
+
+**验证与部署。** `cargo test --workspace` 全绿；`cargo clippy --all-targets -- -D warnings`
+干净；`cargo fmt --all` 干净。两台生产节点同一份二进制：`sha256[:16] = 7c1f26d3955f5b4d`
+（NAS + oleFedora01，`systemctl --user` active、`NRestarts=0`）。线上观察指标
+`maxllm_circuit_breaker_peer_failure_opens_total`（按 peer 分标签）。
+
+**同一轮的生产配置手术（两台均已热加载，不动二进制）。**
+- `auto_home` 池裁剪 `14 → 2`：实测 12 个成员在每条 HTTP 路径上都 `RemoteDisconnected`
+  （连 `/v1/models`、`/health` 都断），Fedora 本机 11051–11053 直接 connect refused；
+  只留 `olefedora_gpu0_minicpmv47`(10.126.126.20:11050) 与 `humanizer_gpu3`(10.126.126.10:11060)。
+  日志确认两节点都刷出 `Auto pool ready pool=auto_home entries=2`。
+- **所有 provider 补 `read_timeout_secs = 60`**：路由层 `timeout_secs = 120` 是兜底，
+  没配 read_timeout 的 provider（比如 `open_design`）之前继承 120 s 预算，日志里出现过
+  300 s+ 的超时墙。现在每个上游 60 s 读超时，卡死的上游快速让位给下一家。
+
+**入口层残留风险（唯一外部阻塞，需要 VPS root）。** nginx `:18081` 的 upstream 补丁
+（ops 仓库 `~/.agents/ops/machines/vm_tecent_cloud_01/maxllm/nginx-maxllm-ha.conf`）已就绪：
+顺序改为 NAS（主）→ Fedora（backup）→ VPS 老 0.3.10（最后 backup），
+`proxy_next_upstream error timeout http_502 http_503 http_504 non_idempotent`（429 故意不在
+列表里：新网关自己拥有配额墙，只回干净的 503）。但**腾讯云 VPS 上那台仍是 0.3.10**
+（`/health` 自报 `version 0.3.10`，`auto_home` 还是 14/14 的旧配置），它还在 failover 链里：
+NAS/Fedora 都回 503 时 nginx 仍可能把请求转投到它，而它会把上游 429 原文交给客户端
+（§15.17 的阳性对照）。两条修法都需要 `root@10.126.126.199`：升级该机到 0.3.12，
+或把它从 upstream 链里摘掉。
+
 ## 附录 A：复现与口径
 
 ```sh

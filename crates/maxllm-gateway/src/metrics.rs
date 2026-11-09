@@ -61,6 +61,9 @@ pub struct GatewayMetrics {
     /// Quota force-opens adopted from a peer node (cross-node breaker sync)
     /// per provider.
     pub circuit_breaker_peer_quota_opens_total: IntCounterVec,
+    /// Failure-driven opens adopted from a peer node (cross-node breaker
+    /// sync) per provider.
+    pub circuit_breaker_peer_failure_opens_total: IntCounterVec,
     /// Streaming responses whose upstream ended the body before the protocol
     /// terminal event (`response.completed` / `[DONE]`). The gateway appends
     /// an explicit error event and records the exchange as truncated instead
@@ -345,6 +348,18 @@ impl GatewayMetrics {
             .register(Box::new(circuit_breaker_quota_opens_total.clone()))
             .expect("register");
 
+        let circuit_breaker_peer_failure_opens_total = IntCounterVec::new(
+            Opts::new(
+                "maxllm_circuit_breaker_peer_failure_opens_total",
+                "Failure-driven opens adopted from a peer node per provider",
+            ),
+            &["provider"],
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(circuit_breaker_peer_failure_opens_total.clone()))
+            .expect("register");
+
         let circuit_breaker_peer_quota_opens_total = IntCounterVec::new(
             Opts::new(
                 "maxllm_circuit_breaker_peer_quota_opens_total",
@@ -535,6 +550,7 @@ impl GatewayMetrics {
             circuit_breaker_transitions_total,
             circuit_breaker_quota_opens_total,
             circuit_breaker_peer_quota_opens_total,
+            circuit_breaker_peer_failure_opens_total,
             http_failovers_total,
             provider_retries_total,
             model_rewrite_retries_total,

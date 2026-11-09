@@ -16,9 +16,20 @@
 //!
 //! Sharing the quota force-open turns that into a single learning event:
 //! the node that saw the 429 parks the provider until the reset instant, and
-//! the peers adopt the deadline on their next poll. The generic
-//! failure-count breaker is *not* shared: it is short-lived and node-local by
-//! nature, and copying it would move traffic around for no reason.
+//! the peers adopt the deadline on their next poll.
+//!
+//! The *failure* breaker travels too, but with a different shape: it has no
+//! deadline to copy, only the fact that the provider kept failing on the
+//! peer. A node that never sent traffic to that provider cannot know it is
+//! dead, so it keeps picking it and keeps paying a failed attempt per
+//! request. Adopting the peer's open turns that into one learning event as
+//! well — the local circuit is opened for the local fail window and then
+//! half-opens and probes, exactly like a provider that failed here.
+//!
+//! Two guards keep that from costing usable capacity: a locally parked
+//! provider keeps its own (longer) deadline, and a provider that answered
+//! successfully *here* inside the fail window stays — the local success is
+//! fresher evidence than the peer's failure count.
 //!
 //! ```text
 //!   node A: 429 (quota) ──► force-open until T ──► GET /admin/breakers ──┐
@@ -58,6 +69,11 @@ pub struct PeerBreaker {
     /// How often the provider ran into a quota wall.
     #[serde(default)]
     pub quota_opens: u64,
+    /// Consecutive failures the peer counted against the provider. The
+    /// report carries it so a peer can tell a failure-driven open apart from
+    /// an operator park or a stream hold (both of which carry a deadline).
+    #[serde(default)]
+    pub failures: u64,
 }
 
 /// The peer's breaker report.
@@ -106,6 +122,7 @@ pub fn spawn(
     peers: Vec<String>,
     interval_secs: u64,
     auth_token: Option<String>,
+    share_failures: bool,
 ) -> BreakerSyncHandle {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Release>();
     let keepalive = tx.clone();
@@ -153,12 +170,19 @@ pub fn spawn(
                                         }
                                         let mut adopted = 0usize;
                                         for breaker in &report.breakers {
-                                            if adopt(&hot, &admin_api, breaker) {
+                                            // A quota wall and a failure-driven
+                                            // open are mutually exclusive (the
+                                            // wall carries a deadline), so the
+                                            // first one that applies wins.
+                                            if adopt(&hot, &admin_api, breaker)
+                                                || (share_failures
+                                                    && adopt_failure(&hot, &admin_api, breaker))
+                                            {
                                                 adopted += 1;
                                             }
                                         }
                                         if adopted > 0 {
-                                            info!(peer = %peer, adopted, "adopted the peer's quota force-opens");
+                                            info!(peer = %peer, adopted, "adopted the peer's breaker state");
                                         }
                                     }
                                     Err(e) => {
@@ -239,6 +263,72 @@ async fn relay_release(
     Ok(())
 }
 
+/// Adopt one peer's failure-driven open locally.
+///
+/// Only the *failure* breaker travels this way. A peer that put a provider
+/// out of rotation because it kept failing tells the others, so a node that
+/// never sent traffic to that provider stops picking a dead one. The
+/// deadline is the local fail window, not the peer's: the local circuit
+/// half-opens and probes after it, so the provider earns its place back on
+/// local evidence.
+///
+/// A quota wall keeps its own path (it travels with its deadline, and the
+/// deadline is the thing worth copying); a peer that is merely half-open is
+/// probing already, so there is nothing to adopt.
+fn adopt_failure(
+    hot: &ArcSwap<HotState>,
+    admin_api: &Option<Arc<maxllm_admin::AdminApi>>,
+    breaker: &PeerBreaker,
+) -> bool {
+    if !peer_report_is_failure_open(breaker) {
+        return false;
+    }
+    let current = hot.load();
+    let Some(provider) = current.providers.get(&breaker.provider) else {
+        return false;
+    };
+    if !provider.circuit_breaker.adopt_failure_open() {
+        return false;
+    }
+    METRICS
+        .circuit_breaker_peer_failure_opens_total
+        .with_label_values(&[&breaker.provider])
+        .inc();
+    METRICS
+        .circuit_breaker_state
+        .with_label_values(&[&breaker.provider])
+        .set(provider.circuit_breaker.state() as i64);
+    if let Some(api) = admin_api {
+        if let Err(err) =
+            api.save_circuit_breaker_state(provider.circuit_breaker.snapshot(&breaker.provider))
+        {
+            warn!(
+                error = %err,
+                provider = %breaker.provider,
+                "failed to persist an adopted failure-driven open"
+            );
+        }
+    }
+    info!(
+        provider = %breaker.provider,
+        failures = breaker.failures,
+        "adopted a peer's failure-driven open"
+    );
+    true
+}
+
+/// Does the peer's report describe a failure-driven open?
+///
+/// A quota wall, an operator park and a stream hold all carry a deadline;
+/// they travel the quota path, which copies the deadline itself. A peer that
+/// is merely half-open is probing already — there is nothing to adopt, and
+/// an open without a failure count is not a failure breaker either.
+fn peer_report_is_failure_open(breaker: &PeerBreaker) -> bool {
+    breaker.state == crate::circuit_breaker::STATE_OPEN
+        && breaker.force_open_until == 0
+        && breaker.failures > 0
+}
+
 /// Adopt one peer's quota force-open locally.
 ///
 /// Only ever *extends* the local deadline: the local observation is at
@@ -287,4 +377,56 @@ fn adopt(
         "adopted a peer's quota force-open"
     );
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn peer(state: u8, force_open_until: u64, failures: u64) -> PeerBreaker {
+        PeerBreaker {
+            provider: "dead".to_string(),
+            state,
+            force_open_until,
+            quota_opens: 0,
+            failures,
+        }
+    }
+
+    /// A peer that put a provider out of rotation because it kept failing
+    /// tells the others.
+    #[test]
+    fn test_a_failure_driven_open_is_recognised() {
+        assert!(peer_report_is_failure_open(&peer(
+            crate::circuit_breaker::STATE_OPEN,
+            0,
+            3
+        )));
+    }
+
+    /// A quota wall carries a deadline and travels its own path.
+    #[test]
+    fn test_a_quota_wall_is_not_a_failure_open() {
+        assert!(!peer_report_is_failure_open(&peer(
+            crate::circuit_breaker::STATE_OPEN,
+            1_700_000_000_000,
+            3
+        )));
+    }
+
+    /// A closed or half-open peer is not failing: a half-open peer is
+    /// probing already, and there is nothing to adopt.
+    #[test]
+    fn test_a_healthy_or_probing_peer_is_not_adopted() {
+        assert!(!peer_report_is_failure_open(&peer(
+            crate::circuit_breaker::STATE_CLOSED,
+            0,
+            0
+        )));
+        assert!(!peer_report_is_failure_open(&peer(
+            crate::circuit_breaker::STATE_HALF_OPEN,
+            0,
+            3
+        )));
+    }
 }

@@ -77,6 +77,11 @@ pub struct CircuitBreaker {
     /// see `reap_stale_probe`.
     last_probe_admit_ms: AtomicU64,
     last_failure_at: AtomicU64,
+    /// When this provider last answered successfully (ms epoch; 0 = never).
+    ///
+    /// A peer's failure report only means something for a provider this node
+    /// has no fresh evidence about — see [`CircuitBreaker::adopt_failure_open`].
+    last_success_at: AtomicU64,
     max_fails: u32,
     fail_timeout_ms: u64,
     /// Max concurrent probe requests admitted while half-open.
@@ -149,6 +154,7 @@ impl CircuitBreaker {
             pending_probes: AtomicU32::new(0),
             last_probe_admit_ms: AtomicU64::new(0),
             last_failure_at: AtomicU64::new(0),
+            last_success_at: AtomicU64::new(0),
             max_fails: max_fails.max(1),
             fail_timeout_ms: fail_timeout_secs * 1000,
             half_open_max: half_open_max.max(1),
@@ -606,6 +612,9 @@ impl CircuitBreaker {
     pub fn record_success(&self) {
         // The provider answered: the wall is over, the ladder starts over.
         self.quota_cooldown_level.store(0, Ordering::Relaxed);
+        // Fresh local evidence that the provider works *here* — this is what
+        // lets a node keep a provider a peer has given up on.
+        self.last_success_at.store(now_ms(), Ordering::Relaxed);
         match self.state.load(Ordering::Relaxed) {
             STATE_HALF_OPEN => {
                 // The probe finished: return its slot (clamped, because the
@@ -628,6 +637,48 @@ impl CircuitBreaker {
                 self.failures.store(0, Ordering::Relaxed);
             }
         }
+    }
+
+    /// Take over a peer's failure-driven open.
+    ///
+    /// The peer saw this provider fail `max_fails` times in a row and put it
+    /// out of rotation for its fail window. This node adopts the same shape —
+    /// the failure count reaches `max_fails` and the failure stamp is now —
+    /// so the circuit is open here for this node's own fail window and then
+    /// half-opens and probes, exactly like a provider that failed locally.
+    /// No new state is invented: the local state machine does the rest.
+    ///
+    /// Two guards keep a peer's bad news from costing usable capacity:
+    ///
+    /// * a locally parked provider (a quota wall, an operator park, a
+    ///   stream hold) keeps its own, longer deadline — local knowledge
+    ///   outranks the peer's failure count;
+    /// * a provider that answered successfully *here* inside the fail window
+    ///   stays. The local success is fresher evidence than the peer's
+    ///   failure count, so a node whose own network path to the provider is
+    ///   broken cannot take a healthy provider away from the other nodes.
+    ///
+    /// Returns `true` when the circuit changed.
+    pub fn adopt_failure_open(&self) -> bool {
+        let now = now_ms();
+        if self.force_open_until_ms.load(Ordering::Relaxed) != 0 {
+            return false; // a known wall outranks a peer's failure count
+        }
+        let last_success = self.last_success_at.load(Ordering::Relaxed);
+        if last_success != 0 && now.saturating_sub(last_success) < self.fail_timeout_ms {
+            return false; // it works here — the peer's failure is not ours
+        }
+        if self.state.load(Ordering::Relaxed) == STATE_OPEN {
+            return false; // already out of rotation
+        }
+        self.failures.store(self.max_fails, Ordering::Relaxed);
+        self.last_failure_at.store(now, Ordering::Relaxed);
+        self.state.store(STATE_OPEN, Ordering::Relaxed);
+        // The circuit is open: no probe slot may stay reserved.
+        self.pending_probes.store(0, Ordering::Relaxed);
+        self.last_probe_admit_ms.store(0, Ordering::Relaxed);
+        self.state_transitions.fetch_add(1, Ordering::Relaxed);
+        true
     }
 
     /// Consecutive failures recorded against the breaker. Production code
@@ -766,6 +817,53 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A provider that keeps failing on one node is dead for the cluster, not
+    /// for that node alone: the peer that saw the failures tells the others,
+    /// so a node that never sent traffic to it stops picking a dead member.
+    #[test]
+    fn test_a_peer_failure_open_is_adopted() {
+        let cb = CircuitBreaker::new(3, 60);
+        assert!(
+            cb.adopt_failure_open(),
+            "the peer's report puts the provider out of rotation here too"
+        );
+        assert!(cb.is_open(), "the circuit is open after the adoption");
+    }
+
+    /// …but a provider that answered successfully *here* stays. The local
+    /// success is fresher evidence than the peer's failure count, so a node
+    /// whose own network path to the provider is broken cannot take a healthy
+    /// provider away from the other nodes.
+    #[test]
+    fn test_a_local_success_keeps_the_provider_against_a_peer_failure_open() {
+        let cb = CircuitBreaker::new(3, 60);
+        cb.record_success();
+        assert!(
+            !cb.adopt_failure_open(),
+            "the local success wins over the peer's failure count"
+        );
+        assert!(!cb.is_open(), "the provider keeps serving");
+    }
+
+    /// A locally parked provider keeps its own, longer deadline: a quota wall
+    /// (or an operator park, or a stream hold) outranks a peer's failure
+    /// count.
+    #[test]
+    fn test_a_local_quota_wall_survives_a_peer_failure_open() {
+        let cb = CircuitBreaker::new(3, 60);
+        let until = now_ms() + 3_600_000;
+        cb.record_quota_until(until);
+        assert!(
+            !cb.adopt_failure_open(),
+            "the wall is not overwritten by the peer's failure count"
+        );
+        assert_eq!(
+            cb.force_open_until_ms(),
+            until,
+            "the deadline stays the local one"
+        );
+    }
 
     /// A quota wall whose reset instant stays unknown must not be re-probed
     /// every five minutes: the cooldown grows with every unanswered wall.
