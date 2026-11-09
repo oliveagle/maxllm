@@ -8052,7 +8052,7 @@ impl AiGateway {
         // The breaker endpoints are served by the gateway itself: they act on
         // the *live* circuit breakers, which the admin API (a different crate,
         // with its own store) does not see.
-        if path.starts_with("/admin/breakers") {
+        if path.starts_with("/admin/breakers") || path.starts_with("/admin/pool") {
             return self
                 .handle_breaker_admin(&method, path, &auth_key, session)
                 .await;
@@ -8155,6 +8155,7 @@ impl AiGateway {
         let path = path.trim_end_matches('/');
         let (status, payload) = match (method, path) {
             ("GET", "/admin/breakers") => (200, self.breaker_report()),
+            ("GET", "/admin/pool") => (200, self.pool_report()),
             ("POST", "/admin/breakers/force-open") => self.force_open_breaker(&body),
             ("POST", "/admin/breakers/close") => self.close_breaker(&body),
             _ => (404, serde_json::json!({"error": "not found"})),
@@ -8230,6 +8231,118 @@ impl AiGateway {
             "node_name": hot.node_name,
             // The identity of *this instance*: a peer that reports it is this
             // gateway, and the sync skips it instead of talking to itself.
+            "instance_id": self.instance_id,
+        })
+    }
+
+    /// A live view of the capacity pools: every member, its breaker state,
+    /// and the routing evidence the pool sees for it (cache ratio, latency,
+    /// decode speed, recent traffic). The number an operator adding accounts
+    /// watches is `utilization` = closed members / total: quota-walled and
+    /// half-open members are capacity that is parked right now.
+    fn pool_report(&self) -> serde_json::Value {
+        use crate::circuit_breaker::{STATE_CLOSED, STATE_HALF_OPEN};
+        let hot = self.hot.load();
+        let snaps = crate::provider_stats::snapshot();
+        let snap_by: std::collections::HashMap<
+            String,
+            crate::provider_stats::ProviderStatsSnapshot,
+        > = snaps.into_iter().map(|s| (s.provider.clone(), s)).collect();
+
+        let providers_total = hot.providers.len();
+        let mut providers_healthy = 0usize;
+        for provider in hot.providers.values() {
+            if provider.circuit_breaker.effective_state() == STATE_CLOSED {
+                providers_healthy += 1;
+            }
+        }
+
+        let state_name = |state: u8| match state {
+            STATE_CLOSED => "closed",
+            STATE_HALF_OPEN => "half-open",
+            _ => "open",
+        };
+        let until_iso = |until: u64| {
+            if until == 0 {
+                None
+            } else {
+                chrono::DateTime::from_timestamp_millis(until as i64).map(|t| t.to_rfc3339())
+            }
+        };
+
+        let mut pools = serde_json::Map::new();
+        for pool in &hot.auto_pools {
+            let total = pool.entries.len();
+            let mut members: Vec<serde_json::Value> = Vec::new();
+            let mut closed = 0usize;
+            let mut half_open = 0usize;
+            let mut open = 0usize;
+            for entry in &pool.entries {
+                let (state, until) = hot
+                    .providers
+                    .get(&entry.provider)
+                    .map(|p| {
+                        (
+                            p.circuit_breaker.effective_state(),
+                            p.circuit_breaker.force_open_until_ms(),
+                        )
+                    })
+                    .unwrap_or((u8::MAX, 0));
+                match state {
+                    STATE_CLOSED => closed += 1,
+                    STATE_HALF_OPEN => half_open += 1,
+                    _ => open += 1,
+                }
+                let snap = snap_by.get(&entry.provider);
+                let requests = snap.map(|s| s.total_latency.len() as u64).unwrap_or(0);
+                let avg_latency_ms = snap.and_then(|s| {
+                    if s.total_latency.is_empty() {
+                        None
+                    } else {
+                        Some(
+                            s.total_latency.iter().map(|x| x.latency_ms).sum::<f64>()
+                                / s.total_latency.len() as f64,
+                        )
+                    }
+                });
+                members.push(serde_json::json!({
+                    "provider": entry.provider,
+                    "model": entry.model,
+                    "billing": match entry.billing {
+                        BillingMode::Metered => "metered",
+                        _ => "subscription",
+                    },
+                    "state": state,
+                    "state_name": state_name(state),
+                    "force_open_until_iso": until_iso(until),
+                    "requests_10m": requests,
+                    "avg_latency_ms": avg_latency_ms,
+                    "cache_ratio": snap.and_then(|s| s.cache_ratio),
+                    "cache_samples": snap.map(|s| s.cache_samples).unwrap_or(0),
+                    "decode_ms_per_1k": snap.and_then(|s| s.speed_ms_per_1k),
+                }));
+            }
+            pools.insert(
+                pool.name.clone(),
+                serde_json::json!({
+                    "total": total,
+                    "closed": closed,
+                    "half_open": half_open,
+                    "open": open,
+                    "utilization": if total > 0 {
+                        closed as f64 / total as f64
+                    } else {
+                        0.0
+                    },
+                    "members": members,
+                }),
+            );
+        }
+        serde_json::json!({
+            "pools": pools,
+            "providers": { "healthy": providers_healthy, "total": providers_total },
+            "node_name": hot.node_name,
+            "version": env!("CARGO_PKG_VERSION"),
             "instance_id": self.instance_id,
         })
     }
