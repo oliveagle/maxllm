@@ -58,7 +58,7 @@ pub enum NativeResponsesRepair {
     /// Dropping the trailing text turn restores the last user turn as the
     /// prefill anchor; mid-history assistant turns and tool turns are left
     /// alone.
-    ArkTrailingAssistantText,
+    ArkTrailingAssistantTurn,
 }
 
 impl OpenAICompatTranslator {
@@ -178,9 +178,7 @@ impl ProviderTranslator for OpenAICompatTranslator {
     fn normalize_native_responses_request(&self, body: &[u8]) -> Vec<u8> {
         match self.native_responses_repair {
             NativeResponsesRepair::None => body.to_vec(),
-            NativeResponsesRepair::ArkTrailingAssistantText => {
-                drop_trailing_assistant_text_turns(body)
-            }
+            NativeResponsesRepair::ArkTrailingAssistantTurn => drop_trailing_assistant_turns(body),
         }
     }
 
@@ -215,14 +213,19 @@ impl StreamTranslator for OpenAICompatPassthroughStream {
     }
 }
 
-/// Remove trailing assistant text turns from a native Responses `input` list.
+/// Remove trailing assistant message items from a native Responses `input`
+/// list — the repair ark's prefill validator needs.
 ///
 /// Returns the input bytes unchanged when the body is not JSON, when `input`
 /// is absent or not an array (the plain-string prompt form), when the last
-/// item is not an assistant text turn, or when dropping would empty the list
+/// item is not an assistant message, or when dropping would empty the list
 /// (the upstream would then reject an empty input, a worse failure than the
 /// one being repaired).
-pub fn drop_trailing_assistant_text_turns(body: &[u8]) -> Vec<u8> {
+///
+/// Only the **last** item matters upstream: an assistant turn followed by a
+/// user turn, a tool result or even a reasoning item is accepted, so completed
+/// turns in the middle of the history are never touched.
+pub fn drop_trailing_assistant_turns(body: &[u8]) -> Vec<u8> {
     let Ok(mut root) = serde_json::from_slice::<serde_json::Value>(body) else {
         return body.to_vec();
     };
@@ -233,7 +236,7 @@ pub fn drop_trailing_assistant_text_turns(body: &[u8]) -> Vec<u8> {
         return body.to_vec();
     };
     let original_len = items.len();
-    while items.last().map(is_assistant_text_message).unwrap_or(false) {
+    while items.last().map(is_assistant_message_item).unwrap_or(false) {
         items.pop();
     }
     if items.len() == original_len || items.is_empty() {
@@ -242,39 +245,27 @@ pub fn drop_trailing_assistant_text_turns(body: &[u8]) -> Vec<u8> {
     serde_json::to_vec(&root).unwrap_or_else(|_| body.to_vec())
 }
 
-/// Whether one Responses input item is an assistant message whose content is
-/// text-only (a plain string, or an array of text parts). `function_call`,
-/// `function_call_output`, `reasoning`, and messages carrying a non-text part
-/// are not text turns and must not be dropped.
-fn is_assistant_text_message(item: &serde_json::Value) -> bool {
+/// Whether one Responses input item is an assistant **message** — the only
+/// shape ark's prefill validator refuses to end on.
+///
+/// The content is deliberately not inspected. Probed against the live endpoint
+/// on 2026-11-09, ark rejects every trailing assistant content form, with two
+/// equally fatal dialects:
+///
+/// * text / plain string / `[]` / `null` / absent -> `MissingParameter partial`
+/// * refusal part, image part, text+refusal      -> `MissingParameter input.content.text`
+///
+/// `function_call`, `function_call_output` and `reasoning` carry no `role`, so
+/// they never match and are left in place (a trailing one is accepted upstream).
+fn is_assistant_message_item(item: &serde_json::Value) -> bool {
     let Some(obj) = item.as_object() else {
         return false;
     };
     let msg_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
     let role = obj.get("role").and_then(|v| v.as_str()).unwrap_or("");
-    if role != "assistant" || (!msg_type.is_empty() && msg_type != "message") {
-        return false;
-    }
-    let Some(content) = obj.get("content") else {
-        // An assistant message with no content at all is still rejected by
-        // ark (as `input.content.text`); dropping it loses nothing.
-        return true;
-    };
-    if content.is_null() {
-        return true;
-    }
-    if content.is_string() {
-        return true;
-    }
-    let Some(parts) = content.as_array() else {
-        return false;
-    };
-    parts.iter().all(|part| {
-        matches!(
-            part.get("type").and_then(|v| v.as_str()),
-            Some("output_text" | "input_text" | "text")
-        )
-    })
+    // Responses message items carry type "message"; tolerate a missing type
+    // when the role is unambiguous.
+    role == "assistant" && (msg_type.is_empty() || msg_type == "message")
 }
 
 #[cfg(test)]
@@ -370,7 +361,7 @@ mod tests {
             "/api/coding/v3/chat/completions",
             AuthStyle::Bearer,
         )
-        .with_native_responses_repair(NativeResponsesRepair::ArkTrailingAssistantText)
+        .with_native_responses_repair(NativeResponsesRepair::ArkTrailingAssistantTurn)
     }
 
     fn input_of(body: &[u8]) -> serde_json::Value {
@@ -425,10 +416,37 @@ mod tests {
     }
 
     #[test]
-    fn test_ark_repair_is_noop_for_non_text_assistant_part() {
+    fn test_ark_repair_drops_trailing_refusal_turn() {
+        // Probed live 2026-11-09: a trailing assistant turn whose part is a
+        // refusal is rejected too, with the sibling
+        // MissingParameter input.content.text. Every assistant content shape
+        // must therefore be dropped, not just text.
         let body = br#"{"model":"m","input":[
             {"type":"message","role":"user","content":[{"type":"input_text","text":"go"}]},
             {"type":"message","role":"assistant","content":[{"type":"refusal","refusal":"no"}]}
+        ]}"#;
+        let out = ark().normalize_native_responses_request(body);
+        assert_eq!(input_of(&out).as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_ark_repair_drops_trailing_image_turn() {
+        let body = br#"{"model":"m","input":[
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"go"}]},
+            {"type":"message","role":"assistant","content":[{"type":"input_image","image_url":"https://example.test/a.png"}]}
+        ]}"#;
+        let out = ark().normalize_native_responses_request(body);
+        assert_eq!(input_of(&out).as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_ark_repair_is_noop_for_trailing_reasoning() {
+        // ark accepts an assistant turn as long as something else trails it,
+        // and a reasoning item alone is accepted — so it must survive.
+        let body = br#"{"model":"m","input":[
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"go"}]},
+            {"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]},
+            {"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"t"}],"content":[]}
         ]}"#;
         let out = ark().normalize_native_responses_request(body);
         assert_eq!(out, body.to_vec());
