@@ -579,7 +579,7 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
                 };
                 let translator = if wants_ark_repair {
                     translator.with_native_responses_repair(
-                        maxllm_translate::openai_compat::NativeResponsesRepair::ArkTrailingAssistantText,
+                        maxllm_translate::openai_compat::NativeResponsesRepair::ArkTrailingAssistantTurn,
                     )
                 } else {
                     translator
