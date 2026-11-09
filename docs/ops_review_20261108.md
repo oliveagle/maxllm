@@ -2395,6 +2395,41 @@ opencode_go_2 占 6 条**。
 * `maxllm_requests_total{status=~"5.."}` **不应上涨** —— 换人成功时客户端仍然是 200，
   这正是本节的目的（原来客户端等不到就自己断了）。
 
+### 15.16 `auto_home` 池：14 个成员里 11 个的 GPU 端点根本没在跑（基础设施，不是网关）
+
+**测法。** 按配置里每个成员的 `base_url` 逐个探 `/v1/models`（从 NAS 发起）：
+
+| 成员 | 端点 | 结果 |
+|---|---|---|
+| `olefedora_gpu0_minicpmv47` | 10.126.126.20:11050 | **200** |
+| `coding_home_olefedora_gpu0` | 10.126.126.20:11050 | **200** |
+| `humanizer_gpu3` | 10.126.126.10:11060 | **200** |
+| `olefedora_gpu{1,2,3}_minicpmv47` | .20:1105{1,2,3} | 连接被关（服务端没在跑） |
+| `coding_home_olefedora_gpu{1,2,3}` | .20:1105{1,2,3} | 同上 |
+| `oleworkstation_gpu{0,2}_minicpmv47` | .10:11050 / :11053 | 同上 |
+| `coding_home_oleworkstation_gpu{0,2}` | .10:11050 / :11053 | 同上 |
+| `oleworkstation_minicpm` | .10:11023 | 同上 |
+
+宿主机上复核：`oleFedora01` 只有 **11050** 在 LISTEN；`oleworkstation01` 在 LISTEN 的是
+11010 / 11052 / 11060 —— 其中 **11052 跑的是 hy-memory**（Tencent-Hunyuan-30B-A3B-AWQ，
+不是池里要的 minicpmv47），11023 / 11050 / 11053 上没有服务。
+
+**网关侧其实兜住了。** 客户端要 `auto_home` 时：NAS 落到健康的
+`olefedora_gpu0_minicpmv47`（TTFT 0.04–0.18 s）；Fedora 每次先撞一个死成员
+（connect refused 是毫秒级），`X-MaxLLM-Fallback-From` 里能看到被撞的是谁，
+然后换到健康成员，客户端仍然是 **200 / 0.15 s**。所以"池子利用率"在网关这一层没有漏 ——
+漏的是**端点本身**。
+
+**但两台对同一个池的健康度报得不一样**：NAS 报 `auto_home` 3/14（12 个 half-open，
+因为它自己踩过），Fedora 报 14/14（它没踩过）——`breaker_sync` 只共享**配额墙**，
+不共享**失败驱动的 open**。代价很小（失败是一次毫秒级 connect refused），
+但要让 Fedora 一开始就跳过死成员，得把失败驱动的熔断状态也跨节点同步 ——
+那是设计取舍（"在我这儿死的成员未必在我这儿死"），先记着，不擅自改。
+
+**真正要修的是基础设施**：这些 GPU 推理服务没在跑（可能是故意停的，比如腾显存）。
+容量账上，`auto_home` 现在实际只有 **3/14** 可用；真正在扛客户端流量的是
+`auto` 池（订阅池，12 个成员，**10/12** 可用 —— 停放着 `volc_2` 和 `zhipu_1`）。
+
 ## 附录 A：复现与口径
 
 ```sh
