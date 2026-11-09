@@ -15,6 +15,7 @@ maxllm-translate = { path = "../maxllm-translate" }
 maxllm-admin = { path = "../maxllm-admin" }
 pingora = { version = "0.8.0", default-features = false, features = ["lb", "openssl"] }
 pingora-limits = "0.8.0"
+serde = { workspace = true }
 serde_json = { workspace = true }
 ahash = { workspace = true }
 tracing = { workspace = true }

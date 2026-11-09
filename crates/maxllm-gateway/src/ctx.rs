@@ -14,6 +14,44 @@ use maxllm_translate::StreamTranslator;
 use std::sync::Mutex;
 use std::time::Instant;
 
+/// The gateway's own answer to a request whose provider failed and could not
+/// be replaced by another provider.
+///
+/// The upstream's error is the *provider's* business: a Zhipu quota message
+/// ("您的限额将在 2026-11-10 22:58:54 重置"), an upstream request id and an
+/// upstream's wording say nothing the client can act on, and passing them
+/// through makes a healthy client look broken. The gateway answers with its
+/// own 503 instead, naming the provider that failed and — when it knows it —
+/// when that provider will be back.
+#[derive(Debug, Clone)]
+pub struct GatewayError {
+    /// The status the client sees (503).
+    pub status: u16,
+    /// The message the client sees.
+    pub message: String,
+    /// The upstream status that caused it (audit trail, metrics).
+    pub upstream_status: u16,
+    /// The provider that failed.
+    pub upstream_provider: String,
+    /// How long the client should wait before retrying.
+    pub retry_after_secs: Option<u64>,
+}
+
+impl GatewayError {
+    /// The OpenAI-shaped error body the client receives.
+    pub fn render(&self) -> Vec<u8> {
+        serde_json::json!({
+            "error": {
+                "message": self.message,
+                "type": "gateway_error",
+                "code": self.status,
+            }
+        })
+        .to_string()
+        .into_bytes()
+    }
+}
+
 /// Per-request context carried through the Pingora ProxyHttp lifecycle.
 pub struct RequestCtx {
     /// Index into the config routes array (-1 = unmatched).
@@ -234,6 +272,14 @@ pub struct RequestCtx {
     /// but excluded from metrics, request logs and circuit-breaker accounting,
     /// so a monitor cannot poison the production signals it measures.
     pub probe_request: bool,
+    /// The gateway's own answer, set when the upstream failed and no failover
+    /// was possible. The response status was already rewritten to 503 at
+    /// header time; the body filter replaces the upstream's body with this
+    /// error, so the client never sees the provider's own error text.
+    pub own_error: Option<GatewayError>,
+    /// Whether the gateway's own error body was already handed to the client
+    /// (the upstream's remaining body chunks are dropped after that).
+    pub own_error_sent: bool,
     /// The provider named by the request path itself
     /// (`/v1/responses/<provider>`), when that provider has no `[[routes]]`
     /// entry of its own.
@@ -315,6 +361,8 @@ impl RequestCtx {
             client_body_written: false,
             probe_request: false,
             path_pinned_provider: None,
+            own_error: None,
+            own_error_sent: false,
         }
     }
 }
