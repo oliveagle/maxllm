@@ -2629,8 +2629,80 @@ instance_id 与 node_name，/health 带 node_name）；`cargo test --workspace` 
 
 **部署。** 两台生产节点同一份二进制（`scripts/deploy_maxllm.sh nas|fedora`），env 文件各加
 一行 `MAXLLM_NODE_ID`（NAS=`oleNas01`、Fedora=`oleFedora01`）；Fedora 上装
-`scripts/sync_config.sh` + 每 2 分钟的 cron。**事实源赢**：直接改 Fedora 的配置会被下一次
-同步覆盖（旧文件留备份），要改就改 NAS 那份。
+`scripts/sync_config.sh` + **每 2 分钟的 systemd user timer**（`maxllm-config-sync.timer`，
+不是 cron —— 这台机器的定时任务本来就都是 user timer，`maxllm-watch.timer` 等都在
+`~/.config/systemd/user/`）。**事实源赢**：直接改 Fedora 的配置会被下一次同步覆盖
+（旧文件留备份），要改就改 NAS 那份。
+
+**上线与验证（2026-11-09 21:0x 真实跑通）。**
+
+- 二进制：两台同一份 `sha256[:16] = 29262aa8b9990a2b`（commit `c1a526c`），部署后
+  `NRestarts=0`（NAS、Fedora 都是）。
+- 身份：`/health` → NAS `node_name=oleNas01`、Fedora `node_name=oleFedora01`；
+  `/admin/breakers` → `instance_id=oleNas01-2844192-0` / `oleFedora01-236447-0`。
+- 自己认自己：日志 `the peer is this gateway — skipped peer=http://10.126.126.6:3795
+  instance_id=oleNas01-2844192-0`（NAS）与 `peer=http://10.126.126.20:3795
+  instance_id=oleFedora01-236447-0`（Fedora）—— 两台都把 peer 列表里的**自己**正确排除了。
+- 太老的 peer：VPS 的 0.3.10 仍然 404，日志变成
+  `breaker sync peer does not expose the breaker API — skipped for 600s`（不再每 15 s 失败一次）。
+- 顺手修掉的配置漂移：NAS 上 `providers.ollama_local.read_timeout_secs = 45` → `60`
+  （备份 `maxllm.toml.bak-20261109-205755-ollama-local-timeout-60`，热加载生效），
+  两份配置从此**逐字节相同**（`sha256 = d302e96b…`）。
+- **同步链路实测（加一个 → 消失）**：在 NAS 上加一个指向 `127.0.0.1:9`（秒拒）的哑 provider
+  `sync_probe` → 21:02:51 Fedora 的 timer 装上（`d302e96b… → 6af72751…`，备份
+  `maxllm.toml.bak-20261109-210251-sync`）→ 网关**热加载** `changes=["providers: 32 -> 33"]`，
+  `/admin/breakers` 变成 33 项且含 `sync_probe`；从 NAS 删掉 → 21:05:01 再同步回来
+  （`6af72751… → d302e96b…`）→ 热加载 `changes=["providers: 33 -> 32"]`，`sync_probe` 消失。
+  两次同步期间两台 `NRestarts` 都是 0 —— **热加载，没有重启、没有掉连接**。
+  往返延迟 ≤ 2 分钟（timer 周期），实测约 2 分钟整点命中。
+
+### 15.21 入口还在服务 0.3.10，以及"auto rotate 到底有没有在转"（2026-11-09 21:0x 复测）
+
+**从 oleNas01 发起（关键：不能从 NAS/Fedora 发起）。** `GET http://10.126.126.199:18081/health`
+仍然返回 `version 0.3.10`、**没有 `node_name`**、`providers 30/32` —— 入口还在服务腾讯云 VPS
+上那台**老网关**，不是 NAS。§15.20 之前的运维补丁（ops 仓库 `54e096a6`，把 upstream 改成
+NAS 主 + Fedora 备、把 VPS 老网关摘出链）**只进了仓库、没有上线**，因为它需要
+`root@10.126.126.199`（本机 ssh root/oliveagle/deploy 三个账号全部 `Permission denied
+(publickey)`）。
+
+> **NAT 陷阱（复测时又踩了一次）**：NAS 与 Fedora 本机都有 `iptables -t nat -L OUTPUT`
+> 规则把 `10.126.126.199:18081` 重定向到 `192.168.2.190:3795`（NAS 自己）。从这两台机器
+> 测入口，请求**根本没出机器**，量到的永远是本地网关 —— 看起来"入口是好的"，其实是假的。
+> 要量真入口，得从**没有这条规则**的机器发起（本次是 oleNas01），或先临时删掉规则。
+
+**auto rotate 是活的，但"看起来没转"通常量错了端点。**
+
+| 端点 | 语义 |
+|---|---|
+| `/v1/responses/auto`、`/v1/responses/auto_home` | **池子**（`auto_model = true`）：轮换 + 会话钉住 + 缓存加权 |
+| `/v1/responses` | **固定链**：primary = `ollama_local`，只有 primary 挂了才 failover |
+
+实测（2026-11-09 21:1x，NAS 0.3.12，8 发全 200）打到**池子端点**：
+
+```
+xiaomi → ollama_local → volc_1(fallback-from=open_design) → volc_1
+       → volc_t_1 → xiaomi → ollama_local → minimax
+```
+
+8 发命中 6 个不同 provider，轮换正常；打到 `/v1/responses`（固定链）则是 8/8 落在
+`ollama_local` —— 因为 primary 没挂，`x-maxllm-fallback-from` 不会出现。**"auto 不转"的第一
+大原因是量错了端点，第二大原因是 primary 没挂所以没 failover。**
+
+入口（VPS 0.3.10）打同一个池子端点也在轮换（`ollama_local → volc_1(fallback) → volc_1 →
+volc_t_1 → minimax → opencode_go_1`，6 发全 200）—— 老的 0.3.10 **本来就有池子**，
+它缺的不是 rotate，是：
+
+1. **不知道配额墙**：0.3.10 不参加跨节点 breaker sync、也不认 `[quota_parking]`，
+   所以 `zhipu_1` 的周墙它是 11:15 撞了才知道 —— 这正是客户端看到智谱原文的原因。
+2. **不拥有自己的错误**：上游 429 的 body 原样下发（客户端看到的
+   `rate limit exceeded … [20261109111504163e4b0369fd4cc0]` 就是智谱的原文，末尾是智谱的
+   x-log-id，不是 maxllm 的 UUID）。
+3. **大 body 不能 failover**：超过 pingora 64 KiB 重放缓冲的请求（旧链路上 600–700 KB）
+   放弃轮换，直接把上游错误交给客户端。
+4. 配置陈旧（`auto_home` 还是 14/14 的死 GPU 端点）。
+
+所以链路上还剩的唯一一件事就是**把入口从老网关上摘下来**（两条命令要 VPS root，见 README）：
+nginx upstream 只留 NAS（主）+ Fedora（备），等 VPS 自己升级到 0.3.12 再把它加回链尾。
 
 ## 附录 A：复现与口径
 
