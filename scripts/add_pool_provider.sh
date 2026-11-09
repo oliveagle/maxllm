@@ -24,7 +24,7 @@ NAS="${NAS:-oleNas01}"
 TOML="${TOML:-/home/oliveagle/opt/maxllm/maxllm.toml}"
 MASTER_KEY_VAR="${MASTER_KEY_VAR:-MAXLLM_MASTER_KEY}"
 POOL="${POOL:-auto}"
-BILLING="${BILLING:-sub}"
+BILLING="${BILLING:-subscription}"
 
 usage() {
     sed -n '2,24p' "$0"
@@ -34,7 +34,7 @@ usage() {
     echo "        --upstream-path PATH (default /v1/chat/completions)"
     echo "        --model MODEL (required; the pool slot's model)"
     echo "        --api-key-env VAR | --key-from-vault NAME (exactly one required)"
-    echo "        --pool auto|auto_home (default auto)   --billing sub|metered (default sub)"
+    echo "        --pool auto|auto_home (default auto)   --billing subscription|metered (default subscription)"
     echo "        --dry-run"
     exit 2
 }
@@ -83,7 +83,15 @@ fail_timeout_secs = 60
 read_timeout_secs = 60
 $NATIVE
 "
-POOL_ENTRY="[[auto_model.pool]]
+# The entry table is named after the pool it belongs to: the default pool is
+# `[[auto_model.pool]]`, a named pool is `[[auto_models.<name>.pool]]`.
+# Writing the wrong table name silently lands the entry in the AUTO pool.
+if [ "$POOL" = "auto" ]; then
+    POOL_TABLE="auto_model.pool"
+else
+    POOL_TABLE="auto_models.$POOL.pool"
+fi
+POOL_ENTRY="[[$POOL_TABLE]]
 provider = \"$NAME\"
 model = \"$MODEL\"
 billing = \"$BILLING\"
@@ -113,6 +121,18 @@ else:
     m = _re.search(r"(?ms)^\[auto_models\.auto_home\]\n(.*?)(?=^\[\[routes\]\])", s)
     assert m, "auto_home pool block not found"
     s = s[:m.end()] + pe + s[m.end():]
+# The edited file MUST parse before it replaces the live config. A config
+# that does not parse fails the gateway's TOML parse, and the gateway then
+# keeps the OLD config — the new member silently never joins the pool.
+# That is exactly what happened on 2026-11-09 21:27: a `billing = "sub"`
+# (the enum wants "subscription") made the whole file unparseable.
+import tomllib
+try:
+    tomllib.loads(s)
+except Exception as exc:
+    print("REFUSING to write: the edited config does not parse:", exc)
+    raise SystemExit(5)
+
 bak = p + ".bak-" + time.strftime("%Y%m%d-%H%M%S") + "-add-" + "$NAME"
 shutil.copy2(p, bak)
 open(p + ".new", "w", encoding="utf-8").write(s)
@@ -128,7 +148,10 @@ case "$ACTION" in
         [ -n "$MODEL" ] || { echo "ERROR: --model is required" >&2; exit 1; }
         case "$KIND" in openai_compat|opencode) ;; *) echo "ERROR: bad --kind" >&2; exit 1;; esac
         case "$POOL" in auto|auto_home) ;; *) echo "ERROR: bad --pool" >&2; exit 1;; esac
-        case "$BILLING" in sub|metered) ;; *) echo "ERROR: bad --billing" >&2; exit 1;; esac
+        # The config enum is `subscription` | `metered` (serde snake_case).
+        # Anything else fails the whole TOML parse and the gateway then keeps
+        # the OLD config — the pool silently loses the new member.
+        case "$BILLING" in subscription|metered) ;; *) echo "ERROR: --billing must be 'subscription' or 'metered' (got '$BILLING')" >&2; exit 1;; esac
         [ -n "$BASE_URL" ] || { echo "ERROR: base_url missing" >&2; usage; }
         [ -n "$KEY" ] || { echo "ERROR: need --api-key-env or --key-from-vault" >&2; exit 1; }
         if [ "$DRY" = 1 ]; then
@@ -145,7 +168,32 @@ case "$ACTION" in
         printf '%s' "$POOL_ENTRY" > "$TMPDIR_LOCAL/pe.txt"
         gen_edit "$TMPDIR_LOCAL/pb.txt" "$TMPDIR_LOCAL/pe.txt"
         echo "==> 等网关热加载并验证"
-        sleep 3
+        # A write that the gateway cannot parse is silently ignored (it keeps
+        # the old config), so the pool would not grow and nothing would say
+        # so. Confirm the reload actually landed before declaring success.
+        if ! ssh -o BatchMode=yes "$NAS" "python3 -" <<PY
+import json, time, urllib.request
+key = [l.split("=",1)[1].strip().strip(chr(34)) for l in open("/home/oliveagle/opt/maxllm/maxllm.env", errors="replace") if l.startswith("$MASTER_KEY_VAR=")][0]
+deadline = time.time() + 30
+while True:
+    req = urllib.request.Request("http://127.0.0.1:3795/health", headers={"Authorization": "Bearer " + key})
+    try:
+        d = json.load(urllib.request.urlopen(req, timeout=5))
+    except Exception:
+        d = {}
+    if "$NAME" in d.get("providers", {}):
+        print("RELOADED: $NAME is in the running config")
+        break
+    if time.time() > deadline:
+        print("NOT_RELOADED: $NAME is still missing after 30 s — the config was probably rejected")
+        raise SystemExit(6)
+    time.sleep(2)
+PY
+        then
+            echo "ERROR: the gateway did not pick up $NAME — check the log for 'Failed to parse updated config'" >&2
+            echo "  the config file was written; a backup is next to it. Fix or restore it, then re-run." >&2
+            exit 6
+        fi
         exec "$0" verify "$NAME"
         ;;
     rm)
@@ -154,20 +202,42 @@ case "$ACTION" in
 import os, shutil, time, re
 p = "$TOML"
 s = open(p, encoding="utf-8").read()
-i = s.find("# added by add_pool_provider.sh")
-if i < 0:
-    print("NOT_FOUND (provider block with add_pool_provider marker)")
-else:
-    j = s.find("\n[providers.", i+1)
-    if j < 0: j = len(s)
-    pat = re.compile(r"(?ms)^\[\[auto_model\.pool\]\]\nprovider = \"$NAME\"\n.*?(?=^\[\[auto_model\.pool\]\]|\Z|^\[auto)")
-    s2, n = pat.subn("", s)
-    bak = p + ".bak-" + time.strftime("%Y%m%d-%H%M%S") + "-rm-" + "$NAME"
-    shutil.copy2(p, bak)
-    open(p + ".new", "w", encoding="utf-8").write(s2)
-    os.chmod(p + ".new", os.stat(p).st_mode & 0o7777)
-    os.replace(p + ".new", p)
-    print("REMOVED provider + pool-entry x" + str(n), bak)
+
+# Target THIS provider's block. The old code searched for the first
+# "added by add_pool_provider.sh" marker anywhere in the file, so removing
+# one account deleted a different provider's block.
+pat = re.compile(
+    r"(?ms)^# added by add_pool_provider\.sh[^\n]*\n\[providers\.%s\]\n.*?(?=^# added by add_pool_provider\.sh|^\[providers\.|^\[\[auto_model|\Z)"
+    % re.escape("$NAME")
+)
+s2, n = pat.subn("", s)
+if n == 0:
+    print("NOT_FOUND (no add_pool_provider block for $NAME)")
+    raise SystemExit(4)
+
+# The pool entry lives in the pool's own table: the default pool is
+# [[auto_model.pool]], a named pool is [[auto_models.<name>.pool]].
+entry = re.compile(
+    r"(?ms)^\[\[auto_models?\.(?:%s)?\.pool\]\]\nprovider = \"%s\"\n.*?(?=^\[\[auto_models?\.(?:%s)?\.pool\]\]|\Z|^\[auto)"
+    % (re.escape("$POOL"), re.escape("$NAME"), re.escape("$POOL"))
+)
+s3, m = entry.subn("", s2)
+
+# The edited file must still parse: a bad edit would fail the gateway's
+# TOML parse and the gateway would silently keep the old config.
+import tomllib
+try:
+    tomllib.loads(s3)
+except Exception as exc:
+    print("REFUSING: the edited config does not parse:", exc)
+    raise SystemExit(5)
+
+bak = p + ".bak-" + time.strftime("%Y%m%d-%H%M%S") + "-rm-" + "$NAME"
+shutil.copy2(p, bak)
+open(p + ".new", "w", encoding="utf-8").write(s3)
+os.chmod(p + ".new", os.stat(p).st_mode & 0o7777)
+os.replace(p + ".new", p)
+print("REMOVED provider block x" + str(n) + ", pool-entry x" + str(m), bak)
 PY
         sleep 2
         ssh -o BatchMode=yes "$NAS" "python3 -" <<PY
