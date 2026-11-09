@@ -11657,6 +11657,70 @@ provider = "mock_openai"
     );
 }
 
+/// The node names itself: `/health` and the breaker report both carry the
+/// id, so a peer can recognise itself in a peer list that is the same on
+/// every node.
+#[tokio::test]
+async fn test_the_node_names_itself_in_health_and_in_the_breaker_report() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("ok")))
+        .mount(&mock)
+        .await;
+
+    let config = r#"
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[admin]
+master_key = "test-master-key"
+enabled = true
+
+[providers.mock_openai]
+kind = "openai"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "mock_openai"
+"#;
+    let gw = TestGateway::start_with_fallback(config, &mock.uri(), &mock.uri()).await;
+    let c = client();
+
+    let report: Value = c
+        .get(gw.url("/admin/breakers"))
+        .bearer_auth("test-master-key")
+        .send()
+        .await
+        .expect("the report answers")
+        .json()
+        .await
+        .expect("the report is JSON");
+    // The identity is per *instance*, never taken from the config file
+    // (the config file is copied from node to node) and never per machine
+    // (two gateways can share a host).
+    let report_id = report["instance_id"]
+        .as_str()
+        .expect("the report names the instance");
+    assert!(!report_id.is_empty(), "the instance id must not be empty");
+    let node_name = report["node_name"]
+        .as_str()
+        .expect("the report names the node");
+    assert!(!node_name.is_empty(), "the node name must not be empty");
+
+    let health: Value = c
+        .get(gw.url("/health"))
+        .send()
+        .await
+        .expect("health answers")
+        .json()
+        .await
+        .expect("health is JSON");
+    assert_eq!(health["node_name"].as_str(), Some(node_name));
+}
+
 /// The operator's park / unpark, and the live breaker report.
 #[tokio::test]
 async fn test_the_breaker_endpoints_park_and_release_a_provider() {

@@ -47,13 +47,22 @@ use crate::metrics::METRICS;
 use arc_swap::ArcSwap;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 /// How often a failing peer is reported. The first failure is logged
 /// immediately; after that only every n-th one is, so an unreachable peer
 /// cannot drown the log of a busy node.
 const PEER_WARN_EVERY: u64 = 10;
+
+/// How long a peer that does not know the breaker API is left alone.
+///
+/// A peer that answers 404 runs a version without `/admin/breakers` — it
+/// cannot share anything with us. Polling it every interval is a request
+/// every fifteen seconds that can never succeed, and an error line every
+/// tenth one. The peer is skipped for this long and then tried again, so a
+/// node that is upgraded later starts sharing without a restart.
+const PEER_TOO_OLD_BACKOFF: Duration = Duration::from_secs(600);
 
 /// What one peer reports about one provider.
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -81,6 +90,17 @@ pub struct PeerBreaker {
 pub struct PeerBreakerReport {
     #[serde(default)]
     pub breakers: Vec<PeerBreaker>,
+    /// The peer's instance identity, when it reports one.
+    ///
+    /// The peer list is the same on every node (that is what makes a config
+    /// file copyable from node to node), so a node inevitably lists itself.
+    /// A peer that reports this instance's id *is* this gateway, and the
+    /// sync skips it: adopting its own failure open would re-open a
+    /// provider that is half-open and probing, and the provider would never
+    /// be given another chance. A peer too old to report an id is simply not
+    /// recognised as self.
+    #[serde(default)]
+    pub instance_id: Option<String>,
 }
 
 /// One release the operator made on this node, on its way to the peers.
@@ -123,6 +143,7 @@ pub fn spawn(
     interval_secs: u64,
     auth_token: Option<String>,
     share_failures: bool,
+    own_instance_id: String,
 ) -> BreakerSyncHandle {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Release>();
     let keepalive = tx.clone();
@@ -159,14 +180,36 @@ pub fn spawn(
                 let mut ticker =
                     tokio::time::interval(Duration::from_secs(interval_secs.clamp(1, 3600)));
                 let mut failures: HashMap<String, u64> = HashMap::new();
+                // Peers that answered 404: they run a version without the
+                // breaker API and cannot share anything. They are left alone
+                // for a while instead of being polled every interval.
+                let mut too_old: HashMap<String, Instant> = HashMap::new();
+                // This gateway's own identity, so a peer list that names
+                // this node (the normal state once the same config file is
+                // used on every node) does not make the node talk to itself.
+                let own_instance_id = own_instance_id.clone();
                 loop {
                     tokio::select! {
                         _ = ticker.tick() => {
                             for peer in &peers {
+                                if let Some(until) = too_old.get(peer) {
+                                    if Instant::now() < *until {
+                                        continue;
+                                    }
+                                    too_old.remove(peer);
+                                }
                                 match fetch(&client, peer, auth_token.as_deref()).await {
                                     Ok(report) => {
                                         if failures.remove(peer).is_some() {
                                             info!(peer = %peer, "breaker sync poll recovered");
+                                        }
+                                        // The peer is this node: the peer list
+                                        // is the same on every node, and a node
+                                        // that peers with itself adopts its own
+                                        // state and shares nothing.
+                                        if peer_is_self(report.instance_id.as_deref(), &own_instance_id) {
+                                            info!(peer = %peer, instance_id = %own_instance_id, "the peer is this gateway — skipped");
+                                            continue;
                                         }
                                         let mut adopted = 0usize;
                                         for breaker in &report.breakers {
@@ -186,6 +229,18 @@ pub fn spawn(
                                         }
                                     }
                                     Err(e) => {
+                                        // A peer without the breaker API can
+                                        // never share anything: leave it alone
+                                        // for a while instead of asking again
+                                        // every interval.
+                                        if e.starts_with("HTTP 404") {
+                                            too_old.insert(
+                                                peer.clone(),
+                                                Instant::now() + PEER_TOO_OLD_BACKOFF,
+                                            );
+                                            warn!(peer = %peer, "breaker sync peer does not expose the breaker API — skipped for {}s", PEER_TOO_OLD_BACKOFF.as_secs());
+                                            continue;
+                                        }
                                         let count = failures.entry(peer.clone()).or_insert(0);
                                         *count += 1;
                                         if *count == 1 || (*count).is_multiple_of(PEER_WARN_EVERY) {
@@ -261,6 +316,20 @@ async fn relay_release(
         return Err(format!("HTTP {}", resp.status()));
     }
     Ok(())
+}
+
+/// Whether a peer is this gateway.
+///
+/// The peer list is the same on every node — that is what makes a config
+/// file copyable from node to node — so a node inevitably lists itself. A
+/// peer that reports this instance's id *is* this gateway: syncing with it
+/// adopts this node's own state and shares nothing, and it looks like the
+/// sharing works while the real peer is never contacted.
+///
+/// The identity is per *instance*, so two gateways on one host (a canary
+/// next to the live one, a test pair) are two nodes and still share.
+fn peer_is_self(report_instance_id: Option<&str>, own_instance_id: &str) -> bool {
+    matches!(report_instance_id, Some(id) if id == own_instance_id)
 }
 
 /// Adopt one peer's failure-driven open locally.
@@ -412,6 +481,31 @@ mod tests {
             1_700_000_000_000,
             3
         )));
+    }
+
+    /// A peer that reports this instance's own id is this gateway.
+    #[test]
+    fn test_a_peer_that_reports_our_own_instance_id_is_this_gateway() {
+        assert!(peer_is_self(Some("oleNas01-42-0"), "oleNas01-42-0"));
+        assert!(!peer_is_self(Some("oleFedora01-43-0"), "oleNas01-42-0"));
+    }
+
+    /// Two gateways on the same host are two nodes: their instance ids
+    /// differ, so neither mistakes the other for itself.
+    #[test]
+    fn test_two_gateways_on_one_host_are_not_each_other() {
+        let a = "oleNas01-42-0";
+        let b = "oleNas01-42-1";
+        assert!(!peer_is_self(Some(b), a));
+        assert!(!peer_is_self(Some(a), b));
+    }
+
+    /// A peer too old to report an id is not recognised as self — it is
+    /// simply not this gateway, and its state (if it ever answers) is
+    /// adopted.
+    #[test]
+    fn test_a_peer_without_an_instance_id_is_not_this_gateway() {
+        assert!(!peer_is_self(None, "oleNas01-42-0"));
     }
 
     /// A closed or half-open peer is not failing: a half-open peer is

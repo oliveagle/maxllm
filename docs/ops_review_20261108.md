@@ -2584,6 +2584,54 @@ NAS/Fedora 都回 503 时 nginx 仍可能把请求转投到它，而它会把上
 （§15.17 的阳性对照）。两条修法都需要 `root@10.126.126.199`：升级该机到 0.3.12，
 或把它从 upstream 链里摘掉。
 
+### 15.20 一个配置，一套池子：节点身份 + 配置同步（`feat/capacity-resilience`，2026-11-09 晚）
+
+**问题。** 池子是在**配置**里，而配置是**每台机器一份**。用户会往池子里加账号和
+provider，那么"加一个"就意味着"在每台机器上各改一次"——手抄来的两份配置必然漂移。
+漂移已经在生产里发生：`read_timeout_secs` 在 NAS 上是 45、在 Fedora 上是 60（同一个
+provider，两种行为，两套数字），`[breaker_sync] peers` 两台各写各的。
+
+**修法。** 一台机器是**事实源**，其余机器**自动跟随**：
+
+- **事实源**：`oleNas01`（`~/.agents/ops` 的 VPS 部署脚本本来就是从 NAS 拉二进制的）。
+- **同步**：`scripts/sync_config.sh` —— 拉到临时文件 → **先验证能解析成 TOML**（源文件
+  写坏了不会落地）→ sha256 不同才装 → **原子替换**（先写 `.new` 再 `mv`）→ 旧文件留
+  带时间戳的备份 → 网关的 watcher 热加载（**不重启、不掉连接**，熔断状态与配额墙在
+  reload 里都保留）。
+- **peer 列表是集群列表**（两台机器一模一样）：`[VPS, NAS, Fedora]`。因为配置会被抄来
+  抄去，逐机的 peer 列表一旦被抄过去，那台机器就只会跟自己同步——跨节点共享静默失效，
+  直到配额墙被学了两遍才有人发现。
+
+**节点身份（为什么不能放在配置里）。** 配置是**抄**过去的，所以身份必须跟着机器走：
+
+- `MAXLLM_NODE_ID`（env 文件，**逐机**，不会被同步）→ `/health` 里的 `node_name`；
+- **实例 id**（进程内自增，`<node_name>-<pid>-<n>`）→ `/admin/breakers` 报告里的
+  `instance_id`。身份是**逐实例**而不是逐机器：同一台机器上可以跑两个网关（canary、
+  测试对），它们是两个节点。
+
+**自己认自己（否则会把自己的墙再开一次）。** peer 列表含自己 → 每 15 s 拉一次自己的
+报告 → 若不识别，就会**采纳自己的失败开闸**：`adopt_failure_open()` 看到本地状态是
+HALF_OPEN（正在探活）就把它按回 OPEN —— **那个 provider 就再也没有机会被探活了**。
+所以报告带 `instance_id`，对端 id 相同即跳过。
+
+> 这一条是被测试逼出来的：第一版把身份做成**逐机器**（hostname），结果"同一台机器上
+> 两个网关"的三个跨节点测试当场变红（它们互相把对方当成了自己）——测试是对的，身份必须
+> 逐实例。回归用例：`test_two_gateways_on_one_host_are_not_each_other`。
+
+**顺带：太老的 peer 不再每 15 s 问一次。** 老版本网关（腾讯云 VPS 上的 0.3.10）没有
+`/admin/breakers`，返回 404 —— 每次轮询都失败，每第十次打一条 error。现在 404 的 peer
+被**跳过 10 分钟**再问一次（升级之后不用重启就会自己接上），日志安静下来。
+
+**测试。** `peer_is_self` 三例（自己 / 别人 / 老版本没有 id）+ `test_two_gateways_on_one_host_are_not_each_other`；
+集成测试 `test_the_node_names_itself_in_health_and_in_the_breaker_report`（报告带
+instance_id 与 node_name，/health 带 node_name）；`cargo test --workspace` **946 passed / 0 failed**；
+`cargo clippy --all-targets -- -D warnings` 干净；`cargo fmt --all` 干净。
+
+**部署。** 两台生产节点同一份二进制（`scripts/deploy_maxllm.sh nas|fedora`），env 文件各加
+一行 `MAXLLM_NODE_ID`（NAS=`oleNas01`、Fedora=`oleFedora01`）；Fedora 上装
+`scripts/sync_config.sh` + 每 2 分钟的 cron。**事实源赢**：直接改 Fedora 的配置会被下一次
+同步覆盖（旧文件留备份），要改就改 NAS 那份。
+
 ## 附录 A：复现与口径
 
 ```sh
