@@ -9845,8 +9845,7 @@ async fn test_responses_path_unknown_provider_is_rejected() {
 
 /// Zhipu's weekly/monthly quota error: no rate-limit headers at all (the
 /// reset instant is only in the body, in Beijing wall clock).
-const QUOTA_429_BODY: &str =
-    r#"{"error":{"code":"1310","message":"您已达到每周/每月使用上限，您的限额将在 2026-11-10 22:58:54 重置。"}}"#;
+const QUOTA_429_BODY: &str = r#"{"error":{"code":"1310","message":"您已达到每周/每月使用上限，您的限额将在 2026-11-10 22:58:54 重置。"}}"#;
 
 const QUOTA_429_FALLBACK_CONFIG: &str = r#"
 global_plugins = ["api_auth"]
@@ -9906,12 +9905,8 @@ async fn test_quota_429_fails_over_to_the_next_provider() {
         .mount(&alive)
         .await;
 
-    let gw = TestGateway::start_with_fallback(
-        QUOTA_429_FALLBACK_CONFIG,
-        &dead.uri(),
-        &alive.uri(),
-    )
-    .await;
+    let gw = TestGateway::start_with_fallback(QUOTA_429_FALLBACK_CONFIG, &dead.uri(), &alive.uri())
+        .await;
 
     let body = json!({"model": "gpt-4o", "input": "hi"});
     let resp = client()
@@ -9925,8 +9920,7 @@ async fn test_quota_429_fails_over_to_the_next_provider() {
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     assert_eq!(
-        status,
-        200,
+        status, 200,
         "a quota 429 must fail over, not reach the client (body: {text})"
     );
     let served = alive.received_requests().await.unwrap_or_default();
@@ -9955,12 +9949,8 @@ async fn test_quota_429_fails_over_with_a_large_body() {
         .mount(&alive)
         .await;
 
-    let gw = TestGateway::start_with_fallback(
-        QUOTA_429_FALLBACK_CONFIG,
-        &dead.uri(),
-        &alive.uri(),
-    )
-    .await;
+    let gw = TestGateway::start_with_fallback(QUOTA_429_FALLBACK_CONFIG, &dead.uri(), &alive.uri())
+        .await;
 
     let filler = "x".repeat(700_000);
     let body = json!({
@@ -9983,8 +9973,7 @@ async fn test_quota_429_fails_over_with_a_large_body() {
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     assert_eq!(
-        status,
-        200,
+        status, 200,
         "a quota 429 must fail over even with a large body (body: {text})"
     );
     let served = alive.received_requests().await.unwrap_or_default();
@@ -10086,8 +10075,7 @@ async fn test_quota_429_fails_over_with_a_large_body_on_a_translated_provider() 
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     assert_eq!(
-        status,
-        200,
+        status, 200,
         "a quota 429 must fail over even with a large body (body: {text})"
     );
     let served = alive.received_requests().await.unwrap_or_default();
@@ -10206,8 +10194,7 @@ async fn test_quota_429_in_the_auto_pool_rotates_to_the_next_member() {
     let text = resp.text().await.unwrap_or_default();
     let _ = child.kill();
     assert_eq!(
-        status,
-        200,
+        status, 200,
         "a quota 429 in the pool must rotate, not reach the client (body: {text})"
     );
     let served = alive.received_requests().await.unwrap_or_default();
@@ -10257,8 +10244,7 @@ async fn test_quota_429_in_the_auto_pool_rotates_with_a_large_body() {
     let text = resp.text().await.unwrap_or_default();
     let _ = child.kill();
     assert_eq!(
-        status,
-        200,
+        status, 200,
         "a quota 429 in the pool must rotate even with a large body (body: {text})"
     );
     let served = alive.received_requests().await.unwrap_or_default();
@@ -10272,7 +10258,6 @@ async fn test_quota_429_in_the_auto_pool_rotates_with_a_large_body() {
         content.len()
     );
 }
-
 
 /// A route with no fallback, and the layered rate-limit resolver enabled —
 /// the production shape of the incident: the 429's reset instant is only in
@@ -10354,8 +10339,7 @@ async fn test_quota_429_without_a_fallback_is_answered_by_the_gateway() {
     let text = resp.text().await.unwrap_or_default();
 
     assert_eq!(
-        status,
-        503,
+        status, 503,
         "a quota wall with no fallback must become the gateway's own 503 (body: {text})"
     );
     assert!(
@@ -10412,8 +10396,7 @@ async fn test_quota_429_in_the_auto_pool_without_a_healthy_member_is_answered_by
     let _ = child.kill();
 
     assert_eq!(
-        status,
-        503,
+        status, 503,
         "a dead auto pool must become the gateway's own 503 (body: {text})"
     );
     assert!(
@@ -10574,7 +10557,11 @@ endpoint_type = "responses"
         .send()
         .await
         .expect("request completes");
-    assert_eq!(resp.status(), 503, "the quota wall becomes the gateway's 503");
+    assert_eq!(
+        resp.status(),
+        503,
+        "the quota wall becomes the gateway's 503"
+    );
     let calls_after_a = mock.received_requests().await.unwrap_or_default().len();
     assert_eq!(calls_after_a, 1, "node A asked the provider once");
 
@@ -10699,7 +10686,11 @@ endpoint_type = "responses"
         .send()
         .await
         .expect("request completes");
-    assert_eq!(resp.status(), 503, "the quota wall becomes the gateway's 503");
+    assert_eq!(
+        resp.status(),
+        503,
+        "the quota wall becomes the gateway's 503"
+    );
 
     // Node B adopts the park.
     let mut adopted = false;
@@ -10784,10 +10775,9 @@ async fn test_a_parked_provider_is_never_called() {
         .mount(&mock)
         .await;
 
-    let config = format!(
-        r#"
+    let config = r#"
 [server]
-listen = "127.0.0.1:{{PORT}}"
+listen = "127.0.0.1:{PORT}"
 threads = 1
 
 [quota_parking]
@@ -10795,14 +10785,14 @@ threads = 1
 
 [providers.mock_openai]
 kind = "openai"
-base_url = "{{MOCK_URL}}"
+base_url = "{MOCK_URL}"
 api_key = "fake-key"
 
 [[routes]]
 path = "/v1/chat/completions"
 provider = "mock_openai"
 "#
-    );
+    .to_string();
     let gw = TestGateway::start_with_fallback(&config, &mock.uri(), &mock.uri()).await;
 
     let body = json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]});
@@ -10821,7 +10811,10 @@ provider = "mock_openai"
         "the answer names the parked provider: {text}"
     );
     assert!(
-        mock.received_requests().await.unwrap_or_default().is_empty(),
+        mock.received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
         "a parked provider must not be called at all"
     );
 }
@@ -10920,5 +10913,9 @@ provider = "mock_openai"
         .send()
         .await
         .expect("the request completes");
-    assert_eq!(resp.status(), 401, "the breaker report needs the master key");
+    assert_eq!(
+        resp.status(),
+        401,
+        "the breaker report needs the master key"
+    );
 }
