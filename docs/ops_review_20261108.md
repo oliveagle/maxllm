@@ -2981,3 +2981,34 @@ chunk 交回 body filter（不会重复转发、不会截断）。同一个预�
 **仍未做**（需要 root@VPS，见 §15.22）：`http://10.126.126.199:18081` 入口的 nginx
 上游链里还有那台 0.3.10 老网关，429 不在 `proxy_next_upstream` 里，所以走那个入口
 仍可能把厂商原文交给客户端。客户端在这之前一律直连 NAS / Fedora。
+
+### 15.24 /admin/pool —— 容量池的可视化利用率视图（v0.3.13, 2026-11-09 23:3x）
+
+往池子里加账号时缺一块表盘：`/health` 只给 healthy/total，看不到"谁在墙里、谁在
+半开、谁拿走了流量、谁慢"。新增 `GET /admin/pool`（与 `/admin/breakers` 同一把
+admin 密钥）：每个池子给 `total / closed / half_open / open / utilization`
+（utilization = closed/total，即此刻真正在供的容量占比），每个成员给 `billing`、
+熔断状态与 `force_open_until_iso`、`requests_10m`（10 分钟路由窗）、`avg_latency_ms`、
+`cache_ratio`、`decode_ms_per_1k`（含预填的全交换速度，越慢越被 `prefer_fast` 降权）。
+数据全来自 hot state + provider_stats，无 DB 读；测试覆盖"停一辆车 → utilization
+0.5、状态变 open、错误密钥 401"。workspace 955 passed、clippy 干净。
+NAS + oleFedora01 同为 sha `b3e3a7dfb57a731e`。
+
+**现场读数（NAS 23:3x）**：auto 池 13 成员 utilization 8/13：volc_2→11-27、
+volc_t_1→11-26、zhipu_1→11-10 是配额墙（open），minimax 半开待探针，volc_1 正在
+供 112 req/10min、cache_ratio 98.9%、全交换 8.2s/次；xiaomi decode 32084ms/1k
+= 池子中位 3 倍 → 被 `prefer_fast` 降权到 ~2.5% 流量（这正是它"又慢又少被用"的
+原因，是设计不是故障）。
+
+**同日复核**：缓存按命中桶分层验证"缓存就是延迟杠杆"：大请求（in>50k）0% 缓存
+avg 32.8s、50-90% 14.6s、99-100% 8.6s —— 4 倍差距，body affinity 钉会话就是
+钉在这个上；上线后今日 cache 97.1%（24h 含冷期 54.9%）。p50 5.6s / p90 21.7s
+的构成几乎全是 14 万 token 的大输入预填（各成员 62-73 ms/ktok，同量级），非卡死。
+
+**:18081 入口漏确认仍在（需要 root@VPS，第三轮卡点）**：从 oleworkstation01
+（无 NAT 重定向的机器）实测 `POST 10.126.126.199:18081/v1/responses/kimi` →
+**429 + kimi 英文原文原样下发**（http=429），入口 `/health` 仍自报 `0.3.10`、
+`auto_home 14/14`。ops 补丁 `bdac746d`（摘掉老网关 + `proxy_next_upstream
+non_idempotent`）未上线：root@10.126.126.199 七账号全 Permission denied，
+dotvault 无该机凭据、无腾讯云 API secret（TAT 不可用）。在此之前客户端直连
+NAS / Fedora。
