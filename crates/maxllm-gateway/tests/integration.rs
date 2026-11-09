@@ -11974,3 +11974,240 @@ async fn test_plain_native_responses_keeps_trailing_assistant_text_turn() {
         "a non-ark provider must receive the body untouched"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Route matching: a provider's name must not be shadowed by a shorter one
+// ---------------------------------------------------------------------------
+
+/// `/v1/responses/volc_1` is a string prefix of `/v1/responses/volc_1_spare`.
+/// The first prefix hit in config order therefore answered every request for
+/// the spare account with the primary's route (2026-11-09:
+/// "every candidate of route '/v1/responses/volc_1' is rejecting traffic").
+/// Adding accounts to the pool is the whole point, and every account whose
+/// name starts with another account's name was unreachable.
+const ROUTE_SHADOW_CONFIG: &str = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.volc_1]
+kind = "openai_compat"
+base_url = "{MOCK_URL}"
+upstream_path = "/v1/chat/completions"
+api_key = "sk-fake"
+default_model = "test-model"
+native_responses = true
+responses_path = "/v1/responses"
+
+[providers.volc_1_spare]
+kind = "openai_compat"
+base_url = "{FALLBACK_URL}"
+upstream_path = "/v1/chat/completions"
+api_key = "sk-fake"
+default_model = "test-model"
+native_responses = true
+responses_path = "/v1/responses"
+
+[providers.open_design]
+kind = "openai_compat"
+base_url = "{MOCK_URL}"
+upstream_path = "/v1/chat/completions"
+api_key = "sk-fake"
+default_model = "test-model"
+native_responses = true
+responses_path = "/v1/responses"
+
+[[routes]]
+path = "/v1/responses/volc_1"
+provider = "volc_1"
+endpoint_type = "responses"
+
+[[routes]]
+path = "/v1/responses/open-design"
+provider = "open_design"
+endpoint_type = "responses"
+
+[[routes]]
+path = "/v1/responses"
+provider = "volc_1"
+endpoint_type = "responses"
+"#;
+
+fn responses_request_body(model: &str) -> Value {
+    json!({
+        "model": model,
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+        "stream": false
+    })
+}
+
+async fn mount_native_responses(mock: &MockServer, content: &str) {
+    // A native-Responses upstream answers with a Responses object; the
+    // gateway forwards it verbatim, so the text says which mock answered.
+    let body = json!({
+        "id": "resp_shadow",
+        "object": "response",
+        "created_at": 1700000000,
+        "model": "test-model",
+        "status": "completed",
+        "output": [{
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": content}]
+        }],
+        "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5}
+    });
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(mock)
+        .await;
+}
+
+/// Start the shadowing gateway: `primary` serves volc_1 + open_design,
+/// `spare` serves volc_1_spare.
+async fn shadow_gateway() -> (TestGateway, MockServer, MockServer) {
+    let primary = MockServer::start().await;
+    let spare = MockServer::start().await;
+    mount_native_responses(&primary, "from primary").await;
+    mount_native_responses(&spare, "from spare").await;
+    let gw =
+        TestGateway::start_with_fallback(ROUTE_SHADOW_CONFIG, &primary.uri(), &spare.uri()).await;
+    (gw, primary, spare)
+}
+
+#[tokio::test]
+async fn test_a_provider_name_is_not_shadowed_by_a_shorter_one() {
+    let (gw, primary, spare) = shadow_gateway().await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/responses/volc_1_spare"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&responses_request_body("test-model"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("x-maxllm-provider")
+            .and_then(|v| v.to_str().ok()),
+        Some("volc_1_spare"),
+        "the spare account's request must not be answered by volc_1's route"
+    );
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["output"][0]["content"][0]["text"], "from spare");
+    assert_eq!(spare.received_requests().await.unwrap().len(), 1);
+    assert_eq!(
+        primary.received_requests().await.unwrap().len(),
+        0,
+        "volc_1's upstream must not have been called at all"
+    );
+}
+
+#[tokio::test]
+async fn test_the_shorter_provider_route_still_serves_its_own_path() {
+    let (gw, primary, spare) = shadow_gateway().await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/responses/volc_1"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&responses_request_body("test-model"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("x-maxllm-provider")
+            .and_then(|v| v.to_str().ok()),
+        Some("volc_1")
+    );
+    assert_eq!(primary.received_requests().await.unwrap().len(), 1);
+    assert_eq!(spare.received_requests().await.unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn test_the_hyphen_alias_route_still_wins_over_the_generic_route() {
+    let (gw, _primary, _spare) = shadow_gateway().await;
+    let c = client();
+
+    // `/v1/responses/open-design` is the documented alias for the
+    // `open_design` provider (hyphen vs underscore).
+    let resp = c
+        .post(gw.url("/v1/responses/open-design"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&responses_request_body("test-model"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("x-maxllm-provider")
+            .and_then(|v| v.to_str().ok()),
+        Some("open_design")
+    );
+}
+
+#[tokio::test]
+async fn test_the_provider_name_under_the_generic_route_still_pins() {
+    let (gw, primary, spare) = shadow_gateway().await;
+    let c = client();
+
+    // No `[[routes]]` entry names open_design with an underscore: the
+    // generic route must pin it by name.
+    let resp = c
+        .post(gw.url("/v1/responses/open_design"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&responses_request_body("test-model"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("x-maxllm-provider")
+            .and_then(|v| v.to_str().ok()),
+        Some("open_design")
+    );
+    assert_eq!(primary.received_requests().await.unwrap().len(), 1);
+    assert_eq!(spare.received_requests().await.unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn test_a_client_that_appends_the_endpoint_reaches_the_provider_route() {
+    let (gw, primary, spare) = shadow_gateway().await;
+    let c = client();
+
+    // A client whose base URL is `/v1/responses/volc_1_spare` posts to
+    // `/v1/responses/volc_1_spare/responses`: the route still matches,
+    // because the extra segment starts at a boundary.
+    let resp = c
+        .post(gw.url("/v1/responses/volc_1_spare/responses"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&responses_request_body("test-model"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("x-maxllm-provider")
+            .and_then(|v| v.to_str().ok()),
+        Some("volc_1_spare")
+    );
+    assert_eq!(spare.received_requests().await.unwrap().len(), 1);
+    assert_eq!(primary.received_requests().await.unwrap().len(), 0);
+}

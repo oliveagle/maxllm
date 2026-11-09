@@ -278,6 +278,29 @@ fn derive_responses_path(chat_path: &str) -> Option<String> {
     None
 }
 
+/// A route path serves a request path when the request path IS the route
+/// path, or continues with a `/` — the next path segment.
+///
+/// The boundary is what keeps `/v1/responses/volc_1` from claiming
+/// `/v1/responses/volc_1_spare`, while still letting a client that appends
+/// the endpoint to a provider-scoped base URL (`/v1/responses/volc_1/responses`)
+/// reach that provider's route.
+fn path_matches_route(path: &str, route_path: &str) -> bool {
+    // A trailing slash on the route path is not part of the segment boundary.
+    let route = if route_path.len() > 1 {
+        route_path.trim_end_matches('/')
+    } else {
+        route_path
+    };
+    if route.is_empty() {
+        return false;
+    }
+    if !path.starts_with(route) {
+        return false;
+    }
+    path.len() == route.len() || path.as_bytes()[route.len()] == b'/'
+}
+
 /// Runtime state for a configured provider.
 pub struct ProviderState {
     pub kind: ProviderKind,
@@ -2043,9 +2066,20 @@ impl AiGateway {
         Ok(summary)
     }
 
-    /// Find matching route by path prefix.
+    /// Find the route that serves this request path.
+    ///
+    /// The match is on a path-segment boundary, not on a raw string prefix:
+    /// `/v1/responses/volc_1` is a string prefix of `/v1/responses/volc_1_spare`,
+    /// so the first prefix hit in config order sent every request for the
+    /// spare account to the primary's route (2026-11-09:
+    /// `/v1/responses/volc_1_spare` came back as "every candidate of route
+    /// '/v1/responses/volc_1' is rejecting traffic"). Every account whose
+    /// name starts with another account's name was unreachable — which is
+    /// exactly what happens when more accounts are added to the pool.
     fn match_route(hot: &HotState, path: &str) -> Option<usize> {
-        hot.routes.iter().position(|r| path.starts_with(&r.path))
+        hot.routes
+            .iter()
+            .position(|r| path_matches_route(path, &r.path))
     }
 
     /// The first path segment after `/v1/responses/` when it names neither a
