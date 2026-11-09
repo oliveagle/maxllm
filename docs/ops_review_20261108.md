@@ -2247,8 +2247,55 @@ opencode_go_1 opencode_go_2`）、`ollama_local` **45 s**（实测挂过 124 s�
 - **入口的 `/admin/breakers` 回答的不是 VPS 自己**：`:18081/admin/breakers` 返回的 32 条断路器状态
   与 NAS 的**逐条相同**（`zhipu_1` 的 force-open 时刻一致）—— 说明 nginx 的 upstream 链把这个路径
   交给了 NAS，而不是 VPS 的 0.3.10。所以入口这条路也拿不到 VPS 的墙，VPS 还是得升级。
-- 其余未解决项见 §15.12.6（body session id 死代码、TTFB 首字节 deadline、半开成员占槽、
+- 其余未解决项见 §15.12.6（body session id 死代码、TTFB 首字节 deadline、
   探针失败不计入熔断、`auto_home` 常死成员、`open_design` 未配 `read_timeout_secs`）。
+  "半开成员占轮换槽"已查清并修掉：**不是轮换扫描的锅**（`find` 停在第一个准入成功的
+  候选上，拒绝时计数不变），是 **failover 路径**把探针槽带走了 —— 见 §15.14。
+
+### 15.14 半开的探针槽属于请求，不属于 provider（`bcebb86`）
+
+**缺陷。** 熔断器半开时只允许**一个**探针请求（`half_open_max = 1`）。这个槽在请求
+被**准入**到该成员时占下，而归还只有两个地方：① 熔断器自己记outcome 时（5xx、连接
+失败、429、成功）；② 请求结束时 `logging` 归还**最终服务的那一个** provider。
+
+但有一类失败**不记 outcome**：`401/403/404/405/408/409/410/425`，以及 provider 不
+carry 该模型时的 `400/422` —— 它们**直接 failover** 到下一个 provider（`should_failover_status`）。
+于是失败的 provider **把槽带走了**：它停在"半开 + 槽被占"，此后每一个请求都被判
+"circuit open"拒掉，直到staleness reaper 回收（`2 × fail_timeout`，且下限 120 s）。
+
+**后果。** 一个**活着**的成员（它刚刚回话了，只是回的是确定性拒绝）悄悄退出了轮换，
+池子在最需要容量的时候少了一个人。而且它不是"慢"，是"直接不接"。
+
+**不是轮换扫描的锅。** 遗留项写的是"半开成员占轮换槽（warm_target 侧已修，rotation 侧仍可查）"，
+本节查下来 rotation 侧**没有**这个泄漏：轮换用 `find(|e| admits(e))`，`find` 停在第一个
+准入成功的候选上，而 `half_open_admission` 拒绝时是 `fetch_add` 之后立刻 `fetch_sub`（计数
+不变）。warm_target 侧那种"看一圈每个成员都占一个槽"的泄漏在 `3c0fefe`（§15.12.3）已经修掉。
+真正漏的是 **failover 路径**：请求离开了 provider，却没把槽带走。
+
+**修法。** 在 `switch_to_fallback` 里，请求**离开**那个 provider 时把槽还回去；而且
+**只在它仍是半开时**还 —— 被熔断器记过 outcome 的失败（5xx/连接失败/429）已经自己把槽收
+走并重新打开了熔断器，所以状态判断顺带避免了一次重复归还。
+
+```rust
+// The failed provider may still be holding the half-open probe slot
+// this request reserved when it was admitted to it. ...
+if p.circuit_breaker.state() == crate::circuit_breaker::STATE_HALF_OPEN {
+    p.circuit_breaker.release_probe();
+}
+```
+
+**测试（去掉修复即红）。**
+
+| 测试 | 断言 |
+|---|---|
+| `test_a_deterministic_rejection_returns_the_half_open_probe_slot` | 成员跳闸 → 被探 → 回 401 → failover；**紧接着的下一个请求必须还能探到它**（修复前它被跳过，客户端拿到的是 backup 的回答） |
+
+**门禁。** `cargo fmt` / `cargo clippy --all-targets -- -D warnings` 干净；
+`cargo test --workspace` **928 passed, 0 failed**（基线 927 + 新增 1）。
+
+**部署。** NAS `10.126.126.6` 与 oleFedora01 `10.126.126.20`：sha256[:16] =
+**`51cd3cb6dd98993f`**（`bcebb86`），两台 **0.3.12** + `active` + `NRestarts=0` +
+auto 池 9/12 可用，sha 一致。
 
 ## 附录 A：复现与口径
 
