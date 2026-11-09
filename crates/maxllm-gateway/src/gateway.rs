@@ -4470,7 +4470,25 @@ impl ProxyHttp for AiGateway {
                         "402 payment required — force-opened until the balance is topped up"
                     );
                 } else if quota_open {
-                    p.circuit_breaker.record_http_failure(429, retry_after);
+                    match retry_after {
+                        Some(secs) => p.circuit_breaker.record_http_failure(429, Some(secs)),
+                        None => {
+                            // The headers name no reset instant: the wall is
+                            // of unknown length, so the provider is parked on
+                            // the cooldown ladder (5 min → 15 min → 1 h → 6 h
+                            // → 24 h) instead of a flat fail timeout. A
+                            // weekly wall that is re-probed every five
+                            // minutes costs a request and a round trip per
+                            // probe — and eats its share of the pool.
+                            let base = self.rate_limit_resolver.default_cooldown_secs() * 1000;
+                            let cooldown = p.circuit_breaker.record_quota_unknown(base);
+                            info!(
+                                provider = %ctx.provider_name,
+                                cooldown_ms = cooldown,
+                                "429 without a reset instant — parked on the quota cooldown ladder"
+                            );
+                        }
+                    }
                     METRICS
                         .circuit_breaker_quota_opens_total
                         .with_label_values(&[&ctx.provider_name])
@@ -4959,18 +4977,23 @@ impl ProxyHttp for AiGateway {
                         );
                     }
                     crate::rate_limit::RateLimitDecision::QuotaUnknown => {
-                        // Rate limit without a resolvable instant: default cooldown.
-                        let cooldown = self.rate_limit_resolver.default_cooldown_secs();
-                        p.circuit_breaker
-                            .record_quota_until(crate::rate_limit::now_ms() + cooldown * 1000);
+                        // Rate limit without a resolvable instant: the wall is
+                        // of unknown length, so the provider is parked on the
+                        // cooldown ladder (5 min → 15 min → 1 h → 6 h → 24 h)
+                        // instead of a flat cooldown. A weekly wall that is
+                        // re-probed every five minutes costs a request and a
+                        // round trip per probe — and eats its share of the
+                        // pool.
+                        let base = self.rate_limit_resolver.default_cooldown_secs() * 1000;
+                        let cooldown_ms = p.circuit_breaker.record_quota_unknown(base);
                         METRICS
                             .circuit_breaker_quota_opens_total
                             .with_label_values(&[&provider_name])
                             .inc();
                         info!(
                             provider = %provider_name,
-                            cooldown_secs = cooldown,
-                            "429 quota force-opened with the default cooldown (reset instant unresolved)"
+                            cooldown_ms = cooldown_ms,
+                            "429 quota force-opened on the cooldown ladder (reset instant unresolved)"
                         );
                     }
                     crate::rate_limit::RateLimitDecision::OrdinaryFailure => {
@@ -7109,6 +7132,7 @@ impl AiGateway {
                         .and_then(|s| chrono::DateTime::from_timestamp_millis(s as i64 * 1000))
                         .map(|t| t.to_rfc3339()),
                     "quota_opens": cb.quota_opens(),
+                    "quota_cooldown_ms": cb.quota_cooldown_ms(),
                     "failures": cb.failure_count(),
                     "transitions": cb.state_transitions(),
                 })
