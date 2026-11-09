@@ -1777,12 +1777,36 @@ NAS，systemd 每 5 秒重启一次，到 11:13:51 才被 musl 构建替换掉�
 `b127ad9921b4b9d2`。**部署脚本必须从 `/tmp/mx-capacity` 这棵工作树跑**，
 不要从其它分支的工作树跑。
 
-**拓扑更正（§15.5 的补充）**：`10.126.126.199:18081`（VPS 上的 nginx）现在把
-**数据面转给 NAS** —— 实测一次带唯一标记的 `/v1/responses/auto` 请求，
-落进了 NAS 的 `request_logs`（provider=opencode_go_1，client_ip=192.168.2.198），
-本机 DB 无记录。VPS **自己**的 `:3795` 那个老网关才是孤儿（`/admin/breakers`
-返回 `{"error":"not found"}`，不参加熔断共享）。所以客户端挂在 :18081 上是安全的；
-但**如果有人直接打 VPS 的 :3795**，那份老行为还在（上游原文 429、不共享熔断）。
+**拓扑更正（§15.5 的补充，2026-11-09 14:0x 实测）**：入口
+`10.126.126.199:18081`（VPS 上的 nginx）的 upstream 顺序是
+**primary = VPS 自己的 :3795**，backup = oleNas01 → oleFedora01
+（`~/.agents/ops/machines/vm_tecent_cloud_01/maxllm/nginx-maxllm-ha.conf`）。
+三个实测把这件事钉死：
+
+1. 带唯一标记的 `/v1/responses/auto` 请求打 :18081，**NAS 与本机的 recordings
+   里都没有这条**（只有 VPS 的老网关在服务它）—— 之前「数据面已转给 NAS」的说法
+   是错的，那只是把 NAS 的 DB 行误认成了自己的探针。
+2. 以 assistant 轮结尾的 ark 请求打 :18081 → **400 `MissingParameter partial`**
+   （VPS 的老二进制没带 ark 修复），同样的 body 打 NAS → **200**。
+3. `POST :18081/v1/responses/zhipu_1` → 503 `no provider available: zhipu_1=circuit
+   open (quota force-open)` —— VPS 的 0.3.10 已经会自己拥有错误（不再把上游原文
+   429 交给客户端），但它**不认 `[quota_parking]`、不参加熔断共享**
+   （`:3795/admin/breakers` → 404）。
+
+**所以入口的 primary 仍是那台没升级的节点**，两个后果：
+(a) ark 的 `partial` 400 落到客户端 —— nginx 默认的 `proxy_next_upstream` 不含
+400，备份节点不会被试；(b) VPS 的熔断状态是自己的那份，它要自己撞一次墙才知道
+（11:15 那次就是这样撞出来的），而另外两台 11-08 就已经知道了。
+
+**唯一还差的动作就是升级 VPS 自己的那个网关**（需要 root 凭据，本会话没有）：
+
+```bash
+REMOTE=root@10.126.126.199 SOURCE=oliveagle@10.126.126.6 \
+  ~/.agents/ops/machines/vm_tecent_cloud_01/maxllm/deploy.sh
+```
+
+在此之前，客户端若能直连，**把 base_url 指到 NAS（10.126.126.6:3795）或本机
+（10.126.126.20:3795）** 比挂在 :18081 上更稳。
 
 ## 附录 A：复现与口径
 
