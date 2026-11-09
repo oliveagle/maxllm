@@ -2477,6 +2477,52 @@ REMOTE=root@10.126.126.199 \
 升级前，指向 :18081 的客户端仍会拿到上游原文错误；临时兜底是把 base_url 直指
 NAS `http://10.126.126.6:3795/v1`（NAS/Fedora 均为 0.3.12，`breaker_sync` 双向）。
 
+### 15.18 固定 fallback 链跳过已知不带模型的成员：一次 5 跳的浪费归零（`feat/capacity-resilience`，2026-11-09 晚）
+
+**症状。** `.198` 客户端有约 34% 流量走 `/v1/responses`（固定 fallback 链）点名
+`mimo-v2.6-flash`。该模型只有 `xiaomi` 带（`default_model = "mimo-v2.6-flash"`），
+而链是 `ollama_local → volc_1 → volc_2 → volc_t_1 → minimax → xiaomi → …` ——
+前五个成员各自声明了别的 `default_model`（deepseek-v4-flash / MiniMax-M3 等），
+每次请求都先撞五个"不认识这个模型"的 provider（各回 400/404 unknown model），
+然后才轮到 xiaomi。这些无效尝试不进 request_logs（fallback 链只记最终落点），
+但真实发生：DB 里 xiaomi 1217 次、avg 28.2 s、max 410 s —— 一半以上的耗时
+是五个死胡同跳的累计。
+
+**修法。** 在 `next_fallback_provider`（固定链底部 walk）和 `has_usable_fallback`
+（header 时间的 peek）里，跳过**已知不携带该模型**的成员——判定沿用
+`no_later_candidate_carries_model` 的同一语义：provider 有 `default_model` 且
+`!= ctx.model` 才算"已知不携带"；没有 `default_model` 的成员照常尝试（可能是
+one-api 聚合器，什么名字都接）。新增 helper `fallback_member_known_not_to_carry`。
+
+**关键约束：跳过是条件性的。** 只有当**后面还有成员携带该模型**时才跳过死胡同——
+即 `!no_later_candidate_carries_model(hot, ctx)`。当没有任何候选携带时，模型改写
+路径（`model_rewrite_target` / `begin_model_rewrite`）是唯一能服务的办法，而它
+恰恰需要这个成员的 400/404 来触发（`test_unknown_model_is_rewritten_to_the_fallback
+_default`：primary 挂了、fallback 声明不同 default_model、客户端点名 primary 的
+模型 → fallback 先 400 再改写重试 200）。无条件跳过会把"可改写成 200"变成 503
+——首版实现就这么翻车的，两个集成测试当场变红。
+
+**两个地方的行为。**
+- `has_usable_fallback`：池路径不滤（`ctx.model` 已是选中条目 model，池内其他成员
+  default_model 不同是正常的——minimax 进池但 default 是 MiniMax-M3）；只有固定链
+  分支滤。这避免了把 auto 池误判成"没有可用 fallback"。
+- `next_fallback_provider`：auto 池路径（`usable_entries`）与 `admit` 闭包都不动，
+  只在底部固定链的 `.filter(...)` 上加同一条件。
+
+**回归测试（去掉修复即红）。** 新增 `fallback_model_carrying_tests` 四个用例：
+1. `next_fallback_provider_skips_a_member_that_does_not_carry_the_model`：链
+   `[a(deepseek-v4-flash), b(mimo-v2.6-flash)]`、点名 mimo → 跳过 a 落在 b。
+   修复前返回 a（第一个健康）→ 红。
+2. `a_known_non_carrier_keeps_its_turn_when_no_later_candidate_carries`：链
+   `[a]`、点名 mimo → 仍返回 a（它 400 触发改写）→ 无条件跳过版红。
+3. `a_member_without_default_model_keeps_its_turn`：`[c(无 default), b]` → c 先试。
+4. `has_usable_fallback_skips_a_dead_end_when_a_carrier_is_still_available`：
+   有携带者时 peek=true；只有死胡同 + 无携带者时 peek=true（改写路径活着）。
+
+**验证。** `cargo test --workspace` 全绿（gateway 单元 229 + 集成 159 全过）；
+`cargo clippy --all-targets -D warnings` 干净；`cargo fmt` 干净。部署后该链点名
+mimo 的请求应直接落到 xiaomi，不再先撞五个死胡同。
+
 ## 附录 A：复现与口径
 
 ```sh

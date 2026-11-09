@@ -7236,7 +7236,26 @@ impl AiGateway {
         if let Some(pool) = hot.request_pool(route, ctx) {
             return pool.entries.iter().any(|e| usable(&e.provider));
         }
-        route.fallback.iter().any(|name| usable(name))
+        // The route's own chain, not the pool: a member known not to carry
+        // the requested model (it declares a different `default_model`)
+        // would only answer 400/404 "unknown model" before the next
+        // candidate gets its turn — count it out of the peek too, so the
+        // decision to fail over (or to answer with the gateway's own 503)
+        // reflects the providers that can actually serve the request.
+        //
+        // The skip is conditional: when no later candidate carries the name,
+        // the rewrite path is the only way to serve, and it needs the member
+        // to be tried once (its 400/404 triggers the rewrite). Only while a
+        // later candidate still carries the model is the dead-end hop pure
+        // waste worth skipping.
+        let skip_dead_end = |name: &str| -> bool {
+            fallback_member_known_not_to_carry(&hot, name, &ctx.model)
+                && !self.no_later_candidate_carries_model(&hot, ctx)
+        };
+        route
+            .fallback
+            .iter()
+            .any(|name| usable(name) && !skip_dead_end(name))
     }
 
     /// The next provider to try: the first healthy provider of the route's
@@ -7357,6 +7376,22 @@ impl AiGateway {
             .iter()
             .filter(|name| *name != &ctx.provider_name)
             .filter(|name| !ctx.attempted_providers.contains(*name))
+            // Skip members known not to carry the requested model before the
+            // walk reaches one that does: trying a provider whose declared
+            // `default_model` differs from the request only collects a
+            // 400/404 "unknown model" and burns an attempt (and the client
+            // latency of a dead-end hop). Members with no `default_model`
+            // still get their turn — an aggregator may serve any name.
+            //
+            // The skip is conditional on a later candidate still carrying the
+            // model: when no candidate carries the name, the rewrite path is
+            // the only way to serve, and it needs this member's 400/404 to
+            // trigger it (test_unknown_model_is_rewritten_to_the_fallback
+            // _default). Skipping then would turn a rewritable 200 into a 503.
+            .filter(|name| {
+                !(fallback_member_known_not_to_carry(&hot, name, &ctx.model)
+                    && !self.no_later_candidate_carries_model(&hot, ctx))
+            })
             .find_map(|name| {
                 hot.providers
                     .get(name)
@@ -8660,6 +8695,20 @@ fn extract_usage(body: &serde_json::Value, ctx: &mut RequestCtx) {
     }
 }
 
+/// Whether a fallback-chain member is known not to carry the requested model.
+///
+/// A provider with no `default_model` gives no signal — it may be an
+/// aggregator (one-api) that serves any name — so it is treated as possibly
+/// carrying the model and is never skipped. Only a provider whose declared
+/// `default_model` differs from the requested name is known not to carry it.
+/// Mirrors the semantics of `no_later_candidate_carries_model` so the two
+/// decisions stay aligned.
+fn fallback_member_known_not_to_carry(hot: &HotState, name: &str, model: &str) -> bool {
+    hot.providers
+        .get(name)
+        .is_some_and(|p| p.default_model.as_deref().is_some_and(|dm| dm != model))
+}
+
 #[cfg(test)]
 mod unknown_model_body_tests {
     use super::body_reports_unknown_model;
@@ -9648,6 +9697,171 @@ mod helper_function_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod fallback_model_carrying_tests {
+    use super::*;
+    use maxllm_config::Config;
+
+    /// A gateway with only the fields the peek / walk need: a hot state from
+    /// the config, an empty session store, and disabled rate-limit learning.
+    fn gateway(toml: &str) -> AiGateway {
+        let config = Config::parse(toml).unwrap();
+        let hot_state = build_hot_state(&config).unwrap();
+        AiGateway {
+            hot: Arc::new(arc_swap::ArcSwap::from_pointee(hot_state)),
+            budget_enforcer: None,
+            key_rate_limiter: Arc::new(crate::key_rate_limit::KeyRateLimiter::new()),
+            admin_api: None,
+            sessions: Arc::new(SessionStore::new(1024, 3600)),
+            recorder: None,
+            rate_limit_resolver: Arc::new(crate::rate_limit_resolver::RateLimitResolver::new(
+                Default::default(),
+                None,
+                None,
+                None,
+            )),
+            admin_key_hash: None,
+            breaker_sync: None,
+        }
+    }
+
+    const BASE: &str = r#"
+[server]
+listen = "0.0.0.0:8080"
+
+[providers.primary]
+kind = "opencode"
+base_url = "https://primary.ai"
+api_key = "sk-primary"
+default_model = "deepseek-v4.1-flash"
+
+[providers.a]
+kind = "opencode"
+base_url = "https://a.ai"
+api_key = "sk-a"
+default_model = "deepseek-v4-flash"
+
+[providers.b]
+kind = "opencode"
+base_url = "https://b.ai"
+api_key = "sk-b"
+default_model = "mimo-v2.6-flash"
+
+[providers.c]
+kind = "opencode"
+base_url = "https://c.ai"
+api_key = "sk-c"
+"#;
+
+    fn ctx_on(route_index: usize, model: &str, provider: &str) -> RequestCtx {
+        let mut ctx = RequestCtx::new();
+        ctx.route_index = Some(route_index);
+        ctx.model = model.to_string();
+        ctx.provider_name = provider.to_string();
+        ctx
+    }
+
+    /// A fallback member known not to carry the model is skipped before the
+    /// walk reaches the member that does — but only while a later candidate
+    /// still carries it. The production shape: the fixed `/v1/responses`
+    /// chain names `mimo-v2.6-flash`, only `xiaomi` carries it, and every
+    /// request used to bounce off `ollama_local → volc_1 → volc_2 →
+    /// volc_t_1 → minimax` (five 400/404 dead ends) before `xiaomi` got its
+    /// turn.
+    ///
+    /// Removing the fix makes this test red: without the model filter, `a`
+    /// (healthy, first in the chain) is picked even though it declares
+    /// `default_model = "deepseek-v4-flash"` — the request for
+    /// `mimo-v2.6-flash` would then get a 400/404 "unknown model" from `a`
+    /// before `b` (the member that actually carries it) ever gets its turn.
+    #[test]
+    fn next_fallback_provider_skips_a_member_that_does_not_carry_the_model() {
+        let toml = format!(
+            "{BASE}[[routes]]\npath = \"/v1/responses\"\nprovider = \"primary\"\nfallback = [\"a\", \"b\"]\n"
+        );
+        let gw = gateway(&toml);
+        let ctx = ctx_on(0, "mimo-v2.6-flash", "primary");
+        let (name, _) = gw.next_fallback_provider(&ctx).expect("a fallback exists");
+        assert_eq!(
+            name, "b",
+            "the walk must skip `a` (default deepseek-v4-flash) and land on the member that carries mimo-v2.6-flash"
+        );
+    }
+
+    /// The model-rewrite path is the only way to serve when NO later
+    /// candidate carries the name: the member's 400/404 is what triggers the
+    /// rewrite. Skipping it there would turn a rewritable 200 into a 503 —
+    /// the shape of `test_unknown_model_is_rewritten_to_the_fallback_default`
+    /// (primary down, fallback declares a different default). A known
+    /// non-carrier must keep its turn while no later candidate carries the
+    /// model.
+    #[test]
+    fn a_known_non_carrier_keeps_its_turn_when_no_later_candidate_carries() {
+        let toml = format!(
+            "{BASE}[[routes]]\npath = \"/v1/responses\"\nprovider = \"primary\"\nfallback = [\"a\"]\n"
+        );
+        let gw = gateway(&toml);
+        let ctx = ctx_on(0, "mimo-v2.6-flash", "primary");
+        let (name, _) = gw.next_fallback_provider(&ctx).expect("a fallback exists");
+        assert_eq!(
+            name, "a",
+            "the sole fallback must stay reachable: its 400/404 triggers the model rewrite"
+        );
+    }
+
+    /// A member with no `default_model` gives no signal and keeps its turn —
+    /// it may be an aggregator (one-api) that serves any name. The model
+    /// filter must never skip it.
+    #[test]
+    fn a_member_without_default_model_keeps_its_turn() {
+        let toml = format!(
+            "{BASE}[[routes]]\npath = \"/v1/responses\"\nprovider = \"primary\"\nfallback = [\"c\", \"b\"]\n"
+        );
+        let gw = gateway(&toml);
+        let ctx = ctx_on(0, "mimo-v2.6-flash", "primary");
+        let (name, _) = gw.next_fallback_provider(&ctx).expect("a fallback exists");
+        assert_eq!(
+            name, "c",
+            "a member with no default_model (possible aggregator) is tried before the known carrier"
+        );
+    }
+
+    /// The peek (`has_usable_fallback`) also counts a member known not to
+    /// carry the model out of the decision — only providers that can actually
+    /// serve the request make failover worth it. When a later candidate
+    /// carries the model, the dead-end member must not be the thing that
+    /// reports "usable".
+    #[test]
+    fn has_usable_fallback_skips_a_dead_end_when_a_carrier_is_still_available() {
+        // `b` carries the model; `a` does not. The peek must be true (the
+        // carrier is usable), and the dead-end must not be what answers.
+        let toml = format!(
+            "{BASE}[[routes]]\npath = \"/v1/responses\"\nprovider = \"primary\"\nfallback = [\"a\", \"b\"]\n"
+        );
+        let gw = gateway(&toml);
+        let ctx = ctx_on(0, "mimo-v2.6-flash", "primary");
+        assert!(gw.has_usable_fallback(&ctx), "the carrier member is a usable fallback");
+
+        // The same route with only the dead-end as fallback: the peek must
+        // stay true — that member's 400/404 is exactly what triggers the
+        // model rewrite, the only way to serve a name no later candidate
+        // carries. An unconditional skip (the first iteration of this fix)
+        // made the peek answer false here and turned a rewritable 200 into a
+        // 503 (the shape of
+        // `test_unknown_model_is_rewritten_to_the_fallback_default`).
+        let toml = format!(
+            "{BASE}[[routes]]\npath = \"/v1/responses\"\nprovider = \"primary\"\nfallback = [\"a\"]\n"
+        );
+        let gw = gateway(&toml);
+        let ctx = ctx_on(0, "mimo-v2.6-flash", "primary");
+        assert!(
+            gw.has_usable_fallback(&ctx),
+            "a sole non-carrier fallback stays usable: its 400/404 triggers the model rewrite"
+        );
+    }
+}
+
 
 #[cfg(test)]
 mod auth_plugin_wiring_tests {
