@@ -9999,6 +9999,113 @@ async fn test_quota_429_fails_over_with_a_large_body() {
     );
 }
 
+/// The same, on a provider that does NOT speak the Responses contract
+/// natively: the body is translated, so the gateway forwards it with its
+/// original framing. The failover must still happen — the client's context
+/// is the expensive part, and a quota wall must not cost the session.
+const QUOTA_429_LARGE_BODY_TRANSLATED_CONFIG: &str = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.quota_dead]
+kind = "openai_compat"
+base_url = "{MOCK_URL}"
+upstream_path = "/v1/chat/completions"
+api_key = "fake-key"
+
+[providers.alive]
+kind = "openai_compat"
+base_url = "{FALLBACK_URL}"
+upstream_path = "/v1/chat/completions"
+api_key = "fake-key"
+
+[[routes]]
+path = "/v1/responses"
+provider = "quota_dead"
+fallback = ["alive"]
+strategy = "fallback"
+endpoint_type = "responses"
+max_failover_attempts = 3
+"#;
+
+/// A quota wall on a translated provider must still rotate, with the whole
+/// body: the client's context is the expensive part of the request, and a
+/// provider that ran out of quota must not cost the session.
+#[tokio::test]
+async fn test_quota_429_fails_over_with_a_large_body_on_a_translated_provider() {
+    let dead = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .set_body_string(QUOTA_429_BODY)
+                .insert_header("content-type", "application/json"),
+        )
+        .mount(&dead)
+        .await;
+
+    let alive = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from-alive")))
+        .mount(&alive)
+        .await;
+
+    let gw = TestGateway::start_with_fallback(
+        QUOTA_429_LARGE_BODY_TRANSLATED_CONFIG,
+        &dead.uri(),
+        &alive.uri(),
+    )
+    .await;
+
+    let filler = "x".repeat(700_000);
+    let body = json!({
+        "model": "gpt-4o",
+        "input": [{"role": "user", "content": filler}],
+    });
+
+    let resp = tokio::time::timeout(
+        Duration::from_secs(30),
+        client()
+            .post(gw.url("/v1/responses"))
+            .header("Authorization", "Bearer test-key-123")
+            .json(&body)
+            .send(),
+    )
+    .await
+    .expect("a large-body failover must not hang the client")
+    .expect("request completes");
+
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    assert_eq!(
+        status,
+        200,
+        "a quota 429 must fail over even with a large body (body: {text})"
+    );
+    let served = alive.received_requests().await.unwrap_or_default();
+    assert_eq!(served.len(), 1, "the fallback is tried once");
+    let sent: Value = serde_json::from_slice(&served[0].body).expect("json body");
+    let content = sent["messages"]
+        .as_array()
+        .and_then(|m| m.last())
+        .and_then(|m| m["content"].as_str())
+        .unwrap_or_default();
+    assert_eq!(
+        content.len(),
+        700_000,
+        "the replayed body must be complete, got {} bytes",
+        content.len()
+    );
+}
+
 const QUOTA_429_AUTO_POOL_CONFIG: &str = r#"
 [server]
 listen = "127.0.0.1:{PORT}"
@@ -10516,6 +10623,152 @@ endpoint_type = "responses"
         calls_after_b, calls_after_a,
         "the peer must not spend a request on a provider it knows is quota-dead"
     );
+
+    let _ = child_a.kill();
+    let _ = child_b.kill();
+}
+
+/// An operator's release reaches the peers.
+///
+/// A topped-up account must not stay parked on the other nodes: the release
+/// is a cluster decision, and the peers drop exactly the wall it names.
+#[tokio::test]
+async fn test_a_release_is_relayed_to_the_peer() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .set_body_string(QUOTA_429_BODY)
+                .insert_header("content-type", "application/json"),
+        )
+        .mount(&mock)
+        .await;
+
+    let port_a = portpicker::pick_unused_port().expect("free port");
+    let port_b = portpicker::pick_unused_port().expect("free port");
+
+    let config = |port: u16, peer: u16| {
+        format!(
+            r#"
+[server]
+listen = "127.0.0.1:{port}"
+threads = 1
+
+[rate_limit_learning]
+enabled = true
+
+[admin]
+master_key = "test-master-key"
+enabled = true
+
+[breaker_sync]
+enabled = true
+interval_secs = 1
+peers = ["http://127.0.0.1:{peer}"]
+auth_token = "test-master-key"
+
+[providers.dead]
+kind = "openai_compat"
+base_url = "{mock}"
+upstream_path = "/v1/chat/completions"
+api_key = "fake-key"
+native_responses = true
+responses_path = "/v1/responses"
+utc_offset_minutes = 480
+
+[[routes]]
+path = "/v1/responses"
+provider = "dead"
+strategy = "fallback"
+endpoint_type = "responses"
+"#,
+            port = port,
+            peer = peer,
+            mock = mock.uri()
+        )
+    };
+
+    let (mut child_a, _cfg_a) = spawn_gateway_on(&config(port_a, port_b), port_a).await;
+    let (mut child_b, _cfg_b) = spawn_gateway_on(&config(port_b, port_a), port_b).await;
+
+    // Node A learns the wall and parks the provider.
+    let body = json!({"model": "gpt-4o", "input": "hi"});
+    let resp = client()
+        .post(format!("http://127.0.0.1:{port_a}/v1/responses"))
+        .json(&body)
+        .send()
+        .await
+        .expect("request completes");
+    assert_eq!(resp.status(), 503, "the quota wall becomes the gateway's 503");
+
+    // Node B adopts the park.
+    let mut adopted = false;
+    for _ in 0..40 {
+        let report: Value = client()
+            .get(format!("http://127.0.0.1:{port_b}/admin/breakers"))
+            .bearer_auth("test-master-key")
+            .send()
+            .await
+            .expect("the breaker report answers")
+            .json()
+            .await
+            .expect("the report is JSON");
+        let until = report["breakers"]
+            .as_array()
+            .and_then(|b| {
+                b.iter()
+                    .find(|e| e["provider"] == "dead")
+                    .and_then(|e| e["force_open_until"].as_u64())
+            })
+            .unwrap_or(0);
+        if until > 0 {
+            adopted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(adopted, "node B must adopt node A's quota force-open");
+
+    // The operator releases the provider on A.
+    let released: Value = client()
+        .post(format!("http://127.0.0.1:{port_a}/admin/breakers/close"))
+        .bearer_auth("test-master-key")
+        .json(&json!({"provider": "dead"}))
+        .send()
+        .await
+        .expect("the release answers")
+        .json()
+        .await
+        .expect("the release is JSON");
+    assert_eq!(released["released"], true, "the provider is freed on A");
+
+    // …and the release reaches B.
+    let mut freed = false;
+    for _ in 0..40 {
+        let report: Value = client()
+            .get(format!("http://127.0.0.1:{port_b}/admin/breakers"))
+            .bearer_auth("test-master-key")
+            .send()
+            .await
+            .expect("the breaker report answers")
+            .json()
+            .await
+            .expect("the report is JSON");
+        let until = report["breakers"]
+            .as_array()
+            .and_then(|b| {
+                b.iter()
+                    .find(|e| e["provider"] == "dead")
+                    .and_then(|e| e["force_open_until"].as_u64())
+            })
+            .unwrap_or(0);
+        if until == 0 {
+            freed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(freed, "the release must reach the peer");
 
     let _ = child_a.kill();
     let _ = child_b.kill();

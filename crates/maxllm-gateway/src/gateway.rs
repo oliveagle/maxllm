@@ -420,6 +420,9 @@ pub struct AiGateway {
     /// endpoints itself (they act on the *live* circuit breakers), so it
     /// needs the key to authenticate them.
     pub admin_key_hash: Option<String>,
+    /// Cross-node breaker sharing. Used to relay an operator's release to
+    /// the peers, so a provider that is freed here is freed everywhere.
+    pub breaker_sync: Option<crate::breaker_sync::BreakerSyncHandle>,
 }
 
 /// The instant a parked provider becomes usable again, in epoch ms.
@@ -1272,15 +1275,16 @@ impl AiGateway {
         // Cross-node breaker sharing: a quota force-open learned on one node
         // is adopted by the peers, so the wall costs one learning event
         // instead of one per node.
+        let mut breaker_sync = None;
         if let Some(sync) = &config.breaker_sync {
             if sync.enabled && !sync.peers.is_empty() {
-                crate::breaker_sync::spawn(
+                breaker_sync = Some(crate::breaker_sync::spawn(
                     Arc::clone(&hot),
                     admin_api.clone(),
                     sync.peers.clone(),
                     sync.interval_secs,
                     sync.auth_token.clone(),
-                );
+                ));
                 info!(
                     peers = ?sync.peers,
                     interval_secs = sync.interval_secs,
@@ -1301,6 +1305,7 @@ impl AiGateway {
                 .admin
                 .as_ref()
                 .map(|a| maxllm_admin::keys::hash_key(&a.master_key)),
+            breaker_sync,
         })
     }
 
@@ -7069,10 +7074,16 @@ impl AiGateway {
                         _ => "closed",
                     },
                     "force_open_until": until,
-                    "force_open_until_iso": until
-                        .checked_div(1000)
-                        .and_then(|s| chrono::DateTime::from_timestamp_millis(s as i64 * 1000))
-                        .map(|t| t.to_rfc3339()),
+                    // `null` — not the epoch — when the provider is not
+                    // parked: "no wall" must not read as "wall since 1970".
+                    "force_open_until_iso": if until == 0 {
+                        None
+                    } else {
+                        until
+                            .checked_div(1000)
+                            .and_then(|s| chrono::DateTime::from_timestamp_millis(s as i64 * 1000))
+                            .map(|t| t.to_rfc3339())
+                    },
                     "quota_opens": cb.quota_opens(),
                     "quota_cooldown_ms": cb.quota_cooldown_ms(),
                     "failures": cb.failure_count(),
@@ -7159,6 +7170,15 @@ impl AiGateway {
     }
 
     /// Release a parked provider: it is usable again right away.
+    ///
+    /// Two callers:
+    ///
+    /// * the operator, who releases a provider because the account was
+    ///   topped up — the release is *cluster-wide*, so it is relayed to the
+    ///   peers: a provider freed here must not stay parked there;
+    /// * a peer, relaying its own release. That one carries the deadline it
+    ///   releases, and the peer drops the park only if it holds exactly that
+    ///   deadline: a peer that knows a later wall keeps it.
     fn close_breaker(&self, body: &[u8]) -> (u16, serde_json::Value) {
         let parsed: serde_json::Value = match serde_json::from_slice(body) {
             Ok(v) => v,
@@ -7177,6 +7197,11 @@ impl AiGateway {
         if provider.is_empty() {
             return (400, serde_json::json!({"error": "the provider name is required"}));
         }
+        let relay = parsed
+            .get("relay")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let until_ms = parsed.get("until_ms").and_then(|v| v.as_u64());
         let hot = self.hot.load();
         let Some(state) = hot.providers.get(&provider) else {
             return (
@@ -7184,19 +7209,69 @@ impl AiGateway {
                 serde_json::json!({"error": format!("unknown provider '{provider}'")}),
             );
         };
-        state.circuit_breaker.clear_quota();
+        let cb = &state.circuit_breaker;
+
+        if relay {
+            // A relayed release frees exactly the wall it names.
+            let Some(until_ms) = until_ms else {
+                return (
+                    400,
+                    serde_json::json!({"error": "a relayed release needs until_ms"}),
+                );
+            };
+            if !cb.clear_quota_until(until_ms) {
+                return (
+                    200,
+                    serde_json::json!({
+                        "provider": provider,
+                        "released": false,
+                        "force_open_until": cb.force_open_until_ms(),
+                        "state": cb.effective_state(),
+                    }),
+                );
+            }
+            METRICS
+                .circuit_breaker_state
+                .with_label_values(&[&provider])
+                .set(cb.state() as i64);
+            self.persist_circuit_breaker(&provider, cb);
+            info!(
+                provider = %provider,
+                until = until_ms,
+                "provider released by a peer"
+            );
+            return (
+                200,
+                serde_json::json!({
+                    "provider": provider,
+                    "released": true,
+                    "force_open_until": 0,
+                    "state": cb.effective_state(),
+                }),
+            );
+        }
+
+        // The operator's release: unconditional, and cluster-wide.
+        let released_until = cb.force_open_until_ms();
+        cb.clear_quota();
         METRICS
             .circuit_breaker_state
             .with_label_values(&[&provider])
-            .set(state.circuit_breaker.state() as i64);
-        self.persist_circuit_breaker(&provider, &state.circuit_breaker);
-        info!(provider = %provider, "provider released by an operator request");
+            .set(cb.state() as i64);
+        self.persist_circuit_breaker(&provider, cb);
+        if released_until > 0 {
+            if let Some(sync) = &self.breaker_sync {
+                sync.release(&provider, released_until);
+            }
+        }
+        info!(provider = %provider, until = released_until, "provider released by an operator request");
         (
             200,
             serde_json::json!({
                 "provider": provider,
+                "released": true,
                 "force_open_until": 0,
-                "state": state.circuit_breaker.effective_state(),
+                "state": cb.effective_state(),
             }),
         )
     }
