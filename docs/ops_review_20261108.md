@@ -2044,6 +2044,121 @@ minimax 全程健康：04:14:11 一次 502 之后再无失败日志
 - 半开成员仍占轮换槽；探针失败不计入熔断；
 - `auto_home` 池 14 个成员里 11 个常死。
 
+### 15.12 池子自己消化容量：三件套（停顿预算 / 配置热加载 / 逃逸目标）（`3c0fefe`，2026-11-09 15:5x CST 部署）
+
+§15.9 解释了 11:15 那次为什么"没转"：rotate 是活的，但那一轮**没有可轮换的候选**
+（智谱是那个模型唯一的 provider），请求又落在还没升级的入口 VPS 上。本节把
+"池子自己消化容量"这件事做实：池子的成员**上游卡住**、**运营改配置**、**逃逸时
+选谁**这三件事，网关自己兜住，不等客户端重试、不等人工重启。
+
+#### 15.12.1 per-provider 停顿预算：`read_timeout_secs`
+
+**问题。** 路由级 `timeout_secs = 120` 是"整个响应"的预算，上游接了连接却不说
+话，客户端就被挂满 120 s。NAS 上 `ollama_local` 实测挂过 **124 s**（TTFB p99
+30 s）——这不是"慢"，是"哑了"，而哑掉的成员还在轮换池里占着会话。
+
+**做法。** `ProviderConfig::read_timeout_secs`（秒）；peer 的读预算改成
+
+```rust
+peer.options.read_timeout = Some(
+    provider.read_timeout.or(route_timeout).unwrap_or(DEFAULT_READ_TIMEOUT /* 60s */),
+);
+peer.options.write_timeout = Some(route_timeout.unwrap_or(Duration::from_secs(30)));
+```
+
+**语义已核实：pingora 的 `read_timeout` 是「每次读操作」的超时，不是整个响应的
+总时长。** 所以缩短它**只砍"上游卡住"**，不砍长回答 —— 长回答的两次 delta 之间
+本来就远小于 read_timeout。写超时仍然走路由预算（写的是请求体，不是响应）。
+
+**failover 已核实。** `ReadTimedout` 在 `error_while_proxy` 的 `starved` 集合里
+（`ConnectionClosed | ReadError | ReadTimedout | WriteError | WriteTimedout`），
+所以读超时属于"这个成员哑了"而不是"这个 provider 挂了"：池内**重放**到下一个
+成员，同时记一次熔断失败。`gateway.rs:6515`。
+
+**NAS 上线（热加载生效，无需重启）。** 12 个 auto 池成员加 `read_timeout_secs`：
+云端 60 s（`volc_1 volc_2 volc_t_1 minimax xiaomi zhipu_1 deepseek kimi
+opencode_go_1 opencode_go_2`）、`ollama_local` **45 s**（实测挂过 124 s）。
+备份：`maxllm.toml.bak-<ts>-stallbudget`。
+
+**端到端测试（新增）。** `crates/maxllm-gateway/tests/integration.rs`：
+`test_read_timeout_budget_stops_a_stuck_upstream_and_fails_over` —— provider 配
+`read_timeout_secs = 1`、mock 上游延迟 5 s，断言请求**没有等满 5 s**，而是按停顿
+预算放弃、failover 到 backup provider 并返回 200（`X-MaxLLM-Provider: backup`、
+`X-MaxLLM-Fallback-From: stuck`）。实测耗时 **1.17 s**（改判据前这一条要等 5 s）。
+
+#### 15.12.2 配置热加载加固：半写的 `maxllm.toml` 不再让新池静默失效
+
+**问题。** 旧的热加载逻辑有两个洞：① inotify 事件在 **1 秒窗口内被丢弃**；
+② **首次解析失败就放弃**。于是运营用"非原子写"改配置（先截断、再补齐）时，
+网关正好读到那个空文件 → 解析失败 → **新池/新 provider 静默不生效**，而监控上
+一切正常。8 小时内实测 **3 次** `TOML parse error at line 1, column 1`。
+
+**做法（`crates/maxllm-gateway/src/main.rs`）。**
+
+- **settle**：最后一个事件后 **800 ms** 才读文件；
+- **重试**：解析不过就重读，最多 **5 次 × 250 ms**（`read_config_settled`）；
+- **30 s 轮询兜底**：`config_stamp` 比 mtime/size，事件丢了也能发现；
+- **两个指标**：`maxllm_config_reloads_total` / `maxllm_config_reload_failures_total`。
+
+**实测通过。** 用非原子写入（截断 → 150 ms → 补齐）改 NAS 的 `maxllm.toml`，
+网关 `07:51:44Z` 成功重载：`config_reloads_total 1`、`failures 0`、**无重启**。
+
+#### 15.12.3 逃逸目标不落到另一个慢成员 + 扫描不占探针槽
+
+**问题。** `auto_pool_warm_target` 过去用 `is_open()` 扫描候选 —— 每扫过一个
+**半开**成员就泄漏一个探针槽，于是那些成员卡在半开、对外一律 503；而且逃逸
+时可能从一个慢成员逃到**另一个同样慢**的成员。
+
+**做法。** 扫描改用**只读**谓词 `allows_traffic`，选中的那一个才用 `is_open()`
+去**预留**半开探针槽；目标排序新增**每 token 速率**优先级：不慢的成员优先于慢的
+成员，**全池都慢时仍然会选一个**（不回归成"不逃逸"）。
+
+**测试。** `the_escape_prefers_a_fast_member_over_a_slow_one` /
+`the_escape_still_lands_when_every_member_is_slow`（2 个新单测）。
+
+#### 15.12.4 部署与门禁
+
+- **NAS `10.126.126.6` 与 oleFedora01 `10.126.126.20`：sha `bbb187f147d53182`
+  （`3c0fefe`），musl static-pie，两台 `0.3.12` + `active` + `/health` 200 +
+  `NRestarts=0`，两台 sha 一致**（上一轮只上了 NAS，本轮补齐 Fedora）**。
+- 门禁：`cargo fmt` / `cargo test --workspace`（919 passed, 0 failed）/
+  `cargo clippy --all-targets -- -D warnings` 全绿。
+
+#### 15.12.5 NAS 实测快照（2026-11-09）
+
+| 指标 | 数值 |
+|---|---|
+| TTFB（38 031 条 client_response） | p50 **1 849 ms** / p90 5 303 / p95 8 048 / p99 19 203 |
+| 客户端断开 | 5 078 次，**全部是 agent 循环主动取消**，不是首字节超时 |
+| 速度谱系（整程 ms/1k，中位） | `ollama_local` 7 875（127 tok/s）< `minimax` 10 575 < `opencode_go_1` 10 751 < `volc_1` 13 623 ≪ **`xiaomi` 27 792（36 tok/s，慢 3.5 倍）** |
+| 缓存命中率（token 加权） | `opencode_go_1` 97.9% / `opencode_go_2` 97.8% / `volc_t_1` 97.1% / `minimax` 97.0% / `volc_1` 96.6% / `xiaomi` 96.5% / `ollama_local` 94.9% |
+| 会话粘性 | 33 个 session，**6 个大 session 占 96% 请求**，每个跨 4~6 个 provider（迁移时刻与上游故障/配额墙吻合）；`session_affinity_hits_total 117 / misses 1` |
+| 8 h 故障全景 | 1 855 次客户端断开（正常）/ **97 次 `breaker sync poll failed peer=http://10.126.126.199:18081 error=HTTP 404`**（VPS 还没升级）/ 28 次 429 / 6 次 ConnectTimedout / 11 次 Upstream WriteError / 2 次截断 |
+
+#### 15.12.6 仍然未解决（已量化）
+
+- **入口 VPS 仍是 0.3.10**：`/admin/breakers` 返回 **404**（老二进制没有这个端点
+  ⇒ 不认 `[quota_parking]`、不参加跨节点 breaker 共享），也没有 `own_the_error`
+  ⇒ 客户端打 `:18081` 仍会拿到上游 429 原文。15:5x CST 复测：两台的
+  `/v1/responses/zhipu_1` 都已返回网关自己的 503
+  （`zhipu_1=circuit open (quota force-open)`），`/v1/responses/auto` 两台都 200
+  （VPS 那次还带 `X-MaxLLM-Fallback-From: kimi`，说明 failover 活着）—— 但
+  **老二进制只有在撞墙当下**才会把原文交给客户端。需要 root：
+  ```bash
+  REMOTE=root@10.126.126.199 SOURCE=oliveagle@10.126.126.6 \
+    ~/.agents/ops/machines/vm_tecent_cloud_01/maxllm/deploy.sh
+  REMOTE=root@10.126.126.199 \
+    ~/.agents/ops/machines/vm_tecent_cloud_01/maxllm/deploy-nginx.sh
+  ```
+  在那之前，客户端 base_url 直指 NAS `http://10.126.126.6:3795/v1` 或本机
+  `http://10.126.126.20:3795/v1`。
+- **body 里的 session id 是死代码**（要么选路前缓冲 body，要么删文档那三种写法）。
+- **TTFB 专项**（首字节 deadline）还没有 —— 现在的 read_timeout 是"每次读"，
+  一个**每 30 s 才吐一个 token** 的上游仍能占住客户端很久。
+- 半开成员占轮换槽（warm_target 侧已修，rotation 侧仍可查）。
+- 探针失败不计入熔断；`auto_home` 池 14 个成员里 11~14 个常死。
+- `open_design` 还没配 `read_timeout_secs`（脚本没匹配到那段配置）。
+
 ## 附录 A：复现与口径
 
 ```sh

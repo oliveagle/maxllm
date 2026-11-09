@@ -6299,6 +6299,109 @@ session_sticky = true
     );
 }
 
+/// A provider with its own stall budget must not hold the client for the
+/// route's whole timeout: the upstream accepts the connection, says nothing,
+/// and the budget cuts it — then the walk moves on instead of serving the
+/// stall.
+///
+/// Without the budget the request waited for the route's 120s and the client
+/// saw the upstream's own error text.
+#[tokio::test]
+async fn test_read_timeout_budget_stops_a_stuck_upstream_and_fails_over() {
+    let stuck = MockServer::start().await;
+    let backup = MockServer::start().await;
+
+    // The upstream takes the request and never answers within the test.
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(openai_response("never"))
+                .set_delay(Duration::from_secs(5)),
+        )
+        .mount(&stuck)
+        .await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from backup")))
+        .mount(&backup)
+        .await;
+
+    let config = r#"
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[metrics]
+enabled = true
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.stuck]
+kind = "openai_compat"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+# The stall budget: one second of silence from the upstream is enough.
+read_timeout_secs = 1
+
+[providers.backup]
+kind = "openai_compat"
+base_url = "{FALLBACK_URL}"
+api_key = "fake-key"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "stuck"
+fallback = ["backup"]
+strategy = "fallback"
+max_failover_attempts = 1
+"#;
+
+    let gw = TestGateway::start_with_fallback(config, &stuck.uri(), &backup.uri()).await;
+    let c = client();
+
+    let started = std::time::Instant::now();
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&chat_body("model-x", "hi"))
+        .send()
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+
+    // The budget cut the stall and the walk moved on: the client got the
+    // backup provider's answer, not the stuck one's.
+    assert_eq!(resp.status(), 200, "the stuck provider must fail over");
+    assert_eq!(resp.headers().get("X-MaxLLM-Provider").unwrap(), "backup");
+    assert_eq!(
+        resp.headers().get("X-MaxLLM-Fallback-From").unwrap(),
+        "stuck"
+    );
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "from backup");
+
+    // The 5s stall was cut by the 1s budget: the answer came back long
+    // before the upstream would have replied.
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "the read budget did not cut the stall: {elapsed:?}"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(900),
+        "the budget fired earlier than the read timeout: {elapsed:?}"
+    );
+
+    // Both providers were tried exactly once.
+    let stuck_reqs = stuck.received_requests().await.unwrap();
+    assert_eq!(stuck_reqs.len(), 1);
+    let backup_reqs = backup.received_requests().await.unwrap();
+    assert_eq!(backup_reqs.len(), 1);
+}
+
 /// A client that selects the `auto` model on a route that does **not**
 /// declare `auto_model = true` (a model-picker switch without moving the base
 /// URL onto the auto route) must still rotate: the sentinel is a rotation
