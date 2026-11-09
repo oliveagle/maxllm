@@ -6427,14 +6427,12 @@ impl AiGateway {
         let _ = upstream_response.remove_header("content-type");
         let _ = upstream_response.insert_header("content-type", "application/json");
         if let Some(secs) = retry_after_secs {
-            let _ = upstream_response.insert_header("retry-after", &secs.to_string());
+            let _ = upstream_response.insert_header("retry-after", secs.to_string());
         }
         // The upstream's own status travels with the answer: a 503 that
         // stands for a 429 quota wall has to stay visible as one.
-        let _ = upstream_response.insert_header(
-            "X-MaxLLM-Upstream-Status",
-            upstream_status.to_string(),
-        );
+        let _ = upstream_response
+            .insert_header("X-MaxLLM-Upstream-Status", upstream_status.to_string());
         info!(
             provider = %ctx.provider_name,
             upstream_status = upstream_status,
@@ -6471,7 +6469,7 @@ impl AiGateway {
             let until = p.circuit_breaker.force_open_until_ms();
             let now = crate::rate_limit::now_ms();
             if until > now {
-                let secs = (until - now + 999) / 1000;
+                let secs = until.saturating_sub(now).div_ceil(1000);
                 return Some(secs.min(86_400));
             }
         }
@@ -6513,7 +6511,8 @@ impl AiGateway {
         let usable = |name: &str| -> bool {
             name != ctx.provider_name
                 && !ctx.attempted_providers.iter().any(|p| p == name)
-                && hot.providers
+                && hot
+                    .providers
                     .get(name)
                     .map(|p| p.circuit_breaker.allows_traffic())
                     .unwrap_or(false)
@@ -7179,17 +7178,17 @@ impl AiGateway {
             .unwrap_or_default()
             .to_string();
         if provider.is_empty() {
-            return (400, serde_json::json!({"error": "the provider name is required"}));
+            return (
+                400,
+                serde_json::json!({"error": "the provider name is required"}),
+            );
         }
-        let until = parsed
-            .get("until_ms")
-            .and_then(|v| v.as_u64())
-            .or_else(|| {
-                parsed
-                    .get("until")
-                    .and_then(|v| v.as_str())
-                    .and_then(parse_instant_ms)
-            });
+        let until = parsed.get("until_ms").and_then(|v| v.as_u64()).or_else(|| {
+            parsed
+                .get("until")
+                .and_then(|v| v.as_str())
+                .and_then(parse_instant_ms)
+        });
         let Some(until) = until else {
             return (
                 400,
@@ -7204,7 +7203,10 @@ impl AiGateway {
             );
         };
         if until <= crate::rate_limit::now_ms() {
-            return (400, serde_json::json!({"error": "the instant is in the past"}));
+            return (
+                400,
+                serde_json::json!({"error": "the instant is in the past"}),
+            );
         }
         state.circuit_breaker.park_until(until);
         METRICS
@@ -7253,7 +7255,10 @@ impl AiGateway {
             .unwrap_or_default()
             .to_string();
         if provider.is_empty() {
-            return (400, serde_json::json!({"error": "the provider name is required"}));
+            return (
+                400,
+                serde_json::json!({"error": "the provider name is required"}),
+            );
         }
         let relay = parsed
             .get("relay")

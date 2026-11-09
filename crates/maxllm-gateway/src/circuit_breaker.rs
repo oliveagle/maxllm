@@ -37,10 +37,10 @@ pub const PAYMENT_REQUIRED_COOLDOWN_MS: u64 = 10 * 60 * 1000;
 /// the resolver's default cooldown and grows with every unanswered wall,
 /// up to a day.
 const QUOTA_COOLDOWN_LADDER_MS: [u64; 5] = [
-    5 * 60 * 1000,     // 5 min
-    15 * 60 * 1000,    // 15 min
-    60 * 60 * 1000,    // 1 h
-    6 * 60 * 60 * 1000, // 6 h
+    5 * 60 * 1000,       // 5 min
+    15 * 60 * 1000,      // 15 min
+    60 * 60 * 1000,      // 1 h
+    6 * 60 * 60 * 1000,  // 6 h
     24 * 60 * 60 * 1000, // 24 h
 ];
 
@@ -777,7 +777,10 @@ mod tests {
         let first = cb.record_quota_unknown(base);
         assert_eq!(first, base, "the first wall uses the base cooldown");
         let second = cb.record_quota_unknown(base);
-        assert!(second > first, "the second wall waits longer: {second} > {first}");
+        assert!(
+            second > first,
+            "the second wall waits longer: {second} > {first}"
+        );
         let third = cb.record_quota_unknown(base);
         assert!(third > second, "the third wall waits longer still");
 

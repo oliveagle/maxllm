@@ -164,7 +164,7 @@ pub fn spawn(
                                     Err(e) => {
                                         let count = failures.entry(peer.clone()).or_insert(0);
                                         *count += 1;
-                                        if *count == 1 || *count % PEER_WARN_EVERY == 0 {
+                                        if *count == 1 || (*count).is_multiple_of(PEER_WARN_EVERY) {
                                             warn!(peer = %peer, error = %e, failures = *count, "breaker sync poll failed");
                                         }
                                     }
