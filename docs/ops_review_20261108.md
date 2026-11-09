@@ -1554,6 +1554,127 @@ untracked，本仓不涉及）。08:01:34 定时轮 **七项全 OK**，连续失
 
 ---
 
+## 15. 容量自消化：网关拥有错误 + 配额墙跨节点共享（2026-11-09 上午–下午）
+
+### 15.1 事故：客户端看到的是上游的配额原文
+
+11:15:04 CST，客户端（codex，base_url `http://10.126.126.199:18081/v1/responses/auto`）拿到：
+
+```
+rate limit exceeded: 您已达到每周/每月使用上限，您的限额将在 2026-11-10 22:58:54 重置。[20261109111504163e4b0369fd4cc0]
+```
+
+三个事实叠在一起，才让这句话出现在客户端面前：
+
+1. **这是智谱的原文**，不是 maxllm 的话。末尾那串 `20261109111504163e4b0369fd4cc0` 是智谱的 x-log-id
+   （格式 `YYYYMMDDHHMMSS` + 16 位 hex），网关把上游的 body 原样透传了。
+2. **智谱的周配额墙是真的**：NAS 于 11-08 22:06 CST 学到 `zhipu_1` 的配额耗尽，
+   `force_open_until=1794322734000` = **2026-11-10 22:58:54 CST**，与报错里的重置时刻一字不差。
+3. **那一轮没有轮换成功**：请求体约 600–700 KB（194k input tokens），超过 pingora 的
+   64 KiB 重放缓冲，老版本放弃 failover，把上游 429 直接交给客户端；而且当时
+   **客户端连的是 VPS 节点**，它的熔断状态是自己的一份（11-08 21:40 刚部署、DB 为空），
+   根本不知道另外两台已经把智谱判死刑了。
+
+所以「不是要 auto rotate 么」——rotate 一直在，但那一轮既没有可轮换的候选
+（智谱是这个模型唯一的 provider），也没有可重放的请求体。
+
+### 15.2 现在的行为：网关拥有自己的错误
+
+老网关把上游的状态码和 body 交给客户端，于是「上游配额墙」被客户端读成「我被限流了」，
+agent 就停在那里等重置。新网关自己回答（`ctx::GatewayError`）：
+
+| 上游状态 | 现在的回答 |
+|---|---|
+| 401 / 402 / 403 / 408 / 409 / 425 / 429 / 5xx | **503** `{"error":{"message":…,"type":"gateway_error","code":503}}` + `Retry-After` + `X-MaxLLM-Upstream-Status: <上游状态>` |
+| 400 / 404 / 405 / 410 / 422 | 保留上游原样（这是客户端自己的错，`model not found` 这类诊断必须送达） |
+
+上游的 body 一律不进客户端的响应体；上游状态码留在 `X-MaxLLM-Upstream-Status` 里供审计。
+
+实测（本地节点，2026-11-09 12:46 CST）：
+
+```
+POST /v1/responses/kimi  → 503
+{"error":{"code":503,"message":"no provider available: kimi=circuit open (quota force-open) — every candidate of route '/v1/responses/kimi' is rejecting traffic","type":"gateway_error"}}
+```
+
+### 15.3 轮换：预算、候选、请求体
+
+* **failover 预算 ≥ 池子大小**（`failover_budget(hot, ctx)`）：老版本按路由配置的
+  `max_failover_attempts` 走，池子有 12 个成员时预算可能比候选少，白白浪费成员。
+* **候选**：被配额墙占住的 provider 立刻离开轮换，不再每轮拿它试一次。
+* **请求体**：700 KB 的 body 在 native 与 translated 两条路径上都能重放并完成轮换
+  （回归测试 `test_quota_429_fails_over_with_a_large_body`、
+  `test_quota_429_fails_over_with_a_large_body_on_a_translated_provider`）。
+
+实测（本地节点）：`POST /v1/responses` → 200，响应头 `X-MaxLLM-Provider: volc_1`、
+`X-MaxLLM-Fallback-From: ollama_local` —— 主选失败，自动换人，客户端拿到正常答案。
+
+### 15.4 配额墙怎么记、怎么跨节点共享
+
+* **墙的长度已知**（上游给了重置时刻）：直接 park 到那一刻，`quota_cooldown_level` 归零。
+* **墙的长度未知**（如 kimi 的 "weekly (7-day) usage limit"）：走阶梯
+  `5m → 15m → 1h → 6h → 24h`（`QUOTA_COOLDOWN_LADDER_MS`），墙还在就升一级，
+  探针成功则复位。阶梯的意义：不再每 5 分钟用一个请求去撞一次已知的墙。
+* **跨节点共享**（`breaker_sync.rs`，新）：每个节点每 15 s 拉一次 peers 的
+  `GET /admin/breakers`，**只延长**、不缩短别人的墙。学到墙的节点不再让每个节点各交一次学费。
+* **运维预置**（`[quota_parking]`）：已知墙直接写进配置，所有节点启动即生效：
+
+  ```toml
+  [quota_parking]
+  "zhipu_1" = "2026-11-10T22:58:54+08:00"
+  ```
+
+* **释放也是集群动作**（2026-11-09 13:0x 补）：运维在一个节点释放 provider，
+  释放会带着它释放的那个截止时刻转发给 peers；peer 只有在**自己持有的截止时刻完全相同**
+  时才丢掉这个 park（知道更晚的墙的 peer 保留自己的）。
+
+### 15.5 节点拓扑（2026-11-09 13:0x CST 实测）
+
+| 节点 | 地址 | 网关 | 熔断共享 |
+|---|---|---|---|
+| oleFedora01（本机） | 10.126.126.20 / 192.168.2.137 / 192.168.2.198 : 3795 | 0.3.10 / `f249760dacfd4d11` | ✅ 与 NAS 双向 |
+| oleNas01 | 192.168.2.190 / 10.126.126.6 : 3795 | 0.3.10 / `f249760dacfd4d11` | ✅ 与本机双向 |
+| 腾讯云 VPS | 10.126.126.199 : 3795（nginx : 18081） | **旧版本**（无 `/admin/breakers`） | ❌ 孤立 |
+
+实测证据：
+
+* 本机 park `cmd` → NAS 与 VPS 视图都在一个 poll（15 s）内变成 `open`，截止时刻逐毫秒相同；
+* 本机 release `cmd` → NAS 立刻回到 `closed`（新版本的释放转发）；
+* VPS 的 `10.126.126.199:3795/admin/breakers` 返回 404 —— **VPS 上的网关还是旧二进制**，
+  它不参加熔断共享，也不认新的 breaker 端点；`18081` 上 `GET /admin/breakers`
+  其实是 nginx 转到本机的（返回的就是本机那份状态），所以**别把 18081 当成 VPS 的状态源**。
+
+### 15.6 待办：VPS 节点升级（需运维在本机执行）
+
+```bash
+# 1) 上传（静态 musl，sha256[:16]=f249760dacfd4d11）
+scp ~/.cache/mx-gate-target/x86_64-unknown-linux-musl/release/maxllm-server \
+    root@10.126.126.199:/opt/maxllm/bin/maxllm-server.new
+# 2) 切换 + 重启
+ssh root@10.126.126.199 'cd /opt/maxllm/bin && chmod 755 maxllm-server.new \
+  && cp -p maxllm-server maxllm-server.bak-$(date +%Y%m%d-%H%M)-deploy \
+  && mv maxllm-server.new maxllm-server && systemctl restart maxllm'
+```
+
+VPS 的 `maxllm.toml` 需要补上：
+
+```toml
+[breaker_sync]
+enabled = true
+interval_secs = 15
+peers = ["http://10.126.126.20:3795", "http://192.168.2.190:3795"]
+auth_token = "${MAXLLM_MASTER_KEY}"
+
+[quota_parking]
+"zhipu_1" = "2026-11-10T22:58:54+08:00"
+```
+
+若 VPS 的 ssh 别名 `vm_tecent_cloud_01` 可用，直接 `scripts/deploy_maxllm.sh vps`
+（自带 static-pie 守卫、备份、20 s 健康检查与自动回滚）。
+
+升级之前，**指向 VPS 的客户端仍会拿到上游原文 429**（老网关的行为）——
+临时办法是把客户端的 base_url 指向本机或 NAS（两者都是新版本）。
+
 ## 附录 A：复现与口径
 
 ```sh
