@@ -2856,3 +2856,83 @@ and will result in account ban." —— 把包月订阅通过自建网关转出�
 - 线上（NAS 生产节点）停用 `maxllm-commandcode.service` 并把二进制移出 `bin/`；
 - **保留** `kind = "commandcode"`（Provider API，厂商授权路径）——Go 计划下它恒 403，
   升级 Provider 计划后 `/v1/responses/cmd` 原生透传即可用，网关侧无需改动。
+
+### 15.22 "不是要 auto rotate 么" —— 追到真正的链路：那一发根本没过 maxllm（2026-11-09 22:0x）
+
+**先纠正 §15.21 的一个误判**：客户端看到的
+`rate limit exceeded: 您已达到每周/每月使用上限，您的限额将在 2026-11-10 22:58:54 重置。
+[20261109111504163e4b0369fd4cc0]`，末尾那串**不是智谱的 x-log-id，而是 one-api 的
+request id**：one-api 的 id 格式是 `14 位本地时间 + 16 位随机`（本机
+`~/opt/one-api/logs/oneapi.log` 里 `2026110913192985903599755976479` 就是同一格式，
+且前 14 位与日志时间戳逐秒吻合）。`20261109111504…` = **2026-11-09 11:15:04**。
+§15.21 把它当成智谱的 id，因此把整件事归到了 VPS 老网关上——方向错了。
+
+**那一发走的是 one-api 的渠道池，不是 maxllm 的轮换。** 本机 Codex 的
+`~/.codex/config.toml` 是 `model_provider = "one-api-local"` →
+`http://127.0.0.1:3794/v1` + `model = "coding_resps"`；one-api 的
+`coding_resps` 渠道是**直连上游**的 6 条（volc-1/2/t-1、minimax、zhipu、kimi），
+其中 8 号 `one-api-zhipu-1 → https://open.bigmodel.cn/api/v1`。智谱回 429，one-api
+把原文原样转给客户端——它**没有 maxllm 的熔断共享、没有配额停放、也没有"网关拥有
+自己的错误"**。同一台机器的 one-api 日志里今天已经出现过同型错误两次：
+`13:19:30 channel id 8`（智谱中文原文）、`13:19:30 channel id 16`（kimi 英文原文）。
+
+**maxllm 这边是好的（22:0x 现场实测）**：NAS/Fedora 均 0.3.12、`/health` 200；
+池子端点 `/v1/responses/auto` 8 发全 200 且命中 6 个不同 provider；点名路由撞墙时返回
+**自己造的** 503 `no provider available: zhipu_1=circuit open (quota force-open)`，
+上游 body 一步不下发；`/v1/responses/auto/responses`（客户端把端点接在 provider 级
+base URL 后面）也能命中池子。
+
+**入口 `:18081` 的漏仍然在（需要 root@VPS 才能修）**：从 oleNas01（无 NAT 重定向）实测
+`POST http://10.126.126.199:18081/v1/responses/kimi` → **429 + kimi 英文原文**
+（`X-MaxLLM-Provider: kimi`），而直连 NAS 同一路由是干净 503。入口 nginx 的上游链里
+仍有那台 0.3.10 老网关（它排在最前，429 又不在 `proxy_next_upstream` 列表里，所以
+老网关的原文直接落到客户端）。ops 仓库的补丁（`bdac746d`：把老网关摘出链 + 补
+`proxy_next_upstream ... non_idempotent`）**仍未上线**，因为需要
+`root@10.126.126.199`（root/ubuntu/opc/admin/ecs-user/lighthouse/opencloudos/centos
+七个账号全 `Permission denied`；dotvault 无该机条目；本机无 id_rsa）。在此之前，客户端
+一律直连 NAS（`http://10.126.126.6:3795/v1`）或 Fedora（`10.126.126.20:3795/v1`）。
+
+**已修（一）：让 one-api 的客户端真的走 maxllm 的池子。** one-api 继续管鉴权/配额，
+但上游只剩 maxllm 一个：
+
+- 渠道 49 `maxllm-auto`：`base_url` 从 `…:3795/v1`（**固定链**，primary 是家里的
+  `ollama_local`，池子根本不参与）改成 `…:3795/v1/responses/auto`（**池子**）；
+  `models` 增加 `coding_resps`；`priority` 提到 1。
+- 直连上游的 6 条渠道去掉 `coding_resps`（各自保留其它 model；智谱那条只剩
+  `coding_resps`，已置 `status=2` 停用）——它们是**同一批账号的第二份、无状态的拷贝**，
+  正是"墙到了还照打"的那一份。
+- one-api 的渠道缓存每 10 分钟自同步一次，改完 ~5 分钟后生效；实测
+  `coding_resps` → 池子（`deepseek-v4.1-flash` / `MiniMax-M3`）、`auto` → 池子，
+  NAS `request_logs` 里 `route_path=/v1/responses/auto`。回滚点：
+  `~/opt/one-api/data/one-api.db.bak.20261109-poolroute-20261109-220631`。
+
+**已修（二）：`scripts/add_pool_provider.sh` 写死的 Responses 路径**（提交 `c24450c`）。
+新账号进池后**每个请求都 404 然后 failover**——`volc_1_spare` 就是这么"在池子里但从不
+服务"的：脚本给所有 openai_compat 写死 `responses_path = "/v1/responses"`，而 Ark
+Coding 的真实 Responses 路由是 `/api/coding/v3/responses`（`gateway.rs`
+`derive_responses_path` 本来就会从 chat 路径推导）。现在：路径**按 chat 路径推导**，
+`--responses-path` 用于"Responses 路由不是 chat 路由的兄弟"的上游（`zhipu_1`：
+chat `/api/coding/paas/v4/…`，responses `/api/v1/responses`），`--chat-only` 表示上游
+只会说 chat（此时网关做 Responses→chat 翻译，不写 `native_responses`）。
+线上 `volc_1_spare` 已就地改成 `/api/coding/v3/responses`（备份
+`maxllm.toml.bak-20261109-221452-spare-responses-path`），实测 **3/3 干净 200、零 fallback**；
+随后它自己的 Ark 账号回了 429（`429 quota force-opened until the resolved reset
+instant`，22:30 CST 恢复）——这是账号配额，不是网关问题。
+
+**已修（三）：provider 名被短名遮蔽**（提交 `c24450c`）。`/v1/responses/volc_1` 是
+`/v1/responses/volc_1_spare` 的**字符串前缀**，而 `match_route` 取配置顺序里的**第一个**
+前缀命中 → 备用账号的请求被主账号的路由接走，报错长得像"主账号挂了"：
+`no provider available: volc_1=circuit open … every candidate of route
+'/v1/responses/volc_1' is rejecting traffic`。**凡是名字以别的账号名开头的账号都够不着**
+——而"往池子里加账号"正是接下来的主线。现在按**路径段边界**匹配：路由要么**等于**
+请求路径，要么请求路径以 `/` 续上。`/v1/responses/volc_1_spare` 因此落到通用路由并由
+子路由 pin 认领；`/v1/responses/volc_1`、`/v1/responses/open-design`（连字符别名）、
+`/v1/responses/open_design`（通用路由按名 pin）、`/v1/responses/volc_1/responses`
+（客户端接端点）四种写法都有集成测试守着。线上复测：报错已从
+"route '/v1/responses/volc_1'"变成"the provider **'volc_1_spare'** named by the request
+path"。
+
+**部署**：NAS + oleFedora01 同为 sha `a7c546f287b9e243`（musl static-pie，
+`scripts/deploy_maxllm.sh nas|fedora`，自带备份/健康检查/自动回滚），
+`cargo test --workspace` 951 passed / 0 failed，`cargo clippy --all-targets -D warnings`
+干净，`scripts/tests` 29 tests OK。
