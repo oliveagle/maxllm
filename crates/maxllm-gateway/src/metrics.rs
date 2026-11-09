@@ -41,6 +41,12 @@ pub struct GatewayMetrics {
     /// cold conversation — a rising share here is a falling cache hit rate.
     pub opencode_affinity_source_total: IntCounterVec,
     pub session_affinity_misses_total: IntCounter,
+    /// Sessions that left their pinned provider because that provider does
+    /// not keep the conversation's prefix cache warm.
+    pub session_affinity_cold_escapes_total: IntCounterVec,
+    /// The share of the input each provider served from its prompt cache
+    /// (percent), as the pool sees it.
+    pub provider_cache_ratio: IntGaugeVec,
     pub session_affinity_evictions_total: IntCounter,
     pub session_affinity_size: IntGauge,
     /// Circuit breaker state per provider: 0=closed, 1=open, 2=half-open.
@@ -218,6 +224,30 @@ impl GatewayMetrics {
         .expect("metric");
         registry
             .register(Box::new(session_affinity_misses_total.clone()))
+            .expect("register");
+
+        let session_affinity_cold_escapes_total = IntCounterVec::new(
+            Opts::new(
+                "maxllm_session_affinity_cold_escapes_total",
+                "Sessions that left their pinned provider because it does not keep the prefix cache warm",
+            ),
+            &["provider"],
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(session_affinity_cold_escapes_total.clone()))
+            .expect("register");
+
+        let provider_cache_ratio = IntGaugeVec::new(
+            Opts::new(
+                "maxllm_provider_cache_ratio",
+                "Share of the input each provider served from its prompt cache (percent)",
+            ),
+            &["provider"],
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(provider_cache_ratio.clone()))
             .expect("register");
 
         let session_affinity_evictions_total = IntCounter::new(
@@ -455,6 +485,8 @@ impl GatewayMetrics {
             opencode_affinity_source_total,
             session_affinity_hits_total,
             session_affinity_misses_total,
+            session_affinity_cold_escapes_total,
+            provider_cache_ratio,
             session_affinity_evictions_total,
             session_affinity_size,
             circuit_breaker_state,

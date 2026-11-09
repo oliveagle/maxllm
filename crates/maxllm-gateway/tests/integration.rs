@@ -429,6 +429,19 @@ fn openai_response(content: &str) -> Value {
     })
 }
 
+/// A response whose usage reports exactly how much of the input the
+/// upstream served from its prompt cache.
+///
+/// The pool reads that share to tell a member that *keeps* a conversation
+/// warm from one that re-reads the whole context every turn.
+fn openai_response_with_cache(content: &str, prompt_tokens: u64, cached_tokens: u64) -> Value {
+    let mut body = openai_response(content);
+    body["usage"]["prompt_tokens"] = json!(prompt_tokens);
+    body["usage"]["total_tokens"] = json!(prompt_tokens + 5);
+    body["usage"]["prompt_tokens_details"] = json!({"cached_tokens": cached_tokens});
+    body
+}
+
 /// Same body as [`openai_response`], but the prompt side reports a cache hit.
 ///
 /// Routing now grades a provider on its *warm* exchanges: a reply that never
@@ -5161,6 +5174,210 @@ auto_model = true
     assert_eq!(a_sent["model"], "model-a");
     let b_sent: Value = serde_json::from_slice(&b_reqs[0].body).expect("json body");
     assert_eq!(b_sent["model"], "model-b");
+}
+
+// ---------------------------------------------------------------------------
+// auto model: the rotation follows the cache
+// ---------------------------------------------------------------------------
+
+/// The config the two cache tests share: a route that serves the auto pool
+/// directly, with two members — one that keeps the conversation warm and one
+/// that re-reads the whole context every turn.
+const CACHE_POOL_CONFIG: &str = r#"
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[providers.mock]
+kind = "openai"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+
+[providers.pool_a]
+kind = "openai"
+base_url = "{POOL_A_URL}"
+api_key = "fake-key"
+
+[providers.pool_b]
+kind = "openai"
+base_url = "{POOL_B_URL}"
+api_key = "fake-key"
+
+[auto_model]
+enabled = true
+name = "auto"
+
+[[auto_model.pool]]
+provider = "pool_a"
+model = "model-a"
+
+[[auto_model.pool]]
+provider = "pool_b"
+model = "model-b"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "mock"
+auto_model = true
+"#;
+
+/// The pool must send the traffic where the conversation stays warm.
+///
+/// A member that re-reads the whole context on every turn is paid for twice
+/// — in prefill and in latency — so it earns less of the rotation than a
+/// member that serves the context from its prompt cache. It still keeps a
+/// slot: the pool has to keep measuring the members it has.
+#[tokio::test]
+async fn test_auto_pool_prefers_the_member_that_keeps_the_conversation_warm() {
+    let mock = MockServer::start().await;
+    let warm = MockServer::start().await;
+    let cold = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("unused")))
+        .mount(&mock)
+        .await;
+    // 90% of the input came from the upstream's prompt cache.
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(openai_response_with_cache("warm", 4000, 3600)),
+        )
+        .mount(&warm)
+        .await;
+    // The upstream re-read everything, every turn.
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(openai_response_with_cache("cold", 4000, 0)),
+        )
+        .mount(&cold)
+        .await;
+
+    let (mut child, base, _cfg) =
+        spawn_gateway_with_pool(CACHE_POOL_CONFIG, [&mock.uri(), &warm.uri(), &cold.uri()]).await;
+    let c = client();
+
+    for _ in 0..30 {
+        let resp = c
+            .post(format!("{base}/v1/chat/completions"))
+            .json(&chat_body("auto", "hi"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    let warm_reqs = warm.received_requests().await.unwrap_or_default().len();
+    let cold_reqs = cold.received_requests().await.unwrap_or_default().len();
+    let mock_reqs = mock.received_requests().await.unwrap_or_default().len();
+
+    assert_eq!(
+        warm_reqs + cold_reqs,
+        30,
+        "every request is served by the pool"
+    );
+    assert_eq!(mock_reqs, 0, "the route's own provider is not used");
+    assert!(
+        warm_reqs > cold_reqs * 3,
+        "the member that keeps the conversation warm must earn the traffic: \
+         warm={warm_reqs} cold={cold_reqs}"
+    );
+    assert!(
+        cold_reqs >= 1,
+        "no member is starved: the pool has to keep measuring the ones it has"
+    );
+
+    child.kill().ok();
+    child.wait().ok();
+}
+
+/// A session that is pinned to a member which re-reads the whole context
+/// every turn has nothing to lose by moving: there is no cache to keep. The
+/// session moves to a member that serves it warm.
+///
+/// The move is only allowed once the member has served enough turns for its
+/// ratio to be a verdict rather than a guess, and only when some member of
+/// the pool is clearly warm — otherwise the pin stays.
+#[tokio::test]
+async fn test_a_session_pinned_to_a_cold_member_moves_to_a_warm_one() {
+    let mock = MockServer::start().await;
+    let warm = MockServer::start().await;
+    let cold = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("unused")))
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(openai_response_with_cache("warm", 4000, 3600)),
+        )
+        .mount(&warm)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(openai_response_with_cache("cold", 4000, 0)),
+        )
+        .mount(&cold)
+        .await;
+
+    let config = format!(
+        "[session_sticky]\nenabled = true\ntimeout_secs = 3600\nmax_entries = 100\n{}",
+        CACHE_POOL_CONFIG
+    );
+    let (mut child, base, _cfg) =
+        spawn_gateway_with_pool(&config, [&mock.uri(), &warm.uri(), &cold.uri()]).await;
+    let c = client();
+
+    // Find a session that lands on the cold member. The rotation keeps the
+    // cold member's slot at the head of every cycle, so a handful of
+    // attempts is enough to hit it.
+    let mut cold_session: Option<String> = None;
+    for i in 0..12 {
+        let sid = format!("escape-{i}");
+        let resp = c
+            .post(format!("{base}/v1/chat/completions"))
+            .header("session-id", &sid)
+            .json(&chat_body("auto", "hi"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: Value = resp.json().await.unwrap();
+        if body["choices"][0]["message"]["content"] == json!("cold") {
+            cold_session = Some(sid);
+            break;
+        }
+    }
+    let cold_session = cold_session.expect("no session landed on the cold member");
+
+    // The session stays on the cold member until the evidence is a verdict:
+    // one cold turn is not a reason to move a live conversation.
+    let mut moved = false;
+    for _ in 0..5 {
+        let resp = c
+            .post(format!("{base}/v1/chat/completions"))
+            .header("session-id", &cold_session)
+            .json(&chat_body("auto", "hi"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: Value = resp.json().await.unwrap();
+        if body["choices"][0]["message"]["content"] == json!("warm") {
+            moved = true;
+            break;
+        }
+    }
+    assert!(
+        moved,
+        "a session pinned to a member that caches nothing must move to a member \
+         that keeps the conversation warm"
+    );
+
+    child.kill().ok();
+    child.wait().ok();
 }
 
 /// A streaming request on an auto route must keep the native Responses

@@ -965,6 +965,48 @@ const AUTO_POOL_PIN_ESCAPE_FLOOR_MS: f64 = 10_000.0;
 /// and can rejoin the fast cohort.
 const AUTO_POOL_EXPLORE_EVERY: u64 = 50;
 
+/// The cache ratio at which a member of the pool counts as "keeps the
+/// conversation warm" — the upstream serves most of the input from its
+/// prompt cache instead of re-reading it.
+const AUTO_POOL_CACHE_WARM_RATIO: f64 = 0.5;
+
+/// How much colder than the pool's best member a *pin* may be before the
+/// session is allowed to leave it.
+///
+/// A pin on a cold provider has nothing to lose: the next turn re-reads the
+/// whole context anyway, so staying costs a full prefill per turn, while
+/// leaving costs nothing. A pin on a warm provider is worth keeping even if
+/// another member is warmer — that is the cache the conversation is built
+/// on.
+const AUTO_POOL_CACHE_COLD_FACTOR: f64 = 0.5;
+
+/// The cache ratio below which a member is cold whatever the rest of the
+/// pool does.
+///
+/// The relative rule alone lets a session hop between two members that are
+/// both mediocre, and every hop throws away a cache that was worth
+/// something. Below this ratio the upstream re-reads the conversation on
+/// every turn, so the session has nothing to lose by moving and the pool
+/// says so outright.
+const AUTO_POOL_CACHE_COLD_FLOOR: f64 = 0.25;
+
+/// How many observations a member needs before its cache ratio is allowed
+/// to decide the fate of a session that is already pinned to it.
+///
+/// One cold turn is not a verdict — the same provider serves the very next
+/// turn warm. The rotation may still *prefer* a member on thin evidence;
+/// moving a live conversation is a different matter.
+const AUTO_POOL_CACHE_MIN_SAMPLES: u64 = 3;
+
+/// The slots every member of the rotation keeps, whatever its cache ratio.
+///
+/// A member that is never asked to work is a member nobody knows anything
+/// about: the pool has to keep measuring the members it has.
+const AUTO_POOL_CACHE_WEIGHT_FLOOR: u32 = 1;
+
+/// The extra slots a fully warm member earns on top of the floor.
+const AUTO_POOL_CACHE_WEIGHT_SCALE: u32 = 9;
+
 /// The median of the recent whole-exchange samples (time-to-last-byte, not
 /// TTFB) across `healthy`, or `None` when nothing in the tier has been
 /// measured inside the evidence window.
@@ -1056,6 +1098,150 @@ fn auto_pool_rotation<'a>(
         }
     }
     cohort
+}
+
+/// The slots a member of the rotation earns, from how well it keeps the
+/// conversation's prefix cache warm.
+///
+/// `None` when the member has not been measured: it is neither warm nor
+/// cold, and it must not be judged before it has served a turn.
+fn auto_pool_cache_weight(provider: &str) -> Option<u32> {
+    crate::provider_stats::cache_evidence(provider).map(|ev| {
+        AUTO_POOL_CACHE_WEIGHT_FLOOR
+            + (ev.ratio * AUTO_POOL_CACHE_WEIGHT_SCALE as f64)
+                .round()
+                .clamp(0.0, AUTO_POOL_CACHE_WEIGHT_SCALE as f64) as u32
+    })
+}
+
+/// The rotation expanded into a weighted, *interleaved* order.
+///
+/// A member that re-reads the whole context every turn is paid for twice —
+/// in prefill and in latency — so it earns fewer slots than a member that
+/// serves the conversation warm. But it never earns none: the pool keeps
+/// every member in the rotation, because an idle member is idle because
+/// nobody asked it to work, and the pool is what measures it.
+///
+/// The slots are interleaved, not grouped. A grouped list would hand every
+/// request in a row to the same member — the first member's slots come
+/// first — which is the opposite of a rotation: the pool would look like it
+/// rotates while one member serves everything. Each member instead takes the
+/// slot with the smallest served-to-weight ratio, so the shares stay
+/// proportional *and* the members keep taking turns.
+fn auto_pool_cache_order<'a>(rotation: &[&'a AutoPoolEntry]) -> Vec<&'a AutoPoolEntry> {
+    let measured: Vec<u32> = rotation
+        .iter()
+        .filter_map(|e| auto_pool_cache_weight(&e.provider))
+        .collect();
+    // An unmeasured member shares the average weight of the measured ones:
+    // it must be measured to be judged, and the rotation is what measures
+    // it. With nothing measured at all, every member keeps the floor.
+    let fallback = if measured.is_empty() {
+        AUTO_POOL_CACHE_WEIGHT_FLOOR
+    } else {
+        (measured.iter().sum::<u32>() / measured.len() as u32).max(AUTO_POOL_CACHE_WEIGHT_FLOOR)
+    };
+    let weights: Vec<u32> = rotation
+        .iter()
+        .map(|e| auto_pool_cache_weight(&e.provider).unwrap_or(fallback))
+        .collect();
+    let total: u32 = weights.iter().sum();
+    if total == 0 {
+        return rotation.to_vec();
+    }
+    let mut served = vec![0u32; rotation.len()];
+    let mut order: Vec<&AutoPoolEntry> = Vec::with_capacity(total as usize);
+    for _ in 0..total {
+        let mut best = 0usize;
+        for m in 1..rotation.len() {
+            // served[m] / weights[m] < served[best] / weights[best], in
+            // exact integer arithmetic (no rounding to break a tie).
+            let left = served[m] as u64 * weights[best] as u64;
+            let right = served[best] as u64 * weights[m] as u64;
+            if left < right {
+                best = m;
+            }
+        }
+        served[best] += 1;
+        order.push(rotation[best]);
+    }
+    order
+}
+
+/// Whether a *pin* sits on a member that does not keep the conversation
+/// warm, while another member of the pool does.
+///
+/// Deliberately conservative: the pin is only dropped when the best member
+/// of the tier is clearly warm, the pinned one is clearly not — and the
+/// pinned one has served enough turns for its ratio to be more than a
+/// guess. A session that moves loses the upstream's prompt cache, which is
+/// worth nothing when there was no prompt cache to lose, and worth a lot
+/// when there was: so a member that caches *some* of the input keeps its
+/// sessions, and only a member that caches almost none gives them up.
+fn auto_pool_pin_is_cold(name: &str, healthy: &[&AutoPoolEntry]) -> bool {
+    let Some(pinned) = crate::provider_stats::cache_evidence(name) else {
+        return false;
+    };
+    if pinned.samples < AUTO_POOL_CACHE_MIN_SAMPLES {
+        return false;
+    }
+    let best = healthy
+        .iter()
+        .filter_map(|e| crate::provider_stats::cache_ratio(&e.provider))
+        .fold(None, |acc: Option<f64>, r| {
+            Some(acc.map_or(r, |a: f64| a.max(r)))
+        });
+    match best {
+        Some(best) if best >= AUTO_POOL_CACHE_WARM_RATIO => {
+            pinned.ratio <= AUTO_POOL_CACHE_COLD_FLOOR
+                && pinned.ratio <= best * AUTO_POOL_CACHE_COLD_FACTOR
+        }
+        _ => false,
+    }
+}
+
+/// The member of the tier that keeps the conversation warmest and can take
+/// traffic right now.
+///
+/// The escape does not go back to the rotation: the rotation would happily
+/// hand the session the very member it just left, and the session would pin
+/// itself to a cold member again — an escape that never escapes. Among the
+/// members that are warm, the one with the highest cache ratio wins; on a
+/// tie the one with the shorter queue wins, so a burst of escaped sessions
+/// spreads out instead of piling onto one provider.
+fn auto_pool_warm_target<'a>(
+    healthy: &[&'a AutoPoolEntry],
+    admits: &dyn Fn(&AutoPoolEntry) -> bool,
+) -> Option<&'a AutoPoolEntry> {
+    let mut best: Option<(&'a AutoPoolEntry, f64, u64)> = None;
+    for entry in healthy {
+        if !admits(entry) {
+            continue;
+        }
+        let Some(ev) = crate::provider_stats::cache_evidence(&entry.provider) else {
+            continue;
+        };
+        if ev.ratio < AUTO_POOL_CACHE_WARM_RATIO {
+            continue;
+        }
+        let inflight = crate::provider_stats::inflight(&entry.provider);
+        let better = match best {
+            None => true,
+            Some((_, best_ratio, best_inflight)) => {
+                if ev.ratio > best_ratio + 0.02 {
+                    true
+                } else if (ev.ratio - best_ratio).abs() <= 0.02 {
+                    inflight < best_inflight
+                } else {
+                    false
+                }
+            }
+        };
+        if better {
+            best = Some((entry, ev.ratio, inflight));
+        }
+    }
+    best.map(|(entry, _, _)| entry)
 }
 
 impl AiGateway {
@@ -1512,9 +1698,27 @@ impl AiGateway {
             if let Some(session_id) = ctx.session_id.clone() {
                 match self.sessions.get(&session_id) {
                     Some(pinned_name) => {
-                        chosen = healthy.iter().copied().find(|e| {
-                            e.provider == pinned_name && admits(e) && !pin_is_slow(&e.provider)
-                        });
+                        // A pin on a member that does not keep the
+                        // conversation warm has nothing to lose — the next
+                        // turn re-reads the whole context anyway. It is
+                        // dropped so the session can move to a member that
+                        // serves it warm.
+                        let cold = auto_pool_pin_is_cold(&pinned_name, &healthy);
+                        if cold {
+                            METRICS
+                                .session_affinity_cold_escapes_total
+                                .with_label_values(&[&pinned_name])
+                                .inc();
+                            // Straight to a member that keeps the
+                            // conversation warm: back to the rotation and
+                            // the session would be handed the cold member
+                            // it just left.
+                            chosen = auto_pool_warm_target(&healthy, &admits);
+                        } else {
+                            chosen = healthy.iter().copied().find(|e| {
+                                e.provider == pinned_name && admits(e) && !pin_is_slow(&e.provider)
+                            });
+                        }
                         // Pinned provider unavailable (open circuit, no
                         // longer in the pool, only in a lower billing tier,
                         // its probe slot is busy, or slow enough to escape
@@ -1540,8 +1744,18 @@ impl AiGateway {
             None => {
                 let idx = AUTO_POOL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let rotation = auto_pool_rotation(pool, &healthy, idx);
-                (0..rotation.len())
-                    .map(|i| rotation[(idx as usize + i) % rotation.len()])
+                // Weight the rotation by how well each member keeps the
+                // conversation's prefix cache warm: a member that re-reads
+                // the whole context every turn costs a full prefill per
+                // turn, so it earns fewer slots. None is ever starved —
+                // every member keeps at least one.
+                let slots = auto_pool_cache_order(&rotation);
+                if slots.is_empty() {
+                    return None;
+                }
+                let pick = (idx as usize) % slots.len();
+                (0..slots.len())
+                    .map(|i| slots[(pick + i) % slots.len()])
                     .find(|e| admits(e))?
             }
         };
@@ -6262,6 +6476,22 @@ impl ProxyHttp for AiGateway {
                 latency_ms as f64,
                 warm,
             );
+            // How much of the input the upstream served from its prompt
+            // cache. This is what tells a provider that *keeps* a
+            // conversation warm from one that re-reads the whole context
+            // every turn: the two look alike on a short request and very
+            // unlike on a long one.
+            crate::provider_stats::record_cache_ratio(
+                &ctx.provider_name,
+                ctx.cached_tokens_in,
+                ctx.tokens_in,
+            );
+            if let Some(ratio) = crate::provider_stats::cache_ratio(&ctx.provider_name) {
+                METRICS
+                    .provider_cache_ratio
+                    .with_label_values(&[&ctx.provider_name])
+                    .set((ratio * 100.0).round() as i64);
+            }
         }
 
         info!(
@@ -9092,6 +9322,214 @@ mod auto_pool_latency_tests {
         // Unmeasured entries are kept (they have not been proven slow, and the
         // rotation is what produces their first measurement).
         assert!(names.contains(&"cohort-e"));
+    }
+
+    /// A member that keeps the conversation's prefix cache warm earns more
+    /// of the rotation than one that re-reads the whole context every turn.
+    #[test]
+    fn a_warm_member_earns_more_slots_than_a_cold_one() {
+        crate::provider_stats::record_cache_ratio("slots-warm", 1800, 2000);
+        crate::provider_stats::record_cache_ratio("slots-mid", 1000, 2000);
+        crate::provider_stats::record_cache_ratio("slots-cold", 20, 2000);
+        let pool = pool_with_names(true, &["slots-warm", "slots-mid", "slots-cold"]);
+        let healthy: Vec<&AutoPoolEntry> = pool.entries.iter().collect();
+        let slots = auto_pool_cache_order(&healthy);
+        let share = |name: &str| slots.iter().filter(|e| e.provider == name).count();
+        assert!(
+            share("slots-warm") > share("slots-mid"),
+            "a member that serves the conversation warm earns more slots: {:?}",
+            share("slots-warm")
+        );
+        assert!(
+            share("slots-mid") > share("slots-cold"),
+            "a member that caches half the input earns more than one that caches none"
+        );
+        assert!(
+            share("slots-cold") >= 1,
+            "no member is starved: the pool has to keep measuring the ones it has"
+        );
+    }
+
+    /// The weighted order is a rotation, not a queue: with the same
+    /// evidence the members take turns, so the pool keeps rotating instead
+    /// of handing every request to the first member of the list.
+    #[test]
+    fn the_weighted_order_still_rotates() {
+        for name in ["order-a", "order-b", "order-c"] {
+            crate::provider_stats::record_cache_ratio(name, 1000, 2000);
+        }
+        let pool = pool_with_names(true, &["order-a", "order-b", "order-c"]);
+        let healthy: Vec<&AutoPoolEntry> = pool.entries.iter().collect();
+        let slots = auto_pool_cache_order(&healthy);
+        let runs = slots
+            .windows(2)
+            .filter(|w| w[0].provider == w[1].provider)
+            .count();
+        assert_eq!(
+            runs,
+            0,
+            "the order must interleave the members, got {:?}",
+            slots
+                .iter()
+                .map(|e| e.provider.as_str())
+                .collect::<Vec<_>>()
+        );
+        let share = |name: &str| slots.iter().filter(|e| e.provider == name).count();
+        assert_eq!(share("order-a"), share("order-b"));
+        assert_eq!(share("order-b"), share("order-c"));
+    }
+
+    /// A member that keeps the conversation warm earns the traffic — and the
+    /// cold one still keeps a slot, because the pool has to keep measuring
+    /// the members it has.
+    #[test]
+    fn the_weighted_order_serves_the_warm_member_most() {
+        crate::provider_stats::record_cache_ratio("share2-warm", 1800, 2000);
+        crate::provider_stats::record_cache_ratio("share2-cold", 20, 2000);
+        let pool = pool_with_names(true, &["share2-warm", "share2-cold"]);
+        let healthy: Vec<&AutoPoolEntry> = pool.entries.iter().collect();
+        let slots = auto_pool_cache_order(&healthy);
+        let share = |name: &str| slots.iter().filter(|e| e.provider == name).count();
+        assert!(
+            share("share2-warm") > share("share2-cold") * 3,
+            "the warm member must earn the traffic: {} vs {}",
+            share("share2-warm"),
+            share("share2-cold")
+        );
+        assert!(share("share2-cold") >= 1, "no member is starved");
+    }
+
+    /// An unmeasured member is neither warm nor cold: it must keep a share of
+    /// the rotation, because the rotation is what measures it.
+    #[test]
+    fn an_unmeasured_member_keeps_a_share_of_the_rotation() {
+        crate::provider_stats::record_cache_ratio("share-warm", 1800, 2000);
+        crate::provider_stats::record_cache_ratio("share-cold", 20, 2000);
+        let pool = pool_with_names(true, &["share-warm", "share-cold", "share-new"]);
+        let healthy: Vec<&AutoPoolEntry> = pool.entries.iter().collect();
+        let slots = auto_pool_cache_order(&healthy);
+        let share = |name: &str| slots.iter().filter(|e| e.provider == name).count();
+        assert!(
+            share("share-new") >= 1,
+            "a member nobody has measured yet still gets picked"
+        );
+        assert!(
+            share("share-warm") > share("share-new"),
+            "the warm member still leads: {} vs {}",
+            share("share-warm"),
+            share("share-new")
+        );
+    }
+
+    /// The escape lands on a member that keeps the conversation warm — not
+    /// on the cold member the session just left, which would be an escape
+    /// that never escapes.
+    #[test]
+    fn the_escape_lands_on_a_warm_member() {
+        crate::provider_stats::record_cache_ratio("target-cold", 20, 2000);
+        crate::provider_stats::record_cache_ratio("target-warm", 1800, 2000);
+        let pool = pool_with_names(true, &["target-cold", "target-warm"]);
+        let healthy: Vec<&AutoPoolEntry> = pool.entries.iter().collect();
+        let admits = |_: &AutoPoolEntry| true;
+        let target = auto_pool_warm_target(&healthy, &admits);
+        assert_eq!(
+            target.map(|e| e.provider.as_str()),
+            Some("target-warm"),
+            "the session must move to the member that serves it warm"
+        );
+    }
+
+    /// A member that is warm but cannot take traffic right now is not a
+    /// target: the session stays where it is rather than moving onto a
+    /// closed circuit.
+    #[test]
+    fn the_escape_skips_a_member_that_cannot_take_traffic() {
+        crate::provider_stats::record_cache_ratio("busy-warm", 1800, 2000);
+        crate::provider_stats::record_cache_ratio("busy-cold", 20, 2000);
+        let pool = pool_with_names(true, &["busy-warm", "busy-cold"]);
+        let healthy: Vec<&AutoPoolEntry> = pool.entries.iter().collect();
+        let admits = |e: &AutoPoolEntry| e.provider != "busy-warm";
+        assert!(
+            auto_pool_warm_target(&healthy, &admits).is_none(),
+            "no warm member can take the traffic"
+        );
+    }
+
+    /// A pin on a member that does not keep the conversation warm has nothing
+    /// to lose — the next turn re-reads the whole context anyway — so it is
+    /// dropped. A pin on a warm member is kept.
+    #[test]
+    fn a_pin_on_a_cold_member_is_escapable() {
+        for _ in 0..3 {
+            crate::provider_stats::record_cache_ratio("pin-cold", 20, 2000);
+        }
+        crate::provider_stats::record_cache_ratio("pin-warm", 1800, 2000);
+        crate::provider_stats::record_cache_ratio("pin-mild", 1400, 2000);
+        let pool = pool_with_names(true, &["pin-cold", "pin-warm", "pin-mild"]);
+        let healthy: Vec<&AutoPoolEntry> = pool.entries.iter().collect();
+        assert!(
+            auto_pool_pin_is_cold("pin-cold", &healthy),
+            "a member that caches 1% of the input must not keep the session"
+        );
+        assert!(
+            !auto_pool_pin_is_cold("pin-warm", &healthy),
+            "the cache the conversation is built on is worth keeping"
+        );
+        assert!(
+            !auto_pool_pin_is_cold("pin-mild", &healthy),
+            "a member that caches most of the input is not cold"
+        );
+        for _ in 0..3 {
+            crate::provider_stats::record_cache_ratio("pin-some", 600, 2000);
+            crate::provider_stats::record_cache_ratio("pin-almost", 400, 2000);
+        }
+        assert!(
+            !auto_pool_pin_is_cold("pin-some", &healthy),
+            "a member that caches a third of the input keeps its sessions: the \
+             cache it holds is worth more than the one it could get"
+        );
+        assert!(
+            auto_pool_pin_is_cold("pin-almost", &healthy),
+            "a member that caches a fifth of the input caches nothing worth \
+             keeping: the session pays a full prefill every turn"
+        );
+        assert!(
+            !auto_pool_pin_is_cold("pin-unmeasured", &healthy),
+            "an unmeasured member is not judged"
+        );
+    }
+
+    /// A verdict that outlives its evidence is a permanent verdict: a
+    /// member that stops being measured has to read as *unmeasured* again,
+    /// so the rotation admits it and measures it again.
+    #[test]
+    fn an_expired_cache_verdict_reads_as_unmeasured() {
+        crate::provider_stats::record_cache_ratio("expire-cold", 20, 2000);
+        assert!(
+            crate::provider_stats::cache_ratio("expire-cold").is_some(),
+            "the evidence is fresh"
+        );
+        crate::provider_stats::expire_cache_ratio_evidence("expire-cold");
+        assert!(
+            crate::provider_stats::cache_ratio("expire-cold").is_none(),
+            "aged-out evidence is no evidence: the member is unmeasured again"
+        );
+    }
+
+    /// A pin is only dropped when some member of the tier is *clearly* warm.
+    /// With nothing warm in the pool, a pin stays where it is.
+    #[test]
+    fn a_pin_stays_when_no_member_of_the_pool_is_warm() {
+        for _ in 0..3 {
+            crate::provider_stats::record_cache_ratio("allcold-a", 20, 2000);
+            crate::provider_stats::record_cache_ratio("allcold-b", 40, 2000);
+        }
+        let pool = pool_with_names(true, &["allcold-a", "allcold-b"]);
+        let healthy: Vec<&AutoPoolEntry> = pool.entries.iter().collect();
+        assert!(
+            !auto_pool_pin_is_cold("allcold-a", &healthy),
+            "nowhere better to go: the pin stays"
+        );
     }
 
     /// The window exists so that an exclusion can never become a ban. A
