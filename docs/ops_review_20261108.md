@@ -14,13 +14,13 @@
 | 1 | ~~上游流被截断仍按 200 计成功~~ **（已订正，见 §1.1）**：真正的问题是"200 + error 非空" 把两类完全不同的东西记成了同一件事 | 817 条 200 带 error，其中 **816 条是客户端断开**（`ErrorSource::Downstream`），**只有 1 条是上游截断**（`… without the termination chunk`）。客户端断开里 638 条集中在 11-07 12–18Z 事故窗口、一台工作站；27 条是 300s 客户端超时；窗口外仅 0.4%–5% | P0（口径） |
 | 2 | ~~auto 池路由的**流式**请求全部丢失 usage，token/成本账本对主流量不可用~~ **✅ 已收口（2026-11-09 07:2x CST 复核）**：`request_logs` 尾部 3 000 行 `tokens_out>0` = **2 996**；`spend_logs` 0 行是因为 `virtual_keys`/`teams` 各 0 行 —— 按 key 记账的账本（`budget.rs` 只在虚拟 key 路径 `record_spend`）无对象可记，master key 直用时设计如此 | 原证据保留：`/v1/responses/auto` 4,257 个响应里 4,208 个（98.9%）tokens=0；全站 65.9% 的 200 响应零 usage | P0（已修） |
 | 3 | ~~成本表为空，`cost_usd` 恒为 0，成本告警/预算失效~~ **✅ 已收口（2026-11-09 07:2x CST 复核）**：尾部 3 000 行 `cost_usd>0` = **2 905**、合计 **$19.52**（volc_t_1 $8.44 / volc_1 $5.23 / xiaomi $4.46 / go_2 $1.38）；部署后尾部 2 MB 日志 `no cost entry` **0 条**；`ollama_local` cost=0 是内置表「Zero-marginal-cost channels」的**显式 0/0 行**（`deepseek-v4.1-flash:cloud`，预付/自托管不按 token 计），非缺价 | 原证据保留：配置无 `[cost*]` 段；6,535 条完成日志 cost=0（仅 42 条非 0）；2,186 条 `no cost entry found` WARN（占全部 WARN 的 76%） | P0（已修） |
-| 4 | ~~监控链路"只采不看"：无 maxllm 看板、无告警；日志全部灌进 `default` 流~~ **部分收口**：maxllm 看板已建（§14.7，缓存命中率面板带活动量下限）、7 条告警规则已上线；**残余** = 告警出口仍是 httpbin 占位（§12.7 待办②，需用户 webhook），collector 日志 `stream-name` 本轮未核 | 原证据保留：OpenObserve 20 条指标流均在更新，但 0 条 alert、2 个 dashboard 均与 maxllm 无关；collector 单 exporter 写死 `stream-name: default` | P1 |
-| 5 | provider 改名造成身份断裂：指标里 38 条 breaker series vs 配置 30 个 provider；旧路由被前缀匹配静默吞掉 | 9 条 `one_api_*` 僵尸 series；`one_api_volc_2` 仍 force-open 到 2026-11-27；旧 base_url `/v1/responses/one_api_*` 落到通用路由并被错误 provider 服务 | P1 |
+| 4 | ~~监控链路"只采不看"：无 maxllm 看板、无告警；日志全部灌进 `default` 流~~ **大部分收口**：maxllm 看板已建（§14.7，缓存命中率面板带活动量下限）、7 条告警规则已上线；**`stream-name` 已核（2026-11-09 08:2x CST，见 §14.17）**：NAS `otel-collector-maxllm` 服务 `active`，live config 与 ops 仓 `ops/machines/oleNas01/otel-collector-maxllm/config.yaml` md5 一致（`76274d36…`），导出器已按 `stream-name: maxllm_logs` / `maxllm_recordings` 分流，OpenObserve 实测两流 37 821 / 112 752 docs 且 `_timestamp` 正在推进；**残余仅 1 项** = 告警出口仍是 httpbin 占位（§12.7 待办②，需用户 webhook URL） | 原证据保留：OpenObserve 20 条指标流均在更新，但 0 条 alert、2 个 dashboard 均与 maxllm 无关；collector 单 exporter 写死 `stream-name: default` | P1（残余待用户 webhook） |
+| 5 | ~~provider 改名造成身份断裂：指标里 38 条 breaker series vs 配置 30 个 provider；旧路由被前缀匹配静默吞掉~~ **✅ 已收口（2026-11-09 08:2x CST 三条实测，见 §14.17）**：`/metrics` 里 `one_api` series **0 行**；breaker DB `provider like '%one_api%'` **0 行**（全表 30 行 = 配置 provider 数）；旧 base_url 不再被静默吞掉 —— `POST /v1/responses/one_api_volc_1` / `one_api_zhipu_1` 均 **404** 且报错点名 `unknown provider or pool 'one_api_volc_1' …`，不再落到通用路由被错误 provider 服务 | 原证据保留：9 条 `one_api_*` 僵尸 series；`one_api_volc_2` 仍 force-open 到 2026-11-27；旧 base_url `/v1/responses/one_api_*` 落到通用路由并被错误 provider 服务 | P1（已修） |
 | 6 | **body 哨兵 `auto` 在 `/v1/responses` 上仍然不可用**（真 bug，2026-11-08 23:1x 定位并修复）：`verbatim` 分支让 body 逐字节透传，`adopt_sentinel_model()` 只能解析、不能改写，字面量 `auto` 直接打到上游 | recordings 全量：失败上游尝试里 `model="auto"` **1 931 次**（`ollama_local 404×367`、`opencode_go_1 400×255`、`opencode_go_2 400×241`、`xiaomi 400×200`、`volc_1 404×189`、`minimax 400×118`）；`request_logs` 看不到，是因为 failover 之后成功那一行不带 `auto` | P1（已修 `c845b45`，见 §13.8） |
 | 7 | ~~`/health` 太浅、池健康检查未接线~~ **✅ 已收口**：`/health` 现在回 `pools{healthy,total}` + `open_providers`/`half_open_providers`；`maxllm-pool-health.timer` 5 min 一次；quota probe 已按改名后的 `kimi` 运行 | — | P1 |
 | 8 | ~~breaker 指标是惰性快照~~ **✅ 已收口**：`/metrics` 在 scrape 时输出 `effective_state()`，过期的 open 会算成 closed | `is_open()` 在下次请求时才 lazy half-open，gauge 直接读原子 state | P2（已修） |
 | 9 | ~~`maxllm.err` 长期未轮转~~ **✅ 已收口**：`rotate_logs.py` 的 `DEFAULT_LOGS` 早含它，timer 每日跑（阈值 20 MiB / 留 2 代），当前 0 字节；sentinel 文案随 §6 一起消失 | 23 行、全部停留在 11-04；`route '/v1/responses/auto' references unknown provider 'auto'` | P2（已修） |
-| 10 | 自检探针流量计入生产指标 | 本机 loopback 探针命中已删除路由，产生 429/404/400 并写入 request_logs | P2 |
+| 10 | ~~自检探针流量计入生产指标~~ **✅ 已收口（2026-11-09 08:2x CST 实测，见 §14.17）**：watch 巡检 infer / resp 两个 HTTP 探针已带 `X-MaxLLM-Probe: 1`，网关按 `ctx.rs` 语义「正常服务但排除出 metrics / request_logs / 熔断记账」；08:21:08 手动轮七项全 PASS，同时刻 `request_logs` 00:20:40–00:21:40Z 窗口 13 行**全是 6.8 万–23.6 万 token 的真实流量**，探针那两笔（≈90 tok / ≈38 tok）一行缺席 ⇒ 排除生效；旁证：`request_logs` 自 `2026-11-08T20:00Z` 起 `status>=400` **0 条** | 原证据保留：本机 loopback 探针命中已删除路由，产生 429/404/400 并写入 request_logs | P2（已修） |
 | 11 | **`/v1/responses/<provider>` 只校验不钉住**（2026-11-08 晚发现并修复）：路径里的 provider 段被丢弃，请求按池路由走，最终由**别的** provider 作答，`route_path` 还记成 `/v1/responses` | 修复前 `/v1/responses/open_design` 实际由 `opencode_go_1` 作答；见 §12.1 | P1（已修 `ebcfa9f`） |
 | 12 | **provider 改名不迁移熔断 / 会话状态**（§5.3，本轮修复）：旧行留在 DB，新行从 0 开始，下次启动 prune 还把旧行删掉 | 改名当天 `volc_1` 的 9 次 quota-open 归零、`volc_2` 的 force-open 被"解除"；实测 `one_api_volc_1`→`volc_1` 合并后 state/failures/force_open_until/quota_opens 全部保留 | P1（新增 `maxllm admin rename-provider`，见 §13.1） |
 | 13 | **P2 三项按证据关掉，没有加机制**：请求体落盘（写入侧已脱敏 + 14 天保留）、`maxllm.err` 轮转（本就存在）、breaker gauge 语义（scrape 时算 effective state） | recordings 30 分片 84,833 行 `--dry-run` 0 行待擦；`maxllm.err` 0 字节 | P2（见 §13.2 / §13.3 / §8） |
@@ -1509,6 +1509,48 @@ untracked，本仓不涉及）。08:01:34 定时轮 **七项全 OK**，连续失
   71.87%（分母未长出，窗口内新增 2 发为 0%）仍是仅有的两盏灯，按 §14.11 纪律不喂流量。
 - **watch 归零**：08:01:34 定时轮七项全 OK —— §14.15 修复后的首个定时轮，infer 恰好
   落在带 `[DONE]` 收尾的 volc 路由上也 PASS。
+
+### 14.17 审计 #4 / #5 / #10 收口复核 + 探针排除实测（2026-11-09 08:2x CST）
+
+**#5 provider 改名身份断裂 —— 三条实测全绿**
+
+- `/metrics` 全文 `one_api` **0 行**（改名前 9 条僵尸 series）。
+- breaker DB `circuit_breaker_state` 中 `provider like '%one_api%'` **0 行**，
+  全表 30 行 = 配置 provider 数（改名前是 38 条 series vs 30 个 provider）。
+- 旧 base_url 不再被前缀匹配静默吞掉，而是显式 404 点名：
+  `POST /v1/responses/one_api_volc_1` → **404**
+  `unknown provider or pool 'one_api_volc_1' in /v1/responses/one_api_volc_1; use
+  /v1/responses/<provider>, /v1/responses/auto or /v1/responses/auto_home`
+  （`one_api_zhipu_1` 同样 404）。修复前它是落到通用路由、被**别的** provider 作答
+  且 `route_path` 记成 `/v1/responses` —— 与 §12.1 同族的"只校验不钉住"。
+
+**#10 自检探针不再污染生产信号**
+
+- 代码语义（`crates/maxllm-gateway/src/ctx.rs:233`）：带 `X-MaxLLM-Probe: 1` 的请求
+  "served normally but excluded from metrics, request logs and circuit-breaker accounting"；
+  `gateway.rs:2854` 读头、`:5813` 打 `health probe completed (excluded …)` 日志。
+- 改动：巡检脚本 `probe_infer` / `probe_resp` 的 curl 各加 `-H 'X-MaxLLM-Probe: 1'`
+  （health 探针打的是 unrouted 路径、本就不落账，未加）。
+- 实测（08:21:08 手动轮 exit=0、七项全 PASS）：`request_logs` 在
+  00:20:40–00:21:40Z 窗口内 13 行的 `tokens_in` 全部落在 68 317–235 913 的真实流量区间，
+  推断探针的两笔（infer ≈90 tok、resp ≈38 tok）**一行都没有** ⇒ 排除生效。
+- 旁证：`request_logs` 自 `2026-11-08T20:00Z` 起 `status >= 400` **0 条**
+  （11-08 白天那批 loopback 4xx 属手工测试，不复现）。
+
+**#4 `stream-name` 核验（原"本轮未核"项）**
+
+- NAS `otel-collector-maxllm` 服务 **active**；live
+  `~/opt/otel-collector-maxllm/config.yaml` 与 ops 仓
+  `ops/machines/oleNas01/otel-collector-maxllm/config.yaml` **md5 一致**
+  （`76274d36aaafba6daca69a399db4baba`）。
+- 导出器已按信号分流出独立 stream：`stream-name: maxllm_recordings`（config:101）、
+  `stream-name: maxllm_logs`（config:120）；config 注释明确 OTLP **metrics** 不吃这个头
+  （OpenObserve 按 metric name 一 stream，避免留下空的 `maxllm_metrics`）。
+- OpenObserve 实测（`/api/default/streams?type=logs` + `_search` 计数，08:28 CST 快照）：
+  `maxllm_logs` **37 821** docs、`maxllm_recordings` **112 752** docs，
+  最新 `_timestamp` = 2026-11-09 **00:28:37Z / 00:28:38Z**（= 08:28 CST，正在流入），
+  两流首条均为 2026-11-08 06:08:30Z。
+- **#4 残余只剩 1 项**：告警出口仍是 httpbin 占位（§12.7 待办②，需用户 webhook URL）。
 
 ---
 
