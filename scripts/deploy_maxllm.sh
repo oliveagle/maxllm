@@ -62,7 +62,11 @@ ssh -o BatchMode=yes "$HOST" "cd $DIR/bin && chmod 755 maxllm-server.new && mv m
 echo "==> health check"
 ok=0
 for _ in $(seq 1 20); do
-  code="$(ssh -o BatchMode=yes "$HOST" "curl -s -m 3 -o /dev/null -w '%{http_code}' $HEALTH")"
+  # `|| true`: a failed ssh must not abort the script under `set -e`. The
+  # binary is already switched over at this point, so a silent abort here
+  # left the operator with neither the "OK" line nor the rollback — and
+  # looking like a failed deploy that had in fact succeeded (2026-11-09).
+  code="$(ssh -o BatchMode=yes "$HOST" "curl -s -m 3 -o /dev/null -w '%{http_code}' $HEALTH" || true)"
   if [[ "$code" == 200 ]]; then ok=1; break; fi
   sleep 1
 done
