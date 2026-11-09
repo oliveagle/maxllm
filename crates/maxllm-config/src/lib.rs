@@ -335,6 +335,23 @@ pub struct ProviderConfig {
     /// `upstream_path` (`…/chat/completions` → `…/responses`) when unset.
     #[serde(default)]
     pub responses_path: Option<String>,
+    /// Named repair a provider needs on its **native Responses** request
+    /// body, because its upstream rejects part of the contract. Valid values:
+    ///
+    /// * `"ark_trailing_assistant"` — drop a trailing assistant turn.
+    ///   Volcengine Ark's prefill validation answers
+    ///   `400 MissingParameter \`partial\`` when the last `input` item is an
+    ///   assistant message (the parameter is a red herring; the rejected thing
+    ///   is the trailing turn), which is the shape codex remote compaction
+    ///   sends. Every assistant content form is rejected, so the whole turn is
+    ///   dropped, not just its text.
+    /// * `"none"` — force no repair, overriding the host-based default.
+    ///
+    /// Unset means the gateway picks by upstream host: ark (`*.volces.com`)
+    /// providers get `ark_trailing_assistant`, every other provider gets no
+    /// repair.
+    #[serde(default)]
+    pub native_responses_repair: Option<String>,
     /// Skip the `reasoning_content` placeholder injection for thinking-mode
     /// tool-calling turns (echo collapse still runs). Set on opencode-kind
     /// channels whose upstream does not require `reasoning_content` back, to

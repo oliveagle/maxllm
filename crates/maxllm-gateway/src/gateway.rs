@@ -488,13 +488,30 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
                     .upstream_path
                     .as_deref()
                     .unwrap_or("/v1/chat/completions");
-                Box::new(
-                    maxllm_translate::openai_compat::OpenAICompatTranslator::new(
-                        name.clone(),
-                        path.to_string(),
-                        maxllm_translate::openai_compat::AuthStyle::Bearer,
-                    ),
-                )
+                let translator = maxllm_translate::openai_compat::OpenAICompatTranslator::new(
+                    name.clone(),
+                    path.to_string(),
+                    maxllm_translate::openai_compat::AuthStyle::Bearer,
+                );
+                // Volcengine Ark's Responses prefill validator rejects an
+                // input list ending in an assistant turn with a misleading
+                // MissingParameter `partial`. Codex compaction sends exactly
+                // that shape, so ark providers repair it before forwarding;
+                // every other openai_compat upstream keeps the body
+                // byte-for-byte.
+                let wants_ark_repair = match conf.native_responses_repair.as_deref() {
+                    Some("ark_trailing_assistant") => true,
+                    Some("none") => false,
+                    _ => conf.base_url.to_ascii_lowercase().contains("volces.com"),
+                };
+                let translator = if wants_ark_repair {
+                    translator.with_native_responses_repair(
+                        maxllm_translate::openai_compat::NativeResponsesRepair::ArkTrailingAssistantTurn,
+                    )
+                } else {
+                    translator
+                };
+                Box::new(translator)
             }
             ProviderKind::OpenCode => {
                 let path = conf
