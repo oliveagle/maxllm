@@ -313,9 +313,24 @@ impl CircuitBreaker {
     /// slot the staleness reaper already reclaimed, and an underflow would
     /// wrap the counter to `u32::MAX` and permanently block the provider.
     pub fn release_probe(&self) {
-        let _ = self
-            .pending_probes
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1));
+        // `AtomicU32::try_update` is still nightly-only (rust#135894); this is
+        // the same clamped decrement written as a portable CAS loop.
+        let mut cur = self.pending_probes.load(Ordering::Relaxed);
+        loop {
+            let next = match cur.checked_sub(1) {
+                Some(n) => n,
+                None => return,
+            };
+            match self.pending_probes.compare_exchange_weak(
+                cur,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(actual) => cur = actual,
+            }
+        }
     }
 
     /// Reclaim a probe slot that has been held for longer than two fail
