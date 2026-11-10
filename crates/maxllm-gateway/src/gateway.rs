@@ -19,7 +19,7 @@ use crate::session_sticky::SessionStore;
 use ahash::AHashMap;
 use async_trait::async_trait;
 use bytes::Bytes;
-use maxllm_config::{BillingMode, Config, EndpointType, ProviderKind, RouteConfig};
+use maxllm_config::{AutoPoolScope, BillingMode, Config, EndpointType, ProviderKind, RouteConfig};
 use maxllm_plugin::builtin::auto_compaction::{
     apply_llm_compaction, compact_messages, CompactionParams, CompactionResult,
 };
@@ -331,6 +331,12 @@ pub struct ProviderState {
     /// routing; no routing rule consumes them yet.
     #[allow(dead_code)]
     pub tags: Vec<String>,
+    /// Whether this provider runs on hardware we own (`self_hosted` in the
+    /// config, else inferred from `base_url` — see
+    /// [`maxllm_config::ProviderConfig::is_self_hosted`]). The gateway uses it
+    /// to enforce a scoped auto pool at request time, not only at load time:
+    /// a path pin or a fallback hop must never cross the pool's boundary.
+    pub self_hosted: bool,
     pub default_model: Option<String>,
     /// Whether the provider speaks the Responses contract natively.
     pub native_responses: bool,
@@ -394,12 +400,31 @@ pub struct AutoPoolState {
     /// Whether the rotation prefers the low-latency cohort inside the
     /// preferred billing tier (see `[auto_model].prefer_fast`).
     pub prefer_fast: bool,
+    /// Which side of the deployment boundary this pool may draw from.
+    /// Checked at load (a violating member is a startup error) *and* at
+    /// request time: a path pin or a fallback hop can name a provider that
+    /// is not a member at all, and the runtime check is what stops it from
+    /// serving this pool's traffic.
+    pub scope: AutoPoolScope,
 }
 
 impl AutoPoolState {
     /// The pool entry for a provider, when that provider serves this pool.
     pub fn entry_for(&self, provider: &str) -> Option<&AutoPoolEntry> {
         self.entries.iter().find(|e| e.provider == provider)
+    }
+
+    /// Whether `p` sits on this pool's side of the deployment boundary.
+    ///
+    /// `AutoPoolScope::Any` allows everything (the pre-scope default); a
+    /// scoped pool only admits providers whose `self_hosted` flag matches,
+    /// so a self-hosted pool can never be served by a vendor and vice versa.
+    pub fn scope_allows(&self, p: &ProviderState) -> bool {
+        match self.scope {
+            AutoPoolScope::Any => true,
+            AutoPoolScope::SelfHosted => p.self_hosted,
+            AutoPoolScope::Vendor => !p.self_hosted,
+        }
     }
 }
 
@@ -772,6 +797,7 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
                     None => None,
                 },
                 utc_offset_minutes: conf.utc_offset_minutes(),
+                self_hosted: conf.is_self_hosted(),
             }),
         );
     }
@@ -927,6 +953,7 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
             name,
             entries,
             prefer_fast: auto.prefer_fast,
+            scope: auto.scope,
         });
     }
 
@@ -2475,20 +2502,51 @@ impl AiGateway {
         // before the body is read), so the request takes one 404 from the
         // route's provider and the failover walks into the pool — see
         // `switch_to_fallback` for the replay that makes that safe for a
-        // ~100 KB agent request.
+        // ~100 KB agent request. That first hop is only allowed to stand when
+        // the pool imposes no boundary (`scope = "any"`); a scoped pool
+        // rejects the body-level sentinel at the provider picked before the
+        // body was read — see `reject_scoped_sentinel_mismatch`.
         // A path-pinned provider (`/v1/responses/<provider>` with no route of
         // its own) is served by that provider alone: the caller named one
         // provider, so neither a pool nor the pooled chain may stand in for
-        // it.
-        if ctx.path_pinned_provider.is_none() {
-            if let Some(pool) = hot.request_pool(route, ctx) {
+        // it. When a *scoped* pool (`scope = "self_hosted"` / `"vendor"`) is
+        // already known here, the pin is additionally vetted against that
+        // boundary: the caller may only pin to a provider on the pool's own
+        // side of it.
+        let active_pool = hot.request_pool(route, ctx);
+        if let Some(pool) = active_pool {
+            let scoped = pool.scope != AutoPoolScope::Any;
+            if let Some(pin) = ctx.path_pinned_provider.clone() {
+                if scoped && !hot.providers.get(&pin).is_some_and(|p| pool.scope_allows(p)) {
+                    warn!(
+                        provider = %pin,
+                        pool = %pool.name,
+                        scope = ?pool.scope,
+                        "path-pinned provider is outside the scoped auto pool — refusing to serve it"
+                    );
+                    return None;
+                }
+            } else {
                 let pool_name = pool.name.clone();
                 ctx.auto_pool = Some(pool_name);
                 if let Some(provider) = self.select_from_auto_pool(hot, pool, route, ctx) {
                     return Some(provider);
                 }
-                // Every pool entry is unhealthy — fall through to the route's
-                // own selection so the request still has somewhere to go.
+                if scoped {
+                    // Every pool member is unhealthy. Falling through to the
+                    // route's own chain would hand the request to whatever the
+                    // route names — for a scoped pool that is by definition the
+                    // wrong side of the deployment boundary, so fail closed
+                    // with a 503 instead of misrouting to a vendor.
+                    warn!(
+                        pool = %pool.name,
+                        scope = ?pool.scope,
+                        "every member of the scoped auto pool is unhealthy — no route-chain fallback allowed"
+                    );
+                    return None;
+                }
+                // An unscoped pool may still fall through to the route's own
+                // selection so the request has somewhere to go.
                 ctx.auto_pool = None;
             }
         }
@@ -2525,6 +2583,14 @@ impl AiGateway {
                     });
                 }
             }
+        }
+
+        // Belt and braces: while a scoped pool is active, no candidate on the
+        // other side of its boundary may enter the selection at all (the pin
+        // branch above already vetted a path pin; this also vets a route's
+        // own provider and its fallback chain).
+        if let Some(pool) = active_pool.filter(|p| p.scope != AutoPoolScope::Any) {
+            candidates.retain(|c| pool.scope_allows(&c.state));
         }
 
         // Session-sticky: a session that already succeeded on a provider is
@@ -2787,11 +2853,48 @@ impl AiGateway {
                 route.path
             );
         }
+        // A candidate on the wrong side of the active pool's boundary is not
+        // "rejecting traffic" — the gateway refuses to send it this pool's
+        // request at all. Say so, or the 503 would read as an outage while a
+        // perfectly healthy provider sits on the other side.
+        let scoped_pool = hot
+            .request_pool(route, ctx)
+            .filter(|p| p.scope != AutoPoolScope::Any);
+        let scope_label = |scope: AutoPoolScope| match scope {
+            AutoPoolScope::SelfHosted => "self-hosted",
+            AutoPoolScope::Vendor => "vendor",
+            AutoPoolScope::Any => "any",
+        };
+        // An out-of-scope path pin is not "rejecting traffic": the gateway
+        // refuses to send it this pool's request at all. Say so directly,
+        // before the per-candidate breakdown, so the 503 reads as the
+        // boundary check it is.
+        if let (Some(pin), Some(pool)) = (ctx.path_pinned_provider.as_deref(), scoped_pool) {
+            if hot.providers.get(pin).is_some_and(|p| !pool.scope_allows(p)) {
+                let want = match pool.scope {
+                    AutoPoolScope::SelfHosted => "self-hosted",
+                    _ => "external vendor",
+                };
+                return format!(
+                    "no provider available: {pin}=out of scope ({} is {want} only) — \
+                     the request pinned '{pin}' across pool '{}' boundary",
+                    pool.name, pool.name
+                );
+            }
+        }
         let mut parts: Vec<String> = Vec::new();
         for name in names {
             match hot.providers.get(name) {
                 None => parts.push(format!("{name}=not configured")),
                 Some(p) => {
+                    if let Some(pool) = scoped_pool.filter(|pl| !pl.scope_allows(p)) {
+                        parts.push(format!(
+                            "{name}=out of scope ({} is {} only)",
+                            pool.name,
+                            scope_label(pool.scope)
+                        ));
+                        continue;
+                    }
                     let cb = &p.circuit_breaker;
                     if cb.is_force_open() {
                         parts.push(format!("{name}=circuit open (quota force-open)"));
@@ -3478,6 +3581,20 @@ impl AiGateway {
         // any translation, so responses→chat, guardrails, and the provider
         // translation all see the rewritten model.
         if end_of_stream && !ctx.body_translated {
+            // ── deployment-boundary guard, before any rewrite ─────────────
+            // The provider was picked before the body was read, so it may sit
+            // on the wrong side of the pool the body now names: the summary
+            // route's cloud primary with `{"model":"auto_home"}` in the body,
+            // or a vendor-pool member with `{"model":"auto"}` on the home
+            // route. The upstream's request header may already be on the wire
+            // by now, so the request cannot be re-pointed at the right pool
+            // here — refuse it with a 503 instead of letting a vendor serve
+            // (or even just receive) a sentinel it was never meant to see.
+            // This runs *before* the `auto_target` rewrite below, which would
+            // otherwise silently replace the sentinel with the wrong pool's
+            // model and answer 200.
+            let hot = self.hot.load();
+            self.reject_scoped_sentinel_mismatch(&hot, session, ctx).await?;
             if let Some((_, auto_model)) = ctx.auto_target.clone() {
                 if !ctx.request_body_buf.is_empty() {
                     if let Ok(mut v) =
@@ -4062,6 +4179,69 @@ impl AiGateway {
         }
     }
 
+    /// Refuse a request whose body names a pool on the other side of a
+    /// scoped pool's deployment boundary from the provider that was picked.
+    ///
+    /// Runs at end of stream, once the body (and therefore the sentinel) is
+    /// known and before any rewrite or forward. `Ok(())` means "no violation"
+    /// — either the body carries no pool sentinel, or the selected provider
+    /// sits on the pool's own side.
+    async fn reject_scoped_sentinel_mismatch(
+        &self,
+        hot: &HotState,
+        session: &mut Session,
+        ctx: &mut RequestCtx,
+    ) -> pingora::Result<()> {
+        if ctx.request_body_buf.is_empty() || ctx.provider_name.is_empty() {
+            return Ok(());
+        }
+        let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&ctx.request_body_buf)
+        else {
+            return Ok(());
+        };
+        let Some(sentinel) = parsed
+            .get("model")
+            .and_then(|m| m.as_str())
+            .map(str::to_string)
+        else {
+            return Ok(());
+        };
+        let Some(pool) = hot.pool_named(&sentinel) else {
+            return Ok(());
+        };
+        if pool.scope == AutoPoolScope::Any {
+            return Ok(());
+        }
+        if hot
+            .providers
+            .get(&ctx.provider_name)
+            .is_some_and(|p| pool.scope_allows(p))
+        {
+            return Ok(());
+        }
+        let want = match pool.scope {
+            AutoPoolScope::SelfHosted => "self-hosted",
+            _ => "external vendor",
+        };
+        let msg = format!(
+            "model '{sentinel}' is served by pool '{}' ({want} providers only), but '{}' \
+             is on the other side of the deployment boundary; retry on a route that \
+             enters the pool directly",
+            pool.name, ctx.provider_name
+        );
+        warn!(
+            provider = %ctx.provider_name,
+            pool = %pool.name,
+            scope = ?pool.scope,
+            "body carries a scoped auto sentinel, but the pre-selected provider is out of scope — refusing"
+        );
+        Self::send_error_response(session, 503, &msg).await?;
+        Err(pingora::Error::explain(
+            pingora::ErrorType::HTTPStatus(503),
+            "scoped auto pool: selected provider is out of scope",
+        ))
+    }
+
     /// Rewrite a body-level `auto` sentinel to the model of the pool entry the
     /// request has already landed on.
     ///
@@ -4104,6 +4284,10 @@ impl AiGateway {
         let Some(pool) = hot.pool_named(&sentinel) else {
             return Ok(());
         };
+        // A cross-boundary sentinel was already refused by
+        // `reject_scoped_sentinel_mismatch` at the top of this block; what is
+        // left here is a sentinel whose pool the selected provider *may*
+        // serve.
         let Some((provider, model)) = pool
             .entry_for(&ctx.provider_name)
             .map(|e| (e.provider.clone(), e.model.clone()))
@@ -5207,8 +5391,18 @@ impl ProxyHttp for AiGateway {
                 .auto_pools
                 .iter()
                 .any(|pool| pool.entry_for(&ctx.provider_name).is_some());
-            let may_carry_pool_sentinel =
-                ctx.endpoint_type == EndpointType::Responses && provider_serves_a_pool;
+            // A *scoped* pool turns "the body might name a sentinel" from a
+            // 404-shaped nuisance into a boundary violation: a byte-verbatim
+            // forward would hand `{"model":"auto_home"}` to a vendor before
+            // the gateway ever sees it. Whenever any pool is scoped, buffer
+            // the body (never verbatim) so `request_body_filter` can check
+            // the sentinel against the pool boundary *before* a byte leaves.
+            let scoped_pool_exists = hot
+                .auto_pools
+                .iter()
+                .any(|pool| pool.scope != AutoPoolScope::Any);
+            let may_carry_pool_sentinel = scoped_pool_exists
+                || (ctx.endpoint_type == EndpointType::Responses && provider_serves_a_pool);
             // A Responses body rewritten into chat completions has an
             // unpredictable size (the chat form can be larger than the
             // Responses form), so it travels chunked instead of keeping the
@@ -7574,6 +7768,19 @@ impl AiGateway {
                     .map(|p| p.circuit_breaker.allows_traffic())
                     .unwrap_or(false)
         };
+        let scoped_pool = hot
+            .request_pool(route, ctx)
+            .filter(|p| p.scope != AutoPoolScope::Any);
+        // A route-chain candidate on the wrong side of the active pool's
+        // boundary must not count as a usable fallback — it could never carry
+        // the request without breaking the boundary.
+        let in_scope = |name: &str| -> bool {
+            scoped_pool.map_or(true, |pool| {
+                hot.providers
+                    .get(name)
+                    .is_some_and(|p| pool.scope_allows(p))
+            })
+        };
         if let Some(pool) = hot.request_pool(route, ctx) {
             return pool.entries.iter().any(|e| usable(&e.provider));
         }
@@ -7596,7 +7803,7 @@ impl AiGateway {
         route
             .fallback
             .iter()
-            .any(|name| usable(name) && !skip_dead_end(name))
+            .any(|name| usable(name) && in_scope(name) && !skip_dead_end(name))
     }
 
     /// The next provider to try: the first healthy provider of the route's
@@ -7634,6 +7841,12 @@ impl AiGateway {
         // still points at the summary route. The sentinel means "rotate"; no
         // upstream has a model by that name, so walking the route's own chain
         // would only collect 404s from every provider in it.
+        // While a scoped pool is active, the route's own chain may only be
+        // walked on that pool's side of the boundary (the pool branch below
+        // already keeps its own members in scope; this guards the chain).
+        let scoped_pool = hot
+            .request_pool(route, ctx)
+            .filter(|p| p.scope != AutoPoolScope::Any);
         if let Some(pool) = hot.request_pool(route, ctx) {
             // A genuine auto route picked its first provider in
             // `select_provider` (session-sticky, then round-robin), so this
@@ -7717,6 +7930,13 @@ impl AiGateway {
             .iter()
             .filter(|name| *name != &ctx.provider_name)
             .filter(|name| !ctx.attempted_providers.contains(*name))
+            .filter(|name| {
+                scoped_pool.map_or(true, |pool| {
+                    hot.providers
+                        .get(name.as_str())
+                        .is_some_and(|p| pool.scope_allows(p))
+                })
+            })
             // Skip members known not to carry the requested model before the
             // walk reaches one that does: trying a provider whose declared
             // `default_model` differs from the request only collects a
@@ -9834,6 +10054,7 @@ mod failover_policy_tests {
             read_timeout: None,
             first_byte_timeout: None,
             utc_offset_minutes: 0,
+            self_hosted: true,
         }
     }
 
@@ -10539,6 +10760,7 @@ mod auto_pool_latency_tests {
             name: "auto".to_string(),
             entries: names.iter().map(|n| entry(n)).collect(),
             prefer_fast,
+            scope: AutoPoolScope::Any,
         }
     }
 
