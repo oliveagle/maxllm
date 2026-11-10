@@ -1790,8 +1790,12 @@ impl AiGateway {
         let body = bytes::Bytes::from(buf);
         // The identity is resolved from the body *before* the provider is
         // picked — this is the whole point of the prefetch.
-        if let Some(session_id) = crate::session_sticky::resolve_from_body(&body) {
-            ctx.session_id = Some(session_id);
+        // A header-derived identity wins: it is the client's explicit
+        // statement, while the body field is a proxy-survival fallback.
+        if ctx.session_id.is_none() {
+            if let Some(session_id) = crate::session_sticky::resolve_from_body(&body) {
+                ctx.session_id = Some(session_id);
+            }
         }
         // The body also names the model. When it names a pool sentinel
         // (`auto`, `auto_home`), entering the pool here saves a whole round
@@ -4746,11 +4750,16 @@ impl ProxyHttp for AiGateway {
         // headers on the way. The provider is picked here — before the
         // body filter runs — so the body is read now and re-injected by the
         // body filter as the request's single chunk.
-        if route.session_sticky
-            && hot.session_sticky_enabled
-            && ctx.session_id.is_none()
-            && hot.session_body_affinity
-        {
+        //
+        // This used to run only when the client sent *no* session header.
+        // That gate silently defeated the body's pool sentinel for every
+        // client that always sends one (codex sends `session-id` on every
+        // request): the body said `auto_home` but `ctx.model` stayed empty,
+        // so `request_pool` fell back to the route's pool and the request
+        // was served by a vendor — with the model field rewritten to match.
+        // The header is only an *identity*; the model in the body decides
+        // which pool runs, so the prefetch must not depend on it.
+        if route.session_sticky && hot.session_sticky_enabled && hot.session_body_affinity {
             self.prefetch_body_for_affinity(session, ctx, &hot).await;
         }
 
