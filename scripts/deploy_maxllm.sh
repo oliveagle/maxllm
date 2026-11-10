@@ -26,8 +26,26 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.cache/mx-gate-target}"
 BIN="$TARGET_DIR/x86_64-unknown-linux-musl/release/maxllm-server"
 
-echo "==> building musl static maxllm-server ($(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo '?'))"
-CARGO_TARGET_DIR="$TARGET_DIR" CC_x86_64_unknown_linux_musl=musl-gcc \
+# The musl cross compiler has two names in the wild: `musl-gcc` (Alpine /
+# musl-cross toolchains) and `x86_64-linux-musl-gcc` (Homebrew musl-cross on
+# macOS). Probing both keeps the script working on a MacBook — the host that
+# actually runs the deploy — instead of only inside a Linux container.
+MUSL_CC=""
+for cand in x86_64-linux-musl-gcc musl-gcc; do
+  if command -v "$cand" >/dev/null 2>&1; then MUSL_CC="$cand"; break; fi
+done
+if [[ -z "$MUSL_CC" ]]; then
+  echo "ERROR: no musl cross compiler found (tried x86_64-linux-musl-gcc, musl-gcc)." >&2
+  echo "       macOS: brew install musl-cross   ·   Debian: apt install musl-tools" >&2
+  exit 1
+fi
+# cargo is not on PATH for non-login shells (rustup installs it in ~/.cargo/bin).
+export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:$PATH"
+
+echo "==> building musl static maxllm-server ($(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo '?')) [cc=$MUSL_CC]"
+CARGO_TARGET_DIR="$TARGET_DIR" \
+  CC_x86_64_unknown_linux_musl="$MUSL_CC" \
+  RUSTFLAGS="-C linker=$MUSL_CC -C link-self-contained=yes" \
   cargo build --release --target x86_64-unknown-linux-musl \
     -p maxllm-gateway --bin maxllm-server --manifest-path "$REPO/Cargo.toml"
 
@@ -43,9 +61,15 @@ check_static() {   # $1 = ELF path; refuses anything but static-pie musl
 }
 
 check_static "$BIN" || exit 1
-SHA="$(sha256sum "$BIN" | cut -c1-16)"
+# sha256sum / stat -c are GNU; macOS ships shasum and BSD stat. Probe both.
+if command -v sha256sum >/dev/null 2>&1; then
+  SHA="$(sha256sum "$BIN" | cut -c1-16)"
+else
+  SHA="$(shasum -a 256 "$BIN" | cut -c1-16)"
+fi
+SIZE="$(wc -c < "$BIN" | tr -d ' ')"
 echo "==> guarded ok: $(file -b "$BIN")"
-echo "==> sha256[:16]=$SHA size=$(stat -c%s "$BIN")"
+echo "==> sha256[:16]=$SHA size=$SIZE"
 
 if [[ $CHECK_ONLY == 1 ]]; then echo "==> --check only, nothing deployed"; exit 0; fi
 
