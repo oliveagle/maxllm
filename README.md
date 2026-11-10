@@ -358,11 +358,13 @@ home pool.
 ```toml
 [auto_model]              # sentinel "auto": cloud vendors
 enabled = true
+scope = "vendor"          # enforced: a self-hosted member is a load error
 [[auto_model.pool]]
 provider = "volc_1"
 model = "deepseek-v4-flash"
 
 [auto_models.auto_home]   # sentinel "auto_home": home GPUs
+scope = "self_hosted"     # enforced: a vendor member is a load error
 [[auto_models.auto_home.pool]]
 provider = "oleworkstation_minicpm"
 model = "minicpm5-2b-256k-swa-gpu3"
@@ -385,6 +387,21 @@ first declared pool (the default `[auto_model]`) serves it. Every enabled pool
 is also listed by `GET /v1/models` with `owned_by: "maxllm-auto"`, so a client
 can discover the sentinels. Pool names must be unique, and a route naming a
 pool that is missing or disabled fails config validation at startup.
+
+`scope` turns "these two pools are disjoint" from a convention into a check.
+`scope = "self_hosted"` (what `auto_home` wants) fails the load if any member's
+provider is an external vendor; `scope = "vendor"` is the mirror image. Whether
+a provider counts as self-hosted is inferred from its `base_url` — loopback,
+RFC1918, CGNAT, link-local and `.local` hosts are ours, a public DNS name is a
+vendor's — and `self_hosted = true|false` on the provider overrides the
+inference (a home GPU published behind a public hostname needs `true`). The
+default is `scope = "any"`, so pre-existing configs keep loading unchanged.
+
+This matters because without it the boundary is unenforceable at runtime: the
+gateway only ever sees the members a pool declares, so a vendor accidentally
+added to `auto_home` would serve traffic and the caller — who asked for
+`auto_home` — would get a cloud answer with no indication that the home pool
+was never reached.
 
 Selection is **session-sticky first** — a session pinned to a pool provider
 keeps using it (unless that provider's circuit opens) so the upstream keeps
