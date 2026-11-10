@@ -3097,8 +3097,27 @@ impl ProxyHttp for AiGateway {
             let _ = upstream_request.remove_header("Accept-Encoding");
         }
 
-        // Set provider-specific headers
+        // Set provider-specific headers.
+        //
+        // `Native` / `Passthrough` forward the client body byte-for-byte, so the
+        // body's framing headers must stay the client's own. The translators all
+        // hardcode `Content-Type: application/json`, which silently rewrote a
+        // multipart upload (`/v1/audio/transcriptions`) into "application/json"
+        // while the body stayed multipart — vLLM then parsed the form as JSON and
+        // answered 400 `body.file: Field required` (2026-11-10, ASR via gateway).
+        // Keep the client's Content-Type whenever it sent one; only fill in the
+        // translator default when the client left it out.
+        let keep_client_content_type = matches!(
+            ctx.endpoint_type,
+            EndpointType::Native | EndpointType::Passthrough
+        );
         for (key, value) in provider.translator.upstream_headers(&provider.api_key) {
+            if keep_client_content_type
+                && key.eq_ignore_ascii_case("content-type")
+                && upstream_request.headers.get("Content-Type").is_some()
+            {
+                continue;
+            }
             upstream_request.insert_header(key, &value)?;
         }
 
