@@ -7,6 +7,7 @@
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::io::Write;
+use std::ops::{Deref, DerefMut};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -7368,11 +7369,43 @@ auto_model = true
 /// Spawn the gateway with three upstream placeholders — the route's own
 /// provider plus two auto-pool members — and wait until it answers `/health`.
 /// The auto-pool tests need one more upstream than [`TestGateway`] supports.
+/// A gateway child that is reaped when it goes out of scope.
+///
+/// This helper used to hand out a bare `Child`, so a test that failed on an
+/// assertion leaked the process. The leak kept the test binary's stdout open,
+/// and a piped `cargo test | tail` then blocked forever instead of reporting
+/// the failure. The guard kills *and* waits, so the child is gone before the
+/// process exits.
+struct GatewayChild(Child);
+
+impl Deref for GatewayChild {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.0
+    }
+}
+
+impl DerefMut for GatewayChild {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+
+impl Drop for GatewayChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 async fn spawn_gateway_with_pool(
     config: &str,
     urls: [&str; 3],
-) -> (Child, String, tempfile::NamedTempFile) {
-    let port = portpicker::pick_unused_port().expect("no free port");
+) -> (GatewayChild, String, tempfile::NamedTempFile) {
+    // `pick_gateway_port` (not `portpicker` alone) keeps two tests running in
+    // parallel from being handed the same port; the loser used to lose the
+    // bind and then talk to the winner's gateway.
+    let port = pick_gateway_port();
     let config_str = config
         .replace("{PORT}", &port.to_string())
         .replace("{MOCK_URL}", urls[0])
@@ -7392,9 +7425,20 @@ async fn spawn_gateway_with_pool(
         .env_remove("http_proxy")
         .spawn()
         .expect("spawn gateway");
+    let mut child = GatewayChild(child);
     let base = format!("http://127.0.0.1:{port}");
     let c = client();
-    for _ in 0..40 {
+    // Wait for the gateway, watching the child as well: a gateway that died
+    // during startup must be reported here, not later as "connection refused"
+    // on the first request.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if tokio::time::Instant::now() > deadline {
+            panic!("gateway did not start within 10 seconds (port {port})");
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!("gateway exited during startup ({status}); was port {port} taken?");
+        }
         if c.get(format!("{base}/health"))
             .send()
             .await
@@ -12792,4 +12836,184 @@ async fn test_a_client_that_appends_the_endpoint_reaches_the_provider_route() {
     );
     assert_eq!(spare.received_requests().await.unwrap().len(), 1);
     assert_eq!(primary.received_requests().await.unwrap().len(), 0);
+}
+
+// ── the pool sentinel in the body beats the pool implied by the path ────
+//
+// `auto` must only ever reach a vendor and `auto_home` only ever a home
+// machine. The only thing standing between a caller and a wrong-pool answer
+// is which pool the gateway *enters*, and that used to depend on whether the
+// client sent a session header: the body-sentinel prefetch was skipped
+// whenever one was present, so codex — which sends `session-id` on every
+// request — had its `auto_home` ignored and was served by the route's pool
+// (vendors), with the body's model rewritten to the vendor's model name.
+const SENTINEL_VS_PATH_CONFIG: &str = r#"
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[providers.mock]
+kind = "openai"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+
+[providers.cloud_a]
+kind = "openai"
+base_url = "{POOL_A_URL}"
+api_key = "fake-key"
+# The mock lives on 127.0.0.1, so the URL-based inference would call it
+# self-hosted. Real vendors are reached over a public name; say so, otherwise
+# the `vendor` scope below would (correctly) refuse to start.
+self_hosted = false
+
+[providers.home_b]
+kind = "openai"
+base_url = "{POOL_B_URL}"
+api_key = "fake-key"
+
+[auto_model]
+enabled = true
+name = "auto"
+scope = "vendor"
+
+[[auto_model.pool]]
+provider = "cloud_a"
+model = "model-cloud"
+
+[auto_models.auto_home]
+scope = "self_hosted"
+
+[[auto_models.auto_home.pool]]
+provider = "home_b"
+model = "model-home"
+
+[session_sticky]
+enabled = true
+timeout_secs = 3600
+max_entries = 100
+body_affinity = true
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "mock"
+auto_model = true
+session_sticky = true
+
+[[routes]]
+path = "/v1/home"
+provider = "auto_home"
+auto_model = true
+session_sticky = true
+"#;
+
+fn reply_model(body: &Value) -> String {
+    body["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The body's sentinel decides the pool even when the client sends a session
+/// header, and even when the path names the other pool.
+#[tokio::test]
+async fn test_body_sentinel_beats_the_path_and_the_session_header() {
+    let mock = MockServer::start().await;
+    let a = MockServer::start().await;
+    let b = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("unused")))
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("vendor")))
+        .mount(&a)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("home")))
+        .mount(&b)
+        .await;
+
+    let (mut child, base, _cfg) =
+        spawn_gateway_with_pool(SENTINEL_VS_PATH_CONFIG, [&mock.uri(), &a.uri(), &b.uri()]).await;
+    let c = client();
+
+    // Ask first, assert afterwards. Every request is bounded by a timeout so
+    // a regression fails the test instead of wedging it, and the gateway is
+    // reaped before the first assertion so a failure never leaks the child.
+    async fn ask(
+        c: &Client,
+        base: &str,
+        path: &str,
+        sess: &str,
+        model: &str,
+    ) -> (reqwest::StatusCode, Value) {
+        let resp = tokio::time::timeout(
+            Duration::from_secs(30),
+            c.post(format!("{base}{path}"))
+                .header("session-id", sess)
+                .json(&chat_body(model, "please"))
+                .send(),
+        )
+        .await
+        .expect("the gateway must answer within 30s")
+        .expect("the gateway must answer");
+        let status = resp.status();
+        let body: Value = resp.json().await.expect("a json body");
+        (status, body)
+    }
+
+    // 1. The bug: `auto_home` on the `auto` route *with* a session header.
+    let (s1, b1) = ask(&c, &base, "/v1/chat/completions", "sess-sentinel-1", "auto_home").await;
+    // 2. `auto` on that same route still runs on the vendor pool.
+    let (s2, b2) = ask(&c, &base, "/v1/chat/completions", "sess-sentinel-2", "auto").await;
+    // 3. The mirror image: `auto` on the `auto_home` route runs on vendors,
+    //    so a stale base URL cannot force vendor traffic onto a home GPU.
+    let (s3, b3) = ask(&c, &base, "/v1/home", "sess-sentinel-3", "auto").await;
+    // 4. And `auto_home` on it runs at home.
+    let (s4, b4) = ask(&c, &base, "/v1/home", "sess-sentinel-4", "auto_home").await;
+
+    let home_reqs = b.received_requests().await.unwrap_or_default();
+    let cloud_reqs = a.received_requests().await.unwrap_or_default();
+    let route_reqs = mock.received_requests().await.unwrap_or_default();
+
+    let _ = child.kill();
+
+    assert_eq!(s1, 200);
+    assert_eq!(
+        reply_model(&b1),
+        "home",
+        "auto_home on the auto route must run on the home pool: {b1}"
+    );
+    assert_eq!(s2, 200);
+    assert_eq!(reply_model(&b2), "vendor", "auto must stay on vendors: {b2}");
+    assert_eq!(s3, 200);
+    assert_eq!(reply_model(&b3), "vendor", "auto on the home route: {b3}");
+    assert_eq!(s4, 200);
+    assert_eq!(reply_model(&b4), "home", "auto_home on the home route: {b4}");
+
+    // The sentinel itself never reaches an upstream: the entry's model does.
+    assert!(!home_reqs.is_empty());
+    for req in &home_reqs {
+        let raw = String::from_utf8_lossy(&req.body);
+        assert!(
+            raw.contains("model-home"),
+            "home upstream must be asked for its own model: {raw}"
+        );
+        assert!(
+            !raw.contains("auto_home"),
+            "the sentinel must not leak upstream: {raw}"
+        );
+    }
+    assert!(!cloud_reqs.is_empty());
+    for req in &cloud_reqs {
+        let raw = String::from_utf8_lossy(&req.body);
+        assert!(raw.contains("model-cloud"), "vendor upstream model: {raw}");
+    }
+    // The route's own provider must stay untouched: a request that fell
+    // back to it is a request that no pool claimed.
+    assert!(
+        route_reqs.is_empty(),
+        "the route's own provider must not serve a pooled request: {route_reqs:?}"
+    );
 }

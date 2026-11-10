@@ -463,8 +463,14 @@ it names (it is answered by that route's fallback chain instead).
 The sentinel is recognised on **any** route, not only on routes that declare
 `auto_model = true`. A client that selects `auto` in its model picker usually
 keeps its base URL on the summary route — only the model string changes — so
-its first attempt reaches that route's own provider, which has no model by
-that name and answers 404. Rather than walking the route's fallback chain
+the body's sentinel is read **before** the pool is chosen and it decides the
+pool outright: `auto_home` on `/v1/responses/auto` runs on the home pool, and
+`auto` on `/v1/responses/auto_home` runs on the vendor pool. (This read used
+to be skipped whenever the client sent a session header — codex sends
+`session-id` on every request — which silently left the body's sentinel
+unused and served the route's pool instead.) Without the early read the first
+attempt would reach that route's own provider, which has no model by that
+name and answers 404. Rather than walking the route's fallback chain
 (every entry of which would answer the same 404 and leave the client with a
 502), the walk switches into the pool **named by the sentinel** (each pool is
 recognised by its own name: `auto_home` never enters the `auto` pool),
