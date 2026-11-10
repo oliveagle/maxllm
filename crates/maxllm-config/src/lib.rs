@@ -186,6 +186,30 @@ pub struct AutoModelConfig {
     /// round-robin over the whole tier.
     #[serde(default = "default_true")]
     pub prefer_fast: bool,
+    /// Which side of the deployment boundary this pool may draw from.
+    /// Checked at load: a member that violates it is a startup error, not a
+    /// silent misroute. Defaults to `any` so existing configs keep working.
+    #[serde(default)]
+    pub scope: AutoPoolScope,
+}
+
+/// Which side of the deployment boundary an auto pool may draw from.
+///
+/// `auto` is meant to rotate over external vendors and `auto_home` over the
+/// machines we run ourselves. Without an enforced scope those two pools are
+/// only a naming convention: a vendor added to `auto_home` would serve the
+/// request silently, and a caller who asked for `auto_home` would have no
+/// way to tell that the self-hosted pool was never reached.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoPoolScope {
+    /// No boundary check (the default; pre-existing configs keep working).
+    #[default]
+    Any,
+    /// Every member must be a self-hosted provider.
+    SelfHosted,
+    /// Every member must be an external vendor provider.
+    Vendor,
 }
 
 impl AutoModelConfig {
@@ -515,6 +539,77 @@ pub struct ProviderConfig {
     /// yet consumed by any routing rule — reserved for tag-based routing).
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Whether this provider runs on hardware we control rather than on a
+    /// vendor's API. `None` means "infer it from `base_url`" — see
+    /// [`ProviderConfig::is_self_hosted`]. Set it explicitly when the
+    /// inference would be wrong in either direction, e.g. a home GPU box
+    /// published through a public DNS name, or a vendor reached over a
+    /// private link.
+    #[serde(default)]
+    pub self_hosted: Option<bool>,
+}
+
+impl ProviderConfig {
+    /// Whether this provider runs on hardware we control.
+    ///
+    /// An explicit `self_hosted` wins; otherwise it is inferred from the
+    /// base URL: loopback, RFC1918, CGNAT, link-local and `.local` hosts are
+    /// ours, a DNS name on the public internet is a vendor's.
+    ///
+    /// This is what `[auto_models.<key>] scope = "self_hosted"` is checked
+    /// against, so the inference is a safety boundary, not a label: a
+    /// deployment that reaches its own models through a public hostname must
+    /// say `self_hosted = true` explicitly, and a vendor reached over a
+    /// private address must say `self_hosted = false`.
+    pub fn is_self_hosted(&self) -> bool {
+        self.self_hosted
+            .unwrap_or_else(|| url_host_is_local(&self.base_url))
+    }
+}
+
+/// Whether a base URL points at a private/local host.
+///
+/// Deliberately conservative: anything that is not recognisably local —
+/// including every public DNS name — reads as "vendor". The alternative
+/// (defaulting to "ours") would let a mistyped pool entry spend a vendor's
+/// budget on what the operator believes is the home pool.
+fn url_host_is_local(base_url: &str) -> bool {
+    let rest = base_url.trim();
+    let rest = rest.split_once("://").map(|(_, r)| r).unwrap_or(rest);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // Drop userinfo (`user:pass@host:port`).
+    let host_port = authority
+        .rsplit_once('@')
+        .map(|(_, r)| r)
+        .unwrap_or(authority);
+    let host = if let Some(v6) = host_port.strip_prefix('[') {
+        v6.split(']').next().unwrap_or("")
+    } else {
+        host_port.split(':').next().unwrap_or("")
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() {
+        return false;
+    }
+    if host == "localhost" || host.ends_with(".localhost") || host.ends_with(".local") {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => {
+            let o = ip.octets();
+            ip.is_loopback()
+                || ip.is_private()
+                || ip.is_link_local()
+                // 100.64.0.0/10 — carrier-grade NAT, which is also the
+                // address family some EasyTier mesh nodes hand out.
+                || (o[0] == 100 && (64..=127).contains(&o[1]))
+        }
+        Ok(std::net::IpAddr::V6(ip)) => {
+            let seg = ip.segments();
+            ip.is_loopback() || (seg[0] & 0xfe00) == 0xfc00
+        }
+        Err(_) => false,
+    }
 }
 
 /// Parse a fixed UTC offset into minutes east of UTC.
@@ -879,6 +974,40 @@ impl Config {
                 return Err(ConfigError::Validation(format!(
                     "auto pool name '{name}' is declared twice — each pool needs its own sentinel"
                 )));
+            }
+        }
+        // A pool's scope is a deployment boundary, not a label. Check it
+        // here so that a member on the wrong side of the boundary fails the
+        // load instead of quietly serving traffic it was never meant to see.
+        for (name, auto) in &pools {
+            if auto.scope == AutoPoolScope::Any {
+                continue;
+            }
+            for entry in &auto.pool {
+                let Some(provider) = self.providers.get(&entry.provider) else {
+                    return Err(ConfigError::Validation(format!(
+                        "auto pool '{name}' references unknown provider '{}'",
+                        entry.provider
+                    )));
+                };
+                let self_hosted = provider.is_self_hosted();
+                let off_scope = matches!(
+                    (auto.scope, self_hosted),
+                    (AutoPoolScope::SelfHosted, false) | (AutoPoolScope::Vendor, true)
+                );
+                if off_scope {
+                    let want = match auto.scope {
+                        AutoPoolScope::SelfHosted => "self-hosted",
+                        _ => "external vendor",
+                    };
+                    let got = if self_hosted { "self-hosted" } else { "a vendor" };
+                    return Err(ConfigError::Validation(format!(
+                        "auto pool '{name}' is scoped to {want} providers, but member '{}' \
+                         ({}) is {got} ({}) — remove the entry, or set `self_hosted` on \
+                         that provider if the inference is wrong",
+                        entry.provider, entry.model, provider.base_url
+                    )));
+                }
             }
         }
         for route in &self.routes {
@@ -1749,5 +1878,228 @@ listen = "0.0.0.0:8080"
             err.to_string().contains("providers"),
             "unexpected error: {err}"
         );
+    }
+
+    // ── auto pool scope: the deployment boundary ────────────────────────
+    //
+    // `auto_home` must never be able to reach a vendor, and `auto` must
+    // never spend a home GPU. These are the tests that keep the two pools
+    // from silently trading places when someone edits the config.
+
+    #[test]
+    fn test_self_hosted_is_inferred_from_the_base_url() {
+        let mut p = Config::parse(
+            r#"
+[server]
+listen = "0.0.0.0:8080"
+
+[providers.home]
+kind = "openai_compat"
+base_url = "http://10.126.126.20:11081"
+api_key = "x"
+"#,
+        )
+        .unwrap()
+        .providers
+        .remove("home")
+        .unwrap();
+        assert!(p.is_self_hosted(), "RFC1918 host must read as self-hosted");
+
+        for (url, want) in [
+            ("http://127.0.0.1:8000", true),
+            ("http://localhost:8000/v1", true),
+            ("http://192.168.2.190:3795", true),
+            ("http://172.16.4.9:11060", true),
+            ("http://100.64.7.3:11082", true),   // CGNAT / mesh
+            ("http://[::1]:8000", true),
+            ("http://gpu-box.local:8000", true),
+            ("https://api.minimaxi.com", false),
+            ("https://opencode.ai", false),
+            ("https://api.openai.com/v1", false),
+            ("http://10.126.126.199:3795", true), // private mesh address
+        ] {
+            p.base_url = url.to_string();
+            assert_eq!(p.is_self_hosted(), want, "base_url={url}");
+        }
+    }
+
+    #[test]
+    fn test_explicit_self_hosted_overrides_the_inference() {
+        let mut p = Config::parse(
+            r#"
+[server]
+listen = "0.0.0.0:8080"
+
+[providers.gpu]
+kind = "openai_compat"
+base_url = "https://gpu.example.com"
+self_hosted = true
+api_key = "x"
+"#,
+        )
+        .unwrap()
+        .providers
+        .remove("gpu")
+        .unwrap();
+        assert!(p.is_self_hosted());
+
+        p.base_url = "http://10.0.0.5:8000".into();
+        p.self_hosted = Some(false);
+        assert!(!p.is_self_hosted());
+    }
+
+    #[test]
+    fn test_self_hosted_pool_rejects_a_vendor_member() {
+        let toml = r#"
+[server]
+listen = "0.0.0.0:8080"
+
+[providers.gpu1]
+kind = "openai_compat"
+base_url = "http://10.126.126.20:11081"
+api_key = "x"
+default_model = "groot-awq"
+
+[providers.cloud]
+kind = "opencode"
+base_url = "https://opencode.ai"
+api_key = "x"
+default_model = "deepseek-v4.1-flash"
+
+[auto_models.auto_home]
+scope = "self_hosted"
+
+[[auto_models.auto_home.pool]]
+provider = "gpu1"
+model = "groot-awq"
+
+[[auto_models.auto_home.pool]]
+provider = "cloud"
+model = "deepseek-v4.1-flash"
+"#;
+        let err = Config::parse(toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("auto pool 'auto_home'"), "{msg}");
+        assert!(msg.contains("self-hosted"), "{msg}");
+        assert!(msg.contains("'cloud'"), "{msg}");
+    }
+
+    #[test]
+    fn test_self_hosted_pool_accepts_only_private_members() {
+        let toml = r#"
+[server]
+listen = "0.0.0.0:8080"
+
+[providers.gpu1]
+kind = "openai_compat"
+base_url = "http://10.126.126.20:11082"
+api_key = "x"
+default_model = "groot-awq"
+
+[providers.gpu2]
+kind = "openai_compat"
+base_url = "http://10.126.126.20:11080"
+api_key = "x"
+default_model = "groot-awq"
+
+[providers.humanizer]
+kind = "openai_compat"
+base_url = "http://10.126.126.10:11060"
+api_key = "x"
+default_model = "humanizer-12b"
+
+[auto_models.auto_home]
+scope = "self_hosted"
+
+[[auto_models.auto_home.pool]]
+provider = "gpu1"
+model = "groot-awq"
+[[auto_models.auto_home.pool]]
+provider = "gpu2"
+model = "groot-awq"
+[[auto_models.auto_home.pool]]
+provider = "humanizer"
+model = "humanizer-12b"
+"#;
+        Config::parse(toml).expect("all three members are self-hosted");
+    }
+
+    #[test]
+    fn test_vendor_pool_rejects_a_self_hosted_member() {
+        let toml = r#"
+[server]
+listen = "0.0.0.0:8080"
+
+[providers.gpu1]
+kind = "openai_compat"
+base_url = "http://10.126.126.20:11082"
+api_key = "x"
+default_model = "groot-awq"
+
+[auto_model]
+name = "auto"
+scope = "vendor"
+
+[[auto_model.pool]]
+provider = "gpu1"
+model = "groot-awq"
+"#;
+        let err = Config::parse(toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("auto pool 'auto'"), "{msg}");
+        assert!(msg.contains("external vendor"), "{msg}");
+    }
+
+    #[test]
+    fn test_pool_scope_defaults_to_any() {
+        let toml = r#"
+[server]
+listen = "0.0.0.0:8080"
+
+[providers.gpu1]
+kind = "openai_compat"
+base_url = "http://10.126.126.20:11082"
+api_key = "x"
+default_model = "groot-awq"
+
+[providers.cloud]
+kind = "opencode"
+base_url = "https://opencode.ai"
+api_key = "x"
+default_model = "deepseek-v4.1-flash"
+
+[auto_model]
+[[auto_model.pool]]
+provider = "gpu1"
+model = "groot-awq"
+[[auto_model.pool]]
+provider = "cloud"
+model = "deepseek-v4.1-flash"
+"#;
+        let cfg = Config::parse(toml).expect("mixed pool without a scope stays legal");
+        assert_eq!(cfg.auto_model.as_ref().unwrap().scope, AutoPoolScope::Any);
+    }
+
+    #[test]
+    fn test_scoped_pool_rejects_an_unknown_member() {
+        let toml = r#"
+[server]
+listen = "0.0.0.0:8080"
+
+[providers.gpu1]
+kind = "openai_compat"
+base_url = "http://10.126.126.20:11082"
+api_key = "x"
+default_model = "groot-awq"
+
+[auto_models.auto_home]
+scope = "self_hosted"
+
+[[auto_models.auto_home.pool]]
+provider = "ghost"
+model = "groot-awq"
+"#;
+        let err = Config::parse(toml).unwrap_err();
+        assert!(err.to_string().contains("unknown provider 'ghost'"), "{err}");
     }
 }
