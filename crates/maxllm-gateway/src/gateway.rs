@@ -81,6 +81,16 @@ fn existing_breaker(name: &str) -> Option<Arc<CircuitBreaker>> {
     breakers.get(name).cloned()
 }
 
+/// Runtime build identifier (`MAXLLM_BUILD_ID`). Two builds of the same
+/// semver are otherwise indistinguishable; the layer-1 supervisor records it
+/// per worker generation so an operator can prove which build answered.
+fn build_id() -> Option<String> {
+    std::env::var("MAXLLM_BUILD_ID")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
 /// Well-known models for each provider kind.
 fn well_known_models(kind: ProviderKind) -> &'static [&'static str] {
     match kind {
@@ -488,13 +498,30 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
                     .upstream_path
                     .as_deref()
                     .unwrap_or("/v1/chat/completions");
-                Box::new(
-                    maxllm_translate::openai_compat::OpenAICompatTranslator::new(
-                        name.clone(),
-                        path.to_string(),
-                        maxllm_translate::openai_compat::AuthStyle::Bearer,
-                    ),
-                )
+                let translator = maxllm_translate::openai_compat::OpenAICompatTranslator::new(
+                    name.clone(),
+                    path.to_string(),
+                    maxllm_translate::openai_compat::AuthStyle::Bearer,
+                );
+                // Volcengine Ark's Responses prefill validator rejects an
+                // input list ending in an assistant text turn with a
+                // misleading MissingParameter `partial`. Codex compaction
+                // sends exactly that shape, so ark providers repair it before
+                // forwarding; every other openai_compat upstream keeps the
+                // body byte-for-byte.
+                let wants_ark_repair = match conf.native_responses_repair.as_deref() {
+                    Some("ark_trailing_assistant") => true,
+                    Some("none") => false,
+                    _ => conf.base_url.to_ascii_lowercase().contains("volces.com"),
+                };
+                let translator = if wants_ark_repair {
+                    translator.with_native_responses_repair(
+                        maxllm_translate::openai_compat::NativeResponsesRepair::ArkTrailingAssistantTurn,
+                    )
+                } else {
+                    translator
+                };
+                Box::new(translator)
             }
             ProviderKind::OpenCode => {
                 let path = conf
@@ -2492,8 +2519,9 @@ impl ProxyHttp for AiGateway {
             }
             open_providers.sort_unstable();
             half_open_providers.sort_unstable();
-            let body = serde_json::to_vec(&serde_json::json!({
+            let mut health = serde_json::json!({
                 "status": if degraded { "degraded" } else { "ok" },
+                "layer": 2,
                 "version": env!("CARGO_PKG_VERSION"),
                 "providers": {
                     "healthy": providers_healthy,
@@ -2502,8 +2530,12 @@ impl ProxyHttp for AiGateway {
                 "pools": pools,
                 "open_providers": open_providers,
                 "half_open_providers": half_open_providers,
-            }))
-            .unwrap_or_else(|_| br#"{"status":"degraded"}"#.to_vec());
+            });
+            if let Some(id) = build_id() {
+                health["build_id"] = id.into();
+            }
+            let body = serde_json::to_vec(&health)
+                .unwrap_or_else(|_| br#"{"status":"degraded"}"#.to_vec());
             let content_len = body.len().to_string();
             let mut resp = ResponseHeader::build(200, Some(2))?;
             resp.insert_header("Content-Type", "application/json")?;
@@ -2522,7 +2554,14 @@ impl ProxyHttp for AiGateway {
             // first `await` — an aborted scrape must not reach `logging`
             // unmarked (see the guard there).
             ctx.skip_logging = true;
-            let body = format!(r#"{{"version":"{}"}}"#, env!("CARGO_PKG_VERSION")).into_bytes();
+            let mut version = serde_json::json!({
+                "layer": 2,
+                "version": env!("CARGO_PKG_VERSION"),
+            });
+            if let Some(id) = build_id() {
+                version["build_id"] = id.into();
+            }
+            let body = serde_json::to_vec(&version).unwrap_or_default();
             let content_len = body.len().to_string();
             let mut resp = ResponseHeader::build(200, Some(2))?;
             resp.insert_header("Content-Type", "application/json")?;
