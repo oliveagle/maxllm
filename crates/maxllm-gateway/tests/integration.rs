@@ -13017,3 +13017,311 @@ async fn test_body_sentinel_beats_the_path_and_the_session_header() {
         "the route's own provider must not serve a pooled request: {route_reqs:?}"
     );
 }
+
+// ── runtime scope enforcement: a scoped pool fails closed ────────────────
+//
+// `scope = "self_hosted"` / `"vendor"` is checked when the config loads, but
+// the boundary is only *called* at load — at request time three more ways
+// existed to hand the request across it:
+//   1. every member of the scoped pool is down → the selector used to fall
+//      through to the route's own chain (the vendors),
+//   2. the path pins a provider (`/v1/responses/cloud_a`) while the body
+//      says `auto_home` → the pin used to be served on its own, without ever
+//      consulting the pool,
+//   3. the sentinel only appears in the body and the affinity prefetch is
+//      off → the provider picked before the body was read used to forward
+//      the literal sentinel upstream instead of refusing.
+// Each of these now answers 503, and no vendor ever sees the request body.
+const SCOPE_FAILCLOSED_CONFIG: &str = r#"
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[providers.mock]
+kind = "openai"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+
+[providers.cloud_a]
+kind = "openai"
+base_url = "{POOL_A_URL}"
+api_key = "fake-key"
+self_hosted = false
+
+# The pool member for the fail-closed tests. The tests point {POOL_B_URL} at a
+# dead port, so one refused connection opens its circuit immediately.
+[providers.home_b]
+kind = "openai"
+base_url = "{POOL_B_URL}"
+api_key = "fake-key"
+max_fails = 1
+fail_timeout_secs = 3600
+
+[auto_model]
+enabled = true
+name = "auto"
+scope = "vendor"
+
+[[auto_model.pool]]
+provider = "cloud_a"
+model = "model-cloud"
+
+[auto_models.auto_home]
+scope = "self_hosted"
+
+[[auto_models.auto_home.pool]]
+provider = "home_b"
+model = "model-home"
+
+[session_sticky]
+enabled = true
+timeout_secs = 3600
+max_entries = 100
+body_affinity = true
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "cloud_a"
+fallback = ["mock"]
+auto_model = true
+session_sticky = true
+
+[[routes]]
+path = "/v1/responses"
+provider = "cloud_a"
+fallback = ["mock"]
+endpoint_type = "responses"
+session_sticky = true
+"#;
+
+async fn scope_ask(
+    c: &Client,
+    base: &str,
+    path: &str,
+    sess: &str,
+    body: &Value,
+) -> (reqwest::StatusCode, Value) {
+    let resp = tokio::time::timeout(
+        Duration::from_secs(30),
+        c.post(format!("{base}{path}"))
+            .header("session-id", sess)
+            .json(body)
+            .send(),
+    )
+    .await
+    .expect("the gateway must answer within 30s")
+    .expect("the gateway must answer");
+    let status = resp.status();
+    let body: Value = resp.json().await.expect("a json body");
+    (status, body)
+}
+
+/// No upstream may receive the literal `auto_home` sentinel — not even when
+/// the gateway refuses the request. (A refusal can leave a connection open on
+/// the upstream side, so the guard is on the *body*, not on the count.)
+fn upstream_saw_the_sentinel(reqs: &[wiremock::Request]) -> bool {
+    reqs.iter().any(|r| {
+        String::from_utf8_lossy(&r.body).contains("auto_home")
+            || String::from_utf8_lossy(&r.body).contains("model-home")
+    })
+}
+
+/// 1. Every member of the scoped pool is down: the request must fail closed
+/// with a 503 instead of falling through to the route's vendor chain.
+#[tokio::test]
+async fn test_a_scoped_pool_never_falls_back_to_the_route_chain() {
+    let mock = MockServer::start().await;
+    let a = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("route")))
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("vendor")))
+        .mount(&a)
+        .await;
+
+    // `{POOL_B_URL}` is a dead port: the first request trips home_b's breaker
+    // (max_fails = 1), the second finds the pool empty at selection time.
+    let (mut child, base, _cfg) = spawn_gateway_with_pool(
+        SCOPE_FAILCLOSED_CONFIG,
+        [&mock.uri(), &a.uri(), "http://127.0.0.1:1"],
+    )
+    .await;
+    let c = client();
+
+    let (s1, b1) = scope_ask(
+        &c,
+        &base,
+        "/v1/chat/completions",
+        "scope-dead-1",
+        &chat_body("auto_home", "please"),
+    )
+    .await;
+    let (s2, b2) = scope_ask(
+        &c,
+        &base,
+        "/v1/chat/completions",
+        "scope-dead-2",
+        &chat_body("auto_home", "please"),
+    )
+    .await;
+
+    let route_reqs = mock.received_requests().await.unwrap_or_default();
+    let cloud_reqs = a.received_requests().await.unwrap_or_default();
+    let _ = child.kill();
+
+    // The first request dies at the dead member (it can go nowhere else).
+    assert!(
+        s1.as_u16() >= 500,
+        "the first request must fail while the member is down: {s1} {b1}"
+    );
+    // The second one is the regression: with every member unhealthy the
+    // selector used to clear the pool and continue on the route's chain.
+    assert_eq!(
+        s2, 503,
+        "a scoped pool with no healthy member must fail closed, not fall back: {b2}"
+    );
+    let msg = b2["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("home_b") && msg.contains("circuit open"),
+        "the 503 must name the member and why it is out: {b2}"
+    );
+    assert!(
+        route_reqs.is_empty(),
+        "the route's own provider must not serve a scoped-pool request: {route_reqs:?}"
+    );
+    assert!(
+        cloud_reqs.is_empty(),
+        "vendors must never see a request the home pool could not serve: {cloud_reqs:?}"
+    );
+    assert!(!upstream_saw_the_sentinel(&cloud_reqs));
+}
+
+/// 2. The path pins a vendor while the body asks for `auto_home`: the pin is
+/// on the wrong side of the pool's boundary, so the request is refused.
+#[tokio::test]
+async fn test_path_pinning_cannot_pull_a_scoped_pool_onto_a_vendor() {
+    let mock = MockServer::start().await;
+    let a = MockServer::start().await;
+    let b = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("route")))
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("vendor")))
+        .mount(&a)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("home")))
+        .mount(&b)
+        .await;
+
+    let (mut child, base, _cfg) =
+        spawn_gateway_with_pool(SCOPE_FAILCLOSED_CONFIG, [&mock.uri(), &a.uri(), &b.uri()]).await;
+    let c = client();
+
+    let (status, body) = scope_ask(
+        &c,
+        &base,
+        "/v1/responses/cloud_a",
+        "scope-pin-1",
+        &responses_request_body("auto_home"),
+    )
+    .await;
+
+    let cloud_reqs = a.received_requests().await.unwrap_or_default();
+    let route_reqs = mock.received_requests().await.unwrap_or_default();
+    let home_reqs = b.received_requests().await.unwrap_or_default();
+    let _ = child.kill();
+
+    assert_eq!(
+        status, 503,
+        "a vendor pinned by the path may not serve the self-hosted pool: {body}"
+    );
+    let msg = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("out of scope") && msg.contains("self-hosted only"),
+        "the 503 must say the pin is out of scope: {body}"
+    );
+    assert!(
+        cloud_reqs.is_empty(),
+        "the pinned vendor must get no request at all: {cloud_reqs:?}"
+    );
+    assert!(
+        route_reqs.is_empty(),
+        "the route's own provider must not take over: {route_reqs:?}"
+    );
+    assert!(
+        home_reqs.is_empty(),
+        "a path pin is served by the pinned provider alone: {home_reqs:?}"
+    );
+}
+
+/// 3. The sentinel only lives in the body (no affinity prefetch), so the
+/// provider is picked before the gateway knows what pool was asked for. The
+/// body filter used to forward the literal sentinel to that provider; it must
+/// refuse instead.
+#[tokio::test]
+async fn test_a_body_only_scoped_sentinel_is_refused_when_the_prefetch_is_off() {
+    let mock = MockServer::start().await;
+    let a = MockServer::start().await;
+    let b = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("route")))
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("vendor")))
+        .mount(&a)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("home")))
+        .mount(&b)
+        .await;
+
+    let cfg = SCOPE_FAILCLOSED_CONFIG.replace("body_affinity = true", "body_affinity = false");
+    let (mut child, base, _cfg) =
+        spawn_gateway_with_pool(&cfg, [&mock.uri(), &a.uri(), &b.uri()]).await;
+    let c = client();
+
+    let (status, body) = scope_ask(
+        &c,
+        &base,
+        "/v1/chat/completions",
+        "scope-body-1",
+        &chat_body("auto_home", "please"),
+    )
+    .await;
+
+    let cloud_reqs = a.received_requests().await.unwrap_or_default();
+    let route_reqs = mock.received_requests().await.unwrap_or_default();
+    let home_reqs = b.received_requests().await.unwrap_or_default();
+    let _ = child.kill();
+
+    assert_eq!(
+        status, 503,
+        "without the prefetch the sentinel is discovered too late to re-point; refuse: {body}"
+    );
+    let msg = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("auto_home") && msg.contains("deployment boundary"),
+        "the refusal must name the sentinel and the boundary: {body}"
+    );
+    assert!(
+        !upstream_saw_the_sentinel(&cloud_reqs),
+        "the sentinel must never reach a vendor: {cloud_reqs:?}"
+    );
+    assert!(
+        !upstream_saw_the_sentinel(&route_reqs),
+        "the sentinel must not reach the route's provider either: {route_reqs:?}"
+    );
+    assert!(
+        home_reqs.is_empty(),
+        "the home member is never entered from a body-only first hop: {home_reqs:?}"
+    );
+}
