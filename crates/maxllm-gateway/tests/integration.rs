@@ -109,10 +109,15 @@ impl TestGateway {
         // Wait for the gateway to be ready
         let client = Client::new();
         let health_url = format!("http://127.0.0.1:{port}/health");
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        // The deadline is a safety net, not the expected wait: the loop
+        // breaks as soon as /health answers. It has to be generous because a
+        // parallel test run spawns dozens of gateways at once and each one
+        // needs a second of CPU before it binds — a tight deadline turned a
+        // loaded machine into a red build for a gateway that was healthy.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
         loop {
             if tokio::time::Instant::now() > deadline {
-                panic!("Gateway did not start within 10 seconds");
+                panic!("Gateway did not start within 60 seconds");
             }
             // A gateway that lost a bind race is gone; without this the health
             // poll below would answer from the *other* test's gateway.
@@ -7773,10 +7778,12 @@ async fn spawn_gateway_with_pool(
     // Wait for the gateway, watching the child as well: a gateway that died
     // during startup must be reported here, not later as "connection refused"
     // on the first request.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    // A safety net, not the expected wait — see the note on the other
+    // gateway helper: the loop breaks as soon as /health answers.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
         if tokio::time::Instant::now() > deadline {
-            panic!("gateway did not start within 10 seconds (port {port})");
+            panic!("gateway did not start within 60 seconds (port {port})");
         }
         if let Ok(Some(status)) = child.try_wait() {
             panic!("gateway exited during startup ({status}); was port {port} taken?");
