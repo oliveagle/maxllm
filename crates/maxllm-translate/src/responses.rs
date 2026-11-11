@@ -860,10 +860,10 @@ fn expand_tool_to_chat<'a>(tool: &'a Value, out: &mut Vec<Value>, dropped: &mut 
     }
     // `OpenAIFunction.name` is required: a tool that names nothing would
     // still be rejected, so it is dropped like any other unusable tool.
-    if !func
+    if func
         .get("name")
         .and_then(|n| n.as_str())
-        .is_some_and(|n| !n.is_empty())
+        .is_none_or(|n| n.is_empty())
     {
         dropped.push(kind.unwrap_or("<no type>"));
         return;
