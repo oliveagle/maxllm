@@ -186,6 +186,15 @@ pub struct AutoModelConfig {
     /// round-robin over the whole tier.
     #[serde(default = "default_true")]
     pub prefer_fast: bool,
+    /// The deployment boundary of this pool.
+    ///
+    /// `any` (the default) declares no boundary: the gateway skips every
+    /// scope check. `self_hosted` (the home pool) and `vendor` (the cloud
+    /// pool) are enforced — a member from the wrong side is refused when the
+    /// config is loaded, and a request that would cross the boundary is
+    /// refused with 503 instead of falling back to the other side.
+    #[serde(default)]
+    pub scope: AutoPoolScope,
 }
 
 impl AutoModelConfig {
@@ -216,6 +225,73 @@ impl Config {
             pools.push((auto.sentinel_name(Some(key.as_str())), auto));
         }
         pools
+    }
+}
+
+/// The deployment side an auto pool lives on.
+///
+/// `auto` is the cloud pool, `auto_home` the self-hosted one. Declaring a
+/// scope turns the pool into a *deployment boundary*:
+///
+/// * at config load time a member from the wrong side is a hard error —
+///   the gateway refuses to start rather than serve a cloud model from the
+///   home pool;
+/// * at request time a provider from the wrong side is refused (503), never
+///   silently replaced by a fallback from the other side.
+///
+/// `any` (the default) declares no boundary at all: the gateway skips every
+/// scope check, which is why a pool that means to be a boundary has to say
+/// so out loud.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoPoolScope {
+    /// No boundary: the pool may be served by any provider.
+    #[default]
+    Any,
+    /// Only providers we host ourselves.
+    SelfHosted,
+    /// Only external vendors.
+    Vendor,
+}
+
+impl AutoPoolScope {
+    /// Whether a provider on the given side of the boundary may serve a pool
+    /// with this scope.
+    pub fn allows(self, provider_is_self_hosted: bool) -> bool {
+        match self {
+            AutoPoolScope::Any => true,
+            AutoPoolScope::SelfHosted => provider_is_self_hosted,
+            AutoPoolScope::Vendor => !provider_is_self_hosted,
+        }
+    }
+
+    /// The scope as it is spelled in the config file and in the error
+    /// messages that name it.
+    ///
+    /// The two sides of the boundary are spelled the way the deployment
+    /// talks about them: the home side is "self-hosted", the cloud side is
+    /// "external vendor" (not "vendor" — a *member* that is a vendor is
+    /// called "a vendor", see [`AutoPoolScope::member_label`]).
+    pub fn label(self) -> &'static str {
+        match self {
+            AutoPoolScope::Any => "any",
+            AutoPoolScope::SelfHosted => "self-hosted",
+            AutoPoolScope::Vendor => "external vendor",
+        }
+    }
+
+    /// How a *member* of a scoped pool is spelled when it turns out to sit
+    /// on the wrong side of the boundary.
+    ///
+    /// The pool is named from its own point of view ("scoped to external
+    /// vendor providers"); the member is named from the deployment's ("is a
+    /// vendor"). The two vocabularies are deliberately different.
+    pub fn member_label(is_self_hosted: bool) -> &'static str {
+        if is_self_hosted {
+            "self-hosted"
+        } else {
+            "a vendor"
+        }
     }
 }
 
@@ -515,6 +591,76 @@ pub struct ProviderConfig {
     /// yet consumed by any routing rule — reserved for tag-based routing).
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Which side of the deployment boundary this provider is on.
+    ///
+    /// Unset means the side is inferred from `base_url` (see
+    /// [`ProviderConfig::is_self_hosted`]). Set it explicitly when the
+    /// inference would be wrong — a self-hosted provider reached through a
+    /// public DNS name, or a vendor endpoint on a private address. Getting
+    /// it wrong is not a cosmetic mistake: it is a way around the boundary.
+    #[serde(default)]
+    pub self_hosted: Option<bool>,
+}
+
+impl ProviderConfig {
+    /// Which side of the deployment boundary this provider is on.
+    ///
+    /// An explicit `self_hosted` wins. Otherwise the base URL decides:
+    /// loopback, RFC1918, CGNAT, link-local and `.local` hosts are ours;
+    /// a public DNS name (or a public address) is a vendor's.
+    pub fn is_self_hosted(&self) -> bool {
+        if let Some(explicit) = self.self_hosted {
+            return explicit;
+        }
+        host_is_self_hosted(&base_url_host(&self.base_url))
+    }
+}
+
+/// The host part of a base URL: scheme, userinfo, port and path removed.
+fn base_url_host(base_url: &str) -> String {
+    let rest = match base_url.split_once("://") {
+        Some((_, rest)) => rest,
+        None => base_url,
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    let host = if let Some(after_bracket) = authority.strip_prefix('[') {
+        after_bracket.split(']').next().unwrap_or("")
+    } else {
+        authority.split(':').next().unwrap_or("")
+    };
+    host.trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// Whether a host is ours (self-hosted) or a vendor's.
+///
+/// The rule the deployment boundary is built on: loopback, RFC1918, CGNAT
+/// (100.64/10), link-local and `.local` / `localhost` names are ours; a
+/// public DNS name or a public address is a vendor's.
+fn host_is_self_hosted(host: &str) -> bool {
+    if host.is_empty() {
+        return false;
+    }
+    if host == "localhost" || host.ends_with(".localhost") || host.ends_with(".local") {
+        return true;
+    }
+    if let Ok(v4) = host.parse::<std::net::Ipv4Addr>() {
+        let o = v4.octets();
+        return o[0] == 127                                  // loopback
+            || o[0] == 10                                    // 10/8
+            || (o[0] == 172 && (16..=31).contains(&o[1]))    // 172.16/12
+            || (o[0] == 192 && o[1] == 168)                   // 192.168/16
+            || (o[0] == 169 && o[1] == 254)                   // 169.254/16 link-local
+            || (o[0] == 100 && (64..=127).contains(&o[1])); // 100.64/10 CGNAT
+    }
+    if let Ok(v6) = host.parse::<std::net::Ipv6Addr>() {
+        // Only the loopback and the unique-local range are ours. The
+        // unspecified address (`::`) and the link-local range (`fe80::/10`)
+        // are *not*: they name no host we run, so a provider reached
+        // through one is somebody else's.
+        return v6.is_loopback() || (v6.segments()[0] & 0xfe00) == 0xfc00; // fc00::/7
+    }
+    false
 }
 
 /// Parse a fixed UTC offset into minutes east of UTC.
@@ -881,6 +1027,42 @@ impl Config {
                 )));
             }
         }
+        // The deployment boundary is checked *here*, at config load time: a
+        // pool that declares a scope may not carry a member from the other
+        // side, and it may not name a provider that does not exist. The
+        // gateway refuses to start rather than serve a cloud model from the
+        // home pool (or the other way round) — a boundary that only exists
+        // in the request path is a boundary that can be walked around by a
+        // config reload.
+        //
+        // The members are walked in declaration order, and each member is
+        // checked completely before the next one: an unknown provider is
+        // named before a member that is on the wrong side.
+        for (name, auto) in &pools {
+            if auto.scope == AutoPoolScope::Any {
+                continue;
+            }
+            for entry in &auto.pool {
+                let Some(provider) = self.providers.get(&entry.provider) else {
+                    return Err(ConfigError::Validation(format!(
+                        "auto pool '{name}' references unknown provider '{}'",
+                        entry.provider
+                    )));
+                };
+                let is_self_hosted = provider.is_self_hosted();
+                if auto.scope.allows(is_self_hosted) {
+                    continue;
+                }
+                return Err(ConfigError::Validation(format!(
+                    "auto pool '{name}' is scoped to {} providers, but member '{}' ({}) is {} ({}) — remove the entry, or set `self_hosted` on that provider if the inference is wrong",
+                    auto.scope.label(),
+                    entry.provider,
+                    entry.model,
+                    AutoPoolScope::member_label(is_self_hosted),
+                    provider.base_url
+                )));
+            }
+        }
         for route in &self.routes {
             // An auto route rotates over an auto pool instead of naming a
             // single provider, so its `provider` field is a sentinel (not a
@@ -962,6 +1144,293 @@ fn expand_env_vars(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The deployment boundary classifies a provider by its base URL when
+    /// the config does not say: our own addresses are ours, a public name
+    /// is a vendor's.
+    #[test]
+    fn self_hosted_is_inferred_from_the_base_url() {
+        let cfg: Config = toml::from_str(
+            r#"
+[server]
+listen = "0.0.0.0:1"
+
+[providers.home]
+kind = "openai"
+base_url = "http://10.126.126.20:8000/v1"
+api_key = "k"
+
+[providers.loopback]
+kind = "openai"
+base_url = "http://127.0.0.1:8000/v1"
+api_key = "k"
+
+[providers.mdns]
+kind = "openai"
+base_url = "http://groot.local:8000/v1"
+api_key = "k"
+
+[providers.cgnat]
+kind = "openai"
+base_url = "http://100.100.1.2:8000/v1"
+api_key = "k"
+
+[providers.vendor]
+kind = "openai"
+base_url = "https://api.vendor.ai/v1"
+api_key = "k"
+
+[providers.public_ip]
+kind = "openai"
+base_url = "http://93.184.216.34:8000/v1"
+api_key = "k"
+"#,
+        )
+        .expect("config parses");
+        assert!(cfg.providers["home"].is_self_hosted(), "rfc1918 is ours");
+        assert!(
+            cfg.providers["loopback"].is_self_hosted(),
+            "loopback is ours"
+        );
+        assert!(cfg.providers["mdns"].is_self_hosted(), ".local is ours");
+        assert!(cfg.providers["cgnat"].is_self_hosted(), "cgnat is ours");
+        assert!(
+            !cfg.providers["vendor"].is_self_hosted(),
+            "a public name is a vendor's"
+        );
+        assert!(
+            !cfg.providers["public_ip"].is_self_hosted(),
+            "a public address is a vendor's"
+        );
+    }
+
+    /// The addresses that name *no* host of ours are a vendor's, even
+    /// though they look private at first sight: `0.0.0.0` (the "any
+    /// address"), the IPv6 unspecified address `::` and the IPv6 link-local
+    /// range `fe80::/10`. A provider reached through one of them is
+    /// somebody else's endpoint.
+    #[test]
+    fn addresses_that_name_no_host_of_ours_are_a_vendors() {
+        let cfg: Config = toml::from_str(
+            r#"
+[server]
+listen = "0.0.0.0:1"
+
+[providers.unspecified_v4]
+kind = "openai"
+base_url = "http://0.0.0.0:8000/v1"
+api_key = "k"
+
+[providers.unspecified_v6]
+kind = "openai"
+base_url = "http://[::]:8000/v1"
+api_key = "k"
+
+[providers.link_local_v6]
+kind = "openai"
+base_url = "http://[fe80::1]:8000/v1"
+api_key = "k"
+
+[providers.unique_local_v6]
+kind = "openai"
+base_url = "http://[fc00::1]:8000/v1"
+api_key = "k"
+
+[providers.loopback_v6]
+kind = "openai"
+base_url = "http://[::1]:8000/v1"
+api_key = "k"
+"#,
+        )
+        .expect("config parses");
+        assert!(
+            !cfg.providers["unspecified_v4"].is_self_hosted(),
+            "0.0.0.0/8 is not ours"
+        );
+        assert!(
+            !cfg.providers["unspecified_v6"].is_self_hosted(),
+            ":: is not ours"
+        );
+        assert!(
+            !cfg.providers["link_local_v6"].is_self_hosted(),
+            "fe80::/10 is not ours"
+        );
+        assert!(
+            cfg.providers["unique_local_v6"].is_self_hosted(),
+            "fc00::/7 is ours"
+        );
+        assert!(cfg.providers["loopback_v6"].is_self_hosted(), "::1 is ours");
+    }
+
+    /// A pool that declares a scope is a deployment boundary, and a
+    /// boundary that is already broken is refused when the config is
+    /// loaded — the gateway never starts with a member on the wrong side.
+    #[test]
+    fn a_scoped_pool_with_a_member_on_the_wrong_side_is_refused() {
+        let toml = r#"
+[server]
+listen = "0.0.0.0:1"
+
+[providers.home]
+kind = "openai"
+base_url = "http://10.126.126.20:8000/v1"
+api_key = "k"
+
+[providers.vendor]
+kind = "openai"
+base_url = "https://vendor.ai/v1"
+api_key = "k"
+
+[auto_models.auto_home]
+scope = "self_hosted"
+[[auto_models.auto_home.pool]]
+provider = "vendor"
+model = "groot"
+"#;
+        let err = Config::parse(toml).expect_err("the pool crosses the boundary");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("auto pool 'auto_home' is scoped to self-hosted providers"),
+            "the message names the pool and its scope: {msg}"
+        );
+        assert!(
+            msg.contains("member 'vendor' (groot) is a vendor (https://vendor.ai/v1)"),
+            "the message names the member, its side and its endpoint: {msg}"
+        );
+        assert!(
+            msg.contains("set `self_hosted` on that provider"),
+            "the message says how to fix it: {msg}"
+        );
+    }
+
+    /// A scoped pool that names a provider that does not exist is refused
+    /// too: a boundary whose members are unknown is not a boundary.
+    ///
+    /// An unscoped pool keeps the old behaviour (the unknown entry is
+    /// dropped by the gateway), because a pool that declares no boundary
+    /// must not take the whole gateway down over a stale entry.
+    #[test]
+    fn a_scoped_pool_with_an_unknown_member_is_refused() {
+        let scoped = r#"
+[server]
+listen = "0.0.0.0:1"
+
+[providers.home]
+kind = "openai"
+base_url = "http://10.126.126.20:8000/v1"
+api_key = "k"
+
+[auto_models.auto_home]
+scope = "self_hosted"
+[[auto_models.auto_home.pool]]
+provider = "ghost"
+model = "groot"
+"#;
+        let err = Config::parse(scoped).expect_err("the pool names a ghost");
+        assert!(
+            err.to_string()
+                .contains("auto pool 'auto_home' references unknown provider 'ghost'"),
+            "the message names the pool and the ghost: {err}"
+        );
+
+        let unscoped = scoped.replace("scope = \"self_hosted\"\n", "");
+        Config::parse(&unscoped).expect("an unscoped pool tolerates a ghost");
+    }
+
+    /// An explicit `self_hosted` wins over the inference — that is the
+    /// escape hatch for a self-hosted provider reached through a public
+    /// name (and for a vendor endpoint on a private address).
+    #[test]
+    fn an_explicit_self_hosted_wins_over_the_inference() {
+        let cfg: Config = toml::from_str(
+            r#"
+[server]
+listen = "0.0.0.0:1"
+
+[providers.named]
+kind = "openai"
+base_url = "https://groot.example.com/v1"
+api_key = "k"
+self_hosted = true
+
+[providers.private_vendor]
+kind = "openai"
+base_url = "http://10.0.0.9:8000/v1"
+api_key = "k"
+self_hosted = false
+"#,
+        )
+        .expect("config parses");
+        assert!(cfg.providers["named"].is_self_hosted());
+        assert!(!cfg.providers["private_vendor"].is_self_hosted());
+    }
+
+    /// The scope of a pool is opt-in: a pool that says nothing declares no
+    /// boundary, which is why a pool that means to be one has to say so.
+    #[test]
+    fn a_pool_without_a_scope_declares_no_boundary() {
+        let cfg: Config = toml::from_str(
+            r#"
+[server]
+listen = "0.0.0.0:1"
+
+[providers.mock]
+kind = "openai"
+base_url = "http://127.0.0.1:1"
+api_key = "k"
+
+[auto_model]
+[[auto_model.pool]]
+provider = "mock"
+model = "m"
+"#,
+        )
+        .expect("config parses");
+        let pools = cfg.auto_pools();
+        assert_eq!(pools.len(), 1);
+        assert_eq!(pools[0].1.scope, AutoPoolScope::Any);
+        assert!(pools[0].1.scope.allows(true));
+        assert!(pools[0].1.scope.allows(false));
+    }
+
+    /// The scope is read from the pool's own table, and it decides which
+    /// side of the boundary a provider may be on.
+    #[test]
+    fn a_scoped_pool_decides_which_side_may_serve_it() {
+        let cfg: Config = toml::from_str(
+            r#"
+[server]
+listen = "0.0.0.0:1"
+
+[providers.mock]
+kind = "openai"
+base_url = "http://127.0.0.1:1"
+api_key = "k"
+
+[auto_models.auto_home]
+scope = "self_hosted"
+[[auto_models.auto_home.pool]]
+provider = "mock"
+model = "m"
+
+[auto_model]
+scope = "vendor"
+[[auto_model.pool]]
+provider = "mock"
+model = "m"
+"#,
+        )
+        .expect("config parses");
+        let pools = cfg.auto_pools();
+        let home = pools.iter().find(|(name, _)| name == "auto_home").unwrap();
+        assert_eq!(home.1.scope, AutoPoolScope::SelfHosted);
+        assert!(home.1.scope.allows(true));
+        assert!(!home.1.scope.allows(false));
+        let cloud = pools.iter().find(|(name, _)| name == "auto").unwrap();
+        assert_eq!(cloud.1.scope, AutoPoolScope::Vendor);
+        assert!(cloud.1.scope.allows(false));
+        assert!(!cloud.1.scope.allows(true));
+    }
 
     /// The body affinity is opt-in: a config that does not ask for it keeps
     /// the old behaviour (headers only), and the size cap has a usable

@@ -52,6 +52,22 @@ impl GatewayError {
     }
 }
 
+/// A request the deployment boundary refused.
+///
+/// The pool that fenced the request, the scope it declared and the provider
+/// that sat on the wrong side. The 503 names all three, so the answer says
+/// *which* boundary was crossed instead of reporting a dead provider.
+#[derive(Debug, Clone)]
+pub struct ScopeRefusal {
+    /// The pool that declared the scope (`auto_home`, …).
+    pub pool: String,
+    /// The scope, as it is spelled in the config (`self-hosted`, `external
+    /// vendor`).
+    pub scope: &'static str,
+    /// The provider that was on the wrong side of the boundary.
+    pub provider: String,
+}
+
 /// Per-request context carried through the Pingora ProxyHttp lifecycle.
 pub struct RequestCtx {
     /// Index into the config routes array (-1 = unmatched).
@@ -216,6 +232,12 @@ pub struct RequestCtx {
     /// Set when the route carries the `auto` sentinel; the request body's
     /// model field is rewritten to this model before it is sent upstream.
     pub auto_target: Option<(String, String)>,
+    /// Set when the deployment boundary refused this request.
+    ///
+    /// `None` for every request that was served; set when a path-pinned
+    /// provider sat on the wrong side of a scoped pool's fence, so the 503
+    /// can name the boundary instead of the (healthy) provider.
+    pub scope_refusal: Option<ScopeRefusal>,
     /// The auto pool this request is rotating over, by sentinel name (`auto`,
     /// `auto_home`, …). Set as soon as the sentinel is recognised — from the
     /// path, from the body (adopted before the first upstream hop), or from a
@@ -381,6 +403,7 @@ impl RequestCtx {
             model_404_body_buf: Vec::new(),
             auto_target: None,
             auto_pool: None,
+            scope_refusal: None,
             model_override: None,
             model_rewritten_providers: Vec::new(),
             attempt_trail: Vec::new(),

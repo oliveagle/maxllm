@@ -171,6 +171,7 @@ mod tests {
         ProviderTarget {
             name: name.to_string(),
             state: Arc::new(ProviderState {
+                self_hosted: false,
                 kind: maxllm_config::ProviderKind::OpenAI,
                 translator: Box::new(maxllm_translate::openai::OpenAITranslator),
                 circuit_breaker: Arc::new(CircuitBreaker::new(3, 60)),
@@ -234,6 +235,7 @@ mod tests {
         ProviderTarget {
             name: name.to_string(),
             state: Arc::new(ProviderState {
+                self_hosted: false,
                 kind: maxllm_config::ProviderKind::OpenAI,
                 translator: Box::new(maxllm_translate::openai::OpenAITranslator),
                 circuit_breaker: breaker,
