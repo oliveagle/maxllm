@@ -11258,7 +11258,25 @@ async fn test_responses_path_unknown_provider_is_rejected() {
 
 /// Zhipu's weekly/monthly quota error: no rate-limit headers at all (the
 /// reset instant is only in the body, in Beijing wall clock).
-const QUOTA_429_BODY: &str = r#"{"error":{"code":"1310","message":"您已达到每周/每月使用上限，您的限额将在 2026-11-10 22:58:54 重置。"}}"#;
+/// Zhipu's quota-wall body, with the reset instant an hour ahead.
+///
+/// The instant is computed at run time on purpose: a hard-coded one rots
+/// into the past, and a reset instant in the past is not a parking decision
+/// (the breaker ignores it), so the member would stay in the rotation and
+/// the test would fail on a date rather than on a behaviour.
+fn quota_429_body() -> String {
+    quota_429_body_resetting_at(chrono::Utc::now() + chrono::Duration::hours(1))
+}
+
+/// The Zhipu quota-wall body for a given reset instant, in the provider's
+/// own zone (UTC+8 — the body carries no zone marker).
+fn quota_429_body_resetting_at(reset: chrono::DateTime<chrono::Utc>) -> String {
+    let beijing = reset + chrono::Duration::hours(8);
+    format!(
+        r#"{{"error":{{"code":"1310","message":"您已达到每周/每月使用上限，您的限额将在 {} 重置。"}}}}"#,
+        beijing.format("%Y-%m-%d %H:%M:%S")
+    )
+}
 
 const QUOTA_429_FALLBACK_CONFIG: &str = r#"
 global_plugins = ["api_auth"]
@@ -11306,7 +11324,7 @@ async fn test_quota_429_fails_over_to_the_next_provider() {
     Mock::given(method("POST"))
         .respond_with(
             ResponseTemplate::new(429)
-                .set_body_string(QUOTA_429_BODY)
+                .set_body_string(quota_429_body())
                 .insert_header("content-type", "application/json"),
         )
         .mount(&dead)
@@ -11350,7 +11368,7 @@ async fn test_quota_429_fails_over_with_a_large_body() {
     Mock::given(method("POST"))
         .respond_with(
             ResponseTemplate::new(429)
-                .set_body_string(QUOTA_429_BODY)
+                .set_body_string(quota_429_body())
                 .insert_header("content-type", "application/json"),
         )
         .mount(&dead)
@@ -11591,7 +11609,7 @@ async fn test_quota_429_fails_over_with_a_large_body_on_a_translated_provider() 
     Mock::given(method("POST"))
         .respond_with(
             ResponseTemplate::new(429)
-                .set_body_string(QUOTA_429_BODY)
+                .set_body_string(quota_429_body())
                 .insert_header("content-type", "application/json"),
         )
         .mount(&dead)
@@ -11718,7 +11736,7 @@ async fn test_quota_429_in_the_auto_pool_rotates_to_the_next_member() {
     Mock::given(method("POST"))
         .respond_with(
             ResponseTemplate::new(429)
-                .set_body_string(QUOTA_429_BODY)
+                .set_body_string(quota_429_body())
                 .insert_header("content-type", "application/json"),
         )
         .mount(&dead)
@@ -11764,7 +11782,7 @@ async fn test_quota_429_in_the_auto_pool_rotates_with_a_large_body() {
     Mock::given(method("POST"))
         .respond_with(
             ResponseTemplate::new(429)
-                .set_body_string(QUOTA_429_BODY)
+                .set_body_string(quota_429_body())
                 .insert_header("content-type", "application/json"),
         )
         .mount(&dead)
@@ -11842,7 +11860,7 @@ upstream_path = "/v1/chat/completions"
 api_key = "fake-key"
 native_responses = true
 responses_path = "/v1/responses"
-utc_offset_minutes = 480
+utc_offset = "+08:00"
 
 [[routes]]
 path = "/v1/responses"
@@ -11864,7 +11882,7 @@ async fn test_quota_429_without_a_fallback_is_answered_by_the_gateway() {
     Mock::given(method("POST"))
         .respond_with(
             ResponseTemplate::new(429)
-                .set_body_string(QUOTA_429_BODY)
+                .set_body_string(quota_429_body())
                 .insert_header("content-type", "application/json"),
         )
         .mount(&dead)
@@ -11927,7 +11945,7 @@ async fn test_quota_429_in_the_auto_pool_without_a_healthy_member_is_answered_by
     Mock::given(method("POST"))
         .respond_with(
             ResponseTemplate::new(429)
-                .set_body_string(QUOTA_429_BODY)
+                .set_body_string(quota_429_body())
                 .insert_header("content-type", "application/json"),
         )
         .mount(&dead)
@@ -12051,7 +12069,7 @@ async fn test_a_quota_wall_learned_on_one_node_is_adopted_by_the_peer() {
     Mock::given(method("POST"))
         .respond_with(
             ResponseTemplate::new(429)
-                .set_body_string(QUOTA_429_BODY)
+                .set_body_string(quota_429_body())
                 .insert_header("content-type", "application/json"),
         )
         .mount(&mock)
@@ -12087,7 +12105,7 @@ upstream_path = "/v1/chat/completions"
 api_key = "fake-key"
 native_responses = true
 responses_path = "/v1/responses"
-utc_offset_minutes = 480
+utc_offset = "+08:00"
 
 [[routes]]
 path = "/v1/responses"
@@ -12212,7 +12230,7 @@ upstream_path = "/v1/chat/completions"
 api_key = "fake-key"
 native_responses = true
 responses_path = "/v1/responses"
-utc_offset_minutes = 480
+utc_offset = "+08:00"
 max_fails = 3
 fail_timeout_secs = 60
 
@@ -12311,7 +12329,7 @@ async fn test_a_release_is_relayed_to_the_peer() {
     Mock::given(method("POST"))
         .respond_with(
             ResponseTemplate::new(429)
-                .set_body_string(QUOTA_429_BODY)
+                .set_body_string(quota_429_body())
                 .insert_header("content-type", "application/json"),
         )
         .mount(&mock)
@@ -12347,7 +12365,7 @@ upstream_path = "/v1/chat/completions"
 api_key = "fake-key"
 native_responses = true
 responses_path = "/v1/responses"
-utc_offset_minutes = 480
+utc_offset = "+08:00"
 
 [[routes]]
 path = "/v1/responses"
