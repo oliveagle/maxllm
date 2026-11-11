@@ -191,6 +191,28 @@ pub struct AutoModelConfig {
     /// silent misroute. Defaults to `any` so existing configs keep working.
     #[serde(default)]
     pub scope: AutoPoolScope,
+    /// Which models this pool is allowed to serve.
+    ///
+    /// An empty list means "any model" — the behaviour every config had
+    /// before this field existed. When it is set, a member is only legal if
+    /// the model it serves is on the list, and the model its provider
+    /// defaults to is on the list too (so a member cannot answer with a
+    /// different model than the one it claims).
+    ///
+    /// This is the model-axis twin of [`AutoPoolScope`]: `scope` says
+    /// *whose* hardware may answer, `allowed_models` says *which model* may
+    /// answer. `auto_home` wants both — hardware we run ourselves, and only
+    /// the one home model family — and a pool that says so in config should
+    /// not be able to drift away from it silently. Like `scope`, a
+    /// violation is a startup error, not a runtime surprise.
+    ///
+    /// Not to be confused with a virtual key's `allowed_models` (the admin
+    /// API's per-key "which models may this client ask for" filter): that
+    /// one filters *requests* and is skipped by the static master key, so
+    /// it cannot be what keeps a pool honest. This one is a property of the
+    /// pool itself.
+    #[serde(default)]
+    pub allowed_models: Vec<String>,
 }
 
 /// Which side of the deployment boundary an auto pool may draw from.
@@ -980,37 +1002,79 @@ impl Config {
         // here so that a member on the wrong side of the boundary fails the
         // load instead of quietly serving traffic it was never meant to see.
         for (name, auto) in &pools {
-            if auto.scope == AutoPoolScope::Any {
+            // Two independent boundaries, checked in the same place and in
+            // the same fail-closed shape: `scope` bounds whose hardware may
+            // answer, `allowed_models` bounds which model may answer.
+            let scope_checked = auto.scope != AutoPoolScope::Any;
+            let models_checked = !auto.allowed_models.is_empty();
+            if !scope_checked && !models_checked {
                 continue;
             }
             for entry in &auto.pool {
-                let Some(provider) = self.providers.get(&entry.provider) else {
-                    return Err(ConfigError::Validation(format!(
-                        "auto pool '{name}' references unknown provider '{}'",
-                        entry.provider
-                    )));
-                };
-                let self_hosted = provider.is_self_hosted();
-                let off_scope = matches!(
-                    (auto.scope, self_hosted),
-                    (AutoPoolScope::SelfHosted, false) | (AutoPoolScope::Vendor, true)
-                );
-                if off_scope {
-                    let want = match auto.scope {
-                        AutoPoolScope::SelfHosted => "self-hosted",
-                        _ => "external vendor",
+                let provider = self.providers.get(&entry.provider);
+                if scope_checked {
+                    let Some(provider) = provider else {
+                        return Err(ConfigError::Validation(format!(
+                            "auto pool '{name}' references unknown provider '{}'",
+                            entry.provider
+                        )));
                     };
-                    let got = if self_hosted {
-                        "self-hosted"
-                    } else {
-                        "a vendor"
+                    let self_hosted = provider.is_self_hosted();
+                    let off_scope = matches!(
+                        (auto.scope, self_hosted),
+                        (AutoPoolScope::SelfHosted, false) | (AutoPoolScope::Vendor, true)
+                    );
+                    if off_scope {
+                        let want = match auto.scope {
+                            AutoPoolScope::SelfHosted => "self-hosted",
+                            _ => "external vendor",
+                        };
+                        let got = if self_hosted {
+                            "self-hosted"
+                        } else {
+                            "a vendor"
+                        };
+                        return Err(ConfigError::Validation(format!(
+                            "auto pool '{name}' is scoped to {want} providers, but member '{}' \
+                             ({}) is {got} ({}) — remove the entry, or set `self_hosted` on \
+                             that provider if the inference is wrong",
+                            entry.provider, entry.model, provider.base_url
+                        )));
+                    }
+                }
+                if models_checked {
+                    let Some(provider) = provider else {
+                        return Err(ConfigError::Validation(format!(
+                            "auto pool '{name}' references unknown provider '{}'",
+                            entry.provider
+                        )));
                     };
-                    return Err(ConfigError::Validation(format!(
-                        "auto pool '{name}' is scoped to {want} providers, but member '{}' \
-                         ({}) is {got} ({}) — remove the entry, or set `self_hosted` on \
-                         that provider if the inference is wrong",
-                        entry.provider, entry.model, provider.base_url
-                    )));
+                    let allowed = auto.allowed_models.join(", ");
+                    // The model the pool entry asks for is what the upstream
+                    // is told to serve — the client sees this name.
+                    if !auto.allowed_models.iter().any(|m| m == &entry.model) {
+                        return Err(ConfigError::Validation(format!(
+                            "auto pool '{name}' is restricted to the models [{allowed}], but \
+                             member '{}' serves '{}' — remove the entry, or widen \
+                             `allowed_models`",
+                            entry.provider, entry.model
+                        )));
+                    }
+                    // ...and the model the provider falls back to when the
+                    // request does not name one must be on the list too, so a
+                    // member cannot answer with a model it did not declare.
+                    if let Some(default_model) = provider.default_model.as_deref() {
+                        if !default_model.is_empty()
+                            && !auto.allowed_models.iter().any(|m| m == default_model)
+                        {
+                            return Err(ConfigError::Validation(format!(
+                                "auto pool '{name}' is restricted to the models [{allowed}], but \
+                                 member '{}' defaults to '{}' — remove the entry, or widen \
+                                 `allowed_models`",
+                                entry.provider, default_model
+                            )));
+                        }
+                    }
                 }
             }
         }
@@ -2026,6 +2090,137 @@ provider = "humanizer"
 model = "humanizer-12b"
 "#;
         Config::parse(toml).expect("all three members are self-hosted");
+    }
+
+    #[test]
+    fn test_pool_model_allowlist_rejects_a_foreign_member() {
+        let toml = r#"
+[server]
+listen = "0.0.0.0:8080"
+
+[providers.gpu1]
+kind = "openai_compat"
+base_url = "http://10.126.126.20:11082"
+api_key = "x"
+default_model = "groot-awq"
+
+[providers.humanizer]
+kind = "openai_compat"
+base_url = "http://10.126.126.10:11060"
+api_key = "x"
+default_model = "humanizer-12b"
+
+[auto_models.auto_home]
+scope = "self_hosted"
+allowed_models = ["groot-awq"]
+
+[[auto_models.auto_home.pool]]
+provider = "gpu1"
+model = "groot-awq"
+[[auto_models.auto_home.pool]]
+provider = "humanizer"
+model = "humanizer-12b"
+"#;
+        let err = Config::parse(toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("auto pool 'auto_home'"), "{msg}");
+        assert!(msg.contains("groot-awq"), "{msg}");
+        assert!(msg.contains("humanizer-12b"), "{msg}");
+        assert!(msg.contains("allowed_models"), "{msg}");
+    }
+
+    #[test]
+    fn test_pool_model_allowlist_accepts_the_listed_members() {
+        let toml = r#"
+[server]
+listen = "0.0.0.0:8080"
+
+[providers.gpu1]
+kind = "openai_compat"
+base_url = "http://10.126.126.20:11082"
+api_key = "x"
+default_model = "groot-awq"
+
+[providers.gpu2]
+kind = "openai_compat"
+base_url = "http://10.126.126.20:11080"
+api_key = "x"
+default_model = "groot-awq"
+
+[auto_models.auto_home]
+scope = "self_hosted"
+allowed_models = ["groot-awq"]
+
+[[auto_models.auto_home.pool]]
+provider = "gpu1"
+model = "groot-awq"
+[[auto_models.auto_home.pool]]
+provider = "gpu2"
+model = "groot-awq"
+"#;
+        Config::parse(toml).expect("every member serves an allowed model");
+    }
+
+    #[test]
+    fn test_pool_model_allowlist_catches_a_provider_defaulting_outside_it() {
+        // The entry claims an allowed model, but the provider's own default
+        // is a different one: the member would answer with a model the pool
+        // never allowed, so the load has to fail.
+        let toml = r#"
+[server]
+listen = "0.0.0.0:8080"
+
+[providers.humanizer]
+kind = "openai_compat"
+base_url = "http://10.126.126.10:11060"
+api_key = "x"
+default_model = "humanizer-12b"
+
+[auto_models.auto_home]
+scope = "self_hosted"
+allowed_models = ["groot-awq"]
+
+[[auto_models.auto_home.pool]]
+provider = "humanizer"
+model = "groot-awq"
+"#;
+        let err = Config::parse(toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("auto pool 'auto_home'"), "{msg}");
+        assert!(msg.contains("defaults to 'humanizer-12b'"), "{msg}");
+    }
+
+    #[test]
+    fn test_pool_model_allowlist_defaults_to_unrestricted() {
+        // No `allowed_models` means no model boundary at all — the behaviour
+        // every config had before the field existed.
+        let toml = r#"
+[server]
+listen = "0.0.0.0:8080"
+
+[providers.gpu1]
+kind = "openai_compat"
+base_url = "http://10.126.126.20:11082"
+api_key = "x"
+default_model = "groot-awq"
+
+[providers.cloud]
+kind = "opencode"
+base_url = "https://opencode.ai"
+api_key = "x"
+default_model = "deepseek-v4.1-flash"
+
+[auto_models.anything]
+scope = "any"
+
+[[auto_models.anything.pool]]
+provider = "gpu1"
+model = "groot-awq"
+[[auto_models.anything.pool]]
+provider = "cloud"
+model = "deepseek-v4.1-flash"
+"#;
+        Config::parse(toml).expect("without allowed_models any model is allowed");
     }
 
     #[test]
