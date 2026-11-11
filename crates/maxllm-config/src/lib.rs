@@ -1000,7 +1000,11 @@ impl Config {
                         AutoPoolScope::SelfHosted => "self-hosted",
                         _ => "external vendor",
                     };
-                    let got = if self_hosted { "self-hosted" } else { "a vendor" };
+                    let got = if self_hosted {
+                        "self-hosted"
+                    } else {
+                        "a vendor"
+                    };
                     return Err(ConfigError::Validation(format!(
                         "auto pool '{name}' is scoped to {want} providers, but member '{}' \
                          ({}) is {got} ({}) — remove the entry, or set `self_hosted` on \
@@ -1910,7 +1914,7 @@ api_key = "x"
             ("http://localhost:8000/v1", true),
             ("http://192.168.2.190:3795", true),
             ("http://172.16.4.9:11060", true),
-            ("http://100.64.7.3:11082", true),   // CGNAT / mesh
+            ("http://100.64.7.3:11082", true), // CGNAT / mesh
             ("http://[::1]:8000", true),
             ("http://gpu-box.local:8000", true),
             ("https://api.minimaxi.com", false),
@@ -2100,6 +2104,9 @@ provider = "ghost"
 model = "groot-awq"
 "#;
         let err = Config::parse(toml).unwrap_err();
-        assert!(err.to_string().contains("unknown provider 'ghost'"), "{err}");
+        assert!(
+            err.to_string().contains("unknown provider 'ghost'"),
+            "{err}"
+        );
     }
 }

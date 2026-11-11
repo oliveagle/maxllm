@@ -2517,7 +2517,12 @@ impl AiGateway {
         if let Some(pool) = active_pool {
             let scoped = pool.scope != AutoPoolScope::Any;
             if let Some(pin) = ctx.path_pinned_provider.clone() {
-                if scoped && !hot.providers.get(&pin).is_some_and(|p| pool.scope_allows(p)) {
+                if scoped
+                    && !hot
+                        .providers
+                        .get(&pin)
+                        .is_some_and(|p| pool.scope_allows(p))
+                {
                     warn!(
                         provider = %pin,
                         pool = %pool.name,
@@ -2870,7 +2875,11 @@ impl AiGateway {
         // before the per-candidate breakdown, so the 503 reads as the
         // boundary check it is.
         if let (Some(pin), Some(pool)) = (ctx.path_pinned_provider.as_deref(), scoped_pool) {
-            if hot.providers.get(pin).is_some_and(|p| !pool.scope_allows(p)) {
+            if hot
+                .providers
+                .get(pin)
+                .is_some_and(|p| !pool.scope_allows(p))
+            {
                 let want = match pool.scope {
                     AutoPoolScope::SelfHosted => "self-hosted",
                     _ => "external vendor",
@@ -3594,7 +3603,8 @@ impl AiGateway {
             // otherwise silently replace the sentinel with the wrong pool's
             // model and answer 200.
             let hot = self.hot.load();
-            self.reject_scoped_sentinel_mismatch(&hot, session, ctx).await?;
+            self.reject_scoped_sentinel_mismatch(&hot, session, ctx)
+                .await?;
             if let Some((_, auto_model)) = ctx.auto_target.clone() {
                 if !ctx.request_body_buf.is_empty() {
                     if let Ok(mut v) =
@@ -4195,8 +4205,7 @@ impl AiGateway {
         if ctx.request_body_buf.is_empty() || ctx.provider_name.is_empty() {
             return Ok(());
         }
-        let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&ctx.request_body_buf)
-        else {
+        let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&ctx.request_body_buf) else {
             return Ok(());
         };
         let Some(sentinel) = parsed
@@ -7775,7 +7784,7 @@ impl AiGateway {
         // boundary must not count as a usable fallback — it could never carry
         // the request without breaking the boundary.
         let in_scope = |name: &str| -> bool {
-            scoped_pool.map_or(true, |pool| {
+            scoped_pool.is_none_or(|pool| {
                 hot.providers
                     .get(name)
                     .is_some_and(|p| pool.scope_allows(p))
@@ -7931,7 +7940,7 @@ impl AiGateway {
             .filter(|name| *name != &ctx.provider_name)
             .filter(|name| !ctx.attempted_providers.contains(*name))
             .filter(|name| {
-                scoped_pool.map_or(true, |pool| {
+                scoped_pool.is_none_or(|pool| {
                     hot.providers
                         .get(name.as_str())
                         .is_some_and(|p| pool.scope_allows(p))
@@ -7950,8 +7959,8 @@ impl AiGateway {
             // trigger it (test_unknown_model_is_rewritten_to_the_fallback
             // _default). Skipping then would turn a rewritable 200 into a 503.
             .filter(|name| {
-                !(fallback_member_known_not_to_carry(&hot, name, &ctx.model)
-                    && !self.no_later_candidate_carries_model(&hot, ctx))
+                !fallback_member_known_not_to_carry(&hot, name, &ctx.model)
+                    || self.no_later_candidate_carries_model(&hot, ctx)
             })
             .find_map(|name| {
                 hot.providers
