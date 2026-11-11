@@ -299,6 +299,14 @@ pub struct RequestCtx {
     /// Whether at least one non-empty response body chunk was handed back to
     /// pingora (i.e. the client already received stream data).
     pub client_body_written: bool,
+    /// Whether the stream reported a failure of the answer itself although
+    /// the upstream answered 200 (a quota wall, an upstream error event).
+    ///
+    /// Such a failure is invisible in the HTTP status, so the header-time
+    /// failover never sees it. The body filter detects it in the translated
+    /// stream and hands the request to the failover chain; this flag keeps
+    /// the decision to one place when the failure spans several chunks.
+    pub stream_failure_seen: bool,
     /// A synthetic health probe (`X-MaxLLM-Probe: 1`). It is served normally
     /// but excluded from metrics, request logs and circuit-breaker accounting,
     /// so a monitor cannot poison the production signals it measures.
@@ -393,6 +401,7 @@ impl RequestCtx {
             stream_truncated: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             client_aborted: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             client_body_written: false,
+            stream_failure_seen: false,
             probe_request: false,
             path_pinned_provider: None,
             own_error: None,
