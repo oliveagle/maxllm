@@ -53,6 +53,11 @@ pub struct SessionEntry {
     pub provider: String,
     /// Last time the session was used (ns epoch).
     pub last_accessed: u64,
+    /// Strict recency order (1 = most recent). The wall clock is not enough to
+    /// order two bindings: two accesses inside the same clock tick produce the
+    /// same `last_accessed`, and then the LRU victim would be picked by hash
+    /// order — i.e. at random. This counter gives the eviction a total order.
+    pub seq: u64,
 }
 
 /// In-memory session → provider binding store with LRU eviction.
@@ -67,6 +72,8 @@ pub struct SessionStore {
     evictions: AtomicU64,
     /// When the expired entries were last swept (ms epoch).
     last_sweep: AtomicU64,
+    /// Monotonic counter handing out each binding's recency rank.
+    seq_counter: AtomicU64,
 }
 
 impl SessionStore {
@@ -79,6 +86,7 @@ impl SessionStore {
             misses: AtomicU64::new(0),
             evictions: AtomicU64::new(0),
             last_sweep: AtomicU64::new(0),
+            seq_counter: AtomicU64::new(0),
         }
     }
 
@@ -95,6 +103,7 @@ impl SessionStore {
                     return None;
                 }
                 entry.last_accessed = now;
+                entry.seq = self.next_seq();
                 self.hits.fetch_add(1, Ordering::Relaxed);
                 Some(entry.provider.clone())
             }
@@ -103,6 +112,12 @@ impl SessionStore {
                 None
             }
         }
+    }
+
+    /// Hand out the next recency rank. Strictly increasing, so the LRU
+    /// eviction never has to break a tie on the wall clock.
+    fn next_seq(&self) -> u64 {
+        self.seq_counter.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     /// Look up a binding without refreshing access time or counters. Used to
@@ -137,6 +152,7 @@ impl SessionStore {
             SessionEntry {
                 provider: provider.to_string(),
                 last_accessed: now,
+                seq: self.next_seq(),
             },
         );
         // Evict the least recently used entry when over the cap.
@@ -144,7 +160,7 @@ impl SessionStore {
         while entries.len() > self.max_entries {
             let oldest = entries
                 .iter()
-                .min_by_key(|(_, e)| e.last_accessed)
+                .min_by_key(|(_, e)| e.seq)
                 .map(|(k, _)| k.clone());
             match oldest {
                 Some(key) => {
@@ -307,6 +323,46 @@ mod tests {
         assert!(store.get("s2").is_none());
         assert_eq!(store.get("s1").as_deref(), Some("p1"));
         assert_eq!(store.evictions(), 1);
+    }
+
+    #[test]
+    fn test_eviction_breaks_a_timestamp_tie_by_recency_order() {
+        // Two bindings used within the same clock tick share a `last_accessed`.
+        // The eviction must still pick the genuinely older one, not whichever
+        // the hash map happens to yield first.
+        let store = SessionStore::new(2, 3600);
+        let now = now_ns();
+        // Keep the store's counter ahead of the ranks we hand out by hand.
+        store.seq_counter.store(2, Ordering::Relaxed);
+        {
+            let mut entries = store.entries.lock().unwrap();
+            // Identical timestamps, but s1 was touched after s2: the recency
+            // rank is the only thing that can order them.
+            entries.insert(
+                "s1".to_string(),
+                SessionEntry {
+                    provider: "p1".to_string(),
+                    last_accessed: now,
+                    seq: 2,
+                },
+            );
+            entries.insert(
+                "s2".to_string(),
+                SessionEntry {
+                    provider: "p2".to_string(),
+                    last_accessed: now,
+                    seq: 1,
+                },
+            );
+        }
+        // Insert a third entry, forcing one eviction.
+        store.set("s3", "p3");
+        assert_eq!(store.len(), 2);
+        assert!(
+            store.get("s2").is_none(),
+            "the older binding must be evicted"
+        );
+        assert_eq!(store.get("s1").as_deref(), Some("p1"));
     }
 
     #[test]
