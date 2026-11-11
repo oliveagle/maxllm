@@ -4968,6 +4968,348 @@ async fn test_500_with_a_quota_body_is_treated_as_a_quota_wall() {
     assert_eq!(state, Some(1.0), "the breaker must be open (1)");
 }
 
+/// A raw HTTP/1.1 upstream that sends the response head first and the body
+/// later — the shape that makes the proxy commit the head to the client
+/// before the first body chunk arrives.
+///
+/// The head and the body are separated by a real delay, so the two arrive in
+/// different proxy batches: the head is written on its own, and the body
+/// filter only runs when the head is already on the wire.
+async fn spawn_split_response_server(
+    head: &'static [u8],
+    body: &'static [u8],
+) -> (String, Arc<AtomicUsize>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let served = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&served);
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            counter.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                let _ = socket.read(&mut buf).await;
+                let _ = socket.write_all(head).await;
+                let _ = socket.flush().await;
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                // The head announces a chunked body, so the body has to be
+                // chunked too — and the terminator has to close it.
+                let size = format!("{:x}\r\n", body.len());
+                let _ = socket.write_all(size.as_bytes()).await;
+                let _ = socket.write_all(body).await;
+                let _ = socket.write_all(b"\r\n0\r\n\r\n").await;
+                let _ = socket.flush().await;
+                let _ = socket.shutdown().await;
+            });
+        }
+    });
+    (format!("http://{}", addr), served)
+}
+
+/// The harder shape of the same defect: the upstream sends its response head
+/// first and the failing event later, so the head is already committed to the
+/// client when the failure shows up. The failover cannot take the head back —
+/// but the member must still be judged (quota wall → force-open) so the
+/// *next* request escapes it instead of walking into the same wall forever.
+#[tokio::test]
+async fn test_quota_wall_after_the_head_was_committed_escapes_on_the_next_request() {
+    let head = concat!(
+        "HTTP/1.1 200 OK\r\n",
+        "Content-Type: text/event-stream\r\n",
+        "Transfer-Encoding: chunked\r\n",
+        "\r\n",
+    )
+    .as_bytes();
+    let quota = concat!(
+        "event: response.failed\n",
+        "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_fail\",\"object\":\"response\",\"status\":\"failed\",\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"您已达到每周/每月使用上限，您的限额将在 2099-01-01 00:00:00 重置。\"},\"output\":[]}}\n\n",
+    )
+    .as_bytes();
+    let (primary, primary_hits) = spawn_split_response_server(head, quota).await;
+    let fallback = MockServer::start().await;
+
+    let ok = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_ok\",\"object\":\"response\",\"status\":\"in_progress\"}}\n\n",
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_ok\",\"output_index\":0,\"content_index\":0,\"delta\":\"from fallback\"}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_ok\",\"object\":\"response\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n",
+    );
+    Mock::given(method("POST"))
+        .and(path("/zen/go/v1/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(ok, "text/event-stream"),
+        )
+        .expect(1..)
+        .mount(&fallback)
+        .await;
+
+    let config = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[metrics]
+enabled = true
+
+[rate_limit_learning]
+enabled = true
+default_cooldown_secs = 300
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.primary]
+kind = "opencode"
+base_url = "{MOCK_URL}"
+upstream_path = "/zen/go/v1/chat/completions"
+responses_path = "/zen/go/v1/responses"
+native_responses = true
+api_key = "fake-key"
+
+[providers.fallback]
+kind = "opencode"
+base_url = "{FALLBACK_URL}"
+upstream_path = "/zen/go/v1/chat/completions"
+responses_path = "/zen/go/v1/responses"
+native_responses = true
+api_key = "fake-key"
+
+[[routes]]
+path = "/v1/responses"
+provider = "primary"
+fallback = ["fallback"]
+endpoint_type = "responses"
+strategy = "fallback"
+max_failover_attempts = 4
+"#;
+
+    let gw = TestGateway::start_with_fallback(config, &primary, &fallback.uri()).await;
+    let c = client();
+
+    // First request: the head is already on the wire, so the failure cannot
+    // be taken back — the client is told the answer failed.
+    let resp = c
+        .post(gw.url("/v1/responses"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&json!({"model": "m", "input": "hi", "stream": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let text = resp.text().await.unwrap();
+    assert!(
+        text.contains("response.failed"),
+        "the client must be told the answer failed: {text}"
+    );
+
+    // The member is judged all the same: the wall is a quota wall, so it is
+    // force-opened until the reset instant its own message named.
+    let quota_opens = metric_sample(
+        &gw,
+        "maxllm_circuit_breaker_quota_opens_total{provider=\"primary\"}",
+    )
+    .await;
+    assert_eq!(
+        quota_opens,
+        Some(1.0),
+        "the quota wall must force-open the member even when the head was committed"
+    );
+
+    // Second request: the walled member is skipped — this is what breaks the
+    // endless "reconnecting" loop.
+    let resp = c
+        .post(gw.url("/v1/responses"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&json!({"model": "m", "input": "hi again", "stream": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers().get("X-MaxLLM-Provider").unwrap(), "fallback");
+    let text = resp.text().await.unwrap();
+    assert!(text.contains("from fallback"), "{text}");
+    assert_eq!(
+        primary_hits.load(Ordering::SeqCst),
+        1,
+        "the walled member must not be asked a second time"
+    );
+}
+
+/// A provider that hits a quota wall *inside* its stream answers `200 OK` and
+/// then emits the failure as the first event of the stream. The HTTP status
+/// says nothing about it, so the header-time failover never triggers — and a
+/// session-sticky pool keeps sending the request to the same broken member,
+/// which the client experiences as an endless "reconnecting".
+///
+/// The request must walk on to the next member of the chain (the client sees
+/// only the healthy answer), and the member must be parked until the reset
+/// instant its own message names — so the wall is learned instead of waiting
+/// for a human to drop the member from the pool.
+#[tokio::test]
+async fn test_quota_wall_inside_a_200_stream_fails_over_to_the_next_member() {
+    let primary = MockServer::start().await;
+    let fallback = MockServer::start().await;
+
+    // Zhipu's real answer: 200, and the failure as the first (only) event.
+    let quota = concat!(
+        "event: response.failed\n",
+        "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_fail\",\"object\":\"response\",\"status\":\"failed\",\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"您已达到每周/每月使用上限，您的限额将在 2099-01-01 00:00:00 重置。\"},\"output\":[]}}\n\n",
+    );
+    Mock::given(method("POST"))
+        .and(path("/zen/go/v1/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(quota, "text/event-stream"),
+        )
+        .expect(1)
+        .mount(&primary)
+        .await;
+
+    // The fallback answers a healthy Responses stream.
+    let ok = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_ok\",\"object\":\"response\",\"status\":\"in_progress\"}}\n\n",
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_ok\",\"output_index\":0,\"content_index\":0,\"delta\":\"from fallback\"}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_ok\",\"object\":\"response\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n",
+    );
+    Mock::given(method("POST"))
+        .and(path("/zen/go/v1/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(ok, "text/event-stream"),
+        )
+        // Two requests reach the fallback: the first one (after the failover)
+        // and the second one (which must skip the walled member).
+        .expect(2)
+        .mount(&fallback)
+        .await;
+
+    let config = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[metrics]
+enabled = true
+
+[rate_limit_learning]
+enabled = true
+default_cooldown_secs = 300
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.primary]
+kind = "opencode"
+base_url = "{MOCK_URL}"
+upstream_path = "/zen/go/v1/chat/completions"
+responses_path = "/zen/go/v1/responses"
+native_responses = true
+api_key = "fake-key"
+
+[providers.fallback]
+kind = "opencode"
+base_url = "{FALLBACK_URL}"
+upstream_path = "/zen/go/v1/chat/completions"
+responses_path = "/zen/go/v1/responses"
+native_responses = true
+api_key = "fake-key"
+
+[[routes]]
+path = "/v1/responses"
+provider = "primary"
+fallback = ["fallback"]
+endpoint_type = "responses"
+strategy = "fallback"
+max_failover_attempts = 4
+"#;
+
+    let gw = TestGateway::start_with_fallback(config, &primary.uri(), &fallback.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/responses"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&json!({"model": "m", "input": "hi", "stream": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers().get("X-MaxLLM-Provider").unwrap(), "fallback");
+    let text = resp.text().await.unwrap();
+
+    // The client must not see the failed attempt at all.
+    assert!(
+        !text.contains("response.failed"),
+        "the quota wall must not reach the client: {text}"
+    );
+    assert!(
+        !text.contains("rate_limit_exceeded"),
+        "the quota wall must not reach the client: {text}"
+    );
+    assert!(text.contains("from fallback"), "{text}");
+
+    // The member that hit the wall is parked until the reset instant its own
+    // message named — the pool stops sending requests to it on its own.
+    let quota_opens = metric_sample(
+        &gw,
+        "maxllm_circuit_breaker_quota_opens_total{provider=\"primary\"}",
+    )
+    .await;
+    assert_eq!(
+        quota_opens,
+        Some(1.0),
+        "the quota wall must force-open the member exactly once"
+    );
+    let state = metric_sample(&gw, "maxllm_circuit_breaker_state{provider=\"primary\"}").await;
+    assert_eq!(state, Some(1.0), "the breaker must be open (1)");
+
+    // And the failure is visible as what it is — not as a clean 200.
+    let failures = metric_sample(&gw, "maxllm_stream_failures_total{provider=\"primary\"}").await;
+    assert_eq!(failures, Some(1.0), "the stream failure must be counted");
+
+    // The wall is learned: the next request does not touch the member at
+    // all (the mock expects exactly one call — a second one would fail the
+    // expectation and answer with an error).
+    let resp = c
+        .post(gw.url("/v1/responses"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&json!({"model": "m", "input": "hi again", "stream": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers().get("X-MaxLLM-Provider").unwrap(), "fallback");
+    let text = resp.text().await.unwrap();
+    assert!(text.contains("from fallback"), "{text}");
+    assert_eq!(
+        primary.received_requests().await.unwrap().len(),
+        1,
+        "the walled member must not be asked a second time"
+    );
+}
+
 /// The flip side of the 500-quota fix: a *genuine* 500 (no quota phrasing)
 /// must stay an ordinary transient failure — fail over, count a normal
 /// failure, never a quota open. Without the status-aware fallback the
@@ -12964,7 +13306,14 @@ async fn test_body_sentinel_beats_the_path_and_the_session_header() {
     }
 
     // 1. The bug: `auto_home` on the `auto` route *with* a session header.
-    let (s1, b1) = ask(&c, &base, "/v1/chat/completions", "sess-sentinel-1", "auto_home").await;
+    let (s1, b1) = ask(
+        &c,
+        &base,
+        "/v1/chat/completions",
+        "sess-sentinel-1",
+        "auto_home",
+    )
+    .await;
     // 2. `auto` on that same route still runs on the vendor pool.
     let (s2, b2) = ask(&c, &base, "/v1/chat/completions", "sess-sentinel-2", "auto").await;
     // 3. The mirror image: `auto` on the `auto_home` route runs on vendors,
@@ -12986,11 +13335,19 @@ async fn test_body_sentinel_beats_the_path_and_the_session_header() {
         "auto_home on the auto route must run on the home pool: {b1}"
     );
     assert_eq!(s2, 200);
-    assert_eq!(reply_model(&b2), "vendor", "auto must stay on vendors: {b2}");
+    assert_eq!(
+        reply_model(&b2),
+        "vendor",
+        "auto must stay on vendors: {b2}"
+    );
     assert_eq!(s3, 200);
     assert_eq!(reply_model(&b3), "vendor", "auto on the home route: {b3}");
     assert_eq!(s4, 200);
-    assert_eq!(reply_model(&b4), "home", "auto_home on the home route: {b4}");
+    assert_eq!(
+        reply_model(&b4),
+        "home",
+        "auto_home on the home route: {b4}"
+    );
 
     // The sentinel itself never reaches an upstream: the entry's model does.
     assert!(!home_reqs.is_empty());

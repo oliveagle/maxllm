@@ -6489,9 +6489,13 @@ impl ProxyHttp for AiGateway {
                             }
                         };
                         if let Some(ref t) = translated {
-                            let mut translated = t.clone();
-                            observe_stream_chunk(&mut translated, ctx, end_of_stream);
+                            let translated = t.clone();
                             *body = Some(translated);
+                            // A stream that failed inside a 200 is invisible
+                            // to the header-time failover — the body filter
+                            // is the only place that can see it.
+                            let out = body.as_mut().expect("body was just set");
+                            self.observe_stream_output(session, ctx, out, end_of_stream)?;
                         }
                     }
                 } else {
@@ -6667,9 +6671,13 @@ impl ProxyHttp for AiGateway {
                         }
                     };
                     if let Some(ref t) = translated {
-                        let mut translated = t.clone();
-                        observe_stream_chunk(&mut translated, ctx, end_of_stream);
+                        let translated = t.clone();
                         *body = Some(translated);
+                        // A stream that failed inside a 200 is invisible to
+                        // the header-time failover — the body filter is the
+                        // only place that can see it.
+                        let out = body.as_mut().expect("body was just set");
+                        self.observe_stream_output(session, ctx, out, end_of_stream)?;
                     }
                 }
             } else {
@@ -6878,9 +6886,13 @@ impl ProxyHttp for AiGateway {
                         }
                     };
                     if let Some(ref t) = translated {
-                        let mut translated = t.clone();
-                        observe_stream_chunk(&mut translated, ctx, end_of_stream);
+                        let translated = t.clone();
                         *body = Some(translated);
+                        // A stream that failed inside a 200 is invisible to
+                        // the header-time failover — the body filter is the
+                        // only place that can see it.
+                        let out = body.as_mut().expect("body was just set");
+                        self.observe_stream_output(session, ctx, out, end_of_stream)?;
                     }
                 }
             }
@@ -7411,6 +7423,7 @@ impl ProxyHttp for AiGateway {
         // circuit opens and routing walks to the next fallback provider.
         let judged_stream = ctx.is_streaming
             && ctx.upstream_status == 200
+            && !ctx.stream_failure_seen
             && tracks_stream_terminal(ctx.endpoint_type)
             && (ctx.stream_terminal_seen || truncated);
         if judged_stream {
@@ -7457,6 +7470,7 @@ impl ProxyHttp for AiGateway {
         // because the caller stopped listening, and counting it as "the
         // provider reported nothing" would point at the wrong party.
         if !truncated
+            && !ctx.stream_failure_seen
             && !ctx
                 .client_aborted
                 .load(std::sync::atomic::Ordering::Relaxed)
@@ -7528,6 +7542,16 @@ impl ProxyHttp for AiGateway {
                 .await;
         }
 
+        // A stream that failed inside a 200 is a failure of the exchange,
+        // not a clean answer: the request log must not book it as a
+        // successful 200 — that is exactly how a quota wall used to hide in
+        // the reports ("the provider served 200, the client saw nothing").
+        let logged_status = if ctx.stream_failure_seen {
+            502
+        } else {
+            ctx.upstream_status
+        };
+
         let latency_ms = duration.as_millis() as u64;
         // Feed the auto pool's latency filter with the *whole* exchange
         // duration (time-to-last-byte). Successes only: the cohort must rank
@@ -7539,7 +7563,7 @@ impl ProxyHttp for AiGateway {
         // a prefix prefill that the next turn will not repeat, and it is that
         // prefill — not the provider — that makes the first request of every
         // conversation slow.
-        if ctx.upstream_status < 400 && !ctx.provider_name.is_empty() {
+        if logged_status < 400 && !ctx.provider_name.is_empty() {
             let warm = ctx.cached_tokens_in.saturating_mul(2) >= ctx.tokens_in;
             crate::provider_stats::record_total_latency(
                 &ctx.provider_name,
@@ -7608,7 +7632,7 @@ impl ProxyHttp for AiGateway {
                 cached_tokens: ctx.cached_tokens_in,
                 cost_usd: cost,
                 latency_ms,
-                status: ctx.upstream_status,
+                status: logged_status,
                 request_id: ctx.plugin_ctx.request_id.clone(),
                 session_id: ctx.session_id.clone(),
                 client_ip: ctx.plugin_ctx.client_ip.clone(),
@@ -7628,7 +7652,7 @@ impl ProxyHttp for AiGateway {
         self.record_event(
             EVENT_CLIENT_RESPONSE,
             ctx,
-            Some(ctx.upstream_status),
+            Some(logged_status),
             Some(latency_ms),
             e.map(|err| err.to_string()).or(truncation_error),
             ctx.upstream_body.clone(),
@@ -8300,6 +8324,180 @@ impl AiGateway {
         e.as_up();
         e.set_retry(true);
         Err(e)
+    }
+
+    /// Observe one translated stream chunk and, when the chunk reports a
+    /// failure of the answer itself, hand the request to the failover chain.
+    ///
+    /// The chunk is the *translated* one: the gateway normalizes every
+    /// upstream dialect into the Responses grammar, so one marker
+    /// (`response.failed`) covers both a provider that speaks the Responses
+    /// protocol natively and a chat-only provider whose error the translator
+    /// turns into the same event.
+    fn observe_stream_output(
+        &self,
+        session: &mut Session,
+        ctx: &mut RequestCtx,
+        out: &mut Bytes,
+        end_of_stream: bool,
+    ) -> pingora::Result<Option<std::time::Duration>> {
+        // The failure is looked for in the chunk **as the upstream sent it**,
+        // before the gateway appends its own verdict. The gateway's own
+        // truncation event is an `event: error` too, and it must not be
+        // mistaken for an upstream failure: a truncated stream is booked as
+        // truncated (and demotes the provider), not failed over.
+        let failed = stream_chunk_reports_failure(out, ctx.endpoint_type);
+        observe_stream_chunk(out, ctx, end_of_stream);
+        if !failed {
+            return Ok(None);
+        }
+        self.handle_stream_failure(session, ctx, out)
+    }
+
+    /// Handle a stream whose answer failed although the upstream answered 200.
+    ///
+    /// A quota wall (or an upstream error event) that arrives *inside* the
+    /// stream is invisible in the HTTP status: the header-time failover sees
+    /// a healthy 200, the breaker has no error code to learn from, and the
+    /// session-sticky pool keeps sending the request to the same broken
+    /// member. That is what a client experiences as an endless
+    /// "reconnecting" — the request never gets an answer and never leaves
+    /// the broken provider either.
+    ///
+    /// The decision has two halves:
+    ///
+    /// * **the member is judged** — a quota wall is a deterministic fact
+    ///   (the provider says when it resets), so the breaker is force-opened
+    ///   until that instant and the pool stops sending requests to it. The
+    ///   manual "drop the member from the pool" fix becomes unnecessary:
+    ///   the wall is learned, parked and forgotten on its own.
+    /// * **the request walks on** — when nothing reached the client yet, the
+    ///   failover chain takes over and the client sees only the next
+    ///   provider's answer. When the response head already reached the
+    ///   client, the failure cannot be taken back: it is passed through
+    ///   (the client must know the answer failed) and the *next* request
+    ///   escapes the member, because the pin is gone and the breaker counted
+    ///   the failure.
+    fn handle_stream_failure(
+        &self,
+        session: &mut Session,
+        ctx: &mut RequestCtx,
+        chunk: &[u8],
+    ) -> pingora::Result<Option<std::time::Duration>> {
+        // A failure that spans several chunks is judged once.
+        if ctx.stream_failure_seen {
+            return Ok(None);
+        }
+        ctx.stream_failure_seen = true;
+
+        let provider = ctx.provider_name.clone();
+        METRICS
+            .stream_failures_total
+            .with_label_values(&[&provider])
+            .inc();
+
+        // ── Judge the member ──────────────────────────────────────────
+        //
+        // The failure message is classified with the same body parser the
+        // 429/500 path uses: a quota phrase plus a reset instant is a wall
+        // that ends at a known moment, a quota phrase without one is a wall
+        // of unknown length, anything else is an ordinary failure.
+        let utc_offset_minutes = {
+            let hot = self.hot.load();
+            hot.providers
+                .get(&provider)
+                .map(|p| p.utc_offset_minutes)
+                .unwrap_or(0)
+        };
+        let text = String::from_utf8_lossy(chunk);
+        let (is_rate_limit, candidates) =
+            crate::rate_limit::parse_body_text_with_offset(&text, utc_offset_minutes);
+        let now = crate::rate_limit::now_ms();
+        // A reset instant in the past says nothing about the wall in front
+        // of us (the message may be a stale one) — such a message parks the
+        // member on the cooldown ladder instead of pinning it to a deadline
+        // that has already passed.
+        let reset_at_ms = candidates.iter().map(|c| c.at_ms).find(|at| *at > now);
+        let quota_wall = is_rate_limit == Some(true);
+
+        {
+            let hot = self.hot.load();
+            if let Some(p) = hot.providers.get(&provider) {
+                if quota_wall {
+                    match reset_at_ms {
+                        Some(at) => {
+                            p.circuit_breaker.record_quota_until(at);
+                            info!(
+                                provider = %provider,
+                                reset_at_ms = at,
+                                "the upstream stream carried a quota wall — force-opened until the reset instant"
+                            );
+                        }
+                        None => {
+                            let base = self.rate_limit_resolver.default_cooldown_secs() * 1000;
+                            let cooldown = p.circuit_breaker.record_quota_unknown(base);
+                            info!(
+                                provider = %provider,
+                                cooldown_ms = cooldown,
+                                "the upstream stream carried a quota wall without a reset instant — parked on the cooldown ladder"
+                            );
+                        }
+                    }
+                    METRICS
+                        .circuit_breaker_quota_opens_total
+                        .with_label_values(&[&provider])
+                        .inc();
+                } else if !ctx.probe_request {
+                    // Not a quota wall — an ordinary failure. A probe must
+                    // not move the breaker for it (see the 429/500 path).
+                    p.circuit_breaker.record_failure();
+                    info!(
+                        provider = %provider,
+                        "the upstream stream failed inside a 200 response — counted as an ordinary failure"
+                    );
+                }
+                METRICS
+                    .circuit_breaker_state
+                    .with_label_values(&[&provider])
+                    .set(p.circuit_breaker.state() as i64);
+                self.persist_circuit_breaker(&provider, &p.circuit_breaker);
+            }
+        }
+
+        // A failed member must not keep the session pinned — neither for
+        // this request (it walks on) nor for the next one (it must not walk
+        // into the same wall again).
+        self.unpin_session(ctx);
+
+        // ── Walk on to the next member ────────────────────────────────
+        //
+        // `response_written()` is None while the response head is still
+        // uncommitted, i.e. while nothing has reached the client. Only then
+        // can the failed attempt be replaced whole by the next provider's
+        // attempt; once the head is on the wire the client already has a
+        // 200 and a second head would be a protocol break.
+        if session.response_written().is_none() {
+            // Nothing reached the client: the failed attempt leaves no
+            // trace, so the stream bookkeeping starts over on the retry.
+            ctx.client_body_written = false;
+            ctx.stream_terminal_seen = false;
+            ctx.stream_scan_tail.clear();
+            return self.fail_over_from_body_filter(
+                session,
+                ctx,
+                502,
+                "the upstream stream failed inside a 200 response",
+            );
+        }
+
+        // The client already holds the head: the failure is passed through
+        // (it must know the answer failed), and the next request escapes the
+        // member on its own — the pin is gone and the breaker counted it.
+        warn!(
+            provider = %provider,
+            "the upstream stream failed inside a 200 response after the head reached the client — the failure is passed through"
+        );
+        Ok(None)
     }
 }
 
@@ -9060,6 +9258,47 @@ fn stream_carries_terminal(bytes: &[u8]) -> bool {
     STREAM_TERMINAL_MARKERS
         .iter()
         .any(|marker| find_bytes(bytes, marker, 0).is_some())
+}
+
+/// Markers that prove the *answer* failed although the upstream answered 200.
+///
+/// A provider that hits a quota wall inside its stream answers `200 OK` and
+/// then emits the failure as the first (often only) event of the stream —
+/// Zhipu writes `event: response.failed` carrying `rate_limit_exceeded` and
+/// a Chinese quota message. The HTTP status says nothing about it, so the
+/// header-time failover never triggers; the session-sticky pool keeps
+/// sending the request to the same broken member, which the client sees as
+/// an endless "reconnecting".
+const STREAM_FAILURE_MARKERS: &[&[u8]] = &[
+    b"event: response.failed",
+    b"event: error",
+    b"\"type\":\"response.failed\"",
+];
+
+/// The chat dialect reports a failed answer as a data line whose JSON
+/// carries a top-level `error` object (`data: {"error":{"message":…}}`).
+///
+/// The brace has to follow the quote directly: an assistant that *writes*
+/// JSON in its answer carries the escaped form (`{\"error\"`), which this
+/// marker does not match.
+const CHAT_FAILURE_MARKERS: &[&[u8]] = &[b"{\"error\"", b"{ \"error\""];
+
+/// Whether the chunk reports a failure of the answer itself.
+///
+/// `endpoint` decides the dialect: the Responses protocol has a dedicated
+/// failure event, the chat protocol has none and reuses a JSON error
+/// object.
+fn stream_chunk_reports_failure(chunk: &[u8], endpoint: EndpointType) -> bool {
+    let markers: &[&[u8]] = match endpoint {
+        EndpointType::Responses => STREAM_FAILURE_MARKERS,
+        EndpointType::ChatCompletions | EndpointType::Completions => CHAT_FAILURE_MARKERS,
+        // The other dialects speak a provider-specific grammar the gateway
+        // does not parse, so it cannot tell a failure from a normal event.
+        _ => &[],
+    };
+    markers
+        .iter()
+        .any(|marker| find_bytes(chunk, marker, 0).is_some())
 }
 
 /// Mark this exchange as truncated (idempotent) and bump the counters once.

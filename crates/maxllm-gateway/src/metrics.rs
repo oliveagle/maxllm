@@ -91,6 +91,11 @@ pub struct GatewayMetrics {
     pub client_aborted_total: IntCounterVec,
     /// Circuit force-opens caused by an excessive stream-truncation ratio.
     pub circuit_breaker_stream_opens_total: IntCounterVec,
+    /// Streams whose answer failed *inside* a 200 response — a quota wall or
+    /// an upstream error event. The HTTP status says nothing about them, so
+    /// they are invisible to the header-time failover; without this counter
+    /// they look like ordinary successful answers in the request log.
+    pub stream_failures_total: IntCounterVec,
     /// Failovers caused by an upstream HTTP error (the request is retried on
     /// the next provider of the route's fallback chain).
     pub http_failovers_total: IntCounterVec,
@@ -396,6 +401,18 @@ impl GatewayMetrics {
             .register(Box::new(stream_truncated_before_first_byte_total.clone()))
             .expect("register");
 
+        let stream_failures_total = IntCounterVec::new(
+            Opts::new(
+                "maxllm_stream_failures_total",
+                "Streams whose answer failed inside a 200 response (quota wall, upstream error event)",
+            ),
+            &["provider"],
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(stream_failures_total.clone()))
+            .expect("register");
+
         let usage_missing_total = IntCounterVec::new(
             Opts::new(
                 "maxllm_usage_missing_total",
@@ -532,6 +549,7 @@ impl GatewayMetrics {
             fallbacks_total,
             stream_truncated_total,
             stream_truncated_before_first_byte_total,
+            stream_failures_total,
             usage_missing_total,
             streams_judged_total,
             client_aborted_total,
