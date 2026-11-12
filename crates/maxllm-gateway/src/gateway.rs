@@ -8410,8 +8410,11 @@ impl AiGateway {
                 .unwrap_or(0)
         };
         let text = String::from_utf8_lossy(chunk);
-        let (is_rate_limit, candidates) =
+        let (is_rate_limit, mut candidates) =
             crate::rate_limit::parse_body_text_with_offset(&text, utc_offset_minutes);
+        // A sentinel reset (the 2026-11-11 `2099-01-01` wall) is a parseable
+        // timestamp but not a believable quota window: park on the ladder.
+        crate::rate_limit::retain_plausible_reset_candidates(&mut candidates);
         let now = crate::rate_limit::now_ms();
         // A reset instant in the past says nothing about the wall in front
         // of us (the message may be a stale one) — such a message parks the

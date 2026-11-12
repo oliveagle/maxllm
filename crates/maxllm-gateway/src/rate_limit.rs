@@ -59,11 +59,55 @@ pub struct ResetCandidate {
     pub raw: String,
 }
 
+/// The farthest-out reset instant this gateway will believe.
+///
+/// Every quota window the gateway routes is hours to a month long (5-hour /
+/// weekly / monthly), so a reset instant more than 45 days away is not a
+/// reset instant: it is a parser reading a sentinel value, a bogus header,
+/// or a deadline that rotted (in SQLite, or adopted from a peer that parsed
+/// one before this bound existed).
+///
+/// The 2026-11-11 incident: a streamed `200` carried quota phrasing and the
+/// date `2099-01-01`; `find_absolute_times` read it as an absolute instant
+/// (`reset_at_ms = 4070908800000`), the breaker force-opened `opencode_go_1`
+/// until it, and the member silently left the `auto` pool for 73 years while
+/// the provider's own usage API reported `rolling 0%` — no limit at all.
+///
+/// Anything past this horizon is dropped before it can become a deadline, so
+/// the member parks on the cooldown ladder (minutes → hours) instead.
+pub const MAX_RESET_HORIZON_MS: u64 = 45 * 24 * 60 * 60 * 1000;
+
+/// Is `at_ms` close enough to now to be a real reset instant?
+///
+/// Only the far side is bounded: an instant in the past is a stale message,
+/// which the callers already treat as "no deadline" on their own.
+pub fn plausible_reset_instant(at_ms: u64) -> bool {
+    at_ms <= now_ms().saturating_add(MAX_RESET_HORIZON_MS)
+}
+
+/// Drop reset candidates no quota window can express.
+///
+/// Routing code must call this after the recognition layer returns raw
+/// candidates. Keeping the policy at the trust boundary makes the intent
+/// explicit and lets parser tests use fixed far-future dates without those
+/// dates becoming fixtures that rot.
+pub fn retain_plausible_reset_candidates(candidates: &mut Vec<ResetCandidate>) {
+    candidates.retain(|c| plausible_reset_instant(c.at_ms));
+}
+
 /// Parse rate-limit headers into an absolute epoch-ms reset instant.
 ///
 /// Only the most trustworthy header wins — checked in order of increasing
 /// imprecision (absolute timestamps before relative durations).
+///
+/// A header declaring a reset farther out than [`MAX_RESET_HORIZON_MS`] is
+/// not a reset declaration — it is dropped here, so the caller falls through
+/// to the body instead of parking a member for decades.
 pub fn resolve_from_headers(headers: &http::HeaderMap) -> Option<(u64, &'static str)> {
+    resolve_from_headers_inner(headers).filter(|(at, _)| plausible_reset_instant(*at))
+}
+
+fn resolve_from_headers_inner(headers: &http::HeaderMap) -> Option<(u64, &'static str)> {
     let now_ms = now_ms();
 
     // Absolute reset instants (most precise first).
@@ -146,6 +190,10 @@ fn header_str<'a>(headers: &'a http::HeaderMap, name: &str) -> Option<&'a str> {
 /// Returns `(is_rate_limit, candidates)` where `is_rate_limit` is `Some(true)`
 /// when a deterministic rate-limit phrase was found, `Some(false)` when a
 /// deterministic non-rate-limit phrase was found, `None` when inconclusive.
+///
+/// This is the recognition layer: it deliberately returns all parseable
+/// candidates so timestamp-shape tests stay independent of today's clock.
+/// Routing callers apply [`plausible_reset_instant`] before trusting one.
 #[cfg(test)]
 pub fn parse_body_text(text: &str) -> (Option<bool>, Vec<ResetCandidate>) {
     parse_body_text_with_offset(text, 0)
@@ -153,6 +201,9 @@ pub fn parse_body_text(text: &str) -> (Option<bool>, Vec<ResetCandidate>) {
 
 /// Same as [`parse_body_text`], but interprets **zone-less** timestamps in the
 /// given fixed UTC offset (minutes east of UTC) instead of UTC.
+///
+/// Like its wrapper, this is recognition rather than a routing decision;
+/// apply [`retain_plausible_reset_candidates`] before using a candidate.
 ///
 /// Upstreams routinely omit the zone on quota messages — Zhipu writes
 /// `您的限额将在 2026-11-10 22:58:54 重置` in Beijing time with no offset — and
@@ -887,15 +938,21 @@ mod tests {
 
     /// Every absolute-reset header family resolves to its own label and
     /// value — absolute instants win over relative durations.
+    ///
+    /// The instant is computed at run time: a header reset beyond the
+    /// plausibility horizon is deliberately dropped, so a fixed far-future
+    /// date would test the horizon instead of the header family.
     #[test]
     fn resolve_headers_absolute_families() {
-        let expect = utc_ms(2099, 1, 1, 0, 0, 0);
+        let reset = Utc::now() + chrono::Duration::days(30);
+        let expect = reset.timestamp_millis() as u64;
+        let stamp = reset.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         for name in [
             "anthropic-ratelimit-requests-reset",
             "anthropic-ratelimit-tokens-reset",
             "anthropic-ratelimit-unified-reset",
         ] {
-            let h = headers(&[(name, "2099-01-01T00:00:00Z")]);
+            let h = headers(&[(name, &stamp)]);
             let (ms, src) = resolve_from_headers(&h).unwrap();
             assert_eq!(src, "anthropic_reset_header", "{name}");
             assert_eq!(ms, expect, "{name}");
@@ -909,7 +966,7 @@ mod tests {
 
         // An absolute header outranks every relative one.
         let h = headers(&[
-            ("anthropic-ratelimit-requests-reset", "2099-01-01T00:00:00Z"),
+            ("anthropic-ratelimit-requests-reset", &stamp),
             ("x-ratelimit-reset-requests", "6m0s"),
             ("retry-after", "120"),
             ("ratelimit-reset", "30"),
@@ -944,6 +1001,50 @@ mod tests {
         let (ms, src) = resolve_from_headers(&h).unwrap();
         assert_eq!(src, "ratelimit_reset");
         assert!(ms >= before + 30_000 && ms <= now_ms() + 30_000);
+    }
+
+    /// The recognition layer can see a sentinel timestamp even though routing
+    /// must never trust it. Keeping these concerns separate lets timestamp
+    /// shape tests use fixed dates without rotting into failure detectors.
+    #[test]
+    fn a_far_future_body_candidate_is_recogned_then_rejected() {
+        let text = "配额已用完，将在 2099-01-01 00:00:00 重置";
+        let (is_rl, mut cands) = parse_body_text(text);
+        assert_eq!(is_rl, Some(true));
+        assert_eq!(cands.len(), 1);
+
+        retain_plausible_reset_candidates(&mut cands);
+        assert!(
+            cands.is_empty(),
+            "a 73-year-away instant is not a reset window"
+        );
+    }
+
+    #[test]
+    fn a_near_future_body_candidate_is_trusted() {
+        let reset = Utc::now() + chrono::Duration::days(3);
+        let text = format!(
+            "Rate limit exceeded. Quota resets at {}",
+            reset.format("%Y-%m-%d %H:%M:%S")
+        );
+        let (is_rl, mut cands) = parse_body_text(&text);
+        assert_eq!(is_rl, Some(true));
+        assert_eq!(cands.len(), 1);
+        // The prose form carries second precision — compare on that grid.
+        let expect = reset.timestamp_millis() as u64 / 1000 * 1000;
+        assert_eq!(cands[0].at_ms, expect);
+
+        retain_plausible_reset_candidates(&mut cands);
+        assert_eq!(cands.len(), 1);
+    }
+
+    /// A reset header that claims a reset after the horizon is not a reset
+    /// declaration. Dropping it lets the caller fall through to the body or
+    /// the cooldown ladder instead of pinning a member for decades.
+    #[test]
+    fn a_far_future_reset_header_is_rejected() {
+        let h = headers(&[("x-ratelimit-reset", "4102444800")]); // 2100-01-01
+        assert!(resolve_from_headers(&h).is_none());
     }
 
     /// A bare epoch second in the body becomes a reset candidate; out-of-range

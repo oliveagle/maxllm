@@ -5219,6 +5219,10 @@ enabled = true
 enabled = true
 default_cooldown_secs = 300
 
+[admin]
+master_key = "test-master-key"
+enabled = true
+
 [plugins.api_auth]
 category = "key_auth"
 header = "Authorization"
@@ -5289,6 +5293,34 @@ max_failover_attempts = 4
     );
     let state = metric_sample(&gw, "maxllm_circuit_breaker_state{provider=\"primary\"}").await;
     assert_eq!(state, Some(1.0), "the breaker must be open (1)");
+
+    // The 2026-11-11 incident: the wall named `2099-01-01`, the parser read
+    // it as an instant, and the member left the pool for 73 years while its
+    // own usage API reported no limit at all. A reset instant no quota
+    // window can express is not a reset — the member parks on the cooldown
+    // ladder instead.
+    let report: Value = c
+        .get(gw.url("/admin/breakers"))
+        .bearer_auth("test-master-key")
+        .send()
+        .await
+        .expect("the breaker report answers")
+        .json()
+        .await
+        .expect("the report is JSON");
+    let until = report["breakers"]
+        .as_array()
+        .and_then(|b| {
+            b.iter()
+                .find(|e| e["provider"] == "primary")
+                .and_then(|e| e["force_open_until"].as_u64())
+        })
+        .expect("the walled member is listed");
+    let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+    assert!(
+        until > now_ms && until < now_ms + 24 * 60 * 60 * 1000,
+        "the sentinel must not become the deadline (until={until})"
+    );
 
     // And the failure is visible as what it is — not as a clean 200.
     let failures = metric_sample(&gw, "maxllm_stream_failures_total{provider=\"primary\"}").await;

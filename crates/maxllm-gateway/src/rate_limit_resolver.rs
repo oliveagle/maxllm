@@ -146,8 +146,9 @@ impl RateLimitResolver {
         }
 
         let text = String::from_utf8_lossy(body);
-        let (is_rate_limit, candidates) =
+        let (is_rate_limit, mut candidates) =
             rate_limit::parse_body_text_with_offset(&text, utc_offset_minutes);
+        rate_limit::retain_plausible_reset_candidates(&mut candidates);
         let fingerprint = if text.trim().is_empty() {
             None
         } else {
@@ -290,8 +291,9 @@ impl RateLimitResolver {
             }
         }
         let text = String::from_utf8_lossy(body);
-        let (is_rate_limit, candidates) =
+        let (is_rate_limit, mut candidates) =
             rate_limit::parse_body_text_with_offset(&text, utc_offset_minutes);
+        rate_limit::retain_plausible_reset_candidates(&mut candidates);
         let fingerprint = if text.trim().is_empty() {
             None
         } else {
@@ -397,11 +399,16 @@ impl RateLimitResolver {
             return Some(RateLimitDecision::OrdinaryFailure);
         }
         match verdict.chosen_reset_at_ms {
-            Some(at) => Some(RateLimitDecision::QuotaUntil {
-                reset_at_ms: at,
-                source: "laya",
-            }),
-            None => Some(RateLimitDecision::QuotaUnknown),
+            // Laya picks from the candidates this gateway already filtered,
+            // but its answer is an external opinion: an instant no quota
+            // window can express is not a reset, it is a wrong answer.
+            Some(at) if rate_limit::plausible_reset_instant(at) => {
+                Some(RateLimitDecision::QuotaUntil {
+                    reset_at_ms: at,
+                    source: "laya",
+                })
+            }
+            Some(_) | None => Some(RateLimitDecision::QuotaUnknown),
         }
     }
 
@@ -608,6 +615,38 @@ mod tests {
         // The 429 sync path keeps the ladder fallback.
         let (decision429, _) = resolver.resolve_sync(429, &headers(&[]), b"unexpected", 0);
         assert_eq!(decision429, RateLimitDecision::QuotaUnknown);
+    }
+
+    /// Laya's opinion is still an opinion: it can choose a timestamp the
+    /// deterministic parser would have rejected as a sentinel. That answer
+    /// becomes "quota, reset unknown", never a decades-long deadline.
+    #[tokio::test]
+    async fn laya_far_future_reset_is_downgraded_to_unknown() {
+        let cfg = ResolverConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let laya = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "answers": {
+                        "is_rate_limit": {"noul": 0.99},
+                        "reset_time": {"choice": "4070908800000"}
+                    }
+                })),
+            )
+            .mount(&laya)
+            .await;
+
+        let resolver = RateLimitResolver::new(cfg, Some(&laya.uri()), None, None);
+        let (decision, learned) = resolver
+            .resolve(429, &headers(&[]), b"rate limit exceeded", 0)
+            .await;
+        assert_eq!(decision, RateLimitDecision::QuotaUnknown);
+        let learned = learned.expect("the deterministic rate-limit shape is learned");
+        assert!(learned.is_rate_limit);
+        assert_eq!(learned.reset_expression.as_deref(), None);
     }
 
     #[tokio::test]

@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use maxllm_admin::CircuitBreakerStateRow;
+use tracing::warn;
 
 /// Circuit states (kept as small ints so the whole breaker fits in atomics).
 pub const STATE_CLOSED: u8 = 0;
@@ -368,6 +369,22 @@ impl CircuitBreaker {
         if reset_at_ms <= now {
             return; // already reset; nothing to force-open
         }
+        // Last line of defence: a deadline no quota window can express is a
+        // parser reading a sentinel (`2099-01-01`), not a wall. Parking a
+        // member for decades silently shrinks the pool — the 2026-11-11
+        // opencode_go_1 incident — so park on the cooldown ladder instead.
+        // Callers normally never get here: the body/header layers already
+        // drop implausible instants, which is what makes their logs honest.
+        if reset_at_ms > now.saturating_add(crate::rate_limit::MAX_RESET_HORIZON_MS) {
+            warn!(
+                reset_at_ms,
+                now,
+                horizon_ms = crate::rate_limit::MAX_RESET_HORIZON_MS,
+                "implausible quota reset instant — parking on the cooldown ladder instead"
+            );
+            self.record_quota_unknown(self.quota_cooldown_ms());
+            return;
+        }
         // The wall has a known end: the ladder starts over when it is
         // answered again.
         self.quota_cooldown_level.store(0, Ordering::Relaxed);
@@ -395,6 +412,17 @@ impl CircuitBreaker {
     pub fn extend_quota_until(&self, reset_at_ms: u64) -> bool {
         let now = now_ms();
         if reset_at_ms <= now {
+            return false;
+        }
+        // A peer parses upstream text the same way this node does: before the
+        // horizon bound existed it could have adopted a sentinel instant and
+        // be trying to hand it over now. Adopting it would re-infect this
+        // node (and the SQLite row) with a decades-long wall.
+        if reset_at_ms > now.saturating_add(crate::rate_limit::MAX_RESET_HORIZON_MS) {
+            warn!(
+                reset_at_ms,
+                now, "peer reported an implausible quota deadline — not adopted"
+            );
             return false;
         }
         let current = self.force_open_until_ms.load(Ordering::Relaxed);
@@ -813,9 +841,38 @@ impl CircuitBreaker {
         self.last_probe_admit_ms.store(0, Ordering::Relaxed);
         self.last_failure_at
             .store(row.last_failure_at, Ordering::Relaxed);
-        self.state.store(row.state, Ordering::Relaxed);
+        // A persisted deadline can outlive the wall it described — or never
+        // have described one (the 2026-11-11 sentinel, written to SQLite and
+        // re-adopted by every peer). Restoring it would park the member for
+        // decades across restarts, so drop it: the member starts closed with
+        // a clean failure count (the count was `max_fails` only because the
+        // quota open set it; it is not failure history), and re-learns the
+        // wall in one request if the wall is still there.
+        let dropped_deadline =
+            row.force_open_until > now_ms().saturating_add(crate::rate_limit::MAX_RESET_HORIZON_MS);
+        if dropped_deadline {
+            warn!(
+                force_open_until = row.force_open_until,
+                provider = %row.provider,
+                "persisted quota deadline is implausible — dropping it"
+            );
+            self.failures.store(0, Ordering::Relaxed);
+        }
+        let force_open_until = if dropped_deadline {
+            0
+        } else {
+            row.force_open_until
+        };
+        self.state.store(
+            if dropped_deadline {
+                STATE_CLOSED
+            } else {
+                row.state
+            },
+            Ordering::Relaxed,
+        );
         self.force_open_until_ms
-            .store(row.force_open_until, Ordering::Relaxed);
+            .store(force_open_until, Ordering::Relaxed);
         self.state_transitions
             .store(row.transitions, Ordering::Relaxed);
         self.quota_opens.store(row.quota_opens, Ordering::Relaxed);
@@ -1136,6 +1193,63 @@ mod tests {
             "4 truncations in 8 judged streams must demote"
         );
         assert_eq!(cb.stream_opens(), 1, "the demotion is counted once");
+    }
+
+    /// A known deadline beyond every possible quota window is a sentinel or a
+    /// rotted row. The last-line guard must park on the ladder, not accept it.
+    #[test]
+    fn test_an_implausible_quota_deadline_parks_on_the_ladder() {
+        let cb = CircuitBreaker::new(3, 60);
+        cb.record_quota_until(
+            now_ms() + crate::rate_limit::MAX_RESET_HORIZON_MS + 24 * 60 * 60 * 1000,
+        );
+
+        assert!(cb.is_open(), "the implausible wall still parks the member");
+        assert!(
+            cb.force_open_until_ms() < now_ms() + 24 * 60 * 60 * 1000,
+            "the deadline is the cooldown ladder, not the sentinel"
+        );
+    }
+
+    /// Peer adoption cannot re-infect this node with a far-future deadline.
+    #[test]
+    fn test_an_implausible_peer_quota_deadline_is_not_adopted() {
+        let cb = CircuitBreaker::new(3, 60);
+        let valid = now_ms() + 60 * 60 * 1000;
+        assert!(cb.extend_quota_until(valid));
+        assert!(
+            !cb.extend_quota_until(
+                now_ms() + crate::rate_limit::MAX_RESET_HORIZON_MS + 60 * 60 * 1000
+            ),
+            "a sentinel deadline must be refused"
+        );
+        assert_eq!(cb.force_open_until_ms(), valid);
+    }
+
+    /// A bad row written before the horizon bound existed must not survive a
+    /// restart: the member starts closed and relearns any real wall.
+    #[test]
+    fn test_an_implausible_persisted_quota_deadline_is_dropped_on_restore() {
+        let row = CircuitBreakerStateRow {
+            provider: "opencode_go_1".to_string(),
+            state: STATE_OPEN,
+            failures: 3,
+            last_failure_at: now_ms(),
+            force_open_until: now_ms()
+                + crate::rate_limit::MAX_RESET_HORIZON_MS
+                + 24 * 60 * 60 * 1000,
+            successes_half_open: 0,
+            transitions: 1,
+            quota_opens: 1,
+            updated_at: chrono::Utc::now(),
+        };
+        let cb = CircuitBreaker::new(3, 60);
+        cb.restore(&row);
+
+        assert!(!cb.is_open(), "a sentinel row must not park the member");
+        assert_eq!(cb.state(), STATE_CLOSED);
+        assert_eq!(cb.force_open_until_ms(), 0);
+        assert_eq!(cb.failure_count(), 0);
     }
 
     fn hold_secs(cb: &CircuitBreaker) -> u64 {
