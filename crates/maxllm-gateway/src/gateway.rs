@@ -3469,6 +3469,9 @@ impl AiGateway {
                             &ctx.request_body_buf,
                         ),
                     };
+                    if maxllm_translate::responses::body_has_synthetic_call_id(&normalized) {
+                        ctx.repaired_call_ids = true;
+                    }
                     let mut out = normalized;
                     // This request keeps the client's Content-Length (the
                     // upstream answers a chunked request with a 400), so the
@@ -3704,6 +3707,10 @@ impl AiGateway {
                     Ok(translated) => {
                         if translated.is_streaming {
                             ctx.is_streaming = true;
+                        }
+                        if maxllm_translate::responses::body_has_synthetic_call_id(&translated.body)
+                        {
+                            ctx.repaired_call_ids = true;
                         }
                         ctx.request_body_buf = translated.body;
                     }
@@ -4080,11 +4087,13 @@ impl AiGateway {
                 // repairs the provider needs (nested function tools -> flat,
                 // the OpenDesign link's `tool_choice: "any"`).
                 let translated = if ctx.native_responses {
+                    let body =
+                        Self::normalize_native_responses_body(provider, &ctx.request_body_buf);
+                    if maxllm_translate::responses::body_has_synthetic_call_id(&body) {
+                        ctx.repaired_call_ids = true;
+                    }
                     Ok(TranslatedRequest {
-                        body: Self::normalize_native_responses_body(
-                            provider,
-                            &ctx.request_body_buf,
-                        ),
+                        body,
                         is_streaming: ctx.is_streaming,
                     })
                 } else {
@@ -4433,6 +4442,16 @@ fn should_failover_status(status: u16, ctx: &RequestCtx, provider: &ProviderStat
         // The request is wrong — unless this provider simply does not carry
         // the requested model (its own default differs from the request).
         400 | 422 => {
+            // A request whose tool-call ids the gateway had to repair can be
+            // rejected for a shape the upstream does not accept — "input[N].
+            // call_id: expected a non-empty string", "tool_call_id  is not
+            // found". The client did nothing wrong: handing it that 400
+            // would break the agent's loop over a request the gateway
+            // itself produced. The next provider of the chain may well
+            // accept the same conversation, so the request walks on.
+            if ctx.repaired_call_ids {
+                return true;
+            }
             !ctx.model.is_empty()
                 && provider
                     .default_model

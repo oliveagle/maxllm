@@ -2106,10 +2106,171 @@ async fn test_native_responses_repairs_a_missing_call_id() {
         !call_id.trim().is_empty(),
         "the upstream received an empty call_id: {sent}"
     );
-    // The item itself survives the repair — dropping it would take the
-    // user's goal out of the model's view.
-    assert_eq!(sent["input"][1]["output"], json!("the goal"));
+    // The orphan gets a call of its own — a strict upstream rejects an
+    // answer whose call is not in the request ("tool_call_id  is not
+    // found", verified live against kimi).
+    assert_eq!(sent["input"][1]["type"], json!("function_call"));
     assert_eq!(sent["input"][1]["name"], json!("goal_objective"));
+    // The item itself survives the repair — dropping it would take the
+    // user's goal out of the model's view — and it answers that call.
+    assert_eq!(sent["input"][2]["type"], json!("function_call_output"));
+    assert_eq!(sent["input"][2]["call_id"], json!(call_id));
+    assert_eq!(sent["input"][2]["output"], json!("the goal"));
+    assert_eq!(sent["input"][2]["name"], json!("goal_objective"));
+}
+
+const CALL_ID_FAILOVER_CONFIG: &str = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[metrics]
+enabled = true
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.strict_native]
+kind = "openai_compat"
+base_url = "{MOCK_URL}"
+upstream_path = "/v1/responses"
+api_key = "fake-key"
+native_responses = true
+responses_path = "/v1/responses"
+default_model = "strict-model"
+
+[providers.lucky_native]
+kind = "openai_compat"
+base_url = "{FALLBACK_URL}"
+upstream_path = "/v1/responses"
+api_key = "fake-key"
+native_responses = true
+responses_path = "/v1/responses"
+default_model = "strict-model"
+
+[[routes]]
+path = "/v1/responses"
+provider = "strict_native"
+fallback = ["lucky_native"]
+strategy = "fallback"
+endpoint_type = "responses"
+"#;
+
+#[tokio::test]
+async fn test_a_call_id_rejection_fails_over_instead_of_breaking_the_loop() {
+    // A provider that rejects the conversation because of a call id must not
+    // hand that 400 to the client: the agent's loop would stop on it. The
+    // request walks on to the next provider of the chain.
+    let primary = MockServer::start().await;
+    let fallback = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": {
+                "code": "invalid_request_error",
+                "message": "Invalid request: tool_call_id  is not found",
+                "type": "invalid_request_error"
+            }
+        })))
+        .mount(&primary)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "resp_ok",
+            "object": "response",
+            "status": "completed",
+            "model": "strict-model",
+            "output": [],
+            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+        })))
+        .mount(&fallback)
+        .await;
+
+    let config = CALL_ID_FAILOVER_CONFIG
+        .replace("{MOCK_URL}", &primary.uri())
+        .replace("{FALLBACK_URL}", &fallback.uri());
+    let gw = TestGateway::start(&config, &primary.uri()).await;
+    let c = client();
+
+    // The conversation carries the host-side tool output codex records: a
+    // `function_call_output` without a `call_id`.
+    let request_body = json!({
+        "model": "strict-model",
+        "input": [
+            {"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "hi"}]},
+            {"type": "function_call_output", "id": "fco_1",
+             "name": "goal_objective", "output": "the goal"}
+        ],
+        "stream": false
+    });
+
+    let resp = c
+        .post(gw.url("/v1/responses"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&request_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "the client must not see the provider's call-id rejection"
+    );
+
+    // The fallback provider answered.
+    let fallback_requests = fallback.received_requests().await.unwrap();
+    assert_eq!(fallback_requests.len(), 1);
+}
+
+#[tokio::test]
+async fn test_a_call_id_rejection_without_a_fallback_stays_a_400() {
+    // With no provider left to try, the upstream's own answer is what the
+    // client gets — the gateway does not invent one.
+    let mock = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/zen/go/v1/responses"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": {
+                "code": "invalid_request_error",
+                "message": "input[4].call_id: expected a non-empty string",
+                "type": "invalid_request_error"
+            }
+        })))
+        .mount(&mock)
+        .await;
+
+    let gw = TestGateway::start(NATIVE_RESPONSES_CONFIG, &mock.uri()).await;
+    let c = client();
+
+    let request_body = json!({
+        "model": "deepseek-v4.1-flash",
+        "input": [
+            {"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "hi"}]},
+            {"type": "function_call_output", "id": "fco_1",
+             "name": "goal_objective", "output": "the goal"}
+        ],
+        "stream": false
+    });
+
+    let resp = c
+        .post(gw.url("/v1/responses"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&request_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
 }
 
 #[tokio::test]

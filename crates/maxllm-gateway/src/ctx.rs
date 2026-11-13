@@ -212,6 +212,14 @@ pub struct RequestCtx {
     pub pending_model_404: bool,
     /// The 404 error body collected while `pending_model_404` is set.
     pub model_404_body_buf: Vec<u8>,
+    /// Set when the gateway rewrote the request's tool-call ids (a call or a
+    /// tool output without a `call_id`, or a tool output whose call was not
+    /// in the request). The upstream then judges a body the gateway vouched
+    /// for: if it still answers 400/422, the complaint is about the shape the
+    /// gateway produced, not about the client's request — so the request
+    /// walks on to the next provider instead of breaking the agent's loop
+    /// with a 400.
+    pub repaired_call_ids: bool,
     /// The auto-rotation target selected for this request: (provider, model).
     /// Set when the route carries the `auto` sentinel; the request body's
     /// model field is rewritten to this model before it is sent upstream.
@@ -387,6 +395,7 @@ impl RequestCtx {
             rate_limit_headers: Vec::new(),
             pending_model_404: false,
             model_404_body_buf: Vec::new(),
+            repaired_call_ids: false,
             auto_target: None,
             auto_pool: None,
             model_override: None,

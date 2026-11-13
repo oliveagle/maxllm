@@ -84,9 +84,26 @@ const PASSTHROUGH_CHAT_FIELDS: &[&str] = &[
     "n",
 ];
 
+/// Repair the call ids of a Responses request body, returning the (possibly
+/// unchanged) bytes. A body that does not parse as JSON is returned as-is.
+fn repair_body_call_ids(body: &[u8]) -> Vec<u8> {
+    let Ok(mut root) = serde_json::from_slice::<Value>(body) else {
+        return body.to_vec();
+    };
+    if !repair_input_call_ids(&mut root) {
+        return body.to_vec();
+    }
+    serde_json::to_vec(&root).unwrap_or_else(|_| body.to_vec())
+}
+
 /// Translate a Responses API request body into a chat completions body.
 pub fn responses_request_to_chat(body: &[u8]) -> Result<TranslatedRequest, TranslateError> {
-    let req: ResponsesRequest = serde_json::from_slice(body)?;
+    // A tool output without a `call_id` becomes a chat tool message with an
+    // empty `tool_call_id`, and a chat upstream rejects it ("tool_call_id
+    //  is not found", verified live against kimi). Repair the ids before the
+    // translation: the chat form then carries a complete call/answer pair.
+    let body = repair_body_call_ids(body);
+    let req: ResponsesRequest = serde_json::from_slice(&body)?;
 
     let model = req
         .model
@@ -929,15 +946,71 @@ pub fn normalize_responses_request(body: &[u8]) -> Vec<u8> {
     }
 }
 
-/// The item types that carry a `call_id` in the Responses contract.
-const CALL_ID_ITEM_TYPES: [&str; 4] = [
-    "function_call",
-    "function_call_output",
-    "custom_tool_call",
-    "custom_tool_call_output",
-];
+/// The marker of a call id the gateway invented. A body that carries it was
+/// rewritten by the gateway — the gateway must know that, because a request
+/// it rewrote is a request whose shape it can vouch for.
+const SYNTHETIC_CALL_ID_PREFIX: &str = "call_maxllm_";
 
-/// Give every call-bearing input item a non-empty `call_id`.
+/// Whether the body carries a synthetic call id (see
+/// [`repair_input_call_ids`]).
+pub fn body_has_synthetic_call_id(body: &[u8]) -> bool {
+    String::from_utf8_lossy(body).contains(SYNTHETIC_CALL_ID_PREFIX)
+}
+
+/// A call in the input, with the id its answer must carry.
+struct CallSlot {
+    id: String,
+    /// An output has already claimed this call.
+    answered: bool,
+}
+
+/// Build the call item that pairs with an orphaned tool output.
+///
+/// A tool output whose call is not in the request is an orphan: the host
+/// ran the tool itself (codex's goal tool does) and recorded only its
+/// output. Strict upstreams reject such a dangling answer **even when it
+/// carries a non-empty id** — kimi answers `Invalid request: tool_call_id
+///  is not found` for an output whose `call_id` matches no call in the
+/// request (verified live against `api.kimi.com/coding/v1/responses`, which
+/// accepts the same body once the call is present).
+///
+/// So the orphan gets a call of its own, right before it: the pair is then
+/// complete and every upstream accepts it. The call carries the output's
+/// own name, so the model reads "a tool called <name> returned this".
+fn synthetic_call_item(call_id: &str, output: &Value, seq: usize) -> Value {
+    let name = output
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("tool")
+        .to_string();
+    let custom = output.get("type").and_then(|t| t.as_str()) == Some("custom_tool_call_output");
+    let mut call = serde_json::Map::new();
+    call.insert(
+        "type".into(),
+        Value::String(if custom {
+            "custom_tool_call".into()
+        } else {
+            "function_call".into()
+        }),
+    );
+    call.insert("id".into(), Value::String(format!("fc_maxllm_{seq}")));
+    call.insert("call_id".into(), Value::String(call_id.to_string()));
+    call.insert("name".into(), Value::String(name));
+    if let Some(namespace) = output.get("namespace").and_then(|v| v.as_str()) {
+        call.insert("namespace".into(), Value::String(namespace.to_string()));
+    }
+    if custom {
+        call.insert("input".into(), Value::String(String::new()));
+    } else {
+        call.insert("arguments".into(), Value::String("{}".into()));
+    }
+    Value::Object(call)
+}
+
+/// Give every call-bearing input item a non-empty `call_id`, and make sure
+/// every tool output answers a call that is actually in the request.
 ///
 /// The Responses contract requires a non-empty `call_id` on `function_call`
 /// and `function_call_output` items (and on their `custom_tool_call` twins).
@@ -956,68 +1029,146 @@ const CALL_ID_ITEM_TYPES: [&str; 4] = [
 /// The repair mirrors the chat-side `repair_tool_call_ids`:
 /// * a call item with an empty/missing `call_id` gets a synthetic
 ///   `call_maxllm_<n>` and waits for an answer;
-/// * an output item with an empty/missing `call_id` consumes the oldest
-///   waiting synthetic id — so a call and its answer stay paired — and gets a
-///   fresh synthetic id when no call is waiting.
+/// * an output item with an empty/missing `call_id` answers the oldest call
+///   that is still waiting for an answer — so a call and its answer stay
+///   paired — and gets a fresh synthetic id when no call is waiting;
+/// * an output item that already carries a `call_id` keeps it: rewriting a
+///   call id the client chose would break the pairing with the item that
+///   issued the call.
 ///
-/// An output item that already carries a `call_id` is left alone: the
-/// upstream accepts an answer whose call it cannot see (verified live), and
-/// rewriting a call id the client chose would break the pairing with the
-/// item that issued the call.
+/// A tool output whose call is **not in the request** is an orphan, and an
+/// orphan is not enough for a strict upstream: kimi rejects an answer whose
+/// `call_id` matches no call with `Invalid request: tool_call_id  is not
+/// found` (verified live). Such an output therefore gets a call of its own,
+/// inserted right before it and carrying the id the output already had —
+/// the client's id is never rewritten, only completed.
 ///
-/// Returns true if any `call_id` was written.
+/// Returns true if the input was changed.
 pub fn repair_input_call_ids(root: &mut Value) -> bool {
     let Some(items) = root.get_mut("input").and_then(|i| i.as_array_mut()) else {
         return false;
     };
+    let mut original = std::mem::take(items);
 
     let mut modified = false;
     let mut seq: usize = 0;
-    // Synthetic ids handed to call items that no output has answered yet.
-    let mut waiting: std::collections::VecDeque<String> = std::collections::VecDeque::new();
 
-    for item in items.iter_mut() {
+    // ── Pass 1: every call gets a `call_id` ──────────────────────────────
+    let mut calls: Vec<CallSlot> = Vec::new();
+    // (index, synthetic id) of the calls that needed one — written after
+    // the scan, so the scan can borrow the items immutably.
+    let mut synthetic_calls: Vec<(usize, String)> = Vec::new();
+    for (idx, item) in original.iter().enumerate() {
         let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        if !CALL_ID_ITEM_TYPES.contains(&item_type) {
+        if !matches!(item_type, "function_call" | "custom_tool_call") {
             continue;
         }
-        let is_call = matches!(item_type, "function_call" | "custom_tool_call");
         let current = item
             .get("call_id")
             .and_then(|v| v.as_str())
             .unwrap_or("")
-            .trim();
-        if !current.is_empty() {
-            // An answer that carries a real id consumes the synthetic id it
-            // answers, so a later output does not reuse it.
-            if !is_call {
-                if let Some(pos) = waiting.iter().position(|id| id == current) {
-                    waiting.remove(pos);
-                }
-            }
-            continue;
-        }
-
-        let new_id = if is_call {
+            .trim()
+            .to_string();
+        if current.is_empty() {
             seq += 1;
-            let id = format!("call_maxllm_{seq}");
-            waiting.push_back(id.clone());
-            id
+            let id = format!("{SYNTHETIC_CALL_ID_PREFIX}{seq}");
+            synthetic_calls.push((idx, id.clone()));
+            calls.push(CallSlot {
+                id,
+                answered: false,
+            });
         } else {
-            match waiting.pop_front() {
-                Some(id) => id,
-                None => {
-                    seq += 1;
-                    format!("call_maxllm_{seq}")
-                }
-            }
-        };
-        if let Some(obj) = item.as_object_mut() {
-            obj.insert("call_id".into(), Value::String(new_id));
+            calls.push(CallSlot {
+                id: current,
+                answered: false,
+            });
+        }
+    }
+    for (idx, id) in synthetic_calls {
+        if let Some(obj) = original[idx].as_object_mut() {
+            obj.insert("call_id".into(), Value::String(id));
             modified = true;
         }
     }
 
+    // ── Pass 2: every output gets a `call_id`, and a call to answer ─────
+    // (index, call id, whether the output needs a call of its own)
+    let mut plans: Vec<(usize, String, bool)> = Vec::new();
+    for (idx, item) in original.iter().enumerate() {
+        let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        if !matches!(
+            item_type,
+            "function_call_output" | "custom_tool_call_output"
+        ) {
+            continue;
+        }
+        let current = item
+            .get("call_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if !current.is_empty() {
+            // The answer names a call. When that call is in the request the
+            // pair is complete; otherwise the answer is an orphan and gets a
+            // call of its own (carrying the id the client chose).
+            let mut matched = false;
+            for slot in calls.iter_mut() {
+                if slot.id == current {
+                    matched = true;
+                    if !slot.answered {
+                        slot.answered = true;
+                        break;
+                    }
+                }
+            }
+            plans.push((idx, current, !matched));
+        } else {
+            // The answer does not name its call: it answers the oldest call
+            // that is still waiting for an answer.
+            match calls.iter_mut().find(|slot| !slot.answered) {
+                Some(slot) => {
+                    slot.answered = true;
+                    plans.push((idx, slot.id.clone(), false));
+                }
+                None => {
+                    seq += 1;
+                    plans.push((idx, format!("{SYNTHETIC_CALL_ID_PREFIX}{seq}"), true));
+                }
+            }
+        }
+    }
+
+    // ── Pass 3: write the ids and insert the missing calls ──────────────
+    let mut out: Vec<Value> = Vec::with_capacity(original.len());
+    let mut plan_at = 0usize;
+    let mut call_seq = 0usize;
+    for (idx, mut item) in original.into_iter().enumerate() {
+        while plan_at < plans.len() && plans[plan_at].0 == idx {
+            let (_, call_id, needs_own_call) = plans[plan_at].clone();
+            plan_at += 1;
+            if needs_own_call {
+                call_seq += 1;
+                out.push(synthetic_call_item(&call_id, &item, call_seq));
+                modified = true;
+            }
+            if let Some(obj) = item.as_object_mut() {
+                let current = obj
+                    .get("call_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if current.is_empty() {
+                    obj.insert("call_id".into(), Value::String(call_id));
+                    modified = true;
+                }
+            }
+        }
+        out.push(item);
+    }
+
+    *items = out;
     modified
 }
 
@@ -4664,17 +4815,120 @@ mod tests {
             ]
         });
         assert!(repair_input_call_ids(&mut root));
+        // The orphan gets a call of its own, right before it: a strict
+        // upstream rejects an answer whose call is not in the request
+        // ("tool_call_id  is not found").
+        assert_eq!(root["input"][1]["type"], json!("function_call"));
+        assert_eq!(root["input"][1]["name"], json!("goal_objective"));
         let call_id = root["input"][1]["call_id"]
             .as_str()
             .expect("call_id missing");
         assert!(
             !call_id.trim().is_empty(),
-            "the output item still has no call_id"
+            "the synthetic call has no call_id"
         );
-        // The item itself is kept — dropping it would take the user's goal
-        // out of the model's view.
-        assert_eq!(root["input"][1]["output"], json!("the goal"));
-        assert_eq!(root["input"][1]["name"], json!("goal_objective"));
+        // The output item itself is kept — dropping it would take the
+        // user's goal out of the model's view — and it answers that call.
+        assert_eq!(root["input"][2]["type"], json!("function_call_output"));
+        assert_eq!(root["input"][2]["call_id"], json!(call_id));
+        assert_eq!(root["input"][2]["output"], json!("the goal"));
+        assert_eq!(root["input"][2]["name"], json!("goal_objective"));
+    }
+
+    #[test]
+    fn test_an_orphan_output_gets_a_call_that_names_the_same_tool() {
+        // The synthetic call carries the output's own name and namespace, so
+        // the model reads "a tool called <name> returned this".
+        let mut root = json!({
+            "input": [
+                {"type": "function_call_output", "id": "fco_1",
+                 "name": "goal_objective", "namespace": "agent", "output": "the goal"}
+            ]
+        });
+        assert!(repair_input_call_ids(&mut root));
+        assert_eq!(root["input"][0]["type"], json!("function_call"));
+        assert_eq!(root["input"][0]["name"], json!("goal_objective"));
+        assert_eq!(root["input"][0]["namespace"], json!("agent"));
+        assert_eq!(root["input"][0]["arguments"], json!("{}"));
+        assert_eq!(root["input"][1]["call_id"], root["input"][0]["call_id"]);
+    }
+
+    #[test]
+    fn test_an_answer_whose_call_is_missing_gets_that_call_back() {
+        // The client named the call (`call_x`) but never sent the call: the
+        // id is kept as the client chose it, and the call is added.
+        let mut root = json!({
+            "input": [
+                {"type": "function_call_output", "id": "fco_1", "call_id": "call_x",
+                 "name": "f", "output": "done"}
+            ]
+        });
+        assert!(repair_input_call_ids(&mut root));
+        assert_eq!(root["input"][0]["type"], json!("function_call"));
+        assert_eq!(root["input"][0]["call_id"], json!("call_x"));
+        assert_eq!(root["input"][1]["call_id"], json!("call_x"));
+    }
+
+    #[test]
+    fn test_an_answer_without_an_id_answers_the_pending_call() {
+        // The call is in the request and still waiting for its answer: the
+        // answer takes its id, so the pair the client meant survives.
+        let mut root = json!({
+            "input": [
+                {"type": "function_call", "id": "fc_1", "call_id": "call_real",
+                 "name": "f", "arguments": "{}"},
+                {"type": "function_call_output", "id": "fco_1", "output": "done"}
+            ]
+        });
+        assert!(repair_input_call_ids(&mut root));
+        assert_eq!(root["input"][1]["call_id"], json!("call_real"));
+        // No extra call was invented.
+        assert_eq!(root["input"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_the_chat_form_of_an_orphan_output_carries_a_matching_pair() {
+        // The chat contract has no `call_id`: the output becomes a tool
+        // message whose `tool_call_id` must match an assistant tool call.
+        // A chat upstream rejects an empty one ("tool_call_id  is not
+        // found", verified live against kimi).
+        let body = br#"{
+            "model": "m",
+            "input": [
+                {"type": "message", "role": "user", "content": "hi"},
+                {"type": "function_call_output", "id": "fco_1",
+                 "name": "goal_objective", "output": "the goal"}
+            ]
+        }"#;
+        let out = responses_request_to_chat(body).unwrap();
+        let v: Value = serde_json::from_slice(&out.body).unwrap();
+        let msgs = v["messages"].as_array().unwrap();
+        let assistant = msgs
+            .iter()
+            .find(|m| m.get("tool_calls").is_some())
+            .expect("the chat form has no assistant tool call");
+        let tool = msgs
+            .iter()
+            .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
+            .expect("the chat form has no tool message");
+        let call_id = assistant["tool_calls"][0]["id"].as_str().unwrap();
+        assert!(!call_id.trim().is_empty(), "the chat tool call has no id");
+        assert_eq!(tool["tool_call_id"], json!(call_id));
+        assert_eq!(tool["content"], json!("the goal"));
+    }
+
+    #[test]
+    fn test_body_has_synthetic_call_id() {
+        let mut root = json!({
+            "input": [
+                {"type": "function_call_output", "id": "fco_1", "output": "ctx"}
+            ]
+        });
+        let body = serde_json::to_vec(&root).unwrap();
+        assert!(!body_has_synthetic_call_id(&body));
+        assert!(repair_input_call_ids(&mut root));
+        let body = serde_json::to_vec(&root).unwrap();
+        assert!(body_has_synthetic_call_id(&body));
     }
 
     #[test]
@@ -4699,14 +4953,35 @@ mod tests {
                 {"type": "function_call", "id": "fc_1", "call_id": "call_real",
                  "name": "f", "arguments": "{}"},
                 {"type": "function_call_output", "id": "fco_1", "call_id": "call_real",
-                 "output": "done"},
-                {"type": "function_call_output", "id": "fco_2", "call_id": "call_other",
                  "output": "done"}
             ]
         });
         assert!(!repair_input_call_ids(&mut root));
         assert_eq!(root["input"][0]["call_id"], json!("call_real"));
         assert_eq!(root["input"][1]["call_id"], json!("call_real"));
+    }
+
+    #[test]
+    fn test_an_unmatched_answer_keeps_the_id_the_client_chose() {
+        // "call_other" names a call that is not in the request. The id is
+        // the client's own and is never rewritten — the call is added
+        // instead, so the pair is complete for a strict upstream.
+        let mut root = json!({
+            "input": [
+                {"type": "function_call", "id": "fc_1", "call_id": "call_real",
+                 "name": "f", "arguments": "{}"},
+                {"type": "function_call_output", "id": "fco_1", "call_id": "call_real",
+                 "output": "done"},
+                {"type": "function_call_output", "id": "fco_2", "call_id": "call_other",
+                 "output": "done"}
+            ]
+        });
+        assert!(repair_input_call_ids(&mut root));
+        assert_eq!(root["input"][0]["call_id"], json!("call_real"));
+        assert_eq!(root["input"][1]["call_id"], json!("call_real"));
+        assert_eq!(root["input"][3]["call_id"], json!("call_other"));
+        // The call it names was added right before the answer.
+        assert_eq!(root["input"][2]["type"], json!("function_call"));
         assert_eq!(root["input"][2]["call_id"], json!("call_other"));
     }
 
