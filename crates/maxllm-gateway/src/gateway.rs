@@ -3470,6 +3470,18 @@ impl AiGateway {
                         ),
                     };
                     let mut out = normalized;
+                    // This request keeps the client's Content-Length (the
+                    // upstream answers a chunked request with a 400), so the
+                    // forwarded body must not be longer than the body the
+                    // client sent: a longer body would be truncated by the
+                    // upstream's reader and arrive as broken JSON. The shared
+                    // normaliser can grow the body — the call_id repair adds
+                    // a field — so in that case the client's own body is
+                    // forwarded unchanged and the upstream judges it, as it
+                    // did before.
+                    if out.len() > ctx.request_body_buf.len() {
+                        out = ctx.request_body_buf.clone();
+                    }
                     if let Some(original_cl) = ctx
                         .plugin_ctx
                         .extensions
@@ -5412,13 +5424,26 @@ impl ProxyHttp for AiGateway {
                 .any(|pool| pool.scope != AutoPoolScope::Any);
             let may_carry_pool_sentinel = scoped_pool_exists
                 || (ctx.endpoint_type == EndpointType::Responses && provider_serves_a_pool);
+            // The gateway's shared native-Responses normaliser may rewrite
+            // the body: a call item without a `call_id` gets one, and a
+            // chat-style nested function tool is flattened. A rewritten body
+            // no longer matches the client's Content-Length, so it must
+            // travel chunked — like every other body the gateway rewrites
+            // (a body that claims a length it does not have is truncated by
+            // the upstream's reader).
+            //
+            // OpenAI and Cloudflare answer a chunked request with a 400, so
+            // their native Responses bodies keep the client's framing; there
+            // the normaliser is applied only when the rewrite does not grow
+            // the body (the guard in request_body_filter).
+            let native_body_is_rewritten = is_native_responses && !openai_style;
             // A Responses body rewritten into chat completions has an
             // unpredictable size (the chat form can be larger than the
             // Responses form), so it travels chunked instead of keeping the
             // original Content-Length — which would truncate a larger body.
             let verbatim = !is_auto_route
                 && !may_carry_pool_sentinel
-                && ((is_native_responses && !repairs_native_body)
+                && ((is_native_responses && !repairs_native_body && !native_body_is_rewritten)
                     || (openai_style && !is_responses_to_chat));
 
             let compaction_enabled = ctx

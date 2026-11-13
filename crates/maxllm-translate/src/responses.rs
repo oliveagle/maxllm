@@ -918,11 +918,107 @@ pub fn normalize_responses_request(body: &[u8]) -> Vec<u8> {
         }
     }
 
+    // A call-bearing item with no `call_id` is rejected outright by a native
+    // Responses upstream, so it is repaired before the body leaves.
+    changed |= repair_input_call_ids(&mut root);
+
     if changed {
         serde_json::to_vec(&root).unwrap_or_else(|_| body.to_vec())
     } else {
         body.to_vec()
     }
+}
+
+/// The item types that carry a `call_id` in the Responses contract.
+const CALL_ID_ITEM_TYPES: [&str; 4] = [
+    "function_call",
+    "function_call_output",
+    "custom_tool_call",
+    "custom_tool_call_output",
+];
+
+/// Give every call-bearing input item a non-empty `call_id`.
+///
+/// The Responses contract requires a non-empty `call_id` on `function_call`
+/// and `function_call_output` items (and on their `custom_tool_call` twins).
+/// A native-Responses upstream rejects an empty or missing one with
+/// `input[N].call_id: expected a non-empty string` (400) — verified live
+/// against the opencode.ai "zen" `/zen/go/v1/responses` endpoint, which
+/// rejects both an empty `call_id` and a missing one, on either item kind.
+///
+/// A client sends such an item on purpose: codex records the output of a
+/// host-side tool (the goal tool) as a `function_call_output` *without* a
+/// `call_id`, because the call it answers was never issued by the model and
+/// never carried one. The item still belongs to the conversation, so it is
+/// repaired rather than dropped — dropping it would silently take the
+/// user's goal out of the model's view.
+///
+/// The repair mirrors the chat-side `repair_tool_call_ids`:
+/// * a call item with an empty/missing `call_id` gets a synthetic
+///   `call_maxllm_<n>` and waits for an answer;
+/// * an output item with an empty/missing `call_id` consumes the oldest
+///   waiting synthetic id — so a call and its answer stay paired — and gets a
+///   fresh synthetic id when no call is waiting.
+///
+/// An output item that already carries a `call_id` is left alone: the
+/// upstream accepts an answer whose call it cannot see (verified live), and
+/// rewriting a call id the client chose would break the pairing with the
+/// item that issued the call.
+///
+/// Returns true if any `call_id` was written.
+pub fn repair_input_call_ids(root: &mut Value) -> bool {
+    let Some(items) = root.get_mut("input").and_then(|i| i.as_array_mut()) else {
+        return false;
+    };
+
+    let mut modified = false;
+    let mut seq: usize = 0;
+    // Synthetic ids handed to call items that no output has answered yet.
+    let mut waiting: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+
+    for item in items.iter_mut() {
+        let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        if !CALL_ID_ITEM_TYPES.contains(&item_type) {
+            continue;
+        }
+        let is_call = matches!(item_type, "function_call" | "custom_tool_call");
+        let current = item
+            .get("call_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        if !current.is_empty() {
+            // An answer that carries a real id consumes the synthetic id it
+            // answers, so a later output does not reuse it.
+            if !is_call {
+                if let Some(pos) = waiting.iter().position(|id| id == current) {
+                    waiting.remove(pos);
+                }
+            }
+            continue;
+        }
+
+        let new_id = if is_call {
+            seq += 1;
+            let id = format!("call_maxllm_{seq}");
+            waiting.push_back(id.clone());
+            id
+        } else {
+            match waiting.pop_front() {
+                Some(id) => id,
+                None => {
+                    seq += 1;
+                    format!("call_maxllm_{seq}")
+                }
+            }
+        };
+        if let Some(obj) = item.as_object_mut() {
+            obj.insert("call_id".into(), Value::String(new_id));
+            modified = true;
+        }
+    }
+
+    modified
 }
 
 /// Flatten a chat-style nested-function tool (`{"type":"function","function":
@@ -1089,8 +1185,18 @@ fn build_responses_object(chat: &Value, status: ResponseStatus) -> Value {
         }));
     }
 
-    for call in &tool_calls {
-        let call_id = call.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    for (call_index, call) in tool_calls.iter().enumerate() {
+        let upstream_call_id = call.get("id").and_then(|v| v.as_str()).unwrap_or("").trim();
+        // A chat upstream that issues a tool call without an id would hand the
+        // client an empty `call_id`. The client echoes that id back in its next
+        // request, and a native-Responses upstream rejects it
+        // (`input[N].call_id: expected a non-empty string`). Synthesise a
+        // usable id instead — the chat-side repair does the same.
+        let call_id = if upstream_call_id.is_empty() {
+            format!("call_maxllm_{}", call_index + 1)
+        } else {
+            upstream_call_id.to_string()
+        };
         let function = call.get("function");
         let name = function
             .and_then(|f| f.get("name"))
@@ -1576,7 +1682,13 @@ impl ResponsesStreamTranslator {
                 };
 
                 if let Some(id) = call.get("id").and_then(|v| v.as_str()) {
-                    slot.call_id = id.to_string();
+                    // The id is only taken while the item is still open: once
+                    // the item was announced the client already knows the id
+                    // it must echo back, so a later id cannot change it.
+                    let id = id.trim();
+                    if !id.is_empty() && !slot.announced {
+                        slot.call_id = id.to_string();
+                    }
                 }
                 let function = call.get("function");
                 if let Some(name) = function
@@ -1591,6 +1703,14 @@ impl ResponsesStreamTranslator {
                 {
                     if !arguments.is_empty() {
                         if !slot.announced {
+                            if slot.call_id.trim().is_empty() {
+                                // The chat upstream issued the call without an
+                                // id: hand the client a usable one, or the
+                                // client would echo an empty `call_id` back
+                                // and the next native-Responses hop would
+                                // reject it.
+                                slot.call_id = format!("call_maxllm_{}", index + 1);
+                            }
                             slot.announced = true;
                             let item_id = slot.item_id.clone();
                             let output_index = slot.output_index;
@@ -4524,6 +4644,150 @@ mod tests {
         assert!(
             created_at > 1_600_000_000,
             "created_at {created_at} is not a plausible unix timestamp"
+        );
+    }
+    // ── call_id repair (native Responses upstream rejects an empty one) ──
+
+    #[test]
+    fn test_orphan_function_call_output_gets_a_call_id() {
+        // codex records the output of a host-side tool (the goal tool) as a
+        // `function_call_output` without a `call_id`: the call it answers was
+        // never issued by the model and never carried one. A native-Responses
+        // upstream rejects the body with
+        // `input[N].call_id: expected a non-empty string`.
+        let mut root = json!({
+            "model": "m",
+            "input": [
+                {"type": "message", "role": "user", "content": "hi"},
+                {"type": "function_call_output", "id": "fco_1",
+                 "name": "goal_objective", "output": "the goal"}
+            ]
+        });
+        assert!(repair_input_call_ids(&mut root));
+        let call_id = root["input"][1]["call_id"]
+            .as_str()
+            .expect("call_id missing");
+        assert!(
+            !call_id.trim().is_empty(),
+            "the output item still has no call_id"
+        );
+        // The item itself is kept — dropping it would take the user's goal
+        // out of the model's view.
+        assert_eq!(root["input"][1]["output"], json!("the goal"));
+        assert_eq!(root["input"][1]["name"], json!("goal_objective"));
+    }
+
+    #[test]
+    fn test_a_call_and_its_answer_share_the_synthetic_call_id() {
+        let mut root = json!({
+            "input": [
+                {"type": "function_call", "id": "fc_1", "name": "f", "arguments": "{}"},
+                {"type": "function_call_output", "id": "fco_1", "output": "done"}
+            ]
+        });
+        assert!(repair_input_call_ids(&mut root));
+        let call = root["input"][0]["call_id"].as_str().unwrap().to_string();
+        let answer = root["input"][1]["call_id"].as_str().unwrap().to_string();
+        assert!(!call.trim().is_empty(), "the call has no call_id");
+        assert_eq!(call, answer, "the answer does not answer the call");
+    }
+
+    #[test]
+    fn test_a_real_call_id_is_never_rewritten() {
+        let mut root = json!({
+            "input": [
+                {"type": "function_call", "id": "fc_1", "call_id": "call_real",
+                 "name": "f", "arguments": "{}"},
+                {"type": "function_call_output", "id": "fco_1", "call_id": "call_real",
+                 "output": "done"},
+                {"type": "function_call_output", "id": "fco_2", "call_id": "call_other",
+                 "output": "done"}
+            ]
+        });
+        assert!(!repair_input_call_ids(&mut root));
+        assert_eq!(root["input"][0]["call_id"], json!("call_real"));
+        assert_eq!(root["input"][1]["call_id"], json!("call_real"));
+        assert_eq!(root["input"][2]["call_id"], json!("call_other"));
+    }
+
+    #[test]
+    fn test_normalize_responses_request_repairs_a_missing_call_id() {
+        // The body the gateway forwards to a native-Responses upstream.
+        let body = br#"{
+            "model": "m",
+            "input": [
+                {"type": "message", "role": "user", "content": "hi"},
+                {"type": "function_call_output", "id": "fco_1", "output": "ctx"}
+            ]
+        }"#;
+        let out = normalize_responses_request(body);
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        let call_id = v["input"][1]["call_id"].as_str().unwrap_or("");
+        assert!(
+            !call_id.trim().is_empty(),
+            "the forwarded body still has an empty call_id: {v}"
+        );
+    }
+
+    #[test]
+    fn test_a_body_without_call_ids_is_forwarded_unchanged() {
+        let body = br#"{"model":"m","input":[{"type":"message","role":"user","content":"hi"}]}"#;
+        assert_eq!(normalize_responses_request(body), body.to_vec());
+    }
+
+    #[test]
+    fn test_chat_tool_call_without_an_id_gets_a_call_id() {
+        // A chat upstream that issues a tool call without an id must not hand
+        // the client an empty `call_id`: the client echoes it back and the
+        // next native-Responses hop rejects the body.
+        let chat = br#"{
+            "id":"chatcmpl-1","object":"chat.completion","created":1700000000,
+            "model":"m","choices":[{"index":0,"finish_reason":"tool_calls",
+                "message":{"role":"assistant","content":null,
+                    "tool_calls":[{"type":"function",
+                        "function":{"name":"f","arguments":"{}"}}]}}]
+        }"#;
+        let out = chat_response_to_responses(chat).unwrap();
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        let call = v["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["type"] == "function_call")
+            .expect("no function_call item");
+        let call_id = call["call_id"].as_str().unwrap_or("");
+        assert!(
+            !call_id.trim().is_empty(),
+            "the function_call item has an empty call_id: {call}"
+        );
+    }
+
+    #[test]
+    fn test_streamed_tool_call_without_an_id_gets_a_call_id() {
+        let sse = chat_sse(&[
+            r#"{"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"type":"function","function":{"name":"f","arguments":"{}"}}]}}]}"#,
+            r#"{"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ]);
+        let mut t = ResponsesStreamTranslator::new(Box::new(crate::NativePassthroughStream));
+        let s = String::from_utf8(t.process_chunk(sse.as_bytes(), true)).unwrap();
+        let completed: Value = s
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter_map(|d| serde_json::from_str::<Value>(d).ok())
+            .find(|v| v["type"] == "response.completed")
+            .expect("no response.completed event");
+        let calls: Vec<&Value> = completed["response"]["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|i| i["type"] == "function_call")
+            .collect();
+        assert_eq!(calls.len(), 1);
+        let call_id = calls[0]["call_id"].as_str().unwrap_or("");
+        assert!(
+            !call_id.trim().is_empty(),
+            "the streamed function_call has an empty call_id: {}",
+            calls[0]
         );
     }
 }

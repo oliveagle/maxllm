@@ -2050,6 +2050,69 @@ async fn test_native_responses_flattens_nested_function_tools() {
 }
 
 #[tokio::test]
+async fn test_native_responses_repairs_a_missing_call_id() {
+    // codex records the output of a host-side tool (the goal tool) as a
+    // `function_call_output` *without* a `call_id`: the call it answers was
+    // never issued by the model and never carried one. A native-Responses
+    // upstream rejects such a body with
+    // `input[N].call_id: expected a non-empty string` (400 — verified live
+    // against the opencode.ai zen endpoint), so the gateway must repair the
+    // body before the byte-for-byte forward.
+    let mock = MockServer::start().await;
+
+    let upstream_body = json!({
+        "id": "resp_repaired",
+        "object": "response",
+        "status": "completed",
+        "model": "deepseek-v4.1-flash",
+        "output": [],
+        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/zen/go/v1/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(upstream_body.clone()))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let gw = TestGateway::start(NATIVE_RESPONSES_CONFIG, &mock.uri()).await;
+    let c = client();
+
+    let request_body = json!({
+        "model": "deepseek-v4.1-flash",
+        "input": [
+            {"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "hi"}]},
+            {"type": "function_call_output", "id": "fco_1",
+             "name": "goal_objective", "output": "the goal"}
+        ],
+        "stream": false
+    });
+
+    let resp = c
+        .post(gw.url("/v1/responses"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&request_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let requests = mock.received_requests().await.unwrap();
+    let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let call_id = sent["input"][1]["call_id"].as_str().unwrap_or("");
+    assert!(
+        !call_id.trim().is_empty(),
+        "the upstream received an empty call_id: {sent}"
+    );
+    // The item itself survives the repair — dropping it would take the
+    // user's goal out of the model's view.
+    assert_eq!(sent["input"][1]["output"], json!("the goal"));
+    assert_eq!(sent["input"][1]["name"], json!("goal_objective"));
+}
+
+#[tokio::test]
 async fn test_native_responses_passthrough_streaming() {
     let mock = MockServer::start().await;
 
