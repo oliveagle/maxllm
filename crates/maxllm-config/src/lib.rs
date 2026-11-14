@@ -456,6 +456,17 @@ pub struct ProviderConfig {
     #[serde(default)]
     pub api_key: String,
     pub default_model: Option<String>,
+    /// The only models this provider may serve (empty = no restriction).
+    ///
+    /// A request whose model is not on this list is refused with
+    /// `403 model_not_allowed` *before* it reaches the upstream, so a
+    /// deployment that pays for one model cannot be driven with another.
+    /// Unlike an auto pool's `allowed_models` (a load-time invariant over the
+    /// pool's members) this is a per-request gate on the provider that was
+    /// selected to answer. Not to be confused with a virtual key's
+    /// allow-list, which filters what a *client* may ask for.
+    #[serde(default)]
+    pub allowed_models: Vec<String>,
     #[serde(default = "default_max_fails")]
     pub max_fails: u32,
     #[serde(default = "default_fail_timeout_secs")]

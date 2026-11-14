@@ -110,6 +110,10 @@ pub struct RequestCtx {
     /// Cached at authentication time so the per-request enforcement in
     /// `request_body_filter` does not hit the key store again.
     pub virtual_key_allowed_models: Vec<String>,
+    /// The selected provider's model allow-list (empty = every model
+    /// permitted). Cached when the provider is chosen so the per-request
+    /// enforcement does not have to look the provider up again.
+    pub provider_allowed_models: Vec<String>,
     /// In-flight slot for the virtual key's `max_parallel_requests` limit.
     /// Dropping the guard (the context is dropped when the request ends)
     /// releases the slot on every exit path.
@@ -376,6 +380,7 @@ impl RequestCtx {
             active_request_counted: false,
             virtual_key_id: None,
             virtual_key_allowed_models: Vec::new(),
+            provider_allowed_models: Vec::new(),
             key_in_flight: None,
             plugin_ctx: PluginCtx::new(),
             requested_guardrails: None,
