@@ -208,6 +208,27 @@ fn start_config_watcher(config_path: PathBuf, hot: Arc<arc_swap::ArcSwap<gateway
             return;
         }
 
+        // The translation kernel's script is watched directly: saving it is
+        // the deploy, no config touch required. The watched set follows every
+        // reload — a config change that repoints the kernel moves the watch.
+        let mut watched_scripts: Vec<PathBuf> = hot
+            .load()
+            .kernel
+            .as_ref()
+            .map(|k| k.path().to_path_buf())
+            .into_iter()
+            .collect();
+        let watch_kernel_dirs = |watcher: &mut notify::RecommendedWatcher, scripts: &[PathBuf]| {
+            for script in scripts {
+                if let Some(dir) = script.parent() {
+                    if let Err(e) = watcher.watch(dir, RecursiveMode::NonRecursive) {
+                        tracing::warn!(error = %e, path = ?dir, "Failed to watch kernel script directory");
+                    }
+                }
+            }
+        };
+        watch_kernel_dirs(&mut watcher, &watched_scripts);
+
         tracing::info!(path = ?config_path, "Config hot-reload watcher started");
 
         // The reload itself, shared by the event path and the poll path.
@@ -296,11 +317,16 @@ fn start_config_watcher(config_path: PathBuf, hot: Arc<arc_swap::ArcSwap<gateway
             match rx.recv_timeout(wait) {
                 Ok(Ok(event)) => {
                     // Only react to modify/create events on our config file
+                    // or on the translation kernel's script — saving the
+                    // script alone is the deploy.
                     let is_relevant =
                         matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_))
                             && event.paths.iter().any(|p| {
                                 p.canonicalize().ok().as_ref() == Some(&config_path)
                                     || p.file_name() == config_path.file_name()
+                                    || watched_scripts
+                                        .iter()
+                                        .any(|script| p.file_name() == script.file_name())
                             });
                     if is_relevant {
                         pending = Some(std::time::Instant::now() + CONFIG_RELOAD_SETTLE);
@@ -319,6 +345,16 @@ fn start_config_watcher(config_path: PathBuf, hot: Arc<arc_swap::ArcSwap<gateway
                     if due {
                         last_stamp = config_stamp(&config_path);
                         reload();
+                        // Follow the kernel: a config that repoints the
+                        // script moves both the watch and the policy.
+                        watched_scripts = hot
+                            .load()
+                            .kernel
+                            .as_ref()
+                            .map(|k| k.path().to_path_buf())
+                            .into_iter()
+                            .collect();
+                        watch_kernel_dirs(&mut watcher, &watched_scripts);
                         continue;
                     }
                     if !polled {
@@ -332,6 +368,14 @@ fn start_config_watcher(config_path: PathBuf, hot: Arc<arc_swap::ArcSwap<gateway
                     }
                     last_stamp = stamp;
                     reload();
+                    watched_scripts = hot
+                        .load()
+                        .kernel
+                        .as_ref()
+                        .map(|k| k.path().to_path_buf())
+                        .into_iter()
+                        .collect();
+                    watch_kernel_dirs(&mut watcher, &watched_scripts);
                 }
                 Err(RecvTimeoutError::Disconnected) => break,
             }

@@ -227,6 +227,10 @@ pub struct RequestCtx {
     /// the orphan is answered and the request is replayed. One-shot, like
     /// the schema degradation.
     pub tool_calls_repaired: bool,
+    /// The status of the upstream error the tool-plumbing decision is
+    /// deferred on. The kernel classifier wants the true status, and the
+    /// deferral is what carries it to the body filter.
+    pub pending_tool_schema_status: u16,
     /// Set when a 404 arrived that may be a "the model does not exist"
     /// rejection rather than a missing endpoint. Both are 404, so the
     /// decision waits for the error body: an upstream that names the model
@@ -420,6 +424,7 @@ impl RequestCtx {
             tool_schema_body_buf: Vec::new(),
             tool_schema_degraded: false,
             tool_calls_repaired: false,
+            pending_tool_schema_status: 0,
             rate_limit_headers: Vec::new(),
             pending_model_404: false,
             model_404_body_buf: Vec::new(),

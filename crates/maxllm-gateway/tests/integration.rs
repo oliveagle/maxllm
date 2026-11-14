@@ -14347,6 +14347,277 @@ async fn test_moonshot_orphaned_tool_call_is_repaired() {
     );
 }
 
+/// The translation kernel: a Rhai script that owns the provider-dialect
+/// decision surface. Saving the script is the deploy — no release cycle.
+const KERNEL_TEST_CONFIG: &str = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[metrics]
+enabled = true
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.kimi_mock]
+kind = "openai_compat"
+base_url = "{MOCK_URL}"
+upstream_path = "/coding/v1/chat/completions"
+api_key = "fake-key"
+tool_schema = "moonshot"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "kimi_mock"
+
+[translation_kernel]
+script = "{KERNEL_SCRIPT}"
+"#;
+
+/// Write a kernel script to a temp file and return its path.
+fn kernel_script(source: &str) -> (tempfile::NamedTempFile, String) {
+    let mut file = tempfile::NamedTempFile::new().expect("temp kernel script");
+    file.write_all(source.as_bytes()).expect("write kernel");
+    file.flush().expect("flush kernel");
+    let path = file.path().to_string_lossy().to_string();
+    (file, path)
+}
+
+#[tokio::test]
+async fn test_the_translation_kernel_rewrites_the_outgoing_body() {
+    let mock = MockServer::start().await;
+
+    // The script's rewrite must reach the upstream — the kernel is not a
+    // simulation: it owns the last word on the body.
+    Mock::given(method("POST"))
+        .and(path("/coding/v1/chat/completions"))
+        .and(body_string_contains("\"kernel_marker\":\"applied\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("ok")))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let (_script, path) = kernel_script(
+        r#"
+        fn on_request_body(ctx) {
+            let body = ctx["body"];
+            body["kernel_marker"] = "applied";
+            body
+        }
+        "#,
+    );
+    let config = KERNEL_TEST_CONFIG.replace("{KERNEL_SCRIPT}", &path);
+    let gw = TestGateway::start(&config, &mock.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&chat_body("kimi-for-coding", "hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let requests = mock.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(sent["kernel_marker"], "applied");
+}
+
+#[tokio::test]
+async fn test_the_translation_kernel_classifies_an_error_the_baseline_does_not_know() {
+    let mock = MockServer::start().await;
+
+    // The baseline markers know the Moonshot dialect's phrasings; this one
+    // is new. The kernel script recognises it and names the repair — the
+    // request is replayed with degraded schemas instead of ending the
+    // agent's turn on the upstream's 400.
+    Mock::given(method("POST"))
+        .and(path("/coding/v1/chat/completions"))
+        .and(body_string_contains("\"$defs\""))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": {
+                "code": "invalid_request_error",
+                "message": "Invalid request: upstream says: custom dialect rule violated"
+            }
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/coding/v1/chat/completions"))
+        .and(body_string_contains("\"parameters\":{\"type\":\"object\"}"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("after kernel")))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let (_script, path) = kernel_script(
+        r#"
+        fn on_upstream_error(ctx) {
+            if ctx["body"].contains("custom dialect rule violated") {
+                #{ "repair": "schema" }
+            } else {
+                #{ "repair": "none" }
+            }
+        }
+        "#,
+    );
+    let config = KERNEL_TEST_CONFIG.replace("{KERNEL_SCRIPT}", &path);
+    let gw = TestGateway::start(&config, &mock.uri()).await;
+    let c = client();
+
+    let mut body = chat_body("kimi-for-coding", "hi");
+    body["tools"] = json!([zod_tool()]);
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "the kernel-driven repair must answer, not the upstream's 400"
+    );
+    assert_eq!(
+        resp.json::<Value>().await.unwrap()["choices"][0]["message"]["content"],
+        "after kernel"
+    );
+
+    let requests = mock.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2, "the request must be retried once");
+    let degraded: Value = serde_json::from_slice(&requests[1].body).unwrap();
+    assert_eq!(
+        degraded["tools"][0]["function"]["parameters"],
+        json!({"type": "object"}),
+        "the retry carries the degraded schemas"
+    );
+}
+
+#[tokio::test]
+async fn test_saving_the_kernel_script_reloads_it_without_a_restart() {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/coding/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("ok")))
+        .mount(&mock)
+        .await;
+
+    let script = tempfile::NamedTempFile::new().expect("temp kernel script");
+    let script_path = script.path().to_path_buf();
+    let write_script = |marker: &str| {
+        std::fs::write(
+            &script_path,
+            format!(
+                "fn on_request_body(ctx) {{\n    let body = ctx[\"body\"];\n    body[\"kernel_marker\"] = \"{marker}\";\n    body\n}}\n"
+            ),
+        )
+        .expect("write kernel");
+    };
+    write_script("first");
+
+    let config = KERNEL_TEST_CONFIG.replace("{KERNEL_SCRIPT}", &script_path.to_string_lossy());
+    let gw = TestGateway::start(&config, &mock.uri()).await;
+    let c = client();
+
+    let post = || async {
+        c.post(gw.url("/v1/chat/completions"))
+            .header("Authorization", "Bearer test-key-123")
+            .json(&chat_body("kimi-for-coding", "hi"))
+            .send()
+            .await
+            .unwrap()
+    };
+
+    let resp = post().await;
+    assert_eq!(resp.status(), 200);
+    let sent: Value =
+        serde_json::from_slice(&mock.received_requests().await.unwrap()[0].body).unwrap();
+    assert_eq!(sent["kernel_marker"], "first");
+
+    // Save the script: the watcher recompiles the kernel, and the next
+    // request uses the new policy — no restart, no new binary.
+    write_script("second");
+
+    // The watcher settles for 800ms before it reads; give it room.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let mut second_ok = false;
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let resp = post().await;
+        assert_eq!(resp.status(), 200);
+        for request in mock.received_requests().await.unwrap() {
+            let sent: Value = serde_json::from_slice(&request.body).unwrap();
+            if sent["kernel_marker"] == "second" {
+                second_ok = true;
+                break;
+            }
+        }
+        if second_ok {
+            break;
+        }
+    }
+    assert!(
+        second_ok,
+        "saving the kernel script must reload it without a restart"
+    );
+}
+
+#[tokio::test]
+async fn test_a_broken_kernel_script_refuses_to_start() {
+    let mock = MockServer::start().await;
+    let (_script, path) = kernel_script("fn on_request_body(ctx) { let = ; }");
+    let config = KERNEL_TEST_CONFIG
+        .replace("{KERNEL_SCRIPT}", &path)
+        .replace("{MOCK_URL}", &mock.uri());
+
+    // A kernel that does not compile is a config error, not a warning: the
+    // gateway must not keep serving with a policy the operator believes is
+    // live.
+    let port = pick_gateway_port();
+    let config_str = config.replace("{PORT}", &port.to_string());
+    let mut config_file = tempfile::NamedTempFile::new().expect("temp file");
+    config_file
+        .write_all(config_str.as_bytes())
+        .expect("write config");
+    let binary = env!("CARGO_BIN_EXE_maxllm-server");
+    let mut child = Command::new(binary)
+        .arg("--config")
+        .arg(config_file.path())
+        .env("RUST_LOG", "warn")
+        .spawn()
+        .expect("failed to spawn gateway");
+
+    // The gateway exits instead of serving without the kernel.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            assert!(
+                !status.success(),
+                "the gateway must not start with a kernel that does not compile"
+            );
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the gateway neither started nor exited"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 /// Kimi serves the Responses contract natively (`/coding/v1/responses`), so
 /// codex's tools reach it in the flat Responses shape — the projection has to
 /// walk that shape too.

@@ -145,6 +145,13 @@ pub struct GatewayMetrics {
     /// running the previous configuration, so an operator who added a pool
     /// member and sees this counter has a member that is *not* in the pool.
     pub config_reload_failures_total: IntCounter,
+    /// Requests the translation kernel rewrote (the updatable policy did
+    /// something the compiled baseline alone would not).
+    pub kernel_rewrites_total: IntCounter,
+    /// Kernel faults: compile-time is caught at load, these are the
+    /// runtime faults a script hit on a live request. A fault never ends
+    /// the turn — the body goes out unchanged and the baseline decides.
+    pub kernel_faults_total: IntCounter,
 }
 
 impl GatewayMetrics {
@@ -211,6 +218,24 @@ impl GatewayMetrics {
         .expect("metric");
         registry
             .register(Box::new(config_reload_failures_total.clone()))
+            .expect("register");
+
+        let kernel_rewrites_total = IntCounter::new(
+            "maxllm_kernel_rewrites_total",
+            "Requests rewritten by the updatable translation kernel",
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(kernel_rewrites_total.clone()))
+            .expect("register");
+
+        let kernel_faults_total = IntCounter::new(
+            "maxllm_kernel_faults_total",
+            "Translation-kernel script faults on live traffic",
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(kernel_faults_total.clone()))
             .expect("register");
 
         let fallbacks_total = IntCounterVec::new(
@@ -616,6 +641,8 @@ impl GatewayMetrics {
             unrouted_sessions_total,
             config_reloads_total,
             config_reload_failures_total,
+            kernel_rewrites_total,
+            kernel_faults_total,
         }
     }
 

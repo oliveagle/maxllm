@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -39,6 +40,9 @@ pub struct Config {
     /// Global plugin names, executed on every request in order.
     #[serde(default)]
     pub global_plugins: Vec<String>,
+    /// The updatable translation kernel (optional).
+    #[serde(default)]
+    pub translation_kernel: Option<TranslationKernelConfig>,
     /// Model aliases: map requested model name to actual model name.
     #[serde(default)]
     pub model_aliases: HashMap<String, String>,
@@ -942,6 +946,23 @@ pub struct PluginConfig {
     pub category: String,
     #[serde(flatten)]
     pub params: toml::Table,
+}
+
+/// The translation kernel: a Rhai script that owns the provider-dialect
+/// decision surface (request adaptation + upstream-error classification).
+/// Edited without a release cycle; recompiled on every config hot-reload
+/// and watched directly, so saving the file alone is the deploy.
+#[derive(Debug, Deserialize, Clone)]
+pub struct TranslationKernelConfig {
+    /// Path to the kernel script. Relative paths resolve against the
+    /// process working directory (the systemd unit runs from the config
+    /// directory, so a bare filename works there).
+    pub script: PathBuf,
+    /// Rhai operation budget for one script call. The default is generous
+    /// enough for schema walks; a runaway script is stopped by this, never
+    /// by the request timing out.
+    #[serde(default)]
+    pub max_operations: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

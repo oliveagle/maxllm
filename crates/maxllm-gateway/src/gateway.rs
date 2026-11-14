@@ -394,6 +394,10 @@ pub struct HotState {
     pub session_body_affinity_max_bytes: usize,
     pub metrics_enabled: bool,
     pub metrics_allow_remote: bool,
+    /// The updatable translation kernel: a Rhai script that owns the
+    /// provider-dialect decision surface. `None` when the config declares
+    /// no kernel — the Rust baseline rules then decide alone.
+    pub kernel: Option<Arc<maxllm_translate::kernel::TranslationKernel>>,
     pub global_chain: PluginChain,
     pub route_chains: Vec<PluginChain>,
     pub model_aliases: HashMap<String, String>,
@@ -907,6 +911,29 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
         }
     }
 
+    // Load the translation kernel. A kernel that does not compile is a
+    // config error, not a warning: the gateway must not keep serving with
+    // a policy the operator believes is live.
+    let kernel = match config.translation_kernel.as_ref() {
+        Some(kernel_config) => {
+            let script = kernel_config.script.clone();
+            let max_operations = kernel_config.max_operations.unwrap_or(2_000_000);
+            match maxllm_translate::kernel::TranslationKernel::load(&script, max_operations) {
+                Ok(k) => {
+                    tracing::info!(
+                        script = ?script,
+                        request_hook = k.hooks().request,
+                        error_hook = k.hooks().error,
+                        "Translation kernel loaded"
+                    );
+                    Some(Arc::new(k))
+                }
+                Err(e) => return Err(format!("failed to load the translation kernel: {e}").into()),
+            }
+        }
+        None => None,
+    };
+
     // Build global plugin chain
     let global_plugins: Vec<Arc<dyn Plugin>> = global_plugin_names
         .iter()
@@ -1087,6 +1114,7 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
 
     Ok(HotState {
         providers,
+        kernel,
         session_sticky_enabled: config
             .session_sticky
             .as_ref()
@@ -3611,6 +3639,22 @@ impl AiGateway {
                             out = repaired;
                         }
                     }
+                    // The kernel has the last word on the body — it runs
+                    // after the baseline repairs, so a dialect rule the
+                    // baseline does not know can be added without a
+                    // release. The length guard below keeps this path
+                    // honest: a rewrite that grows the body is dropped
+                    // with the client's bytes, because this request keeps
+                    // the client's Content-Length.
+                    let kernel_body = Self::apply_translation_kernel(&self.hot.load(), out, ctx);
+                    if kernel_body.len() > ctx.request_body_buf.len() {
+                        warn!(
+                            "the translation kernel grew the body on a keep-Content-Length path; the client's bytes are sent unchanged"
+                        );
+                        out = ctx.request_body_buf.clone();
+                    } else {
+                        out = kernel_body;
+                    }
                     // This request keeps the client's Content-Length (the
                     // upstream answers a chunked request with a 400), so the
                     // forwarded body must not be longer than the body the
@@ -3983,6 +4027,8 @@ impl AiGateway {
                         outgoing = repaired;
                     }
                 }
+                // The kernel's rewrite is the last word on the body.
+                outgoing = Self::apply_translation_kernel(&hot, outgoing, ctx);
                 *body = Some(Bytes::from(outgoing));
             } else {
                 // ── NORMAL MODE: OpenAI input → provider translation ──
@@ -4282,6 +4328,8 @@ impl AiGateway {
                                 }
                             }
                         }
+                        // The kernel's rewrite is the last word on the body.
+                        outgoing = Self::apply_translation_kernel(&hot, outgoing, ctx);
                         if translated.is_streaming {
                             ctx.is_streaming = true;
                             match ctx.stream_translator.lock() {
@@ -4366,6 +4414,84 @@ impl AiGateway {
             maxllm_translate::moonshot::degrade_tool_schemas(&body)
         } else {
             maxllm_translate::moonshot::normalize_tools(&body)
+        }
+    }
+
+    /// Run the translation kernel over the outgoing body.
+    ///
+    /// The kernel is the updatable half of the gateway: a Rhai script that
+    /// owns the provider-dialect policy. Its rewrite is the last word on the
+    /// body — it runs after the compiled baseline (the Moonshot projection,
+    /// the orphan repair), so a script can add rules the baseline does not
+    /// know yet, and a dialect fix stops needing a release cycle.
+    ///
+    /// A kernel fault never reaches the client: the body goes out unchanged,
+    /// the fault is counted, and the baseline keeps its say. The same rule
+    /// that keeps a translation bug from ending the agent's turn keeps a
+    /// script bug from ending it.
+    fn apply_translation_kernel(hot: &HotState, body: Vec<u8>, ctx: &RequestCtx) -> Vec<u8> {
+        let Some(kernel) = hot.kernel.as_deref() else {
+            return body;
+        };
+        if !kernel.hooks().request {
+            return body;
+        }
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body) else {
+            return body;
+        };
+        let kernel_ctx = maxllm_translate::kernel::RequestKernelCtx {
+            body: value,
+            provider: ctx.provider_name.clone(),
+            model: ctx.model.clone(),
+            tool_schema_degraded: ctx.tool_schema_degraded,
+            tool_calls_repaired: ctx.tool_calls_repaired,
+        };
+        match kernel.transform_request(&kernel_ctx) {
+            Ok(Some(rewritten)) => match serde_json::to_vec(&rewritten) {
+                Ok(bytes) => {
+                    METRICS.kernel_rewrites_total.inc();
+                    bytes
+                }
+                Err(e) => {
+                    warn!(error = %e, "the translation kernel returned an unserializable body");
+                    METRICS.kernel_faults_total.inc();
+                    body
+                }
+            },
+            Ok(None) => body,
+            Err(e) => {
+                warn!(error = %e, script = ?kernel.path(), "the translation kernel faulted; the baseline body is sent unchanged");
+                METRICS.kernel_faults_total.inc();
+                body
+            }
+        }
+    }
+
+    /// Ask the kernel what to do about an upstream error.
+    ///
+    /// The kernel is a policy layer over the baseline, never a replacement:
+    /// it can name a repair, and when it says nothing the baseline rules
+    /// decide. A kernel fault is "no decision", never a decision of its own.
+    fn kernel_error_repair(
+        hot: &HotState,
+        status: u16,
+        body_text: &str,
+        ctx: &RequestCtx,
+    ) -> maxllm_translate::kernel::KernelRepair {
+        use maxllm_translate::kernel::KernelRepair;
+        let Some(kernel) = hot.kernel.as_deref() else {
+            return KernelRepair::None;
+        };
+        if !kernel.hooks().error {
+            return KernelRepair::None;
+        }
+        match kernel.classify_error(status, body_text, &ctx.provider_name, &ctx.model) {
+            Ok(repair) => repair,
+            Err(e) => {
+                warn!(error = %e, script = ?kernel.path(), "the translation kernel faulted while classifying an error");
+                METRICS.kernel_faults_total.inc();
+                KernelRepair::None
+            }
         }
     }
 
@@ -6080,6 +6206,7 @@ impl ProxyHttp for AiGateway {
             && !should_failover_status(status, ctx, provider)
         {
             ctx.pending_tool_schema_repair = true;
+            ctx.pending_tool_schema_status = status;
             ctx.tool_schema_body_buf.clear();
             // The quota classifier wants the same body: a 400 may wear a
             // tier-limit wall, and that wall belongs to the provider, not to
@@ -6481,6 +6608,25 @@ impl ProxyHttp for AiGateway {
             ctx.pending_tool_schema_repair = false;
             let buffered = std::mem::take(&mut ctx.tool_schema_body_buf);
             let text = String::from_utf8_lossy(&buffered).to_string();
+            // The kernel classifies first: it is the operator's live
+            // policy, and it knows phrasings the compiled baseline has
+            // never seen. Its decision escalates — it can name a repair
+            // the baseline would not make — but it can never disable the
+            // baseline repair: "the kernel said nothing" falls through to
+            // the built-in rules, which are the ones that keep a
+            // translation fault from ending the agent's turn.
+            {
+                let hot = self.hot.load();
+                match Self::kernel_error_repair(&hot, ctx.pending_tool_schema_status, &text, ctx) {
+                    maxllm_translate::kernel::KernelRepair::SchemaDegrade => {
+                        return Err(self.begin_tool_schema_repair(ctx));
+                    }
+                    maxllm_translate::kernel::KernelRepair::OrphanRepair => {
+                        return Err(self.begin_orphan_tool_call_repair(ctx));
+                    }
+                    maxllm_translate::kernel::KernelRepair::None => {}
+                }
+            }
             if body_reports_tool_schema(&text) {
                 return Err(self.begin_tool_schema_repair(ctx));
             }
