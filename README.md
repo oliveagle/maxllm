@@ -907,6 +907,12 @@ The knob also covers a Moonshot-compatible upstream on a custom host (set
 *not* run the strict validator (set `"none"`). The projection runs on both
 outgoing paths — chat translation and native Responses forwarding.
 
+Verified live against `api.kimi.com` on 2026-11-14 with the zod 4 shape that
+triggers the rejection: the unprojected body answers `400
+invalid_request_error … At path 'properties.show': detected infinite recursion
+without termination condition`, and the same body after the projection
+answers `200` with a normal completion.
+
 ### Shutdown behaviour
 
 On `SIGTERM` the gateway stops accepting new connections and drains the
