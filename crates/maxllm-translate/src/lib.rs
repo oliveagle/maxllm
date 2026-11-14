@@ -19,6 +19,7 @@ pub mod commandcode;
 pub mod formats;
 pub mod gemini;
 pub mod gemini_stream;
+pub mod kernel;
 pub mod moonshot;
 pub mod open_design;
 pub mod openai;
