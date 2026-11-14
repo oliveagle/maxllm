@@ -146,6 +146,12 @@ recordings（11-12→14）provider_response：`ollama_local` 2,120 条中 **199 
 条目直接摘掉（零成本意图改用显式 `no_charge` 路由），或让 breaker 对
 "同模型同 5xx"做组合级熔断 —— 前者一行配置，立刻省 25 次/天的白转。
 
+**第 5 轮复核（18:29）**：该税仍在持续 —— 09:58→10:29Z 窗口 `ollama_local` 502×6
+（全部 `deepseek-v4.1-flash:cloud`，retrying on opencode_go_2/kimi）+ 同上游客户端
+abort×17（10:00–10:14 每 30~60s 一发，形态是某个 ~5s 耐心的定时任务）。
+row4 之后 kimi 也进了 backoff，`:cloud` 流量更多落到 opencode_go_2 —— 摘除条目的
+收益比基线更大了。
+
 ## 6. P2：open_design —— 402 与 32.4% client abort
 
 - 402（订阅耗尽）逐日：11-09: 41 → 11-10: 40 → 11-11: 6 → 之后 0。
@@ -210,6 +216,7 @@ provider 名，当前 nas.toml 已无定义，日志中的 74 次 ada DNS 502 �
 | 2 | 2026-11-14 17:23 | 增量 481 行（09:12:31Z→09:23:35Z） | 新增 §11：db-locked 丢账本写入，WAL 修复已合入；kimi 23.1% 稳定；minimax 改写量正常 |
 | 3 | 2026-11-14 17:27 | 增量 171 行（→09:27:28Z） | 平稳：0 db-locked / 0 Upstream WARN；kimi 本小时 abort 降至 11%（22/201）；volc backoff 未解除 |
 | 4 | 2026-11-14 17:58 | 增量 1,256 行 / 992 完成（29 分钟，真实计时等待） | 0 db-locked；3 次 failover（kimi 429×2 / 500×1）；kimi §7 已分辨：5s 耐心客户端 × kimi p50 8.2s 错配，权重调整即可 |
+| 5 | 2026-11-14 18:29 | 增量 1,145 行 / 933 完成（→10:29Z） | **kimi 配额墙形成**：quota probe 连续 4 次 429（17:58 起 /10min），网关把 kimi 挂入 backoff（streak=1）；建议 probe 连败退避 + `quota_parking` 显式停车。ollama_local `:cloud` 502×6 + 客户端 abort×17（§5 的 25/天税在继续）；db-locked×4（WAL 修复待发布） |
 
 ## 11. 巡检第 2 轮新增：SQLite 写锁丢弃账本写入（已修复代码，待发布）
 
