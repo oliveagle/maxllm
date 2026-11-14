@@ -20,8 +20,15 @@ serde_json = "1"
 toml = "0.8"
 thiserror = "2"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
 ahash = "0.8"
+# Native OpenTelemetry export (logs + traces). The gateway emits OTLP/HTTP
+# straight to GreptimeDB (or any OTLP endpoint); see `[otel]` in the config.
+opentelemetry = { version = "0.27", features = ["logs", "trace"] }
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio", "logs", "trace"] }
+opentelemetry-otlp = { version = "0.27", features = ["http-proto", "reqwest-client", "logs", "trace"] }
+tracing-opentelemetry = "0.28"
+base64 = "0.22"
 
 # `vendor/pingora-proxy` is upstream pingora-proxy 0.8.0 with one local change:
 # a request body larger than pingora's 64 KiB retry buffer is still handed to
