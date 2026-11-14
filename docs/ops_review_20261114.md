@@ -217,6 +217,7 @@ provider 名，当前 nas.toml 已无定义，日志中的 74 次 ada DNS 502 �
 | 3 | 2026-11-14 17:27 | 增量 171 行（→09:27:28Z） | 平稳：0 db-locked / 0 Upstream WARN；kimi 本小时 abort 降至 11%（22/201）；volc backoff 未解除 |
 | 4 | 2026-11-14 17:58 | 增量 1,256 行 / 992 完成（29 分钟，真实计时等待） | 0 db-locked；3 次 failover（kimi 429×2 / 500×1）；kimi §7 已分辨：5s 耐心客户端 × kimi p50 8.2s 错配，权重调整即可 |
 | 5 | 2026-11-14 18:29 | 增量 1,145 行 / 933 完成（→10:29Z） | **kimi 配额墙形成**：quota probe 连续 4 次 429（17:58 起 /10min），网关把 kimi 挂入 backoff（streak=1）；建议 probe 连败退避 + `quota_parking` 显式停车。ollama_local `:cloud` 502×6 + 客户端 abort×17（§5 的 25/天税在继续）；db-locked×4（WAL 修复待发布） |
+| 6 | 2026-11-14 19:00 | 事件响应 | **open_design tier 400 打断 agent loop**（`400 tier_limit_exceeded`，rpm 101/100 + concurrency 11/10）→ 修复发布 v0.3.22（commit `945a02f`）：① per-provider `max_concurrency`（open_design=10 已入 NAS 配置，热更成功）；② tier-limit 400 → 停车 + failover，普通 400 原样透传（含 envelope 归一化）。WAL 随 v0.3.22 重启生效（maxllm.db-wal 已出现，db-locked 应归零） |
 
 ## 11. 巡检第 2 轮新增：SQLite 写锁丢弃账本写入（已修复代码，待发布）
 
