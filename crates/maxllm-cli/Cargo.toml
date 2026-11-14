@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 maxllm-config = { path = "../maxllm-config" }
 maxllm-admin = { path = "../maxllm-admin" }
+maxllm-translate = { path = "../maxllm-translate" }
 clap = { version = "4", features = ["derive", "env"] }
 serde_json = { workspace = true }
 tracing = { workspace = true }

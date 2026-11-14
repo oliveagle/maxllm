@@ -73,6 +73,46 @@ enum Commands {
         #[command(subcommand)]
         command: AdminCommands,
     },
+    /// The translation kernel: compile-check and dry-run a kernel script
+    /// without starting the gateway (the fast inner loop for kernel edits).
+    Kernel {
+        #[command(subcommand)]
+        command: KernelCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum KernelCommands {
+    /// Compile a kernel script and report which hooks it defines
+    Check {
+        /// Path to the kernel script
+        #[arg(short, long)]
+        script: PathBuf,
+        /// Rhai operation budget (the gateway default is 2,000,000)
+        #[arg(long)]
+        max_operations: Option<u64>,
+    },
+    /// Run a kernel script's `on_upstream_error` hook against a status/body
+    Run {
+        /// Path to the kernel script
+        #[arg(short, long)]
+        script: PathBuf,
+        /// The upstream status to classify
+        #[arg(long, default_value_t = 400)]
+        status: u16,
+        /// The upstream error body to classify ("-" reads stdin)
+        #[arg(long)]
+        error_body: Option<String>,
+        /// The provider name the script should see
+        #[arg(long, default_value = "kimi")]
+        provider: String,
+        /// The model name the script should see
+        #[arg(long, default_value = "model")]
+        model: String,
+        /// Rhai operation budget (the gateway default is 2,000,000)
+        #[arg(long)]
+        max_operations: Option<u64>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -202,6 +242,27 @@ async fn main() {
         Commands::Config { command } => match command {
             ConfigCommands::Check { config } => commands::config::check(config),
             ConfigCommands::Providers { config } => commands::config::providers(config),
+        },
+        Commands::Kernel { command } => match command {
+            KernelCommands::Check {
+                script,
+                max_operations,
+            } => commands::kernel::check(&script, max_operations),
+            KernelCommands::Run {
+                script,
+                status,
+                error_body,
+                provider,
+                model,
+                max_operations,
+            } => commands::kernel::run(
+                &script,
+                status,
+                error_body.as_deref(),
+                &provider,
+                &model,
+                max_operations,
+            ),
         },
         Commands::Admin { command } => match command {
             AdminCommands::RenameProvider {
