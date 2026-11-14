@@ -19,3 +19,6 @@ mutants.out.*/
 # Python bytecode
 __pycache__/
 *.pyc
+
+# Local tool artifacts
+.commandcode/
