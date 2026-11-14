@@ -338,6 +338,10 @@ pub struct ProviderState {
     /// a path pin or a fallback hop must never cross the pool's boundary.
     pub self_hosted: bool,
     pub default_model: Option<String>,
+    /// This provider's model allow-list (empty = no restriction). A request
+    /// for any other model is refused with 403 `model_not_allowed` before it
+    /// reaches the upstream.
+    pub allowed_models: Vec<String>,
     /// Whether the provider speaks the Responses contract natively.
     pub native_responses: bool,
     /// Upstream path of the native Responses endpoint.
@@ -815,6 +819,7 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
                 weight: conf.weight,
                 tags: conf.tags.clone(),
                 default_model: conf.default_model.clone(),
+                allowed_models: conf.allowed_models.clone(),
                 native_responses,
                 responses_path,
                 moonshot_tool_schema: wants_moonshot_tool_schema(conf),
@@ -998,9 +1003,20 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
 
         for (_, provider) in &providers {
             let owned_by = provider_owned_by(provider.kind);
+            // A provider with a model allow-list only advertises the models it
+            // will actually answer for. Listing the rest would tell a client
+            // that a model is available that the same gateway refuses with
+            // 403 `model_not_allowed`.
+            let permits = |model: &str| {
+                provider.allowed_models.is_empty()
+                    || provider
+                        .allowed_models
+                        .iter()
+                        .any(|p| p == model || maxllm_admin::costs::glob_match(p, model))
+            };
 
             if let Some(ref dm) = provider.default_model {
-                if seen.insert(dm.clone()) {
+                if permits(dm) && seen.insert(dm.clone()) {
                     models.push(serde_json::json!({
                         "id": dm,
                         "object": "model",
@@ -1011,7 +1027,7 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
             }
 
             for &model_id in well_known_models(provider.kind) {
-                if seen.insert(model_id.to_string()) {
+                if permits(model_id) && seen.insert(model_id.to_string()) {
                     models.push(serde_json::json!({
                         "id": model_id,
                         "object": "model",
@@ -2507,6 +2523,7 @@ impl AiGateway {
         }
         let provider = Arc::clone(hot.providers.get(&entry.provider)?);
         ctx.provider_name = entry.provider.clone();
+        ctx.provider_allowed_models = provider.allowed_models.clone();
         ctx.auto_target = Some((entry.provider.clone(), entry.model.clone()));
         ctx.model = entry.model.clone();
         ctx.plugin_ctx.model = entry.model.clone();
@@ -2644,6 +2661,8 @@ impl AiGateway {
                             if !pinned.state.circuit_breaker.is_open() {
                                 METRICS.session_affinity_hits_total.inc();
                                 ctx.provider_name = pinned_name.clone();
+                                ctx.provider_allowed_models =
+                                    pinned.state.allowed_models.clone();
                                 ctx.fallback_used = pinned_name != route.provider;
                                 // The session continues on the provider it was
                                 // already talking to — see
@@ -2703,6 +2722,7 @@ impl AiGateway {
                         .inc();
                 }
                 ctx.provider_name = target.name.clone();
+                ctx.provider_allowed_models = target.state.allowed_models.clone();
                 // A provider that speaks the Responses contract natively gets
                 // the request forwarded unchanged (no chat translation round
                 // trip), so the whole Responses feature set survives.
@@ -3000,6 +3020,37 @@ impl AiGateway {
         }
     }
 
+    /// The selected provider's model allow-list denies the request. Empty
+    /// list means the provider serves any model. `resolved` is the model sent
+    /// upstream; `requested` is the raw client-supplied name, so a list entry
+    /// may name either an alias or the upstream model.
+    fn provider_model_denied(
+        provider: &str,
+        allowed_models: &[String],
+        resolved: &str,
+        requested: Option<&str>,
+    ) -> Option<String> {
+        if allowed_models.is_empty() {
+            return None;
+        }
+        let matches = |pattern: &str, model: &str| {
+            !model.is_empty()
+                && (model == pattern || maxllm_admin::costs::glob_match(pattern, model))
+        };
+        let allowed = allowed_models.iter().any(|pattern| {
+            matches(pattern, resolved) || requested.is_some_and(|m| matches(pattern, m))
+        });
+        if allowed {
+            None
+        } else {
+            let shown = requested.filter(|m| !m.is_empty()).unwrap_or(resolved);
+            Some(format!(
+                "model '{shown}' is not allowed on provider '{provider}' (allowed: {})",
+                allowed_models.join(", ")
+            ))
+        }
+    }
+
     /// Write a 403 response for a model the virtual key is not allowed to use.
     async fn write_model_denied(session: &mut Session, message: &str) -> pingora::Result<()> {
         let error_body = serde_json::json!({
@@ -3033,6 +3084,14 @@ impl AiGateway {
     ) -> pingora::Result<()> {
         let Some(message) =
             Self::model_denied(&ctx.virtual_key_allowed_models, resolved, requested)
+                .or_else(|| {
+                    Self::provider_model_denied(
+                        &ctx.provider_name,
+                        &ctx.provider_allowed_models,
+                        resolved,
+                        requested,
+                    )
+                })
         else {
             return Ok(());
         };
@@ -3392,7 +3451,9 @@ impl AiGateway {
         // Gemini-style `/models/<model>:<method>` path) can be checked
         // before anything reaches the upstream.
         if ctx.endpoint_type == EndpointType::Passthrough {
-            if ctx.virtual_key_allowed_models.is_empty() {
+            if ctx.virtual_key_allowed_models.is_empty()
+                && ctx.provider_allowed_models.is_empty()
+            {
                 return Ok(());
             }
             self.buffer_request_body_chunk(ctx, body, end_of_stream);
@@ -3549,7 +3610,8 @@ impl AiGateway {
                 // forwarded whole once the check has run. Keys without an
                 // allow-list keep the zero-copy flow: the body is forwarded
                 // immediately and only a copy is buffered for metadata.
-                let enforce_allowlist = !ctx.virtual_key_allowed_models.is_empty();
+                let enforce_allowlist = !ctx.virtual_key_allowed_models.is_empty()
+                    || !ctx.provider_allowed_models.is_empty();
                 if enforce_allowlist {
                     self.buffer_request_body_chunk(ctx, body, end_of_stream);
                 } else if let Some(ref data) = body {
@@ -9965,6 +10027,84 @@ api_key = "sk-test"
 }
 
 #[cfg(test)]
+mod provider_model_allowlist_tests {
+    use super::*;
+    use maxllm_config::Config;
+
+    const BASE: &str = r#"
+[server]
+listen = "0.0.0.0:8080"
+
+[providers.opencode]
+kind = "opencode"
+base_url = "https://opencode.ai"
+api_key = "sk-test"
+default_model = "deepseek-v4.1-flash"
+allowed_models = ["deepseek-v4.1-flash"]
+"#;
+
+    #[test]
+    fn an_empty_list_permits_every_model() {
+        assert_eq!(AiGateway::provider_model_denied("p", &[], "glm-5.2", None), None);
+    }
+
+    #[test]
+    fn an_explicit_model_is_allowed() {
+        let allowed = vec!["deepseek-v4.1-flash".to_string()];
+        assert_eq!(
+            AiGateway::provider_model_denied(
+                "opencode_1",
+                &allowed,
+                "deepseek-v4.1-flash",
+                Some("deepseek-v4.1-flash")
+            ),
+            None
+        );
+        // A glob entry matches a family.
+        let globbed = vec!["deepseek-*".to_string()];
+        assert_eq!(
+            AiGateway::provider_model_denied("opencode_1", &globbed, "deepseek-v4.1-flash", None),
+            None
+        );
+    }
+
+    #[test]
+    fn any_other_model_is_denied() {
+        let allowed = vec!["deepseek-v4.1-flash".to_string()];
+        let msg =
+            AiGateway::provider_model_denied("opencode_1", &allowed, "glm-5.2", Some("glm-5.2"))
+                .expect("must be denied");
+        assert!(msg.contains("glm-5.2"), "{msg}");
+        assert!(msg.contains("opencode_1"), "{msg}");
+        assert!(msg.contains("deepseek-v4.1-flash"), "{msg}");
+    }
+
+    #[test]
+    fn the_models_list_advertises_only_allowed_models() {
+        let config = Config::parse(BASE).unwrap();
+        let state = build_hot_state(&config).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&state.models_response).unwrap();
+        let ids: Vec<&str> = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m["id"].as_str())
+            .collect();
+        assert_eq!(ids, vec!["deepseek-v4.1-flash"], "{ids:?}");
+    }
+
+    #[test]
+    fn the_config_list_reaches_the_provider_state() {
+        let config = Config::parse(BASE).unwrap();
+        let state = build_hot_state(&config).unwrap();
+        assert_eq!(
+            state.providers["opencode"].allowed_models,
+            vec!["deepseek-v4.1-flash".to_string()]
+        );
+    }
+}
+
+#[cfg(test)]
 mod commandcode_tests {
     use super::*;
     use maxllm_config::Config;
@@ -10538,6 +10678,7 @@ mod failover_policy_tests {
             weight: 100,
             tags: vec![],
             default_model: default_model.map(|m| m.to_string()),
+            allowed_models: Vec::new(),
             native_responses: false,
             responses_path: None,
             moonshot_tool_schema: false,
