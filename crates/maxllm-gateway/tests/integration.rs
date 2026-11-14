@@ -9954,6 +9954,122 @@ fallback = ["member"]
     }
 }
 
+/// A subscription tier that answers over-limit traffic with a **400**
+/// `tier_limit_exceeded` (open-design's shape: "membership rpm limit
+/// exceeded: 101/100 resets …") must be read as quota, not as a request
+/// fault: the gateway parks the provider and walks the chain, and the
+/// agent's turn survives on the next member. The client must never see the
+/// lying 400.
+#[tokio::test]
+async fn test_tier_limit_400_fails_over_to_the_fallback() {
+    let tier = MockServer::start().await;
+    let fallback = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": {
+                "code": "tier_limit_exceeded",
+                "message": "[code=tier_limit_exceeded] membership rpm limit exceeded: 101/100 resets 2026-11-14T10:38:00Z",
+                "type": "tier_limit_exceeded"
+            }
+        })))
+        .mount(&tier)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from-fallback")))
+        .mount(&fallback)
+        .await;
+
+    let config = r#"
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[providers.tier]
+kind = "openai"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+
+[providers.fallback]
+kind = "openai"
+base_url = "{FALLBACK_URL}"
+api_key = "fake-key"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "tier"
+fallback = ["fallback"]
+"#;
+    let gw = TestGateway::start_with_fallback(config, &tier.uri(), &fallback.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .json(&chat_body("some-model", "hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "the tier-limit 400 must walk the chain, not end the turn"
+    );
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "from-fallback");
+
+    let tier_reqs = tier.received_requests().await.unwrap_or_default();
+    let fb_reqs = fallback.received_requests().await.unwrap_or_default();
+    assert_eq!(tier_reqs.len(), 1, "one attempt on the walled provider");
+    assert_eq!(fb_reqs.len(), 1, "the walk reached the fallback");
+}
+
+/// A 400 that is a genuine request fault must reach the client exactly as
+/// before — the tier-limit deferral must not change its shape, status or
+/// body.
+#[tokio::test]
+async fn test_ordinary_400_still_passes_through() {
+    let strict = MockServer::start().await;
+
+    let rejection = json!({
+        "error": {"code": "invalid_request_error", "message": "Invalid request: missing 'messages' parameter"}
+    });
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(rejection.clone()))
+        .mount(&strict)
+        .await;
+
+    let config = r#"
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[providers.strict]
+kind = "openai"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "strict"
+"#;
+    let gw = TestGateway::start(config, &strict.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .json(&chat_body("some-model", "hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "a request fault stays the client's answer");
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["error"]["message"],
+        rejection["error"]["message"],
+        "the body must reach the client untouched"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Large bodies and failover (pingora's 64 KiB replay buffer)
 // ---------------------------------------------------------------------------

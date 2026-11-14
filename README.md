@@ -1052,6 +1052,45 @@ Prometheus metrics: `maxllm_circuit_breaker_state{provider}` (0=closed,
 `maxllm_circuit_breaker_quota_opens_total{provider}` (429 force-opens),
 `maxllm_circuit_breaker_stream_opens_total{provider}` (truncation demotions).
 
+#### Provider concurrency cap
+
+Subscription tiers answer over-limit traffic in two shapes: a 429 (the breaker
+parks the provider until `Retry-After`) and — nastier — a **400** wearing a
+request-fault status:
+
+```
+400 {"error":{"code":"tier_limit_exceeded","message":"[code=tier_limit_exceeded]
+membership rpm limit exceeded: 101/100 resets 2026-11-14T10:38:00Z"}}
+400 {"error":{"code":"tier_limit_exceeded","message":"[code=tier_limit_exceeded]
+membership concurrency limit exceeded: 11/10 resets 2026-11-14T11:02:00Z"}}
+```
+
+open-design answers both ways. Delivered to the client, either ends the
+agent's turn on a wall the *next* provider does not have. Two layers keep the
+loop alive:
+
+1. **`max_concurrency`** caps the requests the gateway keeps in flight to the
+   provider. When the count is reached the provider is skipped by every
+   selection path — rotation, session pin, fallback walk — the same way an
+   open circuit is, so the tier's own ceiling is never crossed and the
+   rejection never happens:
+
+   ```toml
+   [providers.open_design]
+   kind = "open_design"
+   base_url = "https://amr-link.open-design.ai/v1"
+   max_concurrency = 10   # the tier allows 10 concurrent / 100 rpm
+   ```
+
+2. **Tier-limit 400s are quota.** A 400/422 body naming the wall
+   (`tier_limit_exceeded`, "rpm/concurrency/tpm/rate limit exceeded",
+   "too many requests", "requests per minute") parks the provider — on the
+   body's own reset instant when the phrasing carries one ("resets
+   2026-11-14T10:38:00Z"), on the cooldown ladder otherwise — and walks the
+   fallback chain. Any other 400 body is delivered to the client exactly as
+   before: the request-fault semantics are unchanged, including the
+   Anthropic/Gemini error-envelope normalization.
+
 #### Stream truncation demotes a provider
 
 A provider that answers `200` and then drops the body mid-stream is invisible

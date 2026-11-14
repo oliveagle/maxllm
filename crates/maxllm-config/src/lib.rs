@@ -513,6 +513,24 @@ pub struct ProviderConfig {
     /// get the projection, every other provider keeps its body untouched.
     #[serde(default)]
     pub tool_schema: Option<String>,
+    /// Maximum number of requests the gateway keeps in flight to this
+    /// provider at once. When the count is reached the provider is skipped by
+    /// the rotation and the fallback walk — the same way an open circuit is
+    /// — so the excess request is served by another member instead of being
+    /// rejected by the upstream's tier limit.
+    ///
+    /// Subscription tiers answer over-limit traffic in two shapes: a 429
+    /// (the gateway already parks the provider) and — worse — a 400
+    /// `tier_limit_exceeded` wearing a request-fault status (open-design
+    /// answers `membership concurrency limit exceeded: 11/10` and
+    /// `membership rpm limit exceeded: 101/100` this way), which would end
+    /// the caller's agent loop. The cap keeps the gateway under the tier's
+    /// own ceiling so the rejection never happens.
+    ///
+    /// Unset means no local cap: the provider's own limits are discovered by
+    /// its answers (429 → park; tier-limit 400 → park + failover).
+    #[serde(default)]
+    pub max_concurrency: Option<u32>,
     /// Skip the `reasoning_content` placeholder injection for thinking-mode
     /// tool-calling turns (echo collapse still runs). Set on opencode-kind
     /// channels whose upstream does not require `reasoning_content` back, to

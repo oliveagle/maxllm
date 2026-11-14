@@ -352,6 +352,12 @@ pub struct ProviderState {
     /// projection keeps the agent's tool call working instead of ending the
     /// turn with an upstream error.
     pub moonshot_tool_schema: bool,
+    /// Local cap on concurrent in-flight requests to this provider
+    /// (`max_concurrency` in the config). When the count is reached the
+    /// provider is skipped by every selection path — rotation, session pin,
+    /// fallback walk — the same way an open circuit is, so a tier limit is
+    /// never exceeded and never answered to the client.
+    pub max_concurrency: Option<u32>,
     /// TCP connect timeout to the upstream.
     pub connect_timeout: Duration,
     /// Total budget for the upstream connection (TCP connect + TLS).
@@ -818,6 +824,7 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
                 native_responses,
                 responses_path,
                 moonshot_tool_schema: wants_moonshot_tool_schema(conf),
+                max_concurrency: conf.max_concurrency,
                 connect_timeout: Duration::from_secs(
                     conf.connect_timeout_secs
                         .unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECS),
@@ -2363,7 +2370,10 @@ impl AiGateway {
                 // half-open probe slot. The old `is_open()` did exactly that,
                 // so the entries the round-robin *looked at* but never picked
                 // were left permanently half-open and answered 503.
-                .map(|p| p.circuit_breaker.allows_traffic())
+                .map(|p| {
+                    p.circuit_breaker.allows_traffic()
+                        && !provider_saturated(&e.provider, p)
+                })
                 .unwrap_or(false)
         });
         if healthy.is_empty() {
@@ -2379,7 +2389,9 @@ impl AiGateway {
         let admits = |e: &AutoPoolEntry| -> bool {
             hot.providers
                 .get(&e.provider)
-                .map(|p| !p.circuit_breaker.is_open())
+                .map(|p| {
+                    !p.circuit_breaker.is_open() && !provider_saturated(&e.provider, p)
+                })
                 .unwrap_or(false)
         };
         // The *read-only* twin of `admits`: it says whether the member could
@@ -2390,7 +2402,10 @@ impl AiGateway {
         let allows = |e: &AutoPoolEntry| -> bool {
             hot.providers
                 .get(&e.provider)
-                .map(|p| p.circuit_breaker.allows_traffic())
+                .map(|p| {
+                    p.circuit_breaker.allows_traffic()
+                        && !provider_saturated(&e.provider, p)
+                })
                 .unwrap_or(false)
         };
 
@@ -2641,7 +2656,9 @@ impl AiGateway {
                 match self.sessions.get(&session_id) {
                     Some(pinned_name) => {
                         if let Some(pinned) = candidates.iter().find(|c| c.name == pinned_name) {
-                            if !pinned.state.circuit_breaker.is_open() {
+                            if !pinned.state.circuit_breaker.is_open()
+                                && !provider_saturated(&pinned.name, &pinned.state)
+                            {
                                 METRICS.session_affinity_hits_total.inc();
                                 ctx.provider_name = pinned_name.clone();
                                 ctx.fallback_used = pinned_name != route.provider;
@@ -2745,6 +2762,7 @@ impl AiGateway {
             .any(|name| {
                 hot.providers.get(name).is_some_and(|p| {
                     p.circuit_breaker.allows_traffic()
+                        && !provider_saturated(name, p)
                         && p.default_model.as_deref().is_none_or(|dm| dm == ctx.model)
                 })
             })
@@ -4561,6 +4579,50 @@ fn should_failover_status(status: u16, ctx: &RequestCtx, provider: &ProviderStat
 /// `tools.function.parameters is not a valid moonshot flavored json schema`
 /// — and only that shape earns the schema repair: a 400 about anything else
 /// is the client's own fault and must reach the client as it arrived.
+/// Whether `provider` is already running its configured concurrency limit.
+///
+/// The in-flight count lives in [`crate::provider_stats`] (acquired when the
+/// request is dispatched, released when it leaves the provider), so this is a
+/// plain read — the same shape as the circuit-breaker checks the selection
+/// paths already make.
+fn provider_saturated(name: &str, provider: &ProviderState) -> bool {
+    provider
+        .max_concurrency
+        .is_some_and(|cap| crate::provider_stats::inflight(name) >= cap as u64)
+}
+
+/// Whether an error body names a subscription-tier limit rather than a
+/// request fault.
+///
+/// open-design answers an exhausted or over-limit subscription tier with a
+/// **400** —
+///
+/// ```json
+/// {"error":{"code":"tier_limit_exceeded","message":"[code=tier_limit_exceeded]
+/// membership rpm limit exceeded: 101/100 resets 2026-11-14T10:38:00Z"}}
+/// ```
+///
+/// — which the request-fault rules would deliver straight to the client and
+/// end the agent's turn, although the wall belongs to the *provider*: the
+/// next member of the chain does not have it. The phrases below are the
+/// error-code family such tiers use (`tier_limit_exceeded`, the rpm /
+/// concurrency / tpm limit sentences). Deliberately narrow: a genuine 400
+/// must reach the client exactly as before.
+fn body_reports_tier_limit(body: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "tier_limit_exceeded",
+        "tier limit exceeded",
+        "rpm limit exceeded",
+        "concurrency limit exceeded",
+        "tpm limit exceeded",
+        "rate limit exceeded",
+        "requests per minute",
+        "too many requests",
+    ];
+    let lower = body.to_ascii_lowercase();
+    MARKERS.iter().any(|m| lower.contains(m))
+}
+
 fn body_reports_tool_schema(body: &str) -> bool {
     let lower = body.to_ascii_lowercase();
     lower.contains("tools.function.parameters") || lower.contains("moonshot flavored json schema")
@@ -5915,6 +5977,33 @@ impl ProxyHttp for AiGateway {
             ctx.tool_schema_body_buf.clear();
             return Ok(());
         }
+        // A 400/422 whose body may wear a tier/rate/concurrency quota wall:
+        // open-design answers an exhausted subscription tier with
+        // `400 {"error":{"code":"tier_limit_exceeded",…}}` ("membership rpm
+        // limit exceeded: 101/100 resets …"), a quota signal wearing a
+        // request-fault status. Passing it through would end the agent's
+        // turn on a wall the *next* member of the chain does not have.
+        // Defer the decision to the body filter: a body that names the quota
+        // parks this provider and walks the chain; any other body is
+        // restored untouched, so the request-fault semantics are unchanged.
+        // A 400 the route would answer by model rewrite keeps that handling
+        // (checked above); a schema-rejection deferral keeps its precedence
+        // for the Moonshot dialect (checked above too).
+        if matches!(status, 400 | 422) && !should_failover_status(status, ctx, provider) {
+            ctx.pending_rate_limit = Some(status);
+            ctx.rate_limit_body_buf.clear();
+            ctx.rate_limit_headers = upstream_response
+                .headers
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.as_str().to_string(),
+                        v.to_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect();
+            return Ok(()); // let the body flow to the body filter
+        }
         if !should_failover_status(status, ctx, provider) {
             return Ok(());
         }
@@ -6312,6 +6401,126 @@ impl ProxyHttp for AiGateway {
             // Full error body collected → resolve the quota reset instant.
             let status = ctx.pending_rate_limit.take().unwrap();
             let body_bytes = std::mem::take(&mut ctx.rate_limit_body_buf);
+
+            // A 400/422 was deferred from the header phase: decide on the
+            // body alone, deterministically. The layered resolver (learned
+            // patterns → laya) stays reserved for the statuses it owns
+            // (429/500), so a genuine request fault never pays for a
+            // probabilistic classification — and never changes shape.
+            if matches!(status, 400 | 422) {
+                let text = String::from_utf8_lossy(&body_bytes);
+                if body_reports_tier_limit(&text) {
+                    // The wall belongs to the provider. Park it (the body's
+                    // own reset instant when the phrasing carries one, the
+                    // cooldown ladder otherwise) and walk the fallback chain.
+                    let provider_name = ctx.provider_name.clone();
+                    let hot = self.hot.load();
+                    let utc_offset_minutes = hot
+                        .providers
+                        .get(&provider_name)
+                        .map(|p| p.utc_offset_minutes)
+                        .unwrap_or(0);
+                    let (is_rate_limit, mut candidates) =
+                        crate::rate_limit::parse_body_text_with_offset(
+                            &text,
+                            utc_offset_minutes,
+                        );
+                    crate::rate_limit::retain_plausible_reset_candidates(&mut candidates);
+                    if let Some(p) = hot.providers.get(&provider_name) {
+                        match candidates.first().map(|c| c.at_ms) {
+                            Some(reset_at_ms) => {
+                                p.circuit_breaker.record_quota_until(reset_at_ms);
+                                info!(
+                                    provider = %provider_name,
+                                    reset_at_ms = reset_at_ms,
+                                    status = status,
+                                    "{status} tier-limit quota force-opened until the body's reset instant"
+                                );
+                            }
+                            None => {
+                                let base =
+                                    self.rate_limit_resolver.default_cooldown_secs() * 1000;
+                                let cooldown_ms = p.circuit_breaker.record_quota_unknown(base);
+                                info!(
+                                    provider = %provider_name,
+                                    cooldown_ms = cooldown_ms,
+                                    status = status,
+                                    "{status} tier-limit quota parked on the cooldown ladder"
+                                );
+                            }
+                        }
+                        METRICS
+                            .circuit_breaker_quota_opens_total
+                            .with_label_values(&[&provider_name])
+                            .inc();
+                        METRICS
+                            .circuit_breaker_state
+                            .with_label_values(&[&provider_name])
+                            .set(p.circuit_breaker.state() as i64);
+                        self.persist_circuit_breaker(&provider_name, &p.circuit_breaker);
+                    }
+                    let _ = is_rate_limit; // the markers above already decided
+                    // Learn the shape so the next wall resolves without a
+                    // regex walk (same fire-and-forget persist as the 429/500
+                    // path).
+                    if !text.trim().is_empty() {
+                        let learned = crate::rate_limit_resolver::LearnedUpdate {
+                            fingerprint: crate::rate_limit::fingerprint(&text),
+                            is_rate_limit: true,
+                            reset_expression: None,
+                            sample_message: text.chars().take(400).collect(),
+                        };
+                        let resolver = self.rate_limit_resolver.clone();
+                        tokio::spawn(async move {
+                            resolver.persist_learned(learned).await;
+                        });
+                    }
+                    // A quota wall must not keep the session pinned.
+                    self.unpin_session(ctx);
+                    return self.fail_over_from_body_filter(
+                        session,
+                        ctx,
+                        status,
+                        "tier-limit quota wearing a 400",
+                    );
+                }
+                // Ordinary request fault: hand the buffered body through
+                // the same end-of-stream treatment the plain passthrough
+                // applies — error-envelope normalization (Anthropic/Gemini
+                // shapes → OpenAI) and the plugin chains — so the client
+                // receives the upstream's answer with exactly the shape it
+                // had before the deferral existed.
+                let hot = self.hot.load();
+                let normalized = hot
+                    .providers
+                    .get(&ctx.provider_name)
+                    .and_then(|p| {
+                        normalize_error_response(&body_bytes, ctx.upstream_status, p.kind)
+                    });
+                match normalized {
+                    Some(n) => *body = Some(Bytes::from(n)),
+                    None => {
+                        if !body_bytes.is_empty() {
+                            *body = Some(Bytes::from(body_bytes));
+                        }
+                    }
+                }
+                hot.global_chain.run_response_body(
+                    session,
+                    body,
+                    end_of_stream,
+                    &mut ctx.plugin_ctx,
+                )?;
+                if let Some(idx) = ctx.route_index {
+                    hot.route_chains[idx].run_response_body(
+                        session,
+                        body,
+                        end_of_stream,
+                        &mut ctx.plugin_ctx,
+                    )?;
+                }
+                return Ok(None);
+            }
 
             let headers: http::HeaderMap = {
                 let mut m = http::HeaderMap::new();
@@ -8000,7 +8209,10 @@ impl AiGateway {
                 && hot
                     .providers
                     .get(name)
-                    .map(|p| p.circuit_breaker.allows_traffic())
+                    .map(|p| {
+                        p.circuit_breaker.allows_traffic()
+                            && !provider_saturated(name, p)
+                    })
                     .unwrap_or(false)
         };
         let scoped_pool = hot
@@ -8062,7 +8274,9 @@ impl AiGateway {
         let admit = |provider: &str| -> bool {
             hot.providers
                 .get(provider)
-                .map(|p| !p.circuit_breaker.is_open())
+                .map(|p| {
+                    !p.circuit_breaker.is_open() && !provider_saturated(provider, p)
+                })
                 .unwrap_or(false)
         };
 
@@ -8093,7 +8307,10 @@ impl AiGateway {
                         && hot
                             .providers
                             .get(&e.provider)
-                            .map(|p| p.circuit_breaker.allows_traffic())
+                            .map(|p| {
+                                p.circuit_breaker.allows_traffic()
+                                    && !provider_saturated(&e.provider, p)
+                            })
                             .unwrap_or(false)
                 });
                 let entry = next.into_iter().find(|e| admit(&e.provider))?;
@@ -8122,7 +8339,10 @@ impl AiGateway {
                     && hot
                         .providers
                         .get(&e.provider)
-                        .map(|p| p.circuit_breaker.allows_traffic())
+                        .map(|p| {
+                            p.circuit_breaker.allows_traffic()
+                                && !provider_saturated(&e.provider, p)
+                        })
                         .unwrap_or(false)
             });
             let metered_tier = healthy.iter().all(|e| e.billing == BillingMode::Metered);
@@ -8191,7 +8411,9 @@ impl AiGateway {
             .find_map(|name| {
                 hot.providers
                     .get(name)
-                    .filter(|p| !p.circuit_breaker.is_open())
+                    .filter(|p| {
+                        !p.circuit_breaker.is_open() && !provider_saturated(name, p)
+                    })
                     .map(|p| (name.clone(), Arc::clone(p)))
             })
     }
@@ -10541,6 +10763,7 @@ mod failover_policy_tests {
             native_responses: false,
             responses_path: None,
             moonshot_tool_schema: false,
+            max_concurrency: None,
             connect_timeout: Duration::from_secs(10),
             total_connect_timeout: None,
             read_timeout: None,
@@ -10570,6 +10793,49 @@ mod failover_policy_tests {
         assert!(!body_reports_tool_schema(
             r#"{"error":{"message":"Your quota is exhausted until 2026-11-10 22:58:54"}}"#
         ));
+    }
+
+    #[test]
+    fn tier_limit_bodies_are_classified() {
+        let rpm = r#"{"error":{"code":"tier_limit_exceeded","message":"[code=tier_limit_exceeded] membership rpm limit exceeded: 101/100 resets 2026-11-14T10:38:00Z","type":"tier_limit_exceeded"}}"#;
+        let concurrency = r#"{"error":{"code":"tier_limit_exceeded","message":"[code=tier_limit_exceeded] membership concurrency limit exceeded: 11/10 resets 2026-11-14T11:02:00Z","type":"tier_limit_exceeded"}}"#;
+        assert!(body_reports_tier_limit(rpm));
+        assert!(body_reports_tier_limit(concurrency));
+        assert!(body_reports_tier_limit(
+            r#"{"error":{"message":"Rate limit exceeded: 5 requests per minute"}}"#
+        ));
+
+        // A genuine request fault is never mistaken for a quota wall —
+        // it must reach the client exactly as before.
+        assert!(!body_reports_tier_limit(
+            r#"{"error":{"message":"Invalid request: missing 'messages' parameter"}}"#
+        ));
+        assert!(!body_reports_tier_limit(
+            r#"{"error":{"message":"Your quota is exhausted until 2026-11-10 22:58:54"}}"#
+        ));
+        assert!(!body_reports_tier_limit(""));
+    }
+
+    #[test]
+    fn provider_saturation_reads_the_inflight_counter() {
+        let p = provider(Some("MiniMax-M3"));
+        let mut p = p;
+        p.max_concurrency = Some(1);
+        // Uncapped providers are never saturated.
+        let uncapped = provider(Some("MiniMax-M3"));
+        assert!(!provider_saturated("sat-uncapped", &uncapped));
+
+        crate::provider_stats::acquire("sat-a");
+        assert!(
+            provider_saturated("sat-a", &p),
+            "one in-flight request fills a cap of 1"
+        );
+        assert!(
+            !provider_saturated("sat-other", &p),
+            "the count is per provider, not global"
+        );
+        crate::provider_stats::release("sat-a");
+        assert!(!provider_saturated("sat-a", &p), "release frees the slot");
     }
 
     #[test]

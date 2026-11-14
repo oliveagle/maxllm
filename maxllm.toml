@@ -290,6 +290,11 @@ kind = "open_design"
 base_url = "https://amr-link.open-design.ai/v1"
 api_key = "${OPEN_DESIGN_API_KEY}"
 default_model = "deepseek-v4.1-flash"
+# The subscription tier allows 10 concurrent requests / 100 rpm. Over-limit
+# traffic is answered with a 400 tier_limit_exceeded — a quota signal wearing
+# a request-fault status — so the gateway keeps itself under the ceiling
+# (max_concurrency) and treats the phrase as quota when it still slips through.
+max_concurrency = 10
 
 # --- Routes ---
 
