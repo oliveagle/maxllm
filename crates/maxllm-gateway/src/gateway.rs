@@ -342,6 +342,16 @@ pub struct ProviderState {
     pub native_responses: bool,
     /// Upstream path of the native Responses endpoint.
     pub responses_path: Option<String>,
+    /// Whether the provider's upstream validates tool schemas with the
+    /// Moonshot/Kimi dialect and the gateway must project them before they
+    /// are forwarded (see [`maxllm_translate::moonshot`]).
+    ///
+    /// Kimi answers `400 invalid_request_error … not a valid moonshot
+    /// flavored json schema` for a tool schema the other upstreams take —
+    /// codex's zod 4 `$defs.__schemaN` schemas are the known offenders. The
+    /// projection keeps the agent's tool call working instead of ending the
+    /// turn with an upstream error.
+    pub moonshot_tool_schema: bool,
     /// TCP connect timeout to the upstream.
     pub connect_timeout: Duration,
     /// Total budget for the upstream connection (TCP connect + TLS).
@@ -585,6 +595,28 @@ pub fn apply_quota_parking(config: &Config, hot: &HotState) {
     }
 }
 
+/// Whether a provider's tool schemas must be projected into the Moonshot
+/// dialect before they are forwarded upstream.
+///
+/// The config decides first (`tool_schema = "moonshot"` / `"none"`); unset,
+/// the upstream host decides — a Moonshot-family host runs the stricter
+/// validator, every other provider takes the tool schemas as they are.
+fn wants_moonshot_tool_schema(conf: &maxllm_config::ProviderConfig) -> bool {
+    match conf.tool_schema.as_deref() {
+        Some("moonshot") => true,
+        Some("none") => false,
+        Some(other) => {
+            warn!(
+                base_url = %conf.base_url,
+                value = %other,
+                "unknown tool_schema dialect — falling back to the host-based default"
+            );
+            maxllm_translate::moonshot::is_moonshot_family_host(&conf.base_url)
+        }
+        None => maxllm_translate::moonshot::is_moonshot_family_host(&conf.base_url),
+    }
+}
+
 /// Build the hot-reloadable state from a config.
 /// Extracted so it can be called both at startup and on reload.
 pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::Error>> {
@@ -785,6 +817,7 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
                 default_model: conf.default_model.clone(),
                 native_responses,
                 responses_path,
+                moonshot_tool_schema: wants_moonshot_tool_schema(conf),
                 connect_timeout: Duration::from_secs(
                     conf.connect_timeout_secs
                         .unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECS),
@@ -3463,7 +3496,8 @@ impl AiGateway {
                             }
                         }
                     }
-                    let normalized = match hot.providers.get(&ctx.provider_name) {
+                    let provider = hot.providers.get(&ctx.provider_name).cloned();
+                    let normalized = match provider.as_deref() {
                         Some(p) => Self::normalize_native_responses_body(p, &ctx.request_body_buf),
                         None => maxllm_translate::responses::normalize_responses_request(
                             &ctx.request_body_buf,
@@ -3472,16 +3506,25 @@ impl AiGateway {
                     if maxllm_translate::responses::body_has_synthetic_call_id(&normalized) {
                         ctx.repaired_call_ids = true;
                     }
-                    let mut out = normalized;
+                    // A Moonshot-family upstream validates every tool schema
+                    // against its own dialect — project them here too, before
+                    // the body is framed (or degrade them, on the retry after
+                    // a rejection).
+                    let mut out = match provider.as_deref() {
+                        Some(p) => {
+                            Self::apply_tool_schema_dialect(p, normalized, ctx.tool_schema_degraded)
+                        }
+                        None => normalized,
+                    };
                     // This request keeps the client's Content-Length (the
                     // upstream answers a chunked request with a 400), so the
                     // forwarded body must not be longer than the body the
                     // client sent: a longer body would be truncated by the
                     // upstream's reader and arrive as broken JSON. The shared
                     // normaliser can grow the body — the call_id repair adds
-                    // a field — so in that case the client's own body is
-                    // forwarded unchanged and the upstream judges it, as it
-                    // did before.
+                    // a field, the tool-schema projection inlines references —
+                    // so in that case the client's own body is forwarded
+                    // unchanged and the upstream judges it, as it did before.
                     if out.len() > ctx.request_body_buf.len() {
                         out = ctx.request_body_buf.clone();
                     }
@@ -3822,8 +3865,19 @@ impl AiGateway {
                     }
                 }
 
-                // Forward body as-is (no translation)
-                *body = Some(Bytes::from(std::mem::take(&mut ctx.request_body_buf)));
+                // Forward body as-is (no translation). One exception: a
+                // native route on a provider whose upstream validates tool
+                // schemas against a stricter dialect still carries the
+                // OpenAI-shaped tool list, so the projection applies here
+                // too. A body that needs no repair comes back byte-for-byte —
+                // native routes keep their no-rewrite promise for every
+                // other provider.
+                let outgoing = std::mem::take(&mut ctx.request_body_buf);
+                *body = Some(Bytes::from(if provider.moonshot_tool_schema {
+                    Self::apply_tool_schema_dialect(provider, outgoing, ctx.tool_schema_degraded)
+                } else {
+                    outgoing
+                }));
             } else {
                 // ── NORMAL MODE: OpenAI input → provider translation ──
 
@@ -4103,6 +4157,18 @@ impl AiGateway {
                 };
                 match translated {
                     Ok(translated) => {
+                        let mut outgoing = translated.body;
+                        if provider.moonshot_tool_schema {
+                            // The upstream validates every tool schema against
+                            // its own dialect — project them before they leave
+                            // (or degrade them, on the retry after a
+                            // rejection).
+                            outgoing = Self::apply_tool_schema_dialect(
+                                provider,
+                                outgoing,
+                                ctx.tool_schema_degraded,
+                            );
+                        }
                         if translated.is_streaming {
                             ctx.is_streaming = true;
                             match ctx.stream_translator.lock() {
@@ -4134,7 +4200,7 @@ impl AiGateway {
                                 }
                             }
                         }
-                        *body = Some(Bytes::from(translated.body));
+                        *body = Some(Bytes::from(outgoing));
                     }
                     Err(e) => {
                         // Without this context the warning is unattributable:
@@ -4162,6 +4228,32 @@ impl AiGateway {
         }
 
         Ok(())
+    }
+
+    /// Apply the provider's tool-schema dialect to an outgoing request body.
+    ///
+    /// Moonshot/Kimi validates every tool schema against its own dialect and
+    /// answers `400 invalid_request_error … not a valid moonshot flavored
+    /// json schema` for the shapes other upstreams take — codex's zod 4
+    /// `$defs.__schemaN` schemas are the known offenders. The projection
+    /// repairs them before they reach the upstream; a body that needs no
+    /// repair comes back byte-for-byte, so a provider without the dialect
+    /// never sees a rewritten body. A retry after a rejection degrades the
+    /// schemas instead (the tool names survive, the argument contracts
+    /// collapse to a bare object) so the agent's turn continues.
+    fn apply_tool_schema_dialect(
+        provider: &ProviderState,
+        body: Vec<u8>,
+        degraded: bool,
+    ) -> Vec<u8> {
+        if !provider.moonshot_tool_schema {
+            return body;
+        }
+        if degraded {
+            maxllm_translate::moonshot::degrade_tool_schemas(&body)
+        } else {
+            maxllm_translate::moonshot::normalize_tools(&body)
+        }
     }
 
     /// Apply the repairs a **native Responses** request body needs before it
@@ -4461,6 +4553,17 @@ fn should_failover_status(status: u16, ctx: &RequestCtx, provider: &ProviderStat
         // 2xx/3xx and anything else: the provider answered.
         _ => false,
     }
+}
+
+/// Whether an upstream error body blames the tool schemas.
+///
+/// Kimi's rejection names them —
+/// `tools.function.parameters is not a valid moonshot flavored json schema`
+/// — and only that shape earns the schema repair: a 400 about anything else
+/// is the client's own fault and must reach the client as it arrived.
+fn body_reports_tool_schema(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("tools.function.parameters") || lower.contains("moonshot flavored json schema")
 }
 
 /// Whether the gateway answers such an upstream status itself.
@@ -5418,6 +5521,11 @@ impl ProxyHttp for AiGateway {
             // other body the gateway rewrites.
             let repairs_native_body =
                 is_native_responses && provider.translator.repairs_native_responses_body();
+            // A Moonshot-family upstream validates every tool schema against
+            // its own dialect; the gateway may have to rewrite them, which
+            // changes the body's size — the body travels buffered (never
+            // verbatim) so the projection runs before anything leaves.
+            let may_rewrite_tool_schema = provider.moonshot_tool_schema;
             // The provider was picked before the body was read, so a pool
             // sentinel (`{"model": "auto"}`) can only be seen later, in
             // request_body_filter. A body kept byte-verbatim cannot be
@@ -5462,6 +5570,7 @@ impl ProxyHttp for AiGateway {
             // original Content-Length — which would truncate a larger body.
             let verbatim = !is_auto_route
                 && !may_carry_pool_sentinel
+                && !may_rewrite_tool_schema
                 && ((is_native_responses && !repairs_native_body && !native_body_is_rewritten)
                     || (openai_style && !is_responses_to_chat));
 
@@ -5785,6 +5894,25 @@ impl ProxyHttp for AiGateway {
         if status == 404 && self.model_rewrite_target(&hot, ctx, provider).is_some() {
             ctx.pending_model_404 = true;
             ctx.model_404_body_buf.clear();
+            return Ok(());
+        }
+        // A 400 whose body may blame the tool schemas the gateway forwarded:
+        // defer the decision until the body arrives — only the body says the
+        // rejection names them. When it does, the request is replayed once
+        // with degraded tool schemas instead of ending the agent's turn with
+        // the upstream's error; any other 400 passes through untouched.
+        // The deferral only preempts the handling that would end the turn
+        // (a 400 this provider takes as a request fault): a 400 the route
+        // would answer by model rewrite or failover keeps that handling —
+        // the request is retried anyway, and a schema rejection that
+        // survives it reaches this deferral on the next attempt.
+        if status == 400
+            && provider.moonshot_tool_schema
+            && !ctx.tool_schema_degraded
+            && !should_failover_status(status, ctx, provider)
+        {
+            ctx.pending_tool_schema_repair = true;
+            ctx.tool_schema_body_buf.clear();
             return Ok(());
         }
         if !should_failover_status(status, ctx, provider) {
@@ -6117,6 +6245,36 @@ impl ProxyHttp for AiGateway {
                 404,
                 "404 does not name the requested model",
             );
+        }
+
+        // ── Pending tool-schema decision (a 400 that may blame the tool
+        // schemas) ───────────────────────────────────────────────────────
+        //
+        // Kimi answers `400 … not a valid moonshot flavored json schema` for
+        // tool schemas the other upstreams take. The gateway projected them
+        // before forwarding; a rejection that survives the projection means
+        // the projection missed a rule, and the turn must still not die on
+        // it: the request is replayed once with degraded tool schemas (the
+        // tool names survive, the argument contracts collapse to a bare
+        // object). A 400 that names anything else is the client's own
+        // fault — the buffered body is handed back untouched.
+        if ctx.pending_tool_schema_repair {
+            if let Some(data) = body.as_ref() {
+                if ctx.tool_schema_body_buf.len() < 64 * 1024 {
+                    ctx.tool_schema_body_buf.extend_from_slice(data);
+                }
+            }
+            if !end_of_stream {
+                return Ok(None);
+            }
+            ctx.pending_tool_schema_repair = false;
+            let buffered = std::mem::take(&mut ctx.tool_schema_body_buf);
+            if body_reports_tool_schema(&String::from_utf8_lossy(&buffered)) {
+                return Err(self.begin_tool_schema_repair(ctx));
+            }
+            if !buffered.is_empty() {
+                *body = Some(Bytes::from(buffered));
+            }
         }
 
         // ── Pending rate-limit decision (a 429 whose headers did not pin
@@ -8163,6 +8321,44 @@ impl AiGateway {
             .with_label_values(&[&failed_provider, &name])
             .inc();
         Some((failed_provider, name))
+    }
+
+    /// Reset the request for an in-place retry with degraded tool schemas.
+    ///
+    /// The upstream refused the tool schemas the gateway forwarded it. Rather
+    /// than ending the agent's turn with the upstream's error, the request is
+    /// replayed once with every tool schema reduced to a bare object: the
+    /// tool names and the tool list survive, so the conversation keeps its
+    /// function-calling surface and the turn continues.
+    fn begin_tool_schema_repair(&self, ctx: &mut RequestCtx) -> Box<pingora::Error> {
+        ctx.tool_schema_degraded = true;
+        ctx.body_translated = false;
+        ctx.upstream_responded = false;
+        ctx.request_body_buf.clear();
+        ctx.replay_body = ctx.client_body.clone();
+        ctx.replay_injected = false;
+        ctx.keep_request_content_length = false;
+        if let Ok(mut guard) = ctx.stream_translator.lock() {
+            *guard = None;
+        }
+        METRICS
+            .tool_schema_repair_retries_total
+            .with_label_values(&[&ctx.provider_name])
+            .inc();
+        info!(
+            provider = %ctx.provider_name,
+            "upstream refused the tool schemas — retrying with degraded tool schemas"
+        );
+        let mut e = pingora::Error::explain(
+            pingora::ErrorType::HTTPStatus(400),
+            format!(
+                "provider '{}' refused the tool schemas; retrying it with degraded tool schemas",
+                ctx.provider_name
+            ),
+        );
+        e.as_up();
+        e.set_retry(true);
+        e
     }
 
     /// Persist a provider's circuit-breaker state.
@@ -10344,6 +10540,7 @@ mod failover_policy_tests {
             default_model: default_model.map(|m| m.to_string()),
             native_responses: false,
             responses_path: None,
+            moonshot_tool_schema: false,
             connect_timeout: Duration::from_secs(10),
             total_connect_timeout: None,
             read_timeout: None,
@@ -10357,6 +10554,22 @@ mod failover_policy_tests {
         let mut c = RequestCtx::new();
         c.model = model.to_string();
         c
+    }
+
+    #[test]
+    fn tool_schema_rejection_bodies_are_classified() {
+        let rejection = r#"{"error":{"code":"invalid_request_error","message":"Invalid request: tools.function.parameters is not a valid moonshot flavored json schema, details: <At path 'properties.show': detected infinite recursion without termination condition>","type":"invalid_request_error"}}"#;
+        assert!(body_reports_tool_schema(rejection));
+
+        // A 400 about anything else is the client's own fault.
+        assert!(!body_reports_tool_schema(
+            r#"{"error":{"message":"Invalid request: missing 'messages' parameter"}}"#
+        ));
+        assert!(!body_reports_tool_schema(""));
+        // A quota wall never names the tool schemas.
+        assert!(!body_reports_tool_schema(
+            r#"{"error":{"message":"Your quota is exhausted until 2026-11-10 22:58:54"}}"#
+        ));
     }
 
     #[test]

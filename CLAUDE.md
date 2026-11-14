@@ -225,6 +225,82 @@ Built-in cost map for 10+ model families (gpt-4o, claude-sonnet, gemini-flash, e
 | Command Code | Passthrough (chat route) or OpenAI -> Anthropic (messages route) | Passthrough or Anthropic -> OpenAI | Passthrough or Anthropic SSE -> OpenAI SSE |
 | OpenDesign | Passthrough (chat route, `tool_choice: "any"` -> `"required"`) | Passthrough | Passthrough |
 
+## Tool Schema Dialects (MUST)
+
+A provider may validate `tools[].function.parameters` against its own JSON
+Schema dialect. Moonshot/Kimi runs the strictest one: a `$ref` must be the
+*only* keyword of its site, its target must carry a `type`, a `type` beside an
+`anyOf`/`oneOf` is an error, and a reference cycle is rejected outright. The
+shapes codex-cli sends (zod 4 emits `$defs.__schemaN` with `$ref` beside
+siblings) therefore earn
+
+```
+400 {"error":{"code":"invalid_request_error","message":"Invalid request:
+tools.function.parameters is not a valid moonshot flavored json schema,
+details: <At path 'properties.show': detected infinite recursion without
+termination condition>"}}
+```
+
+### Rule: a translation fault must never end the agent loop
+
+An agent's turn is a loop: the client sends a request, the model asks for a
+tool, the client runs it, sends the result back. A translation fault that
+surfaces as a `4xx` **kills that loop** — the client has no turn to continue,
+and every later request in the conversation is dead. So a translation fault is
+never allowed to be the client's answer:
+
+| layer | duty |
+|-------|------|
+| **prevent** | project the tool schemas into the provider's dialect *before* they leave the gateway (`maxllm-translate/src/moonshot.rs`) |
+| **repair** | when an upstream still refuses the schemas, replay the request **once, against the same provider**, with degraded tool schemas — the tool names survive, so the tool-call surface and the turn continue |
+| **pass through** | a `4xx` that names anything else is the client's own fault and must reach the client exactly as it arrived |
+
+The repair only preempts the handling that would end the turn: a 400 the route
+would answer by model rewrite or provider failover keeps that handling — the
+request is retried anyway, and a schema rejection that survives the rewrite
+reaches this deferral on the next attempt (one rewrite per provider, one
+degradation per request).
+
+The repair is bounded (one retry per request, `ctx.tool_schema_degraded`), is
+counted (`maxllm_tool_schema_repair_retries_total{provider}`) and only ever
+fires for a body that names the tool schemas (`tools.function.parameters` /
+`moonshot flavored json schema`). A provider without the dialect keeps its body
+byte-for-byte — the projection returns the original bytes when nothing needs
+repairing, so prompt caches stay warm.
+
+### The projection
+
+`maxllm_translate::moonshot::normalize_tools` rewrites each tool schema:
+
+* a `$ref` **beside** another keyword is inlined — the site's own keywords
+  win over the referenced target's;
+* a `$ref` target without a `type` gains the inferred one (`properties` ->
+  `object`, `items` -> `array`, `enum`/`const` -> the branch's type);
+* a `type` beside an `anyOf`/`oneOf` moves into the branches;
+* a reference cycle is cut at a terminating object (`{"type":"object"}`);
+* a pure, typed, cycle-free `$ref` is kept — it is legal in the dialect.
+
+The last resort is `degrade_tool_schemas`: every `parameters` becomes
+`{"type":"object"}`. The tool list, the tool names and the model's ability to
+call them survive; only the argument contract is lost, which the model still
+fills in from the prompt.
+
+### Configuration
+
+```toml
+[providers.kimi]
+kind = "openai_compat"
+base_url = "https://api.kimi.com"
+tool_schema = "moonshot"   # "moonshot" | "none"; unset = detect by host
+```
+
+Unset means the gateway decides by upstream host: the Moonshot family
+(`api.moonshot.ai`, `api.moonshot.cn`, `api.kimi.com`, `moonshot.ai`,
+`kimi.com`) gets the projection, every other provider keeps its body
+untouched. `tool_schema = "none"` forces no projection, `"moonshot"` forces
+it — use the knob for a Moonshot-compatible upstream on a custom host, or to
+opt a self-hosted mirror out of the projection.
+
 ## Responses Contract Policy (MUST)
 
 `/v1/responses` traffic takes exactly one of two paths:

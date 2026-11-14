@@ -109,6 +109,12 @@ pub struct GatewayMetrics {
     /// every entry; without the rewrite the whole chain 400s and the route
     /// dies with its primary (docs/ops_review_20261108.md §828).
     pub model_rewrite_retries_total: IntCounterVec,
+    /// Same-provider retries that degraded the tool schemas after the
+    /// upstream rejected them (`400 … not a valid moonshot flavored json
+    /// schema`). The tool names survive; the argument contracts collapse to
+    /// a bare object, so the agent's turn continues instead of dying on a
+    /// translation fault.
+    pub tool_schema_repair_retries_total: IntCounterVec,
     /// Requests currently in flight per provider — the live view of the
     /// least-connections routing decision.
     pub provider_inflight_requests: IntGaugeVec,
@@ -497,6 +503,18 @@ impl GatewayMetrics {
             .register(Box::new(model_rewrite_retries_total.clone()))
             .expect("register");
 
+        let tool_schema_repair_retries_total = IntCounterVec::new(
+            Opts::new(
+                "maxllm_tool_schema_repair_retries_total",
+                "Same-provider retries with degraded tool schemas after the upstream rejected them",
+            ),
+            &["provider"],
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(tool_schema_repair_retries_total.clone()))
+            .expect("register");
+
         let provider_inflight_requests = IntGaugeVec::new(
             Opts::new(
                 "maxllm_provider_inflight_requests",
@@ -572,6 +590,7 @@ impl GatewayMetrics {
             http_failovers_total,
             provider_retries_total,
             model_rewrite_retries_total,
+            tool_schema_repair_retries_total,
             provider_inflight_requests,
             recording_redactions_total,
             cached_input_tokens_total,

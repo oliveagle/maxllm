@@ -13963,3 +13963,515 @@ async fn test_a_body_only_scoped_sentinel_is_refused_when_the_prefetch_is_off() 
         "the home member is never entered from a body-only first hop: {home_reqs:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Moonshot tool-schema projection — codex's zod 4 schemas reach Kimi whole
+// ---------------------------------------------------------------------------
+
+/// The provider names a Moonshot-family host in production and the dialect
+/// is switched on by the host; in tests the mock stands in for the host, so
+/// the config names the dialect explicitly (`tool_schema = "moonshot"`).
+const MOONSHOT_TOOL_CONFIG: &str = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[metrics]
+enabled = true
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.kimi_mock]
+kind = "openai_compat"
+base_url = "{MOCK_URL}"
+upstream_path = "/coding/v1/chat/completions"
+api_key = "fake-key"
+tool_schema = "moonshot"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "kimi_mock"
+"#;
+
+/// codex sends zod 4 tool schemas: reused shapes live in `$defs`, refined
+/// ones are written as `$ref` beside their own keywords, and recursive ones
+/// never terminate — the shapes Kimi's "moonshot flavored json schema"
+/// validator refuses.
+fn zod_tool() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "memory_feedback",
+            "description": "Record a quality signal.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "show": {"$ref": "#/$defs/__schema0"},
+                    "score": {"type": "integer", "maximum": 9007199254740991i64, "$ref": "#/$defs/__schema1"}
+                },
+                "required": ["show"],
+                "$defs": {
+                    "__schema0": {"$ref": "#/$defs/__schema0"},
+                    "__schema1": {"type": "number", "minimum": 0}
+                }
+            }
+        }
+    })
+}
+
+fn moonshot_rejection() -> Value {
+    json!({
+        "error": {
+            "code": "invalid_request_error",
+            "message": "Invalid request: tools.function.parameters is not a valid moonshot flavored json schema, details: <At path 'properties.show': detected infinite recursion without termination condition>",
+            "type": "invalid_request_error"
+        }
+    })
+}
+
+#[tokio::test]
+async fn test_moonshot_chat_tools_are_projected_before_the_upstream() {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/coding/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("ok")))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let gw = TestGateway::start(MOONSHOT_TOOL_CONFIG, &mock.uri()).await;
+    let c = client();
+
+    let mut body = chat_body("kimi-for-coding", "hi");
+    body["tools"] = json!([zod_tool()]);
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let requests = mock.received_requests().await.unwrap();
+    let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let schema = &sent["tools"][0]["function"]["parameters"];
+
+    // The recursive chain is cut: the def ends at a typed object, so the
+    // walk Moonshot runs terminates.
+    assert_eq!(
+        schema["$defs"]["__schema0"],
+        json!({"type": "object"}),
+        "the self-reference must be cut: {schema}"
+    );
+    assert_eq!(
+        schema["properties"]["show"],
+        json!({"$ref": "#/$defs/__schema0"}),
+        "the pure reference to the cut target is the honest shape: {schema}"
+    );
+    // The refined `type`+`$ref` site is inlined — the site's type wins.
+    assert_eq!(schema["properties"]["score"]["type"], "integer", "{schema}");
+    assert!(schema["properties"]["score"].get("$ref").is_none());
+    assert_eq!(schema["properties"]["score"]["minimum"], 0);
+    // The tool name and description survive untouched.
+    assert_eq!(sent["tools"][0]["function"]["name"], "memory_feedback");
+    assert_eq!(
+        sent["tools"][0]["function"]["description"],
+        "Record a quality signal."
+    );
+}
+
+#[tokio::test]
+async fn test_moonshot_rejection_is_retried_with_degraded_tools() {
+    let mock = MockServer::start().await;
+
+    // The projection cannot know every dialect rule the upstream might add;
+    // a rejection that survives it is met with the degradation retry. The
+    // first attempt carries the projected schemas (still with `$defs`), the
+    // retry carries the degraded ones — the mocks tell them apart by body.
+    Mock::given(method("POST"))
+        .and(path("/coding/v1/chat/completions"))
+        .and(body_string_contains("\"$defs\""))
+        .respond_with(ResponseTemplate::new(400).set_body_json(moonshot_rejection()))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/coding/v1/chat/completions"))
+        .and(body_string_contains("\"parameters\":{\"type\":\"object\"}"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("after retry")))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let gw = TestGateway::start(MOONSHOT_TOOL_CONFIG, &mock.uri()).await;
+    let c = client();
+
+    let mut body = chat_body("kimi-for-coding", "hi");
+    body["tools"] = json!([zod_tool()]);
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "the degradation retry must answer, not the 400"
+    );
+    assert_eq!(
+        resp.json::<Value>().await.unwrap()["choices"][0]["message"]["content"],
+        "after retry"
+    );
+
+    let requests = mock.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2, "the request must be retried once");
+    let degraded: Value = serde_json::from_slice(&requests[1].body).unwrap();
+    let schema = &degraded["tools"][0]["function"]["parameters"];
+    assert_eq!(
+        *schema,
+        json!({"type": "object"}),
+        "the argument contracts collapse to a bare object: {schema}"
+    );
+    // The tool list survives — the conversation keeps its function surface.
+    assert_eq!(degraded["tools"][0]["function"]["name"], "memory_feedback");
+    assert_eq!(degraded["messages"][0]["role"], "user");
+}
+
+/// Kimi serves the Responses contract natively (`/coding/v1/responses`), so
+/// codex's tools reach it in the flat Responses shape — the projection has to
+/// walk that shape too.
+const MOONSHOT_NATIVE_RESPONSES_CONFIG: &str = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[metrics]
+enabled = true
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.kimi_mock]
+kind = "openai_compat"
+base_url = "{MOCK_URL}"
+upstream_path = "/coding/v1/chat/completions"
+api_key = "fake-key"
+native_responses = true
+tool_schema = "moonshot"
+
+[[routes]]
+path = "/v1/responses"
+provider = "kimi_mock"
+endpoint_type = "responses"
+"#;
+
+fn flat_zod_tool() -> Value {
+    let tool = zod_tool();
+    let mut flat = tool["function"].clone();
+    flat["type"] = json!("function");
+    flat
+}
+
+#[tokio::test]
+async fn test_moonshot_native_responses_tools_are_projected() {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/coding/v1/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "resp_kimi",
+            "object": "response",
+            "status": "completed",
+            "model": "kimi-for-coding",
+            "output": [],
+            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let gw = TestGateway::start(MOONSHOT_NATIVE_RESPONSES_CONFIG, &mock.uri()).await;
+    let c = client();
+
+    let body = json!({
+        "model": "kimi-for-coding",
+        "input": "hi",
+        "stream": false,
+        "tools": [flat_zod_tool()]
+    });
+
+    let resp = c
+        .post(gw.url("/v1/responses"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let requests = mock.received_requests().await.unwrap();
+    let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let schema = &sent["tools"][0]["parameters"];
+    assert_eq!(
+        schema["$defs"]["__schema0"],
+        json!({"type": "object"}),
+        "the recursive chain is cut in the flat shape too: {schema}"
+    );
+    assert_eq!(schema["properties"]["score"]["type"], "integer");
+    assert!(schema["properties"]["score"].get("$ref").is_none());
+    assert_eq!(sent["tools"][0]["name"], "memory_feedback");
+}
+
+#[tokio::test]
+async fn test_an_unrelated_400_is_not_retried_or_rewritten() {
+    let mock = MockServer::start().await;
+
+    // A 400 that names anything else is the client's own fault — the answer
+    // reaches the client as it arrived, and the tool schemas stay whole.
+    Mock::given(method("POST"))
+        .and(path("/coding/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": {"code": "invalid_request_error",
+                      "message": "Invalid request: missing 'messages' parameter",
+                      "type": "invalid_request_error"}
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let gw = TestGateway::start(MOONSHOT_TOOL_CONFIG, &mock.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&chat_body("kimi-for-coding", "hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let answer: Value = resp.json().await.unwrap();
+    assert!(
+        answer["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("missing 'messages'"),
+        "the upstream's own answer must reach the client: {answer}"
+    );
+
+    let requests = mock.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1, "an unrelated 400 must not be retried");
+}
+
+#[tokio::test]
+async fn test_a_non_moonshot_upstream_keeps_its_tool_schemas() {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("ok")))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    // A generic openai provider on a non-Moonshot host: the body is
+    // forwarded byte-for-byte, zod schemas and all.
+    let gw = TestGateway::start(MOCK_CONFIG, &mock.uri()).await;
+    let c = client();
+
+    let mut body = chat_body("gpt-4o", "hi");
+    body["tools"] = json!([zod_tool()]);
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let requests = mock.received_requests().await.unwrap();
+    let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(
+        sent["tools"][0]["function"]["parameters"]["properties"]["score"]["$ref"],
+        "#/$defs/__schema1",
+        "a provider without the dialect must not see a rewritten schema"
+    );
+}
+
+/// A native route on a Moonshot provider still carries OpenAI-shaped tool
+/// schemas — the upstream validates them against its dialect no matter which
+/// route carried them, so the projection applies to the native path too.
+const MOONSHOT_NATIVE_ROUTE_CONFIG: &str = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[metrics]
+enabled = true
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.kimi_mock]
+kind = "openai_compat"
+base_url = "{MOCK_URL}"
+upstream_path = "/coding/v1/chat/completions"
+api_key = "fake-key"
+tool_schema = "moonshot"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "kimi_mock"
+endpoint_type = "native"
+"#;
+
+#[tokio::test]
+async fn test_moonshot_native_route_tools_are_projected() {
+    let mock = MockServer::start().await;
+
+    // A native route forwards the client's own path upstream.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("ok")))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let gw = TestGateway::start(MOONSHOT_NATIVE_ROUTE_CONFIG, &mock.uri()).await;
+    let c = client();
+
+    let mut body = chat_body("kimi-for-coding", "hi");
+    body["tools"] = json!([zod_tool()]);
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let requests = mock.received_requests().await.unwrap();
+    let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let schema = &sent["tools"][0]["function"]["parameters"];
+    assert_eq!(
+        schema["$defs"]["__schema0"],
+        json!({"type": "object"}),
+        "the recursive chain is cut on the native route too: {schema}"
+    );
+    assert!(schema["properties"]["score"].get("$ref").is_none());
+    assert_eq!(sent["tools"][0]["function"]["name"], "memory_feedback");
+}
+/// A Moonshot provider that does not carry the requested model answers 400
+/// (one-api's `invalid params, unknown model`). The route must fail over to
+/// the provider that does carry it — the tool-schema deferral only preempts
+/// the handling that would end the turn, never the one that retries.
+const MOONSHOT_FAILOVER_CONFIG: &str = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[metrics]
+enabled = true
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.kimi_mock]
+kind = "openai_compat"
+base_url = "{MOCK_URL}"
+upstream_path = "/coding/v1/chat/completions"
+api_key = "fake-key"
+default_model = "kimi-for-coding"
+tool_schema = "moonshot"
+
+[providers.backup_openai]
+kind = "openai"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+default_model = "gpt-4o"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "kimi_mock"
+fallback = ["backup_openai"]
+strategy = "fallback"
+"#;
+
+#[tokio::test]
+async fn test_a_moonshot_model_mismatch_still_fails_over() {
+    let mock = MockServer::start().await;
+
+    // The Moonshot provider does not carry "gpt-4o" and says so with a 400.
+    Mock::given(method("POST"))
+        .and(path("/coding/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": {"code": "invalid_request_error",
+                      "message": "invalid params, unknown model: gpt-4o",
+                      "type": "invalid_request_error"}
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from the backup")))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let gw = TestGateway::start(MOONSHOT_FAILOVER_CONFIG, &mock.uri()).await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&chat_body("gpt-4o", "hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "the route must fail over, not swallow the 400 on the tool-schema deferral"
+    );
+    assert_eq!(
+        resp.json::<Value>().await.unwrap()["choices"][0]["message"]["content"],
+        "from the backup"
+    );
+
+    let requests = mock.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2, "the request must reach the backup");
+}

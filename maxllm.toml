@@ -197,6 +197,17 @@ default_model = "gemini-2.5-flash"
 # base_url = "https://api.x.ai"
 # api_key = "${XAI_API_KEY}"
 
+# [providers.kimi]
+# kind = "openai_compat"
+# base_url = "https://api.kimi.com"
+# api_key = "${KIMI_API_KEY}"
+# The tool-schema dialect the upstream validates against: "moonshot"
+# projects the tool schemas into the Moonshot/Kimi dialect (a strict $ref
+# with no siblings, a typed ref target, no type beside anyOf/oneOf), "none"
+# forces no projection. Unset = detected by host, so the Moonshot family
+# (api.moonshot.ai, api.kimi.com, ...) is projected automatically.
+# tool_schema = "moonshot"
+
 [providers.ollama]
 kind = "ollama"
 base_url = "http://127.0.0.1:11434"

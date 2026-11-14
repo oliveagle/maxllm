@@ -204,6 +204,18 @@ pub struct RequestCtx {
     /// The upstream response headers of the pending 429 (needed by the
     /// resolver's header layer once the body arrives).
     pub rate_limit_headers: Vec<(String, String)>,
+    /// Set when a 400 arrived that may blame the tool schemas the gateway
+    /// forwarded. Only the body names the offending schema, so the decision
+    /// waits for it: the request is replayed once with degraded tool schemas
+    /// instead of ending the agent's turn with the upstream's error.
+    pub pending_tool_schema_repair: bool,
+    /// The 400 error body collected while `pending_tool_schema_repair` is set.
+    pub tool_schema_body_buf: Vec<u8>,
+    /// Set when the request must be (re)sent with degraded tool schemas —
+    /// the upstream refused the schemas it was sent, and a translation fault
+    /// must not end the agent's turn. Consumed by the next
+    /// `request_body_filter` pass.
+    pub tool_schema_degraded: bool,
     /// Set when a 404 arrived that may be a "the model does not exist"
     /// rejection rather than a missing endpoint. Both are 404, so the
     /// decision waits for the error body: an upstream that names the model
@@ -392,6 +404,9 @@ impl RequestCtx {
             upstream_body: None,
             pending_rate_limit: None,
             rate_limit_body_buf: Vec::new(),
+            pending_tool_schema_repair: false,
+            tool_schema_body_buf: Vec::new(),
+            tool_schema_degraded: false,
             rate_limit_headers: Vec::new(),
             pending_model_404: false,
             model_404_body_buf: Vec::new(),

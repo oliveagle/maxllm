@@ -858,6 +858,55 @@ python3 scripts/check_responses_policy.py --config maxllm.toml --live   # probe 
 
 For pass-through routes, the path suffix after the route prefix is forwarded to the upstream provider (e.g., `/passthrough/anthropic/v1/messages` proxies to `https://api.anthropic.com/v1/messages`).
 
+### Moonshot tool schemas (Moonshot/Kimi dialect)
+
+Moonshot-family providers (api.moonshot.ai, api.kimi.com, ...) validate
+`tools[].function.parameters` against their own JSON Schema dialect — stricter
+than the OpenAI one. Shapes every other upstream takes earn
+
+```
+400 {"error":{"code":"invalid_request_error","message":"Invalid request:
+tools.function.parameters is not a valid moonshot flavored json schema,
+details: <At path 'properties.show': detected infinite recursion without
+termination condition>"}}
+```
+
+codex-cli's tool schemas are the known offender (zod 4 emits `$defs.__schemaN`
+with `$ref` beside sibling keywords). Because a request-fault `400` kills the
+agent's turn — there is no loop to continue — the gateway handles this on
+three layers:
+
+1. **Projection (before the request leaves).** Tool schemas are rewritten into
+   the Moonshot dialect: inline `$ref`s that have sibling keywords, infer a
+   `type` for untyped ref targets and enum branches, move a `type` beside
+   `anyOf`/`oneOf` into the branches, and cut reference cycles at a terminating
+   object. Providers without the dialect keep their body byte-for-byte —
+   nothing is rewritten unless it needs to be, so prompt caches stay warm.
+2. **Repair (when the upstream still refuses).** A `400` that names the tool
+   schemas replays the request once against the same provider with every tool
+   schema degraded to `{"type":"object"}` — the tool names survive, the model
+   keeps its function-calling surface, and the turn continues instead of
+   dying. The replay only fires for a `400` the route would otherwise end the
+   turn with: a `400` it answers by model rewrite or provider failover keeps
+   that handling, and a `400` about anything else passes through untouched.
+3. **Observability.** The retry is counted in
+   `maxllm_tool_schema_repair_retries_total{provider}`.
+
+Detection is automatic by upstream host; opt in or out explicitly per
+provider:
+
+```toml
+[providers.kimi]
+kind = "openai_compat"
+base_url = "https://api.kimi.com"
+tool_schema = "moonshot"   # "moonshot" | "none"; unset = detect by host
+```
+
+The knob also covers a Moonshot-compatible upstream on a custom host (set
+`"moonshot"`) and a self-hosted mirror on a Moonshot-family domain that does
+*not* run the strict validator (set `"none"`). The projection runs on both
+outgoing paths — chat translation and native Responses forwarding.
+
 ### Shutdown behaviour
 
 On `SIGTERM` the gateway stops accepting new connections and drains the

@@ -495,6 +495,24 @@ pub struct ProviderConfig {
     /// repair.
     #[serde(default)]
     pub native_responses_repair: Option<String>,
+    /// The tool-schema dialect the upstream validates `tools[].function.
+    /// parameters` against. Valid values:
+    ///
+    /// * `"moonshot"` — project every tool schema into the Moonshot/Kimi
+    ///   dialect before it is forwarded: a `$ref` beside another keyword is
+    ///   inlined, an untyped reference target gains its inferred type, a
+    ///   `type` beside an `anyOf`/`oneOf` moves into the branches, and every
+    ///   reference cycle is cut at a terminating object. Kimi answers
+    ///   `400 invalid_request_error … not a valid moonshot flavored json
+    ///   schema` for the shapes this projection repairs (codex's zod 4
+    ///   `$defs.__schemaN` schemas are the known offenders).
+    /// * `"none"` — force no projection, overriding the host-based default.
+    ///
+    /// Unset means the gateway picks by upstream host: Moonshot-family
+    /// providers (`api.moonshot.ai`, `api.moonshot.cn`, `api.kimi.com`, …)
+    /// get the projection, every other provider keeps its body untouched.
+    #[serde(default)]
+    pub tool_schema: Option<String>,
     /// Skip the `reasoning_content` placeholder injection for thinking-mode
     /// tool-calling turns (echo collapse still runs). Set on opencode-kind
     /// channels whose upstream does not require `reasoning_content` back, to
@@ -1318,6 +1336,40 @@ timeout_secs = 120
         assert_eq!(config.routes[0].fallback, vec!["anthropic"]);
         assert!(config.auth.is_some());
         assert!(config.metrics.enabled);
+    }
+
+    #[test]
+    fn test_tool_schema_dialect_is_parsed() {
+        let config: Config = toml::from_str(
+            r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[providers.kimi]
+kind = "openai_compat"
+base_url = "https://api.kimi.com"
+tool_schema = "moonshot"
+"#,
+        )
+        .expect("parse");
+        assert_eq!(
+            config.providers["kimi"].tool_schema.as_deref(),
+            Some("moonshot")
+        );
+
+        // Unset means the gateway picks by upstream host.
+        let config: Config = toml::from_str(
+            r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[providers.kimi]
+kind = "openai_compat"
+base_url = "https://api.kimi.com"
+"#,
+        )
+        .expect("parse");
+        assert!(config.providers["kimi"].tool_schema.is_none());
     }
 
     #[test]
