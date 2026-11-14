@@ -2874,6 +2874,10 @@ impl AiGateway {
         ctx.body_translated = false;
         ctx.upstream_responded = false;
         ctx.request_body_buf.clear();
+        // The deferred quota decision belonged to the attempt that just
+        // failed; the retry is a fresh answer and must not be swallowed by
+        // the dead attempt's bookkeeping.
+        ctx.pending_rate_limit = None;
         ctx.replay_body = ctx.client_body.clone();
         ctx.replay_injected = false;
         ctx.keep_request_content_length = false;
@@ -3595,6 +3599,18 @@ impl AiGateway {
                         }
                         None => normalized,
                     };
+                    // The orphan-tool-call repair answers a call the
+                    // history never did; the answered history must not grow
+                    // past the frame the client sent, so the orphans are
+                    // dropped instead when they do not fit.
+                    if ctx.tool_calls_repaired {
+                        if let Some(repaired) = maxllm_translate::shrink_orphan_tool_calls(
+                            &out,
+                            ctx.request_body_buf.len(),
+                        ) {
+                            out = repaired;
+                        }
+                    }
                     // This request keeps the client's Content-Length (the
                     // upstream answers a chunked request with a 400), so the
                     // forwarded body must not be longer than the body the
@@ -3952,12 +3968,22 @@ impl AiGateway {
                 // too. A body that needs no repair comes back byte-for-byte —
                 // native routes keep their no-rewrite promise for every
                 // other provider.
-                let outgoing = std::mem::take(&mut ctx.request_body_buf);
-                *body = Some(Bytes::from(if provider.moonshot_tool_schema {
-                    Self::apply_tool_schema_dialect(provider, outgoing, ctx.tool_schema_degraded)
-                } else {
-                    outgoing
-                }));
+                let mut outgoing = std::mem::take(&mut ctx.request_body_buf);
+                if provider.moonshot_tool_schema {
+                    outgoing = Self::apply_tool_schema_dialect(
+                        provider,
+                        outgoing,
+                        ctx.tool_schema_degraded,
+                    );
+                }
+                if ctx.tool_calls_repaired {
+                    // The orphan-tool-call repair — the history is replayed
+                    // with its unanswered calls answered.
+                    if let Some(repaired) = maxllm_translate::repair_orphan_tool_calls(&outgoing) {
+                        outgoing = repaired;
+                    }
+                }
+                *body = Some(Bytes::from(outgoing));
             } else {
                 // ── NORMAL MODE: OpenAI input → provider translation ──
 
@@ -4248,6 +4274,13 @@ impl AiGateway {
                                 outgoing,
                                 ctx.tool_schema_degraded,
                             );
+                            if ctx.tool_calls_repaired {
+                                if let Some(repaired) =
+                                    maxllm_translate::repair_orphan_tool_calls(&outgoing)
+                                {
+                                    outgoing = repaired;
+                                }
+                            }
                         }
                         if translated.is_streaming {
                             ctx.is_streaming = true;
@@ -4688,6 +4721,14 @@ fn body_reports_tier_limit(body: &str) -> bool {
 fn body_reports_tool_schema(body: &str) -> bool {
     let lower = body.to_ascii_lowercase();
     lower.contains("tools.function.parameters") || lower.contains("moonshot flavored json schema")
+}
+
+/// Whether an upstream error body blames an orphaned tool call — an
+/// assistant call the conversation's history never answered. The repair is
+/// [`maxllm_translate::repair_orphan_tool_calls`]; the wrapper keeps the
+/// gateway's classification next to the schema one's.
+fn body_reports_orphan_tool_call(body: &str) -> bool {
+    maxllm_translate::body_reports_orphan_tool_call(body)
 }
 
 /// Whether the gateway answers such an upstream status itself.
@@ -6020,23 +6061,42 @@ impl ProxyHttp for AiGateway {
             ctx.model_404_body_buf.clear();
             return Ok(());
         }
-        // A 400 whose body may blame the tool schemas the gateway forwarded:
-        // defer the decision until the body arrives — only the body says the
-        // rejection names them. When it does, the request is replayed once
-        // with degraded tool schemas instead of ending the agent's turn with
-        // the upstream's error; any other 400 passes through untouched.
+        // A 400 whose body may blame the request's tool plumbing — the
+        // Moonshot schema dialect, or a tool call the conversation's history
+        // never answered: defer the decision until the body arrives, because
+        // only the body says which of the two it is. When it names the
+        // schemas, the request is replayed once with degraded tool schemas;
+        // when it names an unanswered tool call, the history is repaired and
+        // the request replayed. Either way the agent's turn continues; any
+        // other 400 passes through untouched.
         // The deferral only preempts the handling that would end the turn
         // (a 400 this provider takes as a request fault): a 400 the route
         // would answer by model rewrite or failover keeps that handling —
-        // the request is retried anyway, and a schema rejection that
+        // the request is retried anyway, and a tool-plumbing rejection that
         // survives it reaches this deferral on the next attempt.
         if status == 400
-            && provider.moonshot_tool_schema
             && !ctx.tool_schema_degraded
+            && !ctx.tool_calls_repaired
             && !should_failover_status(status, ctx, provider)
         {
             ctx.pending_tool_schema_repair = true;
             ctx.tool_schema_body_buf.clear();
+            // The quota classifier wants the same body: a 400 may wear a
+            // tier-limit wall, and that wall belongs to the provider, not to
+            // the request. The body filter hands the body over when neither
+            // tool-plumbing repair applies, so the wall is still parked.
+            ctx.pending_rate_limit = Some(status);
+            ctx.rate_limit_body_buf.clear();
+            ctx.rate_limit_headers = upstream_response
+                .headers
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.as_str().to_string(),
+                        v.to_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect();
             return Ok(());
         }
         // A 400/422 whose body may wear a tier/rate/concurrency quota wall:
@@ -6420,8 +6480,18 @@ impl ProxyHttp for AiGateway {
             }
             ctx.pending_tool_schema_repair = false;
             let buffered = std::mem::take(&mut ctx.tool_schema_body_buf);
-            if body_reports_tool_schema(&String::from_utf8_lossy(&buffered)) {
+            let text = String::from_utf8_lossy(&buffered).to_string();
+            if body_reports_tool_schema(&text) {
                 return Err(self.begin_tool_schema_repair(ctx));
+            }
+            // The upstream refused the conversation's tool history: an
+            // assistant tool call the history never answered (`… must be
+            // followed by tool messages responding to each 'tool_call_id'`).
+            // The fault is in the history the client replayed, and a
+            // request-fault 400 would end the agent's turn — so the orphan
+            // is answered and the request is replayed once.
+            if body_reports_orphan_tool_call(&text) {
+                return Err(self.begin_orphan_tool_call_repair(ctx));
             }
             if !buffered.is_empty() {
                 *body = Some(Bytes::from(buffered));
@@ -8591,6 +8661,10 @@ impl AiGateway {
         ctx.body_translated = false;
         ctx.upstream_responded = false;
         ctx.request_body_buf.clear();
+        // The deferred quota decision belonged to the attempt that just
+        // failed; the next provider's answer must not be swallowed by the
+        // dead attempt's bookkeeping.
+        ctx.pending_rate_limit = None;
         // Re-feed the whole client body on the retry: the new provider must
         // see the request translated again (the model may change), and
         // pingora's own replay buffer only holds the first 64 KiB.
@@ -8607,6 +8681,49 @@ impl AiGateway {
         Some((failed_provider, name))
     }
 
+    /// Reset the request for an in-place retry with the tool history repaired.
+    ///
+    /// The upstream refused a history whose assistant tool call was never
+    /// answered (`… must be followed by tool messages responding to each
+    /// 'tool_call_id'`). Rather than ending the agent's turn with the
+    /// upstream's error, the request is replayed once with every orphaned
+    /// call answered: the conversation keeps its shape and the turn
+    /// continues.
+    fn begin_orphan_tool_call_repair(&self, ctx: &mut RequestCtx) -> Box<pingora::Error> {
+        ctx.tool_calls_repaired = true;
+        ctx.body_translated = false;
+        ctx.upstream_responded = false;
+        ctx.request_body_buf.clear();
+        // The deferred quota decision belonged to the attempt that just
+        // failed; the repaired retry is a fresh answer and must not be
+        // swallowed by the dead attempt's bookkeeping.
+        ctx.pending_rate_limit = None;
+        ctx.replay_body = ctx.client_body.clone();
+        ctx.replay_injected = false;
+        ctx.keep_request_content_length = false;
+        if let Ok(mut guard) = ctx.stream_translator.lock() {
+            *guard = None;
+        }
+        METRICS
+            .tool_call_repair_retries_total
+            .with_label_values(&[&ctx.provider_name])
+            .inc();
+        info!(
+            provider = %ctx.provider_name,
+            "upstream refused an orphaned tool call — retrying with the tool history repaired"
+        );
+        let mut e = pingora::Error::explain(
+            pingora::ErrorType::HTTPStatus(400),
+            format!(
+                "provider '{}' refused an orphaned tool call; retrying it with the tool history repaired",
+                ctx.provider_name
+            ),
+        );
+        e.as_up();
+        e.set_retry(true);
+        e
+    }
+
     /// Reset the request for an in-place retry with degraded tool schemas.
     ///
     /// The upstream refused the tool schemas the gateway forwarded it. Rather
@@ -8619,6 +8736,10 @@ impl AiGateway {
         ctx.body_translated = false;
         ctx.upstream_responded = false;
         ctx.request_body_buf.clear();
+        // The deferred quota decision belonged to the attempt that just
+        // failed; the degraded retry is a fresh answer and must not be
+        // swallowed by the dead attempt's bookkeeping.
+        ctx.pending_rate_limit = None;
         ctx.replay_body = ctx.client_body.clone();
         ctx.replay_injected = false;
         ctx.keep_request_content_length = false;
@@ -10940,6 +11061,32 @@ mod failover_policy_tests {
         assert!(!body_reports_tool_schema(
             r#"{"error":{"message":"Your quota is exhausted until 2026-11-10 22:58:54"}}"#
         ));
+    }
+
+    #[test]
+    fn orphan_tool_call_bodies_are_classified() {
+        // The shape Kimi refuses: an assistant tool call the history never
+        // answered.
+        let kimi = r#"{"error":{"code":"invalid_request_error","message":"Invalid request: an assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id'. The following tool_call_ids did not have response messages: f:0","type":"invalid_request_error"}}"#;
+        assert!(body_reports_orphan_tool_call(kimi));
+        assert!(body_reports_orphan_tool_call(
+            "Invalid request: tool_call_id  is not found"
+        ));
+        assert!(body_reports_orphan_tool_call(
+            "No tool output found for function call call_abc"
+        ));
+
+        // The schema rejection names the schemas, never an orphaned call —
+        // the two repair classes must not shadow each other.
+        let schema = r#"{"error":{"message":"Invalid request: tools.function.parameters is not a valid moonshot flavored json schema, details: <At path 'properties.show': detected infinite recursion without termination condition>"}}"#;
+        assert!(!body_reports_orphan_tool_call(schema));
+        assert!(body_reports_tool_schema(schema));
+
+        // A genuine request fault is never mistaken for one.
+        assert!(!body_reports_orphan_tool_call(
+            r#"{"error":{"message":"Invalid request: missing 'messages' parameter"}}"#
+        ));
+        assert!(!body_reports_orphan_tool_call(""));
     }
 
     #[test]

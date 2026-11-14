@@ -115,6 +115,12 @@ pub struct GatewayMetrics {
     /// a bare object, so the agent's turn continues instead of dying on a
     /// translation fault.
     pub tool_schema_repair_retries_total: IntCounterVec,
+    /// Same-provider retries that answered an orphaned tool call after the
+    /// upstream refused the history (`… must be followed by tool messages
+    /// responding to each 'tool_call_id'`). The call gains the answer it
+    /// never got, so the agent's turn continues instead of dying on a
+    /// translation fault.
+    pub tool_call_repair_retries_total: IntCounterVec,
     /// Requests currently in flight per provider — the live view of the
     /// least-connections routing decision.
     pub provider_inflight_requests: IntGaugeVec,
@@ -515,6 +521,18 @@ impl GatewayMetrics {
             .register(Box::new(tool_schema_repair_retries_total.clone()))
             .expect("register");
 
+        let tool_call_repair_retries_total = IntCounterVec::new(
+            Opts::new(
+                "maxllm_tool_call_repair_retries_total",
+                "Same-provider retries with a repaired tool history after the upstream rejected it",
+            ),
+            &["provider"],
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(tool_call_repair_retries_total.clone()))
+            .expect("register");
+
         let provider_inflight_requests = IntGaugeVec::new(
             Opts::new(
                 "maxllm_provider_inflight_requests",
@@ -591,6 +609,7 @@ impl GatewayMetrics {
             provider_retries_total,
             model_rewrite_retries_total,
             tool_schema_repair_retries_total,
+            tool_call_repair_retries_total,
             provider_inflight_requests,
             recording_redactions_total,
             cached_input_tokens_total,

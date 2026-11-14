@@ -220,6 +220,13 @@ pub struct RequestCtx {
     /// must not end the agent's turn. Consumed by the next
     /// `request_body_filter` pass.
     pub tool_schema_degraded: bool,
+    /// Set when the request must be (re)sent with its tool history repaired
+    /// — the upstream refused a history whose assistant tool call was never
+    /// answered (`… must be followed by tool messages responding to each
+    /// 'tool_call_id'`). A translation fault must not end the agent's turn:
+    /// the orphan is answered and the request is replayed. One-shot, like
+    /// the schema degradation.
+    pub tool_calls_repaired: bool,
     /// Set when a 404 arrived that may be a "the model does not exist"
     /// rejection rather than a missing endpoint. Both are 404, so the
     /// decision waits for the error body: an upstream that names the model
@@ -412,6 +419,7 @@ impl RequestCtx {
             pending_tool_schema_repair: false,
             tool_schema_body_buf: Vec::new(),
             tool_schema_degraded: false,
+            tool_calls_repaired: false,
             rate_limit_headers: Vec::new(),
             pending_model_404: false,
             model_404_body_buf: Vec::new(),

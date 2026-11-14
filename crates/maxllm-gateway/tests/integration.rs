@@ -14266,6 +14266,87 @@ async fn test_moonshot_rejection_is_retried_with_degraded_tools() {
     assert_eq!(degraded["messages"][0]["role"], "user");
 }
 
+#[tokio::test]
+async fn test_moonshot_orphaned_tool_call_is_repaired() {
+    let mock = MockServer::start().await;
+
+    // Kimi validates tool-call pairing: a history whose assistant call was
+    // never answered (a compaction that kept the call and dropped its
+    // result) is answered with a request-fault 400 that names the call_id —
+    // the exact shape that ends an agent's turn. The gateway must answer the
+    // orphan and replay the request, not die on the upstream's 400.
+    Mock::given(method("POST"))
+        .and(path("/coding/v1/chat/completions"))
+        .and(body_string_contains("call_abc123"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": {
+                "code": "invalid_request_error",
+                "message": "Invalid request: an assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id'. The following tool_call_ids did not have response messages: call_abc123",
+                "type": "invalid_request_error"
+            }
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    // The repaired replay answers the call with the sentinel; both mocks
+    // match the history otherwise, so the sentinel wins by priority.
+    Mock::given(method("POST"))
+        .and(path("/coding/v1/chat/completions"))
+        .and(body_string_contains("call_abc123"))
+        .and(body_string_contains("no result was recorded"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("after repair")))
+        .with_priority(1)
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let gw = TestGateway::start(MOONSHOT_TOOL_CONFIG, &mock.uri()).await;
+    let c = client();
+
+    let mut body = chat_body("kimi-for-coding", "orphan probe");
+    body["messages"] = json!([
+        {"role": "user", "content": "fetch the thing"},
+        {"role": "assistant", "content": null, "tool_calls": [{
+            "id": "call_abc123",
+            "type": "function",
+            "function": {"name": "memory_feedback", "arguments": "{}"}
+        }]},
+    ]);
+    body["tools"] = json!([zod_tool()]);
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "the repair retry must answer, not the upstream's 400"
+    );
+    assert_eq!(
+        resp.json::<Value>().await.unwrap()["choices"][0]["message"]["content"],
+        "after repair"
+    );
+
+    let requests = mock.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2, "the request must be retried once");
+    let repaired: Value = serde_json::from_slice(&requests[1].body).unwrap();
+    let messages = repaired["messages"].as_array().unwrap();
+    // The assistant call is followed by the sentinel tool reply.
+    assert_eq!(messages[0]["role"], "user");
+    assert_eq!(messages[1]["role"], "assistant");
+    assert_eq!(messages[2]["role"], "tool");
+    assert_eq!(messages[2]["tool_call_id"], "call_abc123");
+    assert_eq!(
+        messages[2]["content"],
+        "[tool call interrupted: no result was recorded]"
+    );
+}
+
 /// Kimi serves the Responses contract natively (`/coding/v1/responses`), so
 /// codex's tools reach it in the flat Responses shape — the projection has to
 /// walk that shape too.
