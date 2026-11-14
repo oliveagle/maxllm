@@ -66,9 +66,16 @@ impl SqliteStore {
 
     /// Set connection-level pragmas.
     fn set_pragmas(conn: &Connection) -> Result<(), StoreError> {
+        // WAL lets request-log / session-binding / breaker writers proceed while
+        // readers (ops queries, /admin/breakers) hold the snapshot; in the
+        // default rollback-journal mode the gateway was losing ledger writes to
+        // `database is locked` (31 on 2026-11-14 alone). busy_timeout still
+        // bounds the wait. journal_mode is persistent per database file but
+        // re-asserting it here keeps in-memory and fresh databases correct too.
         conn.execute_batch(
             "PRAGMA busy_timeout = 5000;
-             PRAGMA foreign_keys = ON;",
+             PRAGMA foreign_keys = ON;
+             PRAGMA journal_mode = WAL;",
         )
         .map_err(|e| StoreError::Internal(format!("failed to set pragmas: {e}")))?;
         Ok(())

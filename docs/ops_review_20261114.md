@@ -197,6 +197,38 @@ provider 名，当前 nas.toml 已无定义，日志中的 74 次 ada DNS 502 �
 | 轮次 | 时间 (CST) | 窗口增量 | 结论 |
 |------|-----------|----------|------|
 | 1 | 2026-11-14 17:12 | 全量基线（11-04→14） | 本报告；kimi abort、minimax `?`-类重写率列入下轮复核 |
+| 2 | 2026-11-14 17:23 | 增量 481 行（09:12:31Z→09:23:35Z） | 新增 §11：db-locked 丢账本写入，WAL 修复已合入；kimi 23.1% 稳定；minimax 改写量正常 |
+
+## 11. 巡检第 2 轮新增：SQLite 写锁丢弃账本写入（已修复代码，待发布）
+
+**现象**：`database is locked` 全窗口 38 次，其中 **31 次在今天（11-14）**，四种写路径全部命中：
+
+| 写路径 | 今日丢写次数 |
+|--------|-------------:|
+| `Failed to persist session binding` | 19 |
+| `Failed to record request log`（请求账本） | 10 |
+| `Failed to persist circuit breaker state` | 5 |
+| `failed to persist the provider routing evidence` | 3 |
+
+爆发模式成簇：04:10:48→04:52 三次 5 秒间隔的连发（同一时刻三条不同表全部失败）、
+07:12/07:17/07:29/07:44 同型、08:04 三连发。busy_timeout=5000ms 已设但不够 ——
+存储用的是**默认 rollback-journal 模式**（NAS 上 `maxllm.db` 无 `-wal/-shm` 文件），
+读写互斥、写者之间也互斥，高峰期偶发写等待 >5s 即静默丢行。
+
+**修复**（本轮落地，commit 见 git log）：
+`crates/maxllm-admin/src/sqlite_store.rs::set_pragmas` 追加
+`PRAGMA journal_mode = WAL` —— 读写不再互斥、写者仍由 busy_timeout 兜底。
+`cargo test --workspace` 全绿（含 285 条 gateway 集成测试）。
+journal_mode 对既有 db 文件持久生效，只需下次发布部署后重启一次；重启后
+`ls /home/oliveagle/opt/maxllm/maxllm.db-wal` 应出现文件、`database is locked` 应归零。
+已丢的行无法找回（WARN 即丢弃），但丢的 10 行请求日志对 spend 汇总影响 <$0.05 量级。
+
+**第 2 轮其余复核**（09:12:31Z→09:23:35Z 增量，481 行 / 404 完成）：
+- kimi abort 率 23.1%（292/1,263，p50 5.8s）—— 与基线 24.7% 一致，继续观察；
+- minimax `does not carry model` 改写 97 次（deepseek-v4.1-flash→MiniMax-M3），
+  另 2×500 / 1×401 各触发一次 failover —— 量级正常，无异常；
+- quota probe 最近 30 分钟 102 次全绿，今日仅 15:10/15:20 两次 429；
+- volc 四实例 quota_backoff 未解除（streak=3 不变）。
 
 ## 附录 A：复现命令
 
