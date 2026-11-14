@@ -4693,6 +4693,22 @@ fn model_from_request_path(path: &str) -> Option<String> {
 /// Resolve the upstream time budget for a request: a route may declare
 /// `timeout_secs`, which overrides the hard-coded read/write defaults.
 /// Returns `None` when the route does not configure one (or is unmatched).
+/// Close the current upstream attempt's span with its outcome.
+///
+/// The provider/model are recorded here rather than at span creation: the
+/// model is not known until the request body has been parsed, and the model a
+/// provider is tried with is the one the attempt actually used.
+fn close_upstream_span(ctx: &mut RequestCtx, status: u16, error: Option<&str>) {
+    if let Some(span) = ctx.upstream_span.take() {
+        span.record("http.response.status_code", status as i64);
+        span.record("maxllm.provider", ctx.provider_name.as_str());
+        span.record("maxllm.model", ctx.model.as_str());
+        if let Some(error) = error {
+            span.record("maxllm.error", error);
+        }
+    }
+}
+
 fn route_timeout_secs(routes: &[RouteConfig], route_index: Option<usize>) -> Option<Duration> {
     route_index
         .and_then(|i| routes.get(i))
@@ -5293,6 +5309,26 @@ impl ProxyHttp for AiGateway {
         let route = &hot.routes[route_index];
         ctx.endpoint_type = route.endpoint_type;
 
+        // One span per client request (`[otel].traces`). The outcome fields are
+        // recorded as the request progresses and the span is exported when the
+        // context drops. A disabled OTel pipeline makes this a no-op span.
+        ctx.otel_span = Some(tracing::info_span!(
+            "http.server.request",
+            "otel.kind" = "server",
+            "http.request.method" = %session.req_header().method,
+            "url.path" = %path,
+            "maxllm.route" = %route.path,
+            "maxllm.provider" = tracing::field::Empty,
+            "maxllm.model" = tracing::field::Empty,
+            "maxllm.streaming" = tracing::field::Empty,
+            "http.response.status_code" = tracing::field::Empty,
+            "maxllm.tokens_in" = tracing::field::Empty,
+            "maxllm.tokens_out" = tracing::field::Empty,
+            "maxllm.cost_usd" = tracing::field::Empty,
+            "maxllm.fallback" = tracing::field::Empty,
+            "maxllm.latency_ms" = tracing::field::Empty,
+        ));
+
         // `/v1/responses` is a prefix route on purpose: a client points its
         // base URL at `/v1/responses/<provider-or-pool>` and appends
         // `/responses`. The same prefix match silently swallowed retired
@@ -5548,6 +5584,24 @@ impl ProxyHttp for AiGateway {
                 ));
             }
         };
+
+        // One span per upstream *attempt*; it is closed in `response_filter`,
+        // so its duration is send → response headers (TTFB), the number the
+        // failover decision actually cares about.
+        {
+            let _parent = ctx.otel_span.as_ref().map(|span| span.enter());
+            ctx.upstream_span = Some(tracing::info_span!(
+                "upstream.request",
+                "otel.kind" = "client",
+                "server.address" = %provider.host,
+                "server.port" = provider.port as i64,
+                "maxllm.provider" = %ctx.provider_name,
+                "maxllm.model" = %ctx.model,
+                "maxllm.attempt" = (ctx.failover_count + 1) as i64,
+                "http.response.status_code" = tracing::field::Empty,
+                "maxllm.error" = tracing::field::Empty,
+            ));
+        }
 
         // Set upstream path based on endpoint type
         let path = match ctx.endpoint_type {
@@ -6361,6 +6415,10 @@ impl ProxyHttp for AiGateway {
         // answer is recorded by `response_filter` on the surviving attempt).
         // Recorded before the switch so the provider label matches the status.
         self.record_event(EVENT_PROVIDER_RESPONSE, ctx, Some(status), None, None, None);
+        // This attempt ends here (Pingora skips `response_filter` when the
+        // response is handed back for failover), so its span has to be closed
+        // and labelled now — otherwise it reads as an unanswered attempt.
+        close_upstream_span(ctx, status, Some("upstream_status"));
         ctx.attempt_trail
             .push(format!("{}={}", ctx.provider_name, status));
         let Some((failed_provider, next_provider)) = self.switch_to_fallback(ctx) else {
@@ -6419,6 +6477,9 @@ impl ProxyHttp for AiGateway {
             .map(|e| e.upstream_status)
             .unwrap_or(status);
         ctx.upstream_status = upstream_status;
+        // Time-to-first-byte for this attempt: the span opened in
+        // `upstream_request_filter` ends here.
+        close_upstream_span(ctx, upstream_status, None);
         let provider = hot.providers.get(&ctx.provider_name);
 
         // Circuit breaker bookkeeping happens in `upstream_response_filter`,
@@ -7769,6 +7830,7 @@ impl ProxyHttp for AiGateway {
         // provider's circuit breaker so the fallback chain stops using it.
         self.record_provider_connect_failure(ctx);
         self.unpin_session(ctx);
+        close_upstream_span(ctx, 502, Some("connect"));
         self.record_event(EVENT_ERROR, ctx, Some(502), None, Some(e.to_string()), None);
         ctx.attempt_trail
             .push(format!("{}=connect", ctx.provider_name));
@@ -8294,6 +8356,21 @@ impl ProxyHttp for AiGateway {
                     .set(rate.round() as i64);
             }
         }
+
+        // Fill the request span with the outcome, then enter it so the
+        // `request completed` log record carries the same trace_id.
+        if let Some(span) = ctx.otel_span.as_ref() {
+            span.record("maxllm.provider", ctx.provider_name.as_str());
+            span.record("maxllm.model", ctx.model.as_str());
+            span.record("maxllm.streaming", ctx.is_streaming);
+            span.record("http.response.status_code", logged_status as i64);
+            span.record("maxllm.tokens_in", ctx.tokens_in);
+            span.record("maxllm.tokens_out", ctx.tokens_out);
+            span.record("maxllm.cost_usd", cost);
+            span.record("maxllm.fallback", ctx.fallback_used);
+            span.record("maxllm.latency_ms", latency_ms);
+        }
+        let _otel_guard = ctx.otel_span.as_ref().map(|span| span.enter());
 
         info!(
             provider = %ctx.provider_name,

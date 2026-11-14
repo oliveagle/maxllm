@@ -365,6 +365,17 @@ pub struct RequestCtx {
     /// fallback chain had been walked. A pinned request is served by that
     /// provider alone.
     pub path_pinned_provider: Option<String>,
+    /// The OpenTelemetry span for this request (`http.server.request`).
+    ///
+    /// Held in the context — rather than entered around a block — because the
+    /// request is handled across several `ProxyHttp` callbacks. It is dropped
+    /// (and therefore exported) when the context is, i.e. at the end of the
+    /// request. `None` when `[otel].traces` is off.
+    pub otel_span: Option<tracing::Span>,
+    /// The span of the *current* upstream attempt (`upstream.request`). Set in
+    /// `upstream_request_filter`, closed in `response_filter` so its duration
+    /// is time-to-first-byte rather than the whole request.
+    pub upstream_span: Option<tracing::Span>,
 }
 
 impl RequestCtx {
@@ -420,6 +431,8 @@ impl RequestCtx {
             upstream_body: None,
             pending_rate_limit: None,
             rate_limit_body_buf: Vec::new(),
+            otel_span: None,
+            upstream_span: None,
             pending_tool_schema_repair: false,
             tool_schema_body_buf: Vec::new(),
             tool_schema_degraded: false,

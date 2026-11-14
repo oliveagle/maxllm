@@ -19,6 +19,7 @@ mod rate_limit_resolver;
 mod recorder;
 mod routing;
 mod session_sticky;
+mod telemetry;
 
 use clap::Parser;
 use maxllm_config::Config;
@@ -51,20 +52,34 @@ struct Args {
 }
 
 fn main() {
-    // Initialize tracing
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
-
     let args = Args::parse();
 
-    // Load configuration
+    // Load configuration before installing the subscriber: `[otel]` decides
+    // whether the gateway ships its own logs/traces, so the settings have to
+    // be known before the first line is emitted.
     let config = Config::from_file(&args.config).unwrap_or_else(|e| {
         eprintln!("Failed to load config from {:?}: {e}", args.config);
         std::process::exit(1);
     });
+
+    // OTel-enabled subscriber (fmt + OTLP logs + OTLP spans). A config without
+    // `[otel]` keeps the plain formatter, byte-for-byte as before.
+    let mut telemetry = match telemetry::install(&config.otel) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!(
+                "Failed to initialise OpenTelemetry: {e}; falling back to the plain log formatter"
+            );
+            None
+        }
+    };
+    if telemetry.is_none() {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            )
+            .init();
+    }
 
     tracing::info!(
         listen = %config.server.listen,
@@ -128,7 +143,14 @@ fn main() {
     server.add_service(service);
 
     tracing::info!("MaxLLM gateway is running on {}", config.server.listen);
-    server.run_forever();
+    // `run` (not `run_forever`) returns after the drain path, so the batch
+    // exporters can be flushed before the process exits; `run_forever` ends in
+    // `std::process::exit(0)` and would drop whatever is still queued.
+    server.run(pingora::server::RunArgs::default());
+
+    if let Some(telemetry) = telemetry.as_mut() {
+        telemetry.shutdown();
+    }
 }
 
 /// How long the config file must be quiet before it is read.

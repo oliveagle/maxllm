@@ -34,6 +34,10 @@ pub struct Config {
     pub rate_limit: Option<RateLimitConfig>,
     #[serde(default)]
     pub metrics: MetricsConfig,
+    /// Native OpenTelemetry export (logs + traces over OTLP/HTTP).
+    /// Omitted ⇒ disabled, exactly the pre-0.3.25 behaviour.
+    #[serde(default)]
+    pub otel: OtelConfig,
     /// Named plugin definitions.
     #[serde(default)]
     pub plugins: HashMap<String, PluginConfig>,
@@ -976,6 +980,107 @@ pub struct RateLimitConfig {
     pub requests_per_minute: u64,
 }
 
+/// Native OpenTelemetry export.
+///
+/// The gateway emits OTLP/HTTP **directly** to the configured endpoint — the
+/// same process that produces the log line ships it, so no log file tailing is
+/// involved and `severity_text`/`severity_number` are real. GreptimeDB needs
+/// two different header sets for the two signals (its trace pipeline requires
+/// `X-Greptime-Pipeline-Name: greptime_trace_v1`, while the *same* header on
+/// the logs endpoint is rejected), which is why `logs_headers` and
+/// `traces_headers` are separate.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OtelConfig {
+    /// Master switch. Everything else is ignored unless this is true.
+    #[serde(default)]
+    pub enabled: bool,
+    /// OTLP/HTTP **base** URL. `/v1/logs` and `/v1/traces` are appended.
+    /// GreptimeDB: `http://10.126.126.6:4000/v1/otlp`.
+    #[serde(default = "default_otel_endpoint")]
+    pub endpoint: String,
+    /// `service.name` resource attribute.
+    #[serde(default = "default_otel_service_name")]
+    pub service_name: String,
+    /// Host identity. Written as the `machine` attribute on every record and
+    /// in the resource; defaults to the machine's hostname.
+    #[serde(default)]
+    pub machine: String,
+    /// HTTP basic auth (GreptimeDB user is `otel`). `MAXLLM_OTEL_USERNAME` /
+    /// `MAXLLM_OTEL_PASSWORD` override these, so the secret can live in the
+    /// service's 0600 EnvironmentFile instead of this file.
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
+    /// Export log records (tracing events).
+    #[serde(default = "default_true")]
+    pub logs: bool,
+    /// Export spans.
+    #[serde(default = "default_true")]
+    pub traces: bool,
+    /// Head-based sampling ratio for spans (1.0 = every request).
+    #[serde(default = "default_otel_sample_ratio")]
+    pub sample_ratio: f64,
+    /// Value of the `log_source` log attribute. GreptimeDB extracts it into a
+    /// real column when the exporter sends `X-Greptime-Log-Extract-Keys`.
+    #[serde(default = "default_otel_log_source")]
+    pub log_source: String,
+    /// Headers sent to both exporters.
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    /// Headers sent only to the logs exporter.
+    #[serde(default)]
+    pub logs_headers: HashMap<String, String>,
+    /// Headers sent only to the traces exporter.
+    #[serde(default)]
+    pub traces_headers: HashMap<String, String>,
+    /// `tracing` filter for the exported signals. The file/stdout log keeps
+    /// the process-wide `RUST_LOG`; this only shapes what leaves the process.
+    #[serde(default = "default_otel_filter")]
+    pub filter: String,
+}
+
+impl Default for OtelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: default_otel_endpoint(),
+            service_name: default_otel_service_name(),
+            machine: String::new(),
+            username: String::new(),
+            password: String::new(),
+            logs: true,
+            traces: true,
+            sample_ratio: default_otel_sample_ratio(),
+            log_source: default_otel_log_source(),
+            headers: HashMap::new(),
+            logs_headers: HashMap::new(),
+            traces_headers: HashMap::new(),
+            filter: default_otel_filter(),
+        }
+    }
+}
+
+fn default_otel_endpoint() -> String {
+    "http://127.0.0.1:4318".to_string()
+}
+
+fn default_otel_service_name() -> String {
+    "maxllm".to_string()
+}
+
+fn default_otel_sample_ratio() -> f64 {
+    1.0
+}
+
+fn default_otel_log_source() -> String {
+    "maxllm_logs".to_string()
+}
+
+fn default_otel_filter() -> String {
+    "info".to_string()
+}
+
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct MetricsConfig {
     #[serde(default)]
@@ -1227,6 +1332,76 @@ fn expand_env_vars(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `[otel]` is opt-in and its defaults must be safe: a config that never
+    /// mentions it must behave exactly like 0.3.24 (no exporter, no headers).
+    #[test]
+    fn otel_defaults_are_opt_in() {
+        let cfg: Config = toml::from_str(
+            r#"
+[server]
+listen = "0.0.0.0:1"
+
+[providers.mock]
+kind = "openai"
+base_url = "http://127.0.0.1:1"
+api_key = "k"
+"#,
+        )
+        .expect("config parses");
+        assert!(!cfg.otel.enabled);
+        assert!(cfg.otel.logs && cfg.otel.traces);
+        assert_eq!(cfg.otel.endpoint, "http://127.0.0.1:4318");
+        assert_eq!(cfg.otel.service_name, "maxllm");
+        assert_eq!(cfg.otel.log_source, "maxllm_logs");
+        assert_eq!(cfg.otel.sample_ratio, 1.0);
+        assert!(cfg.otel.logs_headers.is_empty());
+        assert!(cfg.otel.traces_headers.is_empty());
+
+        let cfg: Config = toml::from_str(
+            r#"
+[server]
+listen = "0.0.0.0:1"
+
+[providers.mock]
+kind = "openai"
+base_url = "http://127.0.0.1:1"
+api_key = "k"
+
+[otel]
+enabled = true
+endpoint = "http://10.126.126.6:4000/v1/otlp"
+username = "otel"
+password = "pw"
+machine = "oleNas01"
+sample_ratio = 0.25
+
+[otel.logs_headers]
+X-Greptime-Log-Extract-Keys = "log_source,machine,event,provider,model"
+
+[otel.traces_headers]
+X-Greptime-Pipeline-Name = "greptime_trace_v1"
+"#,
+        )
+        .expect("config parses");
+        assert!(cfg.otel.enabled);
+        assert_eq!(cfg.otel.machine, "oleNas01");
+        assert_eq!(cfg.otel.sample_ratio, 0.25);
+        assert_eq!(
+            cfg.otel
+                .logs_headers
+                .get("X-Greptime-Log-Extract-Keys")
+                .map(String::as_str),
+            Some("log_source,machine,event,provider,model")
+        );
+        assert_eq!(
+            cfg.otel
+                .traces_headers
+                .get("X-Greptime-Pipeline-Name")
+                .map(String::as_str),
+            Some("greptime_trace_v1")
+        );
+    }
 
     /// The body affinity is opt-in: a config that does not ask for it keeps
     /// the old behaviour (headers only), and the size cap has a usable
