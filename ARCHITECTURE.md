@@ -214,6 +214,71 @@ pub struct OpenAIChatRequest {
 4. `translate_response()` converts response back to OpenAI format
 5. For streaming: `streaming_translator()` processes SSE chunks incrementally
 
+#### The translation kernel (`kernel.rs`) — the updatable half
+
+The translation layer is split in two:
+
+| Layer | What it holds | How it changes |
+|-------|---------------|----------------|
+| **Runtime** (compiled) | the format translation, the schema projection, the cycle guard, the orphan repair, the retry machinery | a release cycle (musl build + deploy) |
+| **Kernel** (scripted) | the provider-dialect *policy*: request adaptations and upstream-error classification | save the file — the watcher recompiles it, the next request uses it |
+
+The kernel is a Rhai script (`rhai` with the `serde` + `sync` features),
+sandboxed exactly like the laya-workflow plugin engine: no `eval`, no
+`import`, no raw `print`, hard operation/string/array/map limits, and one
+host function (`log`). It declares up to two hooks:
+
+```rhai
+fn on_request_body(ctx) {   // ctx: body, provider, model, replay flags
+    let body = ctx["body"];
+    body["tool_choice"] = "required";   // return the new body
+}
+
+fn on_upstream_error(ctx) { // ctx: status, body (string), provider, model
+    if ctx["body"].contains("custom dialect rule violated") {
+        return #{ "repair": "schema" };   // "schema" | "orphan" | "none"
+    }
+    #{ "repair": "none" }
+}
+```
+
+**The kernel may only escalate.** When it says "none", the compiled baseline
+rules still decide — a script can never switch a baseline repair off, and a
+script fault (runtime error, operation limit, a body that is not JSON) is
+answered as "no decision". The rule that keeps a translation fault from
+ending an agent's turn keeps a script fault from ending it too.
+
+Wiring:
+
+* `TranslationKernel::load()` compiles the script; a compile error is a
+  **config error** — the gateway refuses to start (or keeps the previous
+  state on a hot-reload), so a broken kernel can never ship silently.
+* The kernel is built with the rest of `HotState`, so a config hot-reload
+  recompiles it.
+* The script's own directory is watched: saving the script is the deploy,
+  no config touch needed.
+* The gateway applies the kernel's rewrite last — after the Moonshot
+  projection and the orphan repair — so a dialect rule the baseline does
+  not know can be added without a release. On the keep-Content-Length path
+  (native Responses) a rewrite that *grows* the body is dropped with a
+  warning, because that request must keep the client's frame.
+
+Metrics: `maxllm_kernel_rewrites_total`, `maxllm_kernel_faults_total`.
+
+Cost: a script with an `on_request_body` hook pays one JSON → Rhai → JSON
+round trip per request on the paths that reach the kernel. A gateway that
+needs no request-side policy declares no kernel (or a script with only the
+error hook) and pays nothing.
+
+The edit loop (no gateway needed):
+
+```bash
+scripts/kernel/check.sh                    # compile every shipped kernel
+scripts/kernel/check.sh --run k.rhai \
+    --error-body 'Invalid request: ...'    # dry-run the classifier
+maxllm kernel check --script k.rhai        # the same gate, directly
+```
+
 ---
 
 ### 4. maxllm-gateway (Main Gateway)

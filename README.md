@@ -913,6 +913,65 @@ invalid_request_error … At path 'properties.show': detected infinite recursion
 without termination condition`, and the same body after the projection
 answers `200` with a normal completion.
 
+### The translation kernel (the updatable half)
+
+The gateway runs in two layers. The **runtime** (this binary) holds the
+format translation, the schema projection and the retry machinery, and it
+changes rarely. The **kernel** is a Rhai script that holds the
+provider-dialect *policy* — how a request body is adapted for a dialect, and
+how an upstream error is classified — and it changes by saving a file.
+
+```toml
+[translation_kernel]
+script = "kernels/moonshot/main.rhai"   # relative to the process working dir
+# max_operations = 2000000              # the script's operation budget
+```
+
+The script declares up to two hooks:
+
+```rhai
+// Adapt the outgoing body. Return the new body, or nothing to pass it on.
+fn on_request_body(ctx) {          // ctx: body, provider, model, flags
+    let body = ctx["body"];
+    if ctx["provider"].contains("open_design") {
+        if body["tool_choice"] == "any" { body["tool_choice"] = "required"; }
+    }
+    body
+}
+
+// Classify an upstream error. ctx: status, body (string), provider, model.
+fn on_upstream_error(ctx) {
+    if ctx["body"].contains("custom dialect rule violated") {
+        return #{ "repair": "schema" };   // "schema" | "orphan" | "none"
+    }
+    #{ "repair": "none" }
+}
+```
+
+`"schema"` replays the request with degraded tool schemas, `"orphan"`
+repairs the tool history, `"none"` leaves the decision to the built-in
+rules.
+
+**The kernel may only escalate.** When it says "none" the built-in rules
+still decide — a script can never switch a built-in repair off, and a
+script fault is answered as "no decision". A translation fault must never
+end the agent's turn; neither may a script fault.
+
+**Saving the script is the deploy.** The script's directory is watched: the
+kernel is recompiled and the next request uses it, with no restart. A script
+that does not compile is a config error — the gateway refuses to start with
+it, and a hot-reload keeps the previous policy instead of dropping it.
+
+The edit loop needs no gateway:
+
+```bash
+scripts/kernel/check.sh                    # compile every shipped kernel
+scripts/kernel/check.sh --run k.rhai     --error-body 'Invalid request: ...'    # dry-run the classifier
+maxllm kernel check --script k.rhai        # the same gate, directly
+```
+
+A shipped example lives in `examples/kernel/moonshot/main.rhai`.
+
 ### Shutdown behaviour
 
 On `SIGTERM` the gateway stops accepting new connections and drains the
