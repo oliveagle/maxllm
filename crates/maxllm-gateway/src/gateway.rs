@@ -10925,6 +10925,12 @@ mod failover_policy_tests {
         let rejection = r#"{"error":{"code":"invalid_request_error","message":"Invalid request: tools.function.parameters is not a valid moonshot flavored json schema, details: <At path 'properties.show': detected infinite recursion without termination condition>","type":"invalid_request_error"}}"#;
         assert!(body_reports_tool_schema(rejection));
 
+        // The same rejection under the property name the upstream named
+        // this time (`source`) classifies identically — the path inside the
+        // details is data, never part of the marker.
+        let source_rejection = r#"{"error":{"code":"invalid_request_error","message":"Invalid request: tools.function.parameters is not a valid moonshot flavored json schema, details: <At path 'properties.source': detected infinite recursion without termination condition>","type":"invalid_request_error"}}"#;
+        assert!(body_reports_tool_schema(source_rejection));
+
         // A 400 about anything else is the client's own fault.
         assert!(!body_reports_tool_schema(
             r#"{"error":{"message":"Invalid request: missing 'messages' parameter"}}"#

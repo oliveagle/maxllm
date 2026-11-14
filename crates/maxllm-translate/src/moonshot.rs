@@ -40,6 +40,14 @@
 //!   given to the branches that lack one.
 //! * **an `enum`/`const` without a `type`** — the value's type is added.
 //!
+//! And one last guard before a body is forwarded (see [`normalize_tools`]):
+//! a reference cycle that survives the projection — hidden under an
+//! applicator keyword the dialect walk does not enter, or closed through a
+//! plain JSON pointer outside `$defs` — degrades the tool schema to a bare
+//! object. The upstream answers a cycle with `detected infinite recursion
+//! without termination condition`, the one rejection that ends an agent's
+//! turn; the gateway must never send it.
+//!
 //! Everything else is left as it arrived: a body whose tool schemas already
 //! satisfy the dialect comes back byte-for-byte, so the rewrite never churns
 //! a prompt-cache prefix that was already valid, and the projection is a pure
@@ -95,6 +103,31 @@ const NON_VALUE_KEYWORDS: [&str; 7] = [
     "$recursiveAnchor",
 ];
 
+/// Keywords whose value is a single subschema, and whose value is a map of
+/// subschemas. The cycle cutter walks all of them: the upstream's validator
+/// descends into every applicator keyword, so a recursion hidden under
+/// `not` / `if` / `contains` / … is still "infinite recursion" for it and
+/// must be cut here even though the projection's own dialect walk (which
+/// also *types* the nodes it enters) deliberately stays on the smaller set.
+const SUBSCHEMA_KEYWORDS: [&str; 11] = [
+    "items",
+    "additionalProperties",
+    "contains",
+    "if",
+    "then",
+    "else",
+    "not",
+    "unevaluatedItems",
+    "unevaluatedProperties",
+    "contentSchema",
+    "propertyNames",
+];
+const SUBSCHEMA_MAP_KEYWORDS: [&str; 3] = ["properties", "patternProperties", "dependentSchemas"];
+
+/// A bound on the reference-walk of [`has_reference_cycle`], so a
+/// pathological document cannot turn the check into a hang.
+const CYCLE_WALK_BUDGET: usize = 100_000;
+
 /// How deep a `$ref` chain may be followed before the projection cuts it.
 /// Honest schemas refine a reused shape two or three levels deep; the bound
 /// only fences the pathological ones.
@@ -133,6 +166,18 @@ pub fn normalize_tools(body: &[u8]) -> Vec<u8> {
         };
         if let Some(schema) = schema {
             if project_schema(schema) {
+                changed = true;
+            }
+            // The projection repairs the shapes it knows; a cycle that
+            // survived it — hidden under a keyword its walk does not enter,
+            // or closed through a plain JSON pointer outside `$defs` — is
+            // the shape the upstream answers with `detected infinite
+            // recursion without termination condition`. It is degraded
+            // *here*, before the request leaves: the tool names survive,
+            // the agent's turn continues, and no upstream round trip is
+            // spent learning what a local check already knew.
+            if has_reference_cycle(schema) {
+                *schema = serde_json::json!({"type": "object"});
                 changed = true;
             }
         }
@@ -485,15 +530,17 @@ fn break_cycles_in(
     let Some(object) = node.as_object_mut() else {
         return false;
     };
-    for keyword in ["properties", "patternProperties"] {
+    for keyword in SUBSCHEMA_MAP_KEYWORDS {
         if let Some(Value::Object(children)) = object.get_mut(keyword) {
             for child in children.values_mut() {
                 changed |= break_cycles_in(child, defs, stack);
             }
         }
     }
-    if let Some(child) = object.get_mut("items") {
-        changed |= break_cycles_in(child, defs, stack);
+    for keyword in SUBSCHEMA_KEYWORDS {
+        if let Some(child) = object.get_mut(keyword) {
+            changed |= break_cycles_in(child, defs, stack);
+        }
     }
     if let Some(Value::Array(items)) = object.get_mut("prefixItems") {
         for item in items.iter_mut() {
@@ -507,10 +554,113 @@ fn break_cycles_in(
             }
         }
     }
-    if let Some(child) = object.get_mut("additionalProperties") {
-        changed |= break_cycles_in(child, defs, stack);
-    }
     changed
+}
+
+/// Whether the schema still carries a reference cycle.
+///
+/// The projection cuts every cycle its own walk can see — but its walk is
+/// bounded by the keywords it knows, and a cycle can hide under an
+/// applicator keyword it does not enter (`unevaluatedProperties` on a
+/// tomorrow's dialect revision, say) or close through a plain JSON pointer
+/// that resolves outside `$defs`. A cycle is the one shape the upstream
+/// answers with `detected infinite recursion without termination
+/// condition`, and the one shape that ends an agent's turn — so before a
+/// projected schema is forwarded, the reference graph is re-checked and a
+/// surviving cycle is degraded here instead of being sent.
+///
+/// The walk follows **any** `$ref` — not only `#/$defs/…` pointers — and
+/// enters every subschema keyword, so it sees exactly what the upstream's
+/// validator sees. A document too large to prove safe within the budget is
+/// reported as cyclic: the schema is degraded, and a degraded schema is
+/// always legal.
+pub fn has_reference_cycle(schema: &Value) -> bool {
+    let mut budget = CYCLE_WALK_BUDGET;
+    let mut stack = Vec::new();
+    walk_for_cycle(schema, schema, &mut stack, &mut budget)
+}
+
+/// Walk one node of the reference graph looking for a cycle.
+///
+/// `doc` is the schema document the pointers resolve against, `stack` the
+/// pointer paths of the reference targets currently being expanded — a
+/// reference back to one of them is the edge that closes a cycle. The
+/// document itself is a tree, so every cycle must cross at least one `$ref`;
+/// entering every child value (any keyword, any nesting) is what makes the
+/// check complete.
+fn walk_for_cycle(node: &Value, doc: &Value, stack: &mut Vec<String>, budget: &mut usize) -> bool {
+    if *budget == 0 {
+        // Too large to prove safe within the budget: assume the worst. A
+        // degraded schema is legal; a missed cycle is a killed turn.
+        return true;
+    }
+    *budget -= 1;
+
+    if let Some(pointer) = node.get(REF_KEYWORD).and_then(Value::as_str) {
+        if let Some((path, target)) = resolve_pointer(doc, pointer) {
+            if stack.iter().any(|seen| seen == &path) {
+                return true;
+            }
+            stack.push(path);
+            if walk_for_cycle(target, doc, stack, budget) {
+                return true;
+            }
+            stack.pop();
+        }
+    }
+
+    match node {
+        Value::Object(object) => {
+            for (keyword, value) in object {
+                if keyword == REF_KEYWORD {
+                    // Followed above; a value under the keyword itself is
+                    // the pointer string, never a subschema.
+                    continue;
+                }
+                if walk_for_cycle(value, doc, stack, budget) {
+                    return true;
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                if walk_for_cycle(item, doc, stack, budget) {
+                    return true;
+                }
+            }
+        }
+        _ => {}
+    }
+    false
+}
+
+/// Resolve a JSON pointer inside the schema document.
+///
+/// Returns the canonical path of the target — rebuilt from the tokens the
+/// pointer walks, so two spellings that reach the same node name it
+/// identically — and the target itself. Only pointers rooted at the document
+/// resolve here; a pointer into another document (a `$id`, say) is unknown
+/// and yields nothing, which the caller reads as "cannot cycle".
+fn resolve_pointer<'a>(doc: &'a Value, pointer: &str) -> Option<(String, &'a Value)> {
+    let rest = pointer.strip_prefix('#')?;
+    let mut node = doc;
+    let mut path = String::from("#");
+    for token in rest.split('/').skip_while(|token| token.is_empty()) {
+        let token = token.replace("~1", "/").replace("~0", "~");
+        node = match node {
+            Value::Object(map) => {
+                path.push_str("/o:");
+                map.get(&token)?
+            }
+            Value::Array(items) => {
+                path.push_str("/i:");
+                items.get(token.parse::<usize>().ok()?)?
+            }
+            _ => return None,
+        };
+        path.push_str(&token);
+    }
+    Some((path, node))
 }
 
 /// The schema a cut reference chain terminates with.
@@ -809,6 +959,169 @@ mod tests {
         assert_moonshot_legal(&out["tools"][0]["parameters"]);
         assert_eq!(out["tools"][0]["parameters"]["type"], "object");
         assert_eq!(out["tools"][0]["parameters"]["required"], json!(["show"]));
+    }
+
+    // ── the reported `properties.source` shape ─────────────────────────
+
+    #[test]
+    fn the_reported_source_shape_projects_to_a_terminating_schema() {
+        // `At path 'properties.source': detected infinite recursion without
+        // termination condition` — the same zod shape as the `show` one,
+        // under the property name the upstream named this time.
+        let schema = project(json!({
+            "type": "object",
+            "properties": {
+                "source": {"$ref": "#/$defs/__schema0"}
+            },
+            "$defs": {
+                "__schema0": {"$ref": "#/$defs/__schema0"}
+            }
+        }));
+        assert_eq!(schema["$defs"]["__schema0"], json!({"type": "object"}));
+        assert_eq!(
+            schema["properties"]["source"],
+            json!({"$ref": "#/$defs/__schema0"}),
+            "a pure reference to the cut target is the honest shape"
+        );
+        assert!(!has_reference_cycle(&schema));
+    }
+
+    #[test]
+    fn a_recursive_source_property_is_cut() {
+        // The property recurses into its own type: `source` is a node of the
+        // type it points at.
+        let schema = project(json!({
+            "type": "object",
+            "properties": {
+                "source": {"$ref": "#/$defs/__schema0"}
+            },
+            "$defs": {
+                "__schema0": {
+                    "type": "object",
+                    "properties": {
+                        "source": {"$ref": "#/$defs/__schema0"}
+                    }
+                }
+            }
+        }));
+        assert_eq!(schema["$defs"]["__schema0"]["type"], "object");
+        assert_eq!(
+            schema["$defs"]["__schema0"]["properties"]["source"],
+            json!({"type": "object"}),
+            "the back edge is cut at a terminating object"
+        );
+        assert!(!has_reference_cycle(&schema));
+    }
+
+    #[test]
+    fn a_cycle_under_an_applicator_keyword_is_cut() {
+        // The recursion hides under `not` — a keyword the projection's
+        // dialect walk does not enter. The cutter does, so the schema the
+        // upstream sees still terminates.
+        let schema = project(json!({
+            "type": "object",
+            "properties": {
+                "source": {
+                    "type": "object",
+                    "not": {"$ref": "#/$defs/__schema0"}
+                }
+            },
+            "$defs": {
+                "__schema0": {
+                    "type": "object",
+                    "not": {"$ref": "#/$defs/__schema0"}
+                }
+            }
+        }));
+        assert_eq!(
+            schema["$defs"]["__schema0"]["not"],
+            json!({"type": "object"}),
+            "the hidden back edge is cut too"
+        );
+        assert!(!has_reference_cycle(&schema));
+    }
+
+    #[test]
+    fn a_cycle_the_projection_cannot_reach_is_degraded_before_it_leaves() {
+        // The recursion closes through a plain JSON pointer —
+        // `#/properties/source` — under a keyword the projection does not
+        // walk. Nothing in the projection can cut it, and the upstream
+        // would answer `detected infinite recursion without termination
+        // condition`: a request-fault 400 that ends the agent's turn. The
+        // schema is degraded here instead, before the request leaves.
+        let body = br##"{"model":"m","input":"hi","tools":[
+            {"type":"function","name":"t","parameters":{
+                "type":"object",
+                "properties":{
+                    "source":{"type":"object","not":{"$ref":"#/properties/source"}}
+                }
+            }}]}"##;
+
+        let out: Value = serde_json::from_slice(&normalize_tools(body)).unwrap();
+        assert_eq!(
+            out["tools"][0]["parameters"],
+            json!({"type": "object"}),
+            "a cycle that cannot be cut degrades the schema, not the turn"
+        );
+        assert_eq!(out["tools"][0]["name"], "t", "the tool itself survives");
+
+        // The projection alone neither cuts nor flags it: the pointer
+        // resolves outside `$defs` and sits under a keyword the dialect
+        // walk does not enter, so the schema is handed on exactly as it
+        // arrived — cycle and all. Only the local check sees it, which is
+        // why the check is not optional.
+        let mut projected = json!({
+            "type": "object",
+            "properties": {
+                "source": {"type": "object", "not": {"$ref": "#/properties/source"}}
+            }
+        });
+        project_schema(&mut projected);
+        assert!(
+            has_reference_cycle(&projected),
+            "the pointer cycle survives the projection — the local check is what catches it"
+        );
+    }
+
+    #[test]
+    fn the_cycle_check_sees_every_recursion_and_no_other_shape() {
+        // A cycle through `$defs`.
+        assert!(has_reference_cycle(&json!({
+            "type": "object",
+            "properties": {"source": {"$ref": "#/$defs/__schema0"}},
+            "$defs": {"__schema0": {"$ref": "#/$defs/__schema0"}}
+        })));
+        // A cycle through a plain JSON pointer.
+        assert!(has_reference_cycle(&json!({
+            "type": "object",
+            "properties": {"source": {"$ref": "#/properties/source"}}
+        })));
+        // A cycle back to the document root.
+        assert!(has_reference_cycle(&json!({
+            "type": "object",
+            "properties": {"source": {"$ref": "#"}}
+        })));
+        // A mutual recursion.
+        assert!(has_reference_cycle(&json!({
+            "type": "object",
+            "properties": {"a": {"$ref": "#/$defs/__a"}},
+            "$defs": {
+                "__a": {"properties": {"b": {"$ref": "#/$defs/__b"}}},
+                "__b": {"properties": {"a": {"$ref": "#/$defs/__a"}}}
+            }
+        })));
+        // A legal schema is not a cycle.
+        assert!(!has_reference_cycle(&json!({
+            "type": "object",
+            "properties": {"source": {"type": "string"}},
+            "$defs": {"__schema0": {"type": "object"}}
+        })));
+        // A reference that resolves to a typed node terminates.
+        assert!(!has_reference_cycle(&json!({
+            "type": "object",
+            "properties": {"source": {"$ref": "#/$defs/__schema0"}},
+            "$defs": {"__schema0": {"type": "string"}}
+        })));
     }
 
     // ── the zod shapes ────────────────────────────────────────────────
