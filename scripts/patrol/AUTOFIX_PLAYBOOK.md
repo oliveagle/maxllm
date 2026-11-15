@@ -1,7 +1,19 @@
 # MaxLLM Autofix Playbook — 30-minute patrol + repair round
 
 You are a fresh headless session. You have NO prior context. This file is the whole procedure.
-The repo is `/mnt/data/repos/github.com/oliveagle/maxllm-src` (origin: oliveagle/maxllm, YOUR repo; upstream chaitanya14/maxllm is NEVER pushed).
+
+PRIMARY STORE: git-ai (graft). Work in the graft workspace `~/opt/git-ai/ws/maxllm` and commit
+with `graft commit -m "..." --land main`. GitHub (`git@github.com:oliveagle/maxllm`) is a
+READ-ONLY MIRROR fed by the mirror timer — NEVER run `git push` to GitHub yourself; a landed
+changeset reaches it within ~10 min (or force it:
+`~/opt/git-ai/bin/mirror-to-github.sh maxllm.git git@github.com:oliveagle/maxllm.git`).
+upstream chaitanya14/maxllm is NEVER pushed.
+
+OPS CHECKOUT: the plain git clone at `/mnt/data/repos/github.com/oliveagle/maxllm-src` is for
+interactive ops only. Before anything that reads it (deploy, audits), sync it from the mirror
+(only when its working tree is clean):
+`git -C /mnt/data/repos/github.com/oliveagle/maxllm-src fetch origin && git -C ... merge --ff-only origin/main`.
+
 The gateway runs on NAS `oliveagle@oleNas01` (also 10.126.126.6), dir `~/opt/maxllm`, log `~/opt/maxllm/logs/maxllm.log`, metrics `http://127.0.0.1:3795/metrics`, health `http://127.0.0.1:3795/health`.
 
 NOTE: the NAS host has no rg and the textual-filter word g-r-e-p is blocked by policy — filter its
@@ -69,15 +81,22 @@ upstream noise or a gap in the baseline walk; investigate that instead.
   `ssh oliveagle@oleNas01 "curl -s http://127.0.0.1:3795/metrics | awk '/maxllm_kernel_/'"`
   (rewrites climbing, faults 0) and the gateway log shows the kernel reloaded
   (`ssh oliveagle@oleNas01 "awk '/[Kk]ernel/' ~/opt/maxllm/logs/maxllm.log | tail -5"`).
-- Commit on the current branch of YOUR repo (English, conventional: `fix(kernel): ...`), push origin.
+- Land the change in git-ai (English, conventional: `fix(kernel): ...`):
+  `graft commit -m "fix(kernel): ..." --land main` (run inside the graft workspace; conflicts:
+  `graft update` then `graft commit --land main --resolve`).
+  Then force the mirror so GitHub sees it:
+  `~/opt/git-ai/bin/mirror-to-github.sh maxllm.git git@github.com:oliveagle/maxllm.git`.
 
 **Runtime fix** (mechanism-level only):
 - Add a regression test in `crates/maxllm-gateway/tests/` that replays the observed chain
   (mirrors the existing "surviving refusal walks the chain" test style).
 - `cargo test` (workspace), `cargo clippy -p maxllm-gateway --all-targets -- -D warnings`,
   `cargo fmt -p maxllm-gateway -- --check` (zero NEW drift vs HEAD).
-- Rebase onto origin/main, push, then deploy: `setsid nohup bash scripts/deploy_maxllm.sh nas`
-  (MUST be setsid+nohup+& or the exec session kill takes the build down).
+- Land in git-ai, then deploy: `graft commit -m "fix(gateway): ..." --land main` (run inside the
+  graft workspace; a conflict after `graft update` resolves with `--resolve`), then deploy:
+  `setsid nohup bash scripts/deploy_maxllm.sh nas` from the graft workspace
+  (MUST be setsid+nohup+& or the exec session kill takes the build down; the deploy script's
+  CARGO_TARGET_DIR defaults outside the workspace, so the build never dirties it).
 - After deploy: confirm NAS `systemctl --user status maxllm` active, health endpoint build id new,
   then run one more `patrol_once.sh` round — the same signature must now be CONTEXT, not FINDINGS.
 
@@ -90,8 +109,10 @@ If you fixed nothing (all findings were absorbed/context), still log one line:
 ## Hard rules
 - NEVER let a translation bug end the agent loop — if in doubt, escalate the repair chain, never
   pass the 400 to the client.
-- NEVER push to upstream. NEVER force push. Commit English, atomic.
-- NEVER deploy from a dirty tree; commit first.
+- NEVER push to GitHub directly (it is the mirror — direct pushes race the mirror timer).
+  NEVER push upstream (chaitanya14/maxllm). NEVER force push. Commit English, atomic, one fix.
+- NEVER deploy from a dirty workspace; `graft status` must be clean (only intentional edits)
+  before a Rust deploy — land first, then deploy.
 - NEVER kill the always-on detector `patrol.sh` (it runs independently; your round is separate).
 - One fix per round. If the fix is big, do the smallest safe kernel-layer mitigation now, note the
   structural follow-up in autofix.log, don't half-deploy a Rust change.

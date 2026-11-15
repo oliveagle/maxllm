@@ -16,11 +16,26 @@ true in production.
    (installed via the ole-cron skill; trigger script at
    `~/.local/state/codex-schedule/codex-cron-maxllm-autofix.sh`, serialized by
    `flock` on `~/.maxllm/patrol/autofix.lock`).
-2. It runs `cx one-api-ch exec` in the repo root with the playbook message.
+2. It runs `cx one-api-ch exec` in the graft workspace with the playbook message.
 3. A clean round exits without touching the repo. A findings round fixes,
-   gates, commits (origin only), deploys (kernel script hot-reload via scp, or
+   gates, lands the changeset in **git-ai** (`graft commit --land main`), mirrors
+   it to GitHub, deploys (kernel script hot-reload via scp, or
    `scripts/deploy_maxllm.sh nas` for Rust changes), verifies, and appends a
    report line to `~/.maxllm/patrol/autofix.log`.
+
+## the primary store is git-ai; GitHub is a mirror
+
+The code of record lives in git-ai (`maxllm.git`, PostgreSQL `graft_refs` + the
+node object store). Commits are landed with `graft commit --land main` from the
+graft workspace `~/opt/git-ai/ws/maxllm`. GitHub
+(`git@github.com:oliveagle/maxllm.git`) is a **read-only mirror**: the systemd
+timer `git-ai-mirror-maxllm.timer` rebuilds a plain git repo from the
+authoritative state (objects from the node repo dir, refs from `graft_refs`) and
+pushes heads+tags with `--prune`. Force it by hand with:
+
+```
+~/opt/git-ai/bin/mirror-to-github.sh maxllm.git git@github.com:oliveagle/maxllm.git
+```
 
 ## install / reinstall on a fresh operator machine
 
