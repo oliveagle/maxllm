@@ -14266,6 +14266,112 @@ async fn test_moonshot_rejection_is_retried_with_degraded_tools() {
     assert_eq!(degraded["messages"][0]["role"], "user");
 }
 
+/// The dialect rejection survives the degraded replay: the provider refuses
+/// the schemas twice — once projected, once degraded — so the request is
+/// sound and the *provider* is the one that cannot serve it. The chain must
+/// walk on; the 400 must never reach the client (it would end the agent's
+/// turn on a request fault the request does not carry).
+const MOONSHOT_PERSISTENT_REJECTION_CONFIG: &str = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[metrics]
+enabled = true
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.kimi_mock]
+kind = "openai_compat"
+base_url = "{MOCK_URL}"
+upstream_path = "/coding/v1/chat/completions"
+api_key = "fake-key"
+tool_schema = "moonshot"
+
+[providers.backup_openai]
+kind = "openai"
+base_url = "{FALLBACK_URL}"
+api_key = "fake-key"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "kimi_mock"
+fallback = ["backup_openai"]
+strategy = "fallback"
+"#;
+
+#[tokio::test]
+async fn test_moonshot_rejection_that_survives_the_degraded_retry_walks_the_chain() {
+    let mock = MockServer::start().await;
+    let fallback = MockServer::start().await;
+
+    // The upstream refuses every attempt with the dialect rejection: the
+    // projected one AND the degraded one. The repair has done all it can.
+    Mock::given(method("POST"))
+        .and(path("/coding/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(moonshot_rejection()))
+        .expect(2)
+        .mount(&mock)
+        .await;
+
+    // The next link of the chain answers.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from fallback")))
+        .expect(1)
+        .mount(&fallback)
+        .await;
+
+    let gw = TestGateway::start_with_fallback(
+        MOONSHOT_PERSISTENT_REJECTION_CONFIG,
+        &mock.uri(),
+        &fallback.uri(),
+    )
+    .await;
+    let c = client();
+
+    let mut body = chat_body("kimi-for-coding", "hi");
+    body["tools"] = json!([zod_tool()]);
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "the refusal must not end the agent's turn — the chain walks on"
+    );
+    assert_eq!(
+        resp.json::<Value>().await.unwrap()["choices"][0]["message"]["content"],
+        "from fallback"
+    );
+
+    // The provider that persisted in its rejection got exactly the two
+    // attempts the repair allows: the projected one and the degraded one.
+    let requests = mock.received_requests().await.unwrap();
+    assert_eq!(
+        requests.len(),
+        2,
+        "the repair is applied once — no third attempt on the same provider"
+    );
+    let degraded: Value = serde_json::from_slice(&requests[1].body).unwrap();
+    assert_eq!(
+        degraded["tools"][0]["function"]["parameters"],
+        json!({"type": "object"}),
+        "the second attempt is the degraded one: {degraded}"
+    );
+}
+
 #[tokio::test]
 async fn test_moonshot_orphaned_tool_call_is_repaired() {
     let mock = MockServer::start().await;
