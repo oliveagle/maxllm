@@ -7,6 +7,11 @@ LOGFILE="${PATROL_LOG:-$HOME/.maxllm/patrol/patrol.log}"
 SEEN="${PATROL_SEEN:-$HOME/.maxllm/patrol/seen_shapes.txt}"
 HOST="${PATROL_HOST:-oliveagle@oleNas01}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
+CLIENT_CONFIG="${CLIENT_CONFIG:-$HOME/.agents/config/codex-settings/configs.d/proxy/one-api-local.toml}"
+
+client_path_ok() {
+  rg -q 'base_url = "http://192\.168\.2\.190:3795/v1/responses/coding_resps"' "$CLIENT_CONFIG"
+}
 
 log() { printf '%s %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$*" >> "$LOGFILE"; }
 
@@ -18,9 +23,17 @@ round() {
     return
   fi
   printf '%s\n' "$out" | while IFS= read -r l; do log "  $l"; done
+  if ! client_path_ok; then
+    log "CLIENT_PATH_FAULT $CLIENT_CONFIG"
+  fi
   # remember the shapes this round reported (append-only, deduped here)
   printf '%s\n' "$out" | rg '^  N ' | sed 's/^  N //' >> "$SEEN"
 }
+
+if [[ "${1:-}" == "--once" ]]; then
+  round
+  exit 0
+fi
 
 log "patrol started (pid $$), every 600s"
 round
