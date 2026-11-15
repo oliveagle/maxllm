@@ -248,6 +248,15 @@ script fault (runtime error, operation limit, a body that is not JSON) is
 answered as "no decision". The rule that keeps a translation fault from
 ending an agent's turn keeps a script fault from ending it too.
 
+**One repair per request.** The decision point for a deferred 400 is a
+single function (`classify_tool_plumbing`): the kernel's verdict first, the
+built-in rules second. The first refusal of a class is repaired (degraded
+tool schemas / a repaired tool history) and replayed. The *same* refusal
+again is not a request fault — the provider persists in its dialect
+rejection — so the request walks the failover chain instead of ending the
+agent's turn with a 400. The next provider may well accept the conversation
+the refusing one would not.
+
 Wiring:
 
 * `TranslationKernel::load()` compiles the script; a compile error is a

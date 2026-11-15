@@ -913,6 +913,13 @@ invalid_request_error … At path 'properties.show': detected infinite recursion
 without termination condition`, and the same body after the projection
 answers `200` with a normal completion.
 
+A repair is applied **once**. When the replay meets the same refusal again —
+the degraded schemas refused like the projected ones — the request is not the
+fault: the provider persists in its dialect rejection, and the failover chain
+walks on to a provider that may accept the conversation. The surviving 400
+never reaches the client as a request fault, because that is what ends the
+agent's turn.
+
 ### The translation kernel (the updatable half)
 
 The gateway runs in two layers. The **runtime** (this binary) holds the
