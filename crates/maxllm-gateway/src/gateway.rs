@@ -4857,6 +4857,76 @@ fn body_reports_orphan_tool_call(body: &str) -> bool {
     maxllm_translate::body_reports_orphan_tool_call(body)
 }
 
+/// What the gateway does with an upstream 400 whose body has been
+/// collected and classified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolPlumbingAction {
+    /// The body names neither the tool schemas nor an orphaned tool call:
+    /// it is the client's own fault and is handed back untouched.
+    None,
+    /// The upstream refused the tool schemas: replay the request once with
+    /// every tool schema reduced to a bare object.
+    DegradeSchema,
+    /// The upstream refused the conversation's tool history: answer the
+    /// orphaned call and replay the request once.
+    RepairOrphan,
+    /// The repair was already applied and the same refusal survived it.
+    /// The request is sound — the provider persists in its dialect
+    /// rejection — so the fault is the provider's and the chain walks on.
+    /// The reason says which refusal survived.
+    FailOver(&'static str),
+}
+
+/// Classify a collected 400 body against the repair the gateway already
+/// applied.
+///
+/// The kernel's decision comes first (it is the operator's live policy and
+/// may escalate to a repair the built-in rules do not know), the built-in
+/// rules second. Either way the *same* repair is never applied twice: a
+/// second refusal of the same class is not a request fault, it is a provider
+/// that does not accept this conversation — so the request walks to the next
+/// provider instead of ending the agent's turn.
+fn classify_tool_plumbing(
+    kernel_repair: maxllm_translate::kernel::KernelRepair,
+    body: &str,
+    schema_degraded: bool,
+    orphan_repaired: bool,
+) -> ToolPlumbingAction {
+    use maxllm_translate::kernel::KernelRepair;
+    match kernel_repair {
+        KernelRepair::SchemaDegrade => {
+            return if schema_degraded {
+                ToolPlumbingAction::FailOver("the tool-schema refusal survives the degraded replay")
+            } else {
+                ToolPlumbingAction::DegradeSchema
+            };
+        }
+        KernelRepair::OrphanRepair => {
+            return if orphan_repaired {
+                ToolPlumbingAction::FailOver("the orphan-call refusal survives the repaired replay")
+            } else {
+                ToolPlumbingAction::RepairOrphan
+            };
+        }
+        KernelRepair::None => {}
+    }
+    if body_reports_tool_schema(body) {
+        return if schema_degraded {
+            ToolPlumbingAction::FailOver("the tool-schema refusal survives the degraded replay")
+        } else {
+            ToolPlumbingAction::DegradeSchema
+        };
+    }
+    if body_reports_orphan_tool_call(body) {
+        return if orphan_repaired {
+            ToolPlumbingAction::FailOver("the orphan-call refusal survives the repaired replay")
+        } else {
+            ToolPlumbingAction::RepairOrphan
+        };
+    }
+    ToolPlumbingAction::None
+}
+
 /// Whether the gateway answers such an upstream status itself.
 ///
 /// A quota wall (429), an empty account (402), a credential the provider
@@ -6200,11 +6270,15 @@ impl ProxyHttp for AiGateway {
         // would answer by model rewrite or failover keeps that handling —
         // the request is retried anyway, and a tool-plumbing rejection that
         // survives it reaches this deferral on the next attempt.
-        if status == 400
-            && !ctx.tool_schema_degraded
-            && !ctx.tool_calls_repaired
-            && !should_failover_status(status, ctx, provider)
-        {
+        //
+        // EVERY such 400 is classified — also the one that arrives after a
+        // repair was already applied. That second 400 is the one that used
+        // to end the agent's turn: the degraded replay was refused just like
+        // the first attempt, and the refusal was handed to the client as the
+        // request's own fault. The body has to be read to tell a surviving
+        // tool-plumbing refusal from an ordinary request fault, so the
+        // deferral cannot stop at the first repair.
+        if status == 400 && !should_failover_status(status, ctx, provider) {
             ctx.pending_tool_schema_repair = true;
             ctx.pending_tool_schema_status = status;
             ctx.tool_schema_body_buf.clear();
@@ -6615,29 +6689,33 @@ impl ProxyHttp for AiGateway {
             // baseline repair: "the kernel said nothing" falls through to
             // the built-in rules, which are the ones that keep a
             // translation fault from ending the agent's turn.
+            //
+            // One repair per request. When the replay meets the same
+            // refusal again, the request is NOT the fault: the provider
+            // persists in its dialect rejection, and the next link of the
+            // chain may well accept the conversation. Such a 400 walks the
+            // chain instead of ending the agent's turn as a request fault.
             {
                 let hot = self.hot.load();
-                match Self::kernel_error_repair(&hot, ctx.pending_tool_schema_status, &text, ctx) {
-                    maxllm_translate::kernel::KernelRepair::SchemaDegrade => {
+                let kernel_repair =
+                    Self::kernel_error_repair(&hot, ctx.pending_tool_schema_status, &text, ctx);
+                match classify_tool_plumbing(
+                    kernel_repair,
+                    &text,
+                    ctx.tool_schema_degraded,
+                    ctx.tool_calls_repaired,
+                ) {
+                    ToolPlumbingAction::DegradeSchema => {
                         return Err(self.begin_tool_schema_repair(ctx));
                     }
-                    maxllm_translate::kernel::KernelRepair::OrphanRepair => {
+                    ToolPlumbingAction::RepairOrphan => {
                         return Err(self.begin_orphan_tool_call_repair(ctx));
                     }
-                    maxllm_translate::kernel::KernelRepair::None => {}
+                    ToolPlumbingAction::FailOver(reason) => {
+                        return self.fail_over_tool_repair(session, ctx, reason);
+                    }
+                    ToolPlumbingAction::None => {}
                 }
-            }
-            if body_reports_tool_schema(&text) {
-                return Err(self.begin_tool_schema_repair(ctx));
-            }
-            // The upstream refused the conversation's tool history: an
-            // assistant tool call the history never answered (`… must be
-            // followed by tool messages responding to each 'tool_call_id'`).
-            // The fault is in the history the client replayed, and a
-            // request-fault 400 would end the agent's turn — so the orphan
-            // is answered and the request is replayed once.
-            if body_reports_orphan_tool_call(&text) {
-                return Err(self.begin_orphan_tool_call_repair(ctx));
             }
             if !buffered.is_empty() {
                 *body = Some(Bytes::from(buffered));
@@ -8910,6 +8988,26 @@ impl AiGateway {
         e.as_up();
         e.set_retry(true);
         e
+    }
+
+    /// A tool-plumbing 400 arrived after the matching repair was already
+    /// applied: the request itself is sound (the repaired replay is a fresh
+    /// answer), so the provider's dialect is the fault now, not the client's.
+    /// The chain walks on like any other provider failure — a tool-plumbing
+    /// 400 must never reach the client as a request fault, because that is
+    /// what ends the agent's turn.
+    fn fail_over_tool_repair(
+        &self,
+        session: &mut Session,
+        ctx: &mut RequestCtx,
+        reason: &str,
+    ) -> pingora::Result<Option<std::time::Duration>> {
+        // The deferral that parked the body for classification belonged to
+        // the attempt that just failed: the next provider's attempt must
+        // not inherit it.
+        ctx.pending_rate_limit = None;
+        ctx.rate_limit_body_buf.clear();
+        self.fail_over_from_body_filter(session, ctx, 400, reason)
     }
 
     /// Persist a provider's circuit-breaker state.
@@ -11233,6 +11331,118 @@ mod failover_policy_tests {
             r#"{"error":{"message":"Invalid request: missing 'messages' parameter"}}"#
         ));
         assert!(!body_reports_orphan_tool_call(""));
+    }
+
+    /// The tool-schema rejection Kimi answers with.
+    const SCHEMA_REJECTION: &str = r#"{"error":{"code":"invalid_request_error","message":"Invalid request: tools.function.parameters is not a valid moonshot flavored json schema, details: <At path 'properties.show': detected infinite recursion without termination condition>","type":"invalid_request_error"}}"#;
+
+    /// The orphaned-tool-call rejection Kimi answers with.
+    const ORPHAN_REJECTION: &str = r#"{"error":{"code":"invalid_request_error","message":"Invalid request: an assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id'. The following tool_call_ids did not have response messages: f:0","type":"invalid_request_error"}}"#;
+
+    #[test]
+    fn a_tool_plumbing_400_is_repaired_once() {
+        use maxllm_translate::kernel::KernelRepair;
+        // The first rejection of each class is repaired: the request is
+        // replayed with the tool schemas degraded / the history repaired.
+        assert_eq!(
+            classify_tool_plumbing(KernelRepair::None, SCHEMA_REJECTION, false, false),
+            ToolPlumbingAction::DegradeSchema
+        );
+        assert_eq!(
+            classify_tool_plumbing(KernelRepair::None, ORPHAN_REJECTION, false, false),
+            ToolPlumbingAction::RepairOrphan
+        );
+        // The kernel's own decision escalates the same way, even when the
+        // built-in rules would not recognise the phrasing.
+        assert_eq!(
+            classify_tool_plumbing(
+                KernelRepair::SchemaDegrade,
+                "some new dialect",
+                false,
+                false
+            ),
+            ToolPlumbingAction::DegradeSchema
+        );
+        assert_eq!(
+            classify_tool_plumbing(KernelRepair::OrphanRepair, "some new dialect", false, false),
+            ToolPlumbingAction::RepairOrphan
+        );
+    }
+
+    #[test]
+    fn a_tool_plumbing_400_that_survives_the_repair_walks_the_chain() {
+        use maxllm_translate::kernel::KernelRepair;
+        // The degraded replay was refused just like the first attempt: the
+        // request is not the fault, the provider's dialect is — the chain
+        // walks on instead of the 400 ending the agent's turn.
+        assert_eq!(
+            classify_tool_plumbing(KernelRepair::None, SCHEMA_REJECTION, true, false),
+            ToolPlumbingAction::FailOver("the tool-schema refusal survives the degraded replay")
+        );
+        assert_eq!(
+            classify_tool_plumbing(KernelRepair::None, ORPHAN_REJECTION, false, true),
+            ToolPlumbingAction::FailOver("the orphan-call refusal survives the repaired replay")
+        );
+        // The kernel's decision says the same: it may escalate a repair, it
+        // may not demand a second one.
+        assert_eq!(
+            classify_tool_plumbing(KernelRepair::SchemaDegrade, SCHEMA_REJECTION, true, false),
+            ToolPlumbingAction::FailOver("the tool-schema refusal survives the degraded replay")
+        );
+        assert_eq!(
+            classify_tool_plumbing(KernelRepair::OrphanRepair, ORPHAN_REJECTION, false, true),
+            ToolPlumbingAction::FailOver("the orphan-call refusal survives the repaired replay")
+        );
+    }
+
+    #[test]
+    fn a_genuine_request_fault_is_still_the_clients_own() {
+        use maxllm_translate::kernel::KernelRepair;
+        // Nothing in the body blames the tool plumbing: the 400 stays the
+        // client's answer, whatever the repairs did before.
+        let fault = r#"{"error":{"message":"Invalid request: missing 'messages' parameter"}}"#;
+        assert_eq!(
+            classify_tool_plumbing(KernelRepair::None, fault, true, true),
+            ToolPlumbingAction::None
+        );
+        assert_eq!(
+            classify_tool_plumbing(KernelRepair::None, fault, false, false),
+            ToolPlumbingAction::None
+        );
+        // A quota wall is not a tool-plumbing rejection either — it is
+        // parked by the quota path, not repaired here.
+        assert_eq!(
+            classify_tool_plumbing(
+                KernelRepair::None,
+                r#"{"error":{"code":"tier_limit_exceeded","message":"[code=tier_limit_exceeded] membership rpm limit exceeded: 101/100 resets 2026-11-14T10:38:00Z","type":"tier_limit_exceeded"}}"#,
+                false,
+                false
+            ),
+            ToolPlumbingAction::None
+        );
+    }
+
+    #[test]
+    fn a_repair_never_repeats_itself() {
+        use maxllm_translate::kernel::KernelRepair;
+        // The decision is a walk, not a loop: every repair is applied at
+        // most once, and the second refusal of the same class walks the
+        // chain. No sequence of refusals can ask for a third repair.
+        let mut degraded = false;
+        let mut repaired = false;
+        for _ in 0..4 {
+            match classify_tool_plumbing(KernelRepair::None, SCHEMA_REJECTION, degraded, repaired) {
+                ToolPlumbingAction::DegradeSchema => degraded = true,
+                ToolPlumbingAction::RepairOrphan => repaired = true,
+                ToolPlumbingAction::FailOver(_) => break,
+                ToolPlumbingAction::None => panic!("the schema rejection is never unclassified"),
+            }
+        }
+        assert!(degraded, "the first refusal is repaired");
+        assert!(
+            !repaired,
+            "the schema repair never becomes the orphan repair"
+        );
     }
 
     #[test]
