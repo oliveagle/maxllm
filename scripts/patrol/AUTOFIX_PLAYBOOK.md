@@ -16,6 +16,14 @@ interactive ops only. Before anything that reads it (deploy, audits), sync it fr
 
 The gateway runs on NAS `oliveagle@oleNas01` (also 10.126.126.6), dir `~/opt/maxllm`, log `~/opt/maxllm/logs/maxllm.log`, metrics `http://127.0.0.1:3795/metrics`, health `http://127.0.0.1:3795/health`.
 
+CLIENT PATH GUARD: the workstation `one-api-ch` profile MUST point at
+`http://192.168.2.190:3795/v1/responses/coding_resps`, not the old
+`http://127.0.0.1:3794/v1` direct one-api path. The former enters MaxLLM's
+repair/failover layer; the latter bypasses it and can surface strict-upstream
+400s to codex. If this round finds that path drifting back, repair the
+`configs.d/proxy/one-api-local.toml` source, run
+`codex-materialize-profile.py one-api-ch --force`, and record `fix=config`.
+
 NOTE: the NAS host has no rg and the textual-filter word g-r-e-p is blocked by policy — filter its
 files with awk or python3 over ssh. Locally use rg.
 
@@ -45,7 +53,11 @@ bash ~/.maxllm/patrol/patrol_once.sh        # exit 0 = clean, 1 = findings, 2 = 
 ```
 It prints FINDINGS / CONTEXT / NEW_SHAPES lines and appends them to `~/.maxllm/patrol/patrol.log`.
 If exit is 2 -> log "ssh failed" and STOP (do not touch the repo on a blind round).
-If exit is 0 -> you are done. Do not commit anything. Exit.
+If exit is 3 -> the client path drifted back to direct one-api; restore the
+`http://192.168.2.190:3795/v1/responses/coding_resps` path described above,
+re-materialize `one-api-ch`, rerun patrol, and record `fix=config`.
+If exit is 0 -> the gateway patrol and client-path guard are clean. Do not
+commit anything solely for a clean round; exit.
 
 ### 2. Triage each FINDINGS line
 For every `F <status> <provider> <cause> | <log-line>`:

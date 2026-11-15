@@ -1,0 +1,23 @@
+FINDINGS 1
+  F 429 minimax CLIENT_ABORTED | 2026-11-15T09:10:02.716397Z  INFO http.server.request{otel.kind="server" http.request.method=POST url.path=/v1
+CONTEXT 0 {}
+NEW_SHAPES 1
+  N WARN pingora_proxy: Fail to proxy: Upstream ReadTimedout context: Peer: addr: <ip>:<n>, scheme: HTTP, sni: <ip> cause: context: while reading response headers, tries: <n>, retry: true, POST /v1/respon
+KERNEL maxllm_kernel_faults_total 0 maxllm_kernel_rewrites_total 79
+GATEWAY build=0.3.26+tool-plumbing-failover.992f934 open=['minimax', 'opencode_go_1', 'volc_1', 'volc_1_spare', 'volc_2', 'volc_t_1']
+BINARY fcb9c0e6817fb3a3
+FINDINGS 1
+  F 429 minimax CLIENT_ABORTED | 2026-11-15T09:10:02.716397Z  INFO http.server.request{otel.kind="server" http.request.method=POST url.path=/v1
+CONTEXT 0 {}
+NEW_SHAPES 1
+  N WARN pingora_proxy: Fail to proxy: Upstream ReadTimedout context: Peer: addr: <ip>:<n>, scheme: HTTP, sni: <ip> cause: context: while reading response headers, tries: <n>, retry: true, POST /v1/respon
+KERNEL maxllm_kernel_faults_total 0 maxllm_kernel_rewrites_total 79
+GATEWAY build=0.3.26+tool-plumbing-failover.992f934 open=['minimax', 'opencode_go_1', 'volc_1', 'volc_1_spare', 'volc_2', 'volc_t_1']
+BINARY fcb9c0e6817fb3a3
+FINDINGS 1
+  F 429 minimax CLIENT_ABORTED | 2026-11-15T09:10:02.716397Z  INFO http.server.request{otel.kind="server" http.request.method=POST url.path=/v1
+CONTEXT 0 {}
+NEW_SHAPES 0
+KERNEL maxllm_kernel_faults_total 0 maxllm_kernel_rewrites_total 84
+GATEWAY build=0.3.26+tool-plumbing-failover.992f934 open=['minimax', 'opencode_go_1', 'volc_1', 'volc_1_spare', 'volc_2', 'volc_t_1']
+BINARY fcb9c0e6817fb3a3
