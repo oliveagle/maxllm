@@ -12353,6 +12353,197 @@ async fn test_quota_429_in_the_auto_pool_without_a_healthy_member_is_answered_by
     assert_eq!(parsed["error"]["type"], "gateway_error");
 }
 
+/// A pool that *names a channel* (`/model` in codex: the body model is
+/// `deepseek-flash` and that name is the whole request).
+const STRICT_NAMED_POOL_CONFIG: &str = r#"
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[session_sticky]
+enabled = true
+body_affinity = true
+
+[providers.channel]
+kind = "openai"
+base_url = "{POOL_A_URL}"
+api_key = "fake-key"
+
+[providers.fallback]
+kind = "openai"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+
+[auto_models."deepseek-flash"]
+strict = true
+
+[[auto_models."deepseek-flash".pool]]
+provider = "channel"
+model = "real-model"
+
+[[routes]]
+path = "/v1/responses"
+provider = "fallback"
+session_sticky = true
+"#;
+
+/// The same config without `strict`: the fall-through every pool had before
+/// the flag existed, kept here so the compatibility guarantee is pinned.
+fn non_strict_variant() -> String {
+    STRICT_NAMED_POOL_CONFIG.replace("strict = true\n", "")
+}
+
+/// A channel pool whose only member is quota-dead must answer 503 from the
+/// gateway — it must *not* be served by whatever provider the route names.
+///
+/// 2026-11-16 (LPT): `{"model":"open_design"}` on the pooled `/v1/responses`
+/// route fell through to `opencode_1` once the open_design breaker was
+/// force-opened by a 402, and the client got
+/// `model 'open_design' is not allowed on provider 'opencode_1'` — a 403
+/// about a model it never asked for. The channel name IS the request, so an
+/// unusable pool has to fail closed and say which pool is down.
+#[tokio::test]
+async fn test_a_strict_named_pool_fails_closed_instead_of_falling_through() {
+    let dead = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .set_body_string(quota_429_body())
+                .insert_header("content-type", "application/json"),
+        )
+        .mount(&dead)
+        .await;
+    let fallback = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from-fallback")))
+        .mount(&fallback)
+        .await;
+
+    let dead_uri = dead.uri();
+    let fallback_uri = fallback.uri();
+    let (mut child, base, _cfg) = spawn_gateway_with_pool(
+        STRICT_NAMED_POOL_CONFIG,
+        [fallback_uri.as_str(), dead_uri.as_str(), dead_uri.as_str()],
+    )
+    .await;
+
+    let body = json!({"model": "deepseek-flash", "input": "hi"});
+    // 1st request: the pool member is still "healthy", so the request goes
+    // there and its quota wall force-opens the circuit.
+    let first = client()
+        .post(format!("{base}/v1/responses"))
+        .json(&body)
+        .send()
+        .await
+        .expect("request completes");
+    let first_status = first.status();
+    let first_text = first.text().await.unwrap_or_default();
+    assert!(
+        !first_status.is_success(),
+        "a quota-walled channel is not a success (body: {first_text})"
+    );
+
+    // 2nd request: the pool is now unusable. A strict pool must answer 503
+    // naming the pool, not hand the request to the route's `fallback`.
+    let second = client()
+        .post(format!("{base}/v1/responses"))
+        .json(&body)
+        .send()
+        .await
+        .expect("request completes");
+    let status = second.status();
+    let text = second.text().await.unwrap_or_default();
+    let _ = child.kill();
+
+    assert_eq!(
+        status, 503,
+        "an unusable strict channel pool must be the gateway's own 503 (body: {text})"
+    );
+    assert!(
+        text.contains("pool 'deepseek-flash'"),
+        "the 503 must name the pool the client asked for: {text}"
+    );
+    assert!(
+        text.contains("quota force-open"),
+        "the 503 must carry the members' circuit state: {text}"
+    );
+    assert!(
+        !text.contains("is not allowed"),
+        "a dead channel must not read as a model-allowlist denial: {text}"
+    );
+    assert!(
+        fallback
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "the route's own provider must never be asked to serve a named channel"
+    );
+}
+
+/// Without `strict`, the same config keeps the old fall-through: the route's
+/// provider answers. This is the behaviour every pre-existing pool relies on,
+/// so it may not change silently.
+#[tokio::test]
+async fn test_a_non_strict_named_pool_still_falls_through_to_the_route() {
+    let dead = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .set_body_string(quota_429_body())
+                .insert_header("content-type", "application/json"),
+        )
+        .mount(&dead)
+        .await;
+    let fallback = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from-fallback")))
+        .mount(&fallback)
+        .await;
+
+    let dead_uri = dead.uri();
+    let fallback_uri = fallback.uri();
+    let config = non_strict_variant();
+    let (mut child, base, _cfg) = spawn_gateway_with_pool(
+        &config,
+        [fallback_uri.as_str(), dead_uri.as_str(), dead_uri.as_str()],
+    )
+    .await;
+
+    let body = json!({"model": "deepseek-flash", "input": "hi"});
+    let _ = client()
+        .post(format!("{base}/v1/responses"))
+        .json(&body)
+        .send()
+        .await
+        .expect("request completes")
+        .text()
+        .await;
+    let second = client()
+        .post(format!("{base}/v1/responses"))
+        .json(&body)
+        .send()
+        .await
+        .expect("request completes");
+    let status = second.status();
+    let text = second.text().await.unwrap_or_default();
+    let _ = child.kill();
+
+    assert_eq!(
+        status, 200,
+        "without `strict` the pool keeps falling through to the route (body: {text})"
+    );
+    assert_eq!(
+        fallback
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .len(),
+        1,
+        "the route's provider is the one that answered"
+    );
+}
+
 /// A client's own mistake keeps the upstream's answer: a 404 that names the
 /// model as unknown is the client's answer to hear, not the gateway's.
 #[tokio::test]

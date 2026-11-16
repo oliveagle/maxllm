@@ -424,6 +424,9 @@ pub struct AutoPoolState {
     /// Whether the rotation prefers the low-latency cohort inside the
     /// preferred billing tier (see `[auto_model].prefer_fast`).
     pub prefer_fast: bool,
+    /// Whether an unusable pool answers 503 instead of falling through to
+    /// the route's own provider chain (see `[auto_models.<key>] strict`).
+    pub strict: bool,
     /// Which side of the deployment boundary this pool may draw from.
     /// Checked at load (a violating member is a startup error) *and* at
     /// request time: a path pin or a fallback hop can name a provider that
@@ -1025,6 +1028,7 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
             name,
             entries,
             prefer_fast: auto.prefer_fast,
+            strict: auto.strict,
             scope: auto.scope,
         });
     }
@@ -2630,21 +2634,24 @@ impl AiGateway {
                 if let Some(provider) = self.select_from_auto_pool(hot, pool, route, ctx) {
                     return Some(provider);
                 }
-                if scoped {
+                if scoped || pool.strict {
                     // Every pool member is unhealthy. Falling through to the
                     // route's own chain would hand the request to whatever the
                     // route names — for a scoped pool that is by definition the
-                    // wrong side of the deployment boundary, so fail closed
-                    // with a 503 instead of misrouting to a vendor.
+                    // wrong side of the deployment boundary, and for a `strict`
+                    // pool (a named *channel*) it is an upstream the client did
+                    // not ask for. Fail closed with a 503 that names the pool
+                    // and its members' state instead.
                     warn!(
                         pool = %pool.name,
                         scope = ?pool.scope,
-                        "every member of the scoped auto pool is unhealthy — no route-chain fallback allowed"
+                        strict = pool.strict,
+                        "every member of the auto pool is unhealthy — no route-chain fallback allowed"
                     );
                     return None;
                 }
-                // An unscoped pool may still fall through to the route's own
-                // selection so the request has somewhere to go.
+                // An unscoped, non-strict pool may still fall through to the
+                // route's own selection so the request has somewhere to go.
                 ctx.auto_pool = None;
             }
         }
@@ -3026,7 +3033,14 @@ impl AiGateway {
         }
         let scope = match ctx.path_pinned_provider.as_deref() {
             Some(pin) => format!("the provider '{pin}' named by the request path"),
-            None => format!("every candidate of route '{}'", route.path),
+            // A request that names a pool asked for that pool's members, not
+            // for the route's chain: say so, or the 503 reads as "every
+            // candidate of route '/v1/responses' is down" while the pool's own
+            // members are the only thing that was ever tried.
+            None => match hot.request_pool(route, ctx) {
+                Some(pool) => format!("every member of pool '{}'", pool.name),
+                None => format!("every candidate of route '{}'", route.path),
+            },
         };
         format!(
             "no provider available: {} — {scope} is rejecting traffic",
@@ -12051,6 +12065,7 @@ mod auto_pool_latency_tests {
             name: "auto".to_string(),
             entries: names.iter().map(|n| entry(n)).collect(),
             prefer_fast,
+            strict: false,
             scope: AutoPoolScope::Any,
         }
     }

@@ -194,6 +194,25 @@ pub struct AutoModelConfig {
     /// round-robin over the whole tier.
     #[serde(default = "default_true")]
     pub prefer_fast: bool,
+    /// Fail closed when no member of this pool can take the traffic.
+    ///
+    /// A pool is normally a *preference*: when every member is
+    /// circuit-open the request falls through to the route's own provider
+    /// chain, so a single-pool route still has somewhere to go. That is the
+    /// right answer for `auto` ("pick one for me"), and the wrong answer for
+    /// a pool that exists to name a **channel** — a client's model field
+    /// says `deepseek-flash` or `open_design` and that name *is* the whole
+    /// request. Falling through then answers with an upstream nobody asked
+    /// for, or with a 403 from a provider whose allow-list rejects the name,
+    /// which reads as "model not allowed" instead of "that channel is down"
+    /// (2026-11-16: `/model open_design` on LPT came back as `model
+    /// 'open_design' is not allowed on provider 'opencode_1'`).
+    ///
+    /// With `strict = true` an unusable pool answers a 503 that names its
+    /// own members and their circuit state. Defaults to `false` so every
+    /// existing pool keeps the fall-through.
+    #[serde(default)]
+    pub strict: bool,
     /// Which side of the deployment boundary this pool may draw from.
     /// Checked at load: a member that violates it is a startup error, not a
     /// silent misroute. Defaults to `any` so existing configs keep working.
