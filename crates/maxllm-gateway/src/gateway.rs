@@ -6988,8 +6988,10 @@ impl ProxyHttp for AiGateway {
                 // The wall ends when the body says it does — and only then.
                 // A body that names a BALANCE problem describes a wall no
                 // timer ends (the account needs a top-up), so the payment
-                // cooldown stays and the operator is told.
-                let reset_at_ms = if body_names_reset(&text) && !body_names_balance_problem(&text) {
+                // cooldown stays and the operator is told which of the two
+                // reasons applies.
+                let balance_problem = body_names_balance_problem(&text);
+                let reset_at_ms = if body_names_reset(&text) && !balance_problem {
                     let (_, mut candidates) =
                         crate::rate_limit::parse_body_text_with_offset(&text, utc_offset_minutes);
                     crate::rate_limit::retain_plausible_reset_candidates(&mut candidates);
@@ -7022,11 +7024,19 @@ impl ProxyHttp for AiGateway {
                             let until = crate::rate_limit::now_ms()
                                 + crate::circuit_breaker::PAYMENT_REQUIRED_COOLDOWN_MS;
                             p.circuit_breaker.record_quota_until(until);
-                            info!(
-                                provider = %provider_name,
-                                cooldown_ms = crate::circuit_breaker::PAYMENT_REQUIRED_COOLDOWN_MS,
-                                "402 payment required — no reset instant in the body, parked on the payment cooldown"
-                            );
+                            if balance_problem {
+                                info!(
+                                    provider = %provider_name,
+                                    cooldown_ms = crate::circuit_breaker::PAYMENT_REQUIRED_COOLDOWN_MS,
+                                    "402 payment required — the body names a balance problem: the account needs a top-up, no timer ends this wall (payment cooldown)"
+                                );
+                            } else {
+                                info!(
+                                    provider = %provider_name,
+                                    cooldown_ms = crate::circuit_breaker::PAYMENT_REQUIRED_COOLDOWN_MS,
+                                    "402 payment required — no reset instant in the body, parked on the payment cooldown"
+                                );
+                            }
                         }
                     }
                     METRICS
