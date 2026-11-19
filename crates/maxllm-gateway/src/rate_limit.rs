@@ -224,6 +224,15 @@ pub fn parse_body_text_with_offset(
         "quota",
         "throttl",
         "too many requests",
+        // NOTE: "usage limit" is deliberately NOT here. OpenCode's monthly
+        // wall says "OpenCode Go usage limit reached (monthly, resets in
+        // 15d 23h)" — but a body that says "usage limit reached" AND
+        // "insufficient balance, please recharge" is a BILLING rejection
+        // that does not reset on a timer, and it must never be parked on
+        // one (the billing markers below decide that, and they win). A
+        // 429 does not need the word list: the status itself says "rate
+        // limited", and the body only has to supply the deadline (see the
+        // resolver's status rule).
         "使用上限",
         "限额",
         "额度",
@@ -622,7 +631,20 @@ fn parse_time_shape(s: &str) -> Option<(String, usize)> {
 /// `regex-lite` via deps; if unavailable, falls back to scanning).
 mod regex_lite {
     /// Find duration patterns like "in 30s", "resets in 5m30s", "12m50s",
-    /// "5分钟" (treated as 5 minutes), "3小时".
+    /// "1h 30m" and "15d 23h" (a compound duration, days included).
+    ///
+    /// The unit ladder is `d > h > m > s`. A compound written with spaces
+    /// continues only with a **strictly smaller** unit, so "15d 23h" is ONE
+    /// duration (15 days 23 hours) while "2h 45h" stays two durations
+    /// instead of becoming 47 hours; a run-together one ("1h30m") keeps
+    /// the older sum-every-unit reading. Days matter: a monthly wall
+    /// states what is left of it in days ("resets in 15d 23h"), and a
+    /// parser that knows only h/m/s reads that as "23h" — one hour of
+    /// probing on a wall that lasts two weeks.
+    ///
+    /// The horizon is the one the callers use
+    /// ([`super::MAX_RESET_HORIZON_MS`]): a duration longer than that is
+    /// not a quota window, it is a sentinel.
     pub fn find_durations(text: &str) -> Vec<u64> {
         let mut out = Vec::new();
         let bytes = text.as_bytes();
@@ -631,41 +653,69 @@ mod regex_lite {
             // Scan for a digit start.
             if bytes[i].is_ascii_digit() {
                 let start = i;
-                let mut total_secs: u64 = 0;
+                let mut total_ms: u64 = 0;
                 let mut j = i;
                 let mut found = false;
-                // Parse sequences like 1h30m, 5m30s, 12ms.
+                let mut prev_mag: Option<u32> = None;
+                let mut via_space = false;
+                // Parse sequences like 1h30m, 5m30s, 15d 23h.
                 while j < bytes.len() {
-                    let mut num = 0u64;
+                    let mut num: u64 = 0;
                     let num_start = j;
                     while j < bytes.len() && bytes[j].is_ascii_digit() {
-                        num = num * 10 + (bytes[j] - b'0') as u64;
+                        num = num
+                            .saturating_mul(10)
+                            .saturating_add((bytes[j] - b'0') as u64);
                         j += 1;
                     }
                     if j == num_start {
                         break;
                     } // no digits, stop
-                      // Look for a unit suffix.
-                    let unit = if j + 1 < bytes.len() && bytes[j] == b'm' && bytes[j + 1] == b's' {
-                        j += 2;
-                        0u64 // milliseconds
-                    } else if j < bytes.len() && bytes[j] == b'h' {
-                        j += 1;
-                        3600u64
-                    } else if j < bytes.len() && bytes[j] == b'm' {
-                        j += 1;
-                        60u64
-                    } else if j < bytes.len() && bytes[j] == b's' {
-                        j += 1;
-                        1u64
-                    } else {
-                        break; // digits without a unit — not a duration
-                    };
-                    total_secs += num * unit;
+                      // Look for a unit suffix — WITHOUT committing to it: a
+                      // spaced compound that does not descend is two
+                      // durations. Milliseconds are not a duration here (the
+                      // unit contributes nothing a second-based window can
+                      // express) — the header path parses those.
+                    let (unit_ms, mag, unit_len) =
+                        if j + 1 < bytes.len() && bytes[j] == b'm' && bytes[j + 1] == b's' {
+                            (0u64, 0u32, 2usize) // milliseconds: no seconds to express
+                        } else if j < bytes.len() && bytes[j] == b'd' {
+                            (86_400_000u64, 4u32, 1usize)
+                        } else if j < bytes.len() && bytes[j] == b'h' {
+                            (3_600_000u64, 3u32, 1usize)
+                        } else if j < bytes.len() && bytes[j] == b'm' {
+                            (60_000u64, 2u32, 1usize)
+                        } else if j < bytes.len() && bytes[j] == b's' {
+                            (1_000u64, 1u32, 1usize)
+                        } else {
+                            break; // digits without a unit — not a duration
+                        };
+                    if via_space && prev_mag.is_some_and(|prev| mag >= prev) {
+                        // A SPACED compound continues only with a strictly
+                        // smaller unit: "15d 23h" is one duration, "2h 45h"
+                        // is two. Hand the digits back to the scanner so the
+                        // next duration is found on its own.
+                        j = num_start;
+                        break;
+                    }
+                    total_ms = total_ms.saturating_add(num.saturating_mul(unit_ms));
                     found = true;
+                    prev_mag = Some(mag);
+                    j += unit_len;
+                    // A compound may be written with spaces ("15d 23h").
+                    let mut k = j;
+                    while k < bytes.len() && (bytes[k] == b' ' || bytes[k] == b'\t') {
+                        k += 1;
+                    }
+                    if k < bytes.len() && bytes[k].is_ascii_digit() {
+                        via_space = k > j;
+                        j = k;
+                    } else {
+                        break;
+                    }
                 }
-                if found && total_secs > 0 && total_secs < 7 * 24 * 3600 {
-                    out.push(total_secs * 1000);
+                if found && total_ms > 0 && total_ms <= super::MAX_RESET_HORIZON_MS {
+                    out.push(total_ms);
                 }
                 i = if j > start { j } else { start + 1 };
             } else {
@@ -758,6 +808,66 @@ mod tests {
     fn no_headers_no_reset() {
         let h = headers(&[("content-type", "application/json")]);
         assert!(resolve_from_headers(&h).is_none());
+    }
+
+    /// The real upstream body of OpenCode's monthly wall (captured
+    /// 2026-11-19 on FAT00913699). Two things the parser had to learn:
+    /// the wording ("usage limit") is no quota word the list knew, and the
+    /// reset is stated in DAYS ("resets in 15d 23h").
+    #[test]
+    fn the_opencode_monthly_wall_reads_its_reset_in_days() {
+        let body = r#"{"type":"error","error":{"type":"GoUsageLimitError","message":"OpenCode Go usage limit reached (monthly, resets in 15d 23h). To keep going now, turn on Extra Usage or upgrade to Go Plus at https://opencode.ai/console/wrk_SCRUBBED/go."},"metadata":{"workspace":"wrk_SCRUBBED","limitName":"monthly"}}"#;
+        let (is_rl, cands) = parse_body_text(body);
+        // The wording is INCONCLUSIVE for the classifier — and must stay
+        // so: "usage limit reached" next to "insufficient balance" is a
+        // billing rejection, not a timer wall. A 429 carries the verdict
+        // by itself (see the resolver's status rule).
+        assert_eq!(is_rl, None);
+        assert_eq!(cands.len(), 1);
+        // 15 d 23 h — NOT 23 h: a parser that knows only h/m/s turns a
+        // two-week wall into an hour of probing.
+        let delta = cands[0].at_ms as i64 - now_ms() as i64;
+        assert!(
+            (delta - 1_378_800_000).abs() < 5_000,
+            "expected 15d23h, got {delta} ms"
+        );
+    }
+
+    #[test]
+    fn a_duration_in_days_is_never_read_as_hours() {
+        let (_, cands) = parse_body_text("quota resets in 15d 23h");
+        assert_eq!(cands.len(), 1);
+        let delta = cands[0].at_ms as i64 - now_ms() as i64;
+        assert!((delta - 1_378_800_000).abs() < 5_000, "got {delta} ms");
+    }
+
+    #[test]
+    fn a_compound_duration_continues_only_with_a_smaller_unit() {
+        // "2h 45h" is two durations, not 47 hours.
+        let (_, cands) = parse_body_text("quota resets in 2h 45h");
+        assert_eq!(cands.len(), 2);
+    }
+
+    #[test]
+    fn a_duration_beyond_the_horizon_is_no_reset() {
+        // 90 days is past the 45-day horizon: a sentinel, not a wall.
+        let (_, cands) = parse_body_text("quota resets in 90d");
+        assert!(cands.is_empty(), "{cands:?}");
+    }
+
+    /// The real upstream body of open-design's exhausted coding plan
+    /// (captured 2026-11-17 on LPT035762): the reset is an absolute
+    /// instant in the body, under `details.reset_at`.
+    #[test]
+    fn the_open_design_body_names_its_reset_instant() {
+        let body = r#"{"code":"insufficient_balance","details":{"coding_plan_exhausted":true,"reset_at":"2026-11-19T14:02:11Z"},"message":"Coding Plan quota is exhausted and wallet balance is insufficient …"}"#;
+        let (is_rl, cands) = parse_body_text(body);
+        assert_eq!(is_rl, Some(true));
+        assert_eq!(cands.len(), 1);
+        let expect = chrono::DateTime::parse_from_rfc3339("2026-11-19T14:02:11Z")
+            .unwrap()
+            .timestamp_millis() as u64;
+        assert_eq!(cands[0].at_ms, expect);
     }
 
     #[test]
@@ -1295,8 +1405,11 @@ mod tests {
         assert_eq!(regex_lite::find_durations("0s"), Vec::<u64>::new());
         // Digits without a unit are not a duration.
         assert_eq!(regex_lite::find_durations("5x"), Vec::<u64>::new());
-        // A week is the upper bound — seven days exactly is dropped.
-        assert_eq!(regex_lite::find_durations("168h"), Vec::<u64>::new());
+        // The horizon is the upper bound: 45 days is still a quota window
+        // (a monthly wall says "resets in 15d 23h"), and beyond it the
+        // duration is a sentinel, not a reset.
+        assert_eq!(regex_lite::find_durations("45d"), vec![3_888_000_000]);
+        assert_eq!(regex_lite::find_durations("46d"), Vec::<u64>::new());
         assert_eq!(regex_lite::find_durations("167h"), vec![601_200_000]);
     }
 

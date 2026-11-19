@@ -5986,6 +5986,150 @@ async fn test_429_retry_after_header_fails_over_immediately() {
 /// 5xx nor a 429), so the breaker kept calling the provider healthy and every
 /// rotation paid one extra upstream round trip before the fallback chain took
 /// over. A 402 must force-open the circuit for a cooldown instead.
+/// A 402 whose body names the reset instant: the gateway must park the
+/// provider until THAT moment. The 402 path never read the body before —
+/// the deadline was a flat 10-minute payment cooldown, so a wall that
+/// states its own end was re-probed every ten minutes for as long as it
+/// lasted. open-design's real body carries `"reset_at"`.
+#[tokio::test]
+async fn test_402_body_reset_instant_replaces_the_payment_cooldown() {
+    let primary = MockServer::start().await;
+    let fallback = MockServer::start().await;
+
+    // Three days out — far beyond the 10-minute payment cooldown, so the
+    // two readings are distinguishable.
+    let reset_at = chrono::Utc::now() + chrono::Duration::days(3);
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(402).set_body_json(json!({
+            "code": "quota_exhausted",
+            "details": {
+                "reset_at": reset_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            },
+            "message": "Your monthly plan is exhausted; it resets at the instant below",
+        })))
+        .expect(1)
+        .mount(&primary)
+        .await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from fallback")))
+        .expect(1)
+        .mount(&fallback)
+        .await;
+
+    let gw =
+        TestGateway::start_with_fallback(HTTP_FAILOVER_CONFIG, &primary.uri(), &fallback.uri())
+            .await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&chat_body("deepseek-v4.1-flash", "hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers().get("X-MaxLLM-Provider").unwrap(), "fallback");
+
+    // /health says WHEN the walled provider comes back: the body's own
+    // instant, not the flat payment cooldown.
+    let health: Value = c
+        .get(gw.url("/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let reset = health["quota_reset_at"]["primary"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no reset instant reported: {health}"));
+    let reported = chrono::DateTime::parse_from_rfc3339(reset)
+        .unwrap()
+        .timestamp_millis();
+    let expected = reset_at.timestamp_millis();
+    assert!(
+        (reported - expected).abs() < 1000,
+        "expected {expected}, reported {reported} ({reset})"
+    );
+}
+
+/// The counterpart: a 402 whose body names a BALANCE problem. open-design's
+/// real body says "Coding Plan quota is exhausted and wallet balance is
+/// insufficient" and carries a `reset_at` — but its own words say the
+/// reset does NOT refill the wallet: the wall ends when the account is
+/// topped up, not on a date. Parking the provider until that date would
+/// keep it out of the rotation for days after it was paid for, so the
+/// payment cooldown (10 minutes) stays.
+#[tokio::test]
+async fn test_402_balance_problem_keeps_the_payment_cooldown() {
+    let primary = MockServer::start().await;
+    let fallback = MockServer::start().await;
+
+    let reset_at = chrono::Utc::now() + chrono::Duration::days(3);
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(402).set_body_json(json!({
+            "code": "insufficient_balance",
+            "details": {
+                "coding_plan_exhausted": true,
+                "reset_at": reset_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            },
+            "message": "Coding Plan quota is exhausted and wallet balance is insufficient",
+        })))
+        .expect(1)
+        .mount(&primary)
+        .await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from fallback")))
+        .expect(1)
+        .mount(&fallback)
+        .await;
+
+    let gw =
+        TestGateway::start_with_fallback(HTTP_FAILOVER_CONFIG, &primary.uri(), &fallback.uri())
+            .await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&chat_body("deepseek-v4.1-flash", "hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers().get("X-MaxLLM-Provider").unwrap(), "fallback");
+
+    let health: Value = c
+        .get(gw.url("/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let reset = health["quota_reset_at"]["primary"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no reset instant reported: {health}"));
+    let reported = chrono::DateTime::parse_from_rfc3339(reset)
+        .unwrap()
+        .timestamp_millis();
+    let expected = reset_at.timestamp_millis();
+    assert!(
+        (reported - expected).abs() > 86_400_000,
+        "the body's date must NOT become the deadline (reported {reset})"
+    );
+    // The payment cooldown is 10 minutes.
+    let now = chrono::Utc::now().timestamp_millis();
+    let remaining = reported - now;
+    assert!(
+        (300_000..=900_000).contains(&remaining),
+        "expected the 10-minute payment cooldown, got {remaining} ms"
+    );
+}
+
 #[tokio::test]
 async fn test_402_payment_required_force_opens_the_provider() {
     let primary = MockServer::start().await;

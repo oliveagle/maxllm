@@ -122,11 +122,34 @@ impl RateLimitResolver {
         body: &[u8],
         utc_offset_minutes: i32,
     ) -> (RateLimitDecision, Option<LearnedUpdate>) {
-        if !self.config.enabled {
-            // Learning disabled: keep the pre-learning behaviour — the
-            // header cooldown the caller applies on its own.
-            return (RateLimitDecision::QuotaUnknown, None);
+        let (decision, learned) = self
+            .resolve_inner(status, headers, body, utc_offset_minutes)
+            .await;
+        // Without learning there is no store to feed: the learned update is
+        // dropped at the door.
+        if self.config.enabled {
+            (decision, learned)
+        } else {
+            (decision, None)
         }
+    }
+
+    async fn resolve_inner(
+        &self,
+        status: u16,
+        headers: &http::HeaderMap,
+        body: &[u8],
+        utc_offset_minutes: i32,
+    ) -> (RateLimitDecision, Option<LearnedUpdate>) {
+        // Learning (the learned-pattern store and laya) is optional; the
+        // DETERMINISTIC layers are not. Gating the whole resolver on the
+        // learning switch meant that a deployment without laya — the corp
+        // fleet has no route to it — never read the upstream's own reset
+        // instant and parked every quota wall on the cooldown ladder
+        // (5 min → 15 min → … → 24 h) instead of on the day the wall ends.
+        // Layers 1 and 3 are local, free and deterministic; only layers 2
+        // and 4 need the switch.
+        let learning = self.config.enabled;
 
         // Layer 1: headers — cheapest and most precise. A header-declared
         // reset instant is only trusted for a 429: a 500 that reaches the
@@ -156,7 +179,9 @@ impl RateLimitResolver {
         };
 
         // Layer 2: learned patterns — a shape seen before answers instantly.
-        if let Some(fp) = fingerprint.as_deref() {
+        // This is the learning layer: without the switch there is no store
+        // to ask, so it is skipped.
+        if let Some(fp) = fingerprint.as_deref().filter(|_| learning) {
             if let Some(learned) = self.lookup_learned(fp).await {
                 if let Some(at) = self.reset_from_learned(&learned, &candidates, &text) {
                     return (
@@ -178,7 +203,15 @@ impl RateLimitResolver {
         }
 
         // Layer 3: body regex.
-        if is_rate_limit == Some(true) {
+        //
+        // A 429 IS a rate limit by definition — the status says so — so for
+        // it the body only has to supply the deadline. Requiring a phrase
+        // the word list happens to know threw away the exact instant of
+        // every wall whose wording is not in the list (OpenCode's "usage
+        // limit reached (monthly, resets in 15d 23h)" was one).
+        let body_says_quota =
+            is_rate_limit == Some(true) || (status == 429 && is_rate_limit.is_none());
+        if body_says_quota {
             if let Some(candidate) = candidates.first() {
                 return (
                     RateLimitDecision::QuotaUntil {
@@ -275,9 +308,26 @@ impl RateLimitResolver {
         body: &[u8],
         utc_offset_minutes: i32,
     ) -> (RateLimitDecision, Option<LearnedUpdate>) {
-        if !self.config.enabled {
-            return (RateLimitDecision::QuotaUnknown, None);
+        let (decision, learned) =
+            self.resolve_sync_inner(status, headers, body, utc_offset_minutes);
+        // See [`Self::resolve`]: without learning there is no store to feed.
+        if self.config.enabled {
+            (decision, learned)
+        } else {
+            (decision, None)
         }
+    }
+
+    fn resolve_sync_inner(
+        &self,
+        status: u16,
+        headers: &http::HeaderMap,
+        body: &[u8],
+        utc_offset_minutes: i32,
+    ) -> (RateLimitDecision, Option<LearnedUpdate>) {
+        // See [`Self::resolve`]: the deterministic layers run whether or not
+        // learning is on; only the learned-pattern layer needs the switch.
+        let learning = self.config.enabled;
         // The header layer is trusted for a 429 only (see [`Self::resolve`]).
         if status == 429 {
             if let Some((reset_at_ms, source)) = rate_limit::resolve_from_headers(headers) {
@@ -299,7 +349,7 @@ impl RateLimitResolver {
         } else {
             Some(rate_limit::fingerprint(&text))
         };
-        if let Some(fp) = fingerprint.as_deref() {
+        if let Some(fp) = fingerprint.as_deref().filter(|_| learning) {
             if let Some(learned) = self.lookup_learned_sync(fp) {
                 if learned.is_rate_limit {
                     if let Some(at) = candidates.first().map(|c| c.at_ms) {
@@ -316,8 +366,11 @@ impl RateLimitResolver {
                 }
             }
         }
-        match is_rate_limit {
-            Some(true) => match candidates.first() {
+        // A 429 is a rate limit by definition (see [`Self::resolve`]).
+        let body_says_quota =
+            is_rate_limit == Some(true) || (status == 429 && is_rate_limit.is_none());
+        if body_says_quota {
+            match candidates.first() {
                 Some(c) => (
                     RateLimitDecision::QuotaUntil {
                         reset_at_ms: c.at_ms,
@@ -339,33 +392,33 @@ impl RateLimitResolver {
                         sample_message: text.chars().take(400).collect(),
                     }),
                 ),
-            },
-            Some(false) => (RateLimitDecision::OrdinaryFailure, None),
-            None => {
-                // Status-aware fallback, mirroring [`Self::resolve`]: an
-                // unclassifiable 429 parks on the cooldown ladder; any other
-                // status is an ordinary transient failure.
-                if status == 429 {
-                    (
-                        RateLimitDecision::QuotaUnknown,
-                        fingerprint.map(|fp| LearnedUpdate {
-                            fingerprint: fp,
-                            is_rate_limit: true,
-                            reset_expression: None,
-                            sample_message: text.chars().take(400).collect(),
-                        }),
-                    )
-                } else {
-                    (
-                        RateLimitDecision::OrdinaryFailure,
-                        fingerprint.map(|fp| LearnedUpdate {
-                            fingerprint: fp,
-                            is_rate_limit: false,
-                            reset_expression: None,
-                            sample_message: text.chars().take(400).collect(),
-                        }),
-                    )
-                }
+            }
+        } else if is_rate_limit == Some(false) {
+            (RateLimitDecision::OrdinaryFailure, None)
+        } else {
+            // Status-aware fallback, mirroring [`Self::resolve`]: an
+            // unclassifiable 429 parks on the cooldown ladder; any other
+            // status is an ordinary transient failure.
+            if status == 429 {
+                (
+                    RateLimitDecision::QuotaUnknown,
+                    fingerprint.map(|fp| LearnedUpdate {
+                        fingerprint: fp,
+                        is_rate_limit: true,
+                        reset_expression: None,
+                        sample_message: text.chars().take(400).collect(),
+                    }),
+                )
+            } else {
+                (
+                    RateLimitDecision::OrdinaryFailure,
+                    fingerprint.map(|fp| LearnedUpdate {
+                        fingerprint: fp,
+                        is_rate_limit: false,
+                        reset_expression: None,
+                        sample_message: text.chars().take(400).collect(),
+                    }),
+                )
             }
         }
     }
@@ -453,6 +506,10 @@ impl RateLimitResolver {
     /// Persist what was learned, so the next message of the same shape is
     /// resolved without laya.
     pub async fn persist_learned(&self, update: LearnedUpdate) {
+        if !self.config.enabled {
+            // Learning is off: nothing is learned, so nothing is stored.
+            return;
+        }
         let Some(admin) = self.admin_api.as_ref() else {
             return;
         };
@@ -502,6 +559,80 @@ mod tests {
         let (decision, learned) = resolver.resolve(429, &headers(&[]), b"rate limit", 0).await;
         assert_eq!(decision, RateLimitDecision::QuotaUnknown);
         assert!(learned.is_none());
+    }
+
+    /// The corp fleet has no route to laya, so the learning switch is off
+    /// there — and with it the upstream's own reset instant used to go
+    /// unread: the wall was re-probed on the 5-minute ladder instead of
+    /// being parked until the day it ends. The deterministic layers are
+    /// local; they must not be gated on the learning switch.
+    #[tokio::test]
+    async fn a_disabled_resolver_still_reads_the_upstreams_reset_instant() {
+        let resolver = RateLimitResolver::new(ResolverConfig::default(), None, None, None);
+        let body = br#"{"type":"error","error":{"type":"GoUsageLimitError","message":"OpenCode Go usage limit reached (monthly, resets in 15d 23h). To keep going now, turn on Extra Usage or upgrade to Go Plus at https://opencode.ai/console/wrk_SCRUBBED/go."},"metadata":{"workspace":"wrk_SCRUBBED","limitName":"monthly"}}"#;
+        let (decision, learned) = resolver.resolve(429, &headers(&[]), body, 0).await;
+        match decision {
+            RateLimitDecision::QuotaUntil {
+                reset_at_ms,
+                source,
+            } => {
+                assert_eq!(source, "body_regex");
+                let delta = reset_at_ms as i64 - crate::rate_limit::now_ms() as i64;
+                assert!(
+                    (delta - 1_378_800_000).abs() < 5_000,
+                    "expected 15d23h, got {delta} ms"
+                );
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(learned.is_none(), "learning is off: nothing is learned");
+    }
+
+    /// The same body with the learning switch on must resolve to the very
+    /// same instant — the deterministic layer does not depend on it.
+    #[tokio::test]
+    async fn the_same_instant_resolves_with_learning_on() {
+        let cfg = ResolverConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let resolver = RateLimitResolver::new(cfg, None, None, None);
+        let body = br#"{"type":"error","error":{"type":"GoUsageLimitError","message":"OpenCode Go usage limit reached (monthly, resets in 15d 23h). To keep going now, turn on Extra Usage or upgrade to Go Plus at https://opencode.ai/console/wrk_SCRUBBED/go."},"metadata":{"workspace":"wrk_SCRUBBED","limitName":"monthly"}}"#;
+        let (decision, _learned) = resolver.resolve(429, &headers(&[]), body, 0).await;
+        match decision {
+            RateLimitDecision::QuotaUntil {
+                reset_at_ms,
+                source,
+            } => {
+                assert_eq!(source, "body_regex");
+                let delta = reset_at_ms as i64 - crate::rate_limit::now_ms() as i64;
+                assert!(
+                    (delta - 1_378_800_000).abs() < 5_000,
+                    "expected 15d23h, got {delta} ms"
+                );
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// A 429 needs no quota phrase: the status says it is a rate limit, so
+    /// the body only has to supply the deadline.
+    #[tokio::test]
+    async fn a_429_resolves_its_instant_without_a_known_phrase() {
+        let resolver = RateLimitResolver::new(ResolverConfig::default(), None, None, None);
+        let body = b"Your plan window is closed; it reopens in 45m";
+        let (decision, _learned) = resolver.resolve(429, &headers(&[]), body, 0).await;
+        match decision {
+            RateLimitDecision::QuotaUntil {
+                reset_at_ms,
+                source,
+            } => {
+                assert_eq!(source, "body_regex");
+                let delta = reset_at_ms as i64 - crate::rate_limit::now_ms() as i64;
+                assert!((delta - 2_700_000).abs() < 5_000, "got {delta} ms");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[tokio::test]

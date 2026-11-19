@@ -4874,6 +4874,47 @@ fn body_reports_tier_limit(body: &str) -> bool {
     MARKERS.iter().any(|m| lower.contains(m))
 }
 
+/// Whether an upstream body names the moment a wall ends.
+///
+/// A 402 says "the account has no balance"; only the body can say WHEN that
+/// changes (`"reset_at": "…"`, "resets at …"). The guard keeps an unrelated
+/// date in the body — a support deadline, a build stamp, a "valid until"
+/// field about something else — from becoming the provider's parking
+/// deadline.
+fn body_names_reset(body: &str) -> bool {
+    const MARKERS: &[&str] = &["reset", "renew", "expir", "valid until", "available at"];
+    let lower = body.to_ascii_lowercase();
+    MARKERS.iter().any(|m| lower.contains(m))
+}
+
+/// Whether an upstream body names a BALANCE problem — a wall no timer ends.
+///
+/// A 402 says "the account has no balance"; only the body can say whether
+/// that clears itself (the plan's quota resets on a date) or whether it
+/// needs a top-up. open-design answers both at once — "Coding Plan quota
+/// is exhausted and wallet balance is insufficient", with a `reset_at`
+/// that is the coding plan's window — and its own words say the reset does
+/// NOT refill the wallet. Parking such a provider until that date would
+/// keep it out of the rotation for days after the account was paid for.
+fn body_names_balance_problem(body: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "insufficient balance",
+        "insufficient credit",
+        "insufficient funds",
+        "balance is insufficient",
+        "recharge",
+        "top up",
+        "top-up",
+        "billing",
+        "余额不足",
+        "欠费",
+    ];
+    // The JSON error code spells it with an underscore
+    // ("insufficient_balance") — normalise it to the spaced form.
+    let lower = body.to_ascii_lowercase().replace('_', " ");
+    MARKERS.iter().any(|m| lower.contains(m))
+}
+
 fn body_reports_tool_schema(body: &str) -> bool {
     let lower = body.to_ascii_lowercase();
     lower.contains("tools.function.parameters") || lower.contains("moonshot flavored json schema")
@@ -5011,6 +5052,21 @@ impl ProxyHttp for AiGateway {
             }
             open_providers.sort_unstable();
             half_open_providers.sort_unstable();
+            // WHEN does each walled provider recover? The question an
+            // operator asks first, and the one the gateway used to answer
+            // with a flat cooldown (the 402 path never even read the body).
+            // The deadline the breaker holds is the upstream's own answer
+            // when it gave one — "reset_at": "…", "resets in 15d 23h".
+            let mut quota_reset_at = serde_json::Map::new();
+            let now = crate::rate_limit::now_ms();
+            for (name, provider) in hot.providers.iter() {
+                let until = provider.circuit_breaker.force_open_until_ms();
+                if until > now {
+                    if let Some(at) = chrono::DateTime::from_timestamp_millis(until as i64) {
+                        quota_reset_at.insert(name.clone(), serde_json::json!(at.to_rfc3339()));
+                    }
+                }
+            }
             let mut health = serde_json::json!({
                 "status": if degraded { "degraded" } else { "ok" },
                 "layer": 2,
@@ -5023,6 +5079,7 @@ impl ProxyHttp for AiGateway {
                 "pools": pools,
                 "open_providers": open_providers,
                 "half_open_providers": half_open_providers,
+                "quota_reset_at": quota_reset_at,
             });
             if let Some(id) = build_id() {
                 health["build_id"] = id.into();
@@ -6077,11 +6134,14 @@ impl ProxyHttp for AiGateway {
         // does, the force-open deadline is set here and the failover proceeds
         // immediately (the body never arrives on the retried attempt).
         //
-        // When it does not, and the learning resolver is enabled, the error's
-        // body is awaited in `upstream_response_body_filter` — that is where
-        // the layered decision (learned patterns → body regex → laya) runs.
-        // Without the resolver the pre-learning behaviour applies: a plain
-        // Retry-After (or the default) cooldown, decided here.
+        // When it does not, the error's body is awaited in
+        // `upstream_response_body_filter` — that is where the layered
+        // decision (learned patterns → body regex → laya) runs. The body is
+        // awaited for a 429 whether or not learning is on: the layers that
+        // read the upstream's own reset instant are local and deterministic,
+        // and gating them on the learning switch left every deployment
+        // without laya (the corp fleet) re-probing a monthly wall on the
+        // 5-minute ladder instead of parking on the day the wall ends.
         //
         // The same deferral covers a 500: its status alone proves nothing
         // (MiniMax wears its quota wall as `500 server_error`), so the body's
@@ -6095,7 +6155,10 @@ impl ProxyHttp for AiGateway {
         // the breaker and counted a quota open, so that block must not run
         // again (it would double-count the failure and the quota-open).
         let mut quota_resolved_by_header = false;
-        if (quota_open || status == 500) && self.rate_limit_resolver.is_enabled() {
+        // A 429 always waits for its body when the headers are inconclusive;
+        // a 500 does so only with the learning resolver on — the 5xx path
+        // owns a same-provider retry that the deferral would skip.
+        if quota_open || (status == 500 && self.rate_limit_resolver.is_enabled()) {
             let header_reset = if quota_open {
                 crate::rate_limit::resolve_from_headers(&upstream_response.headers)
             } else {
@@ -6246,6 +6309,42 @@ impl ProxyHttp for AiGateway {
         let Some(provider) = hot.providers.get(&ctx.provider_name) else {
             return Ok(());
         };
+        // A 402 is an account wall whose END the upstream states in the body:
+        // open-design answers an exhausted coding plan with
+        // `{"code":"insufficient_balance","details":{"reset_at":"…"}}`, and
+        // the header phase cannot see it — the deadline it wrote above is
+        // only the fallback (the payment cooldown, 10 minutes). So the
+        // decision is deferred to the body filter: the body names the real
+        // instant and the breaker is re-parked on it. The client sees the
+        // same answer either way — the failover still happens, one
+        // body-read later.
+        if payment_required {
+            let can_fail_over = self.has_usable_fallback(ctx)
+                && ctx.failover_count < self.failover_budget(&hot, ctx)
+                && body_is_replayable(session, ctx);
+            ctx.pending_rate_limit = Some(status);
+            ctx.rate_limit_body_buf.clear();
+            // Keep the headers around: the resolver's header layer may still
+            // pin the reset instant from them.
+            ctx.rate_limit_headers = upstream_response
+                .headers
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.as_str().to_string(),
+                        v.to_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect();
+            if !can_fail_over {
+                // No failover possible: the gateway answers the client
+                // itself (a 402 is the gateway's status to answer), never
+                // the upstream's billing message.
+                let message = self.no_provider_message_after_failure(&hot, ctx, status);
+                self.own_the_error(upstream_response, ctx, status, message, None);
+            }
+            return Ok(()); // let the body flow to the body filter
+        }
         // A 404 whose body may name the requested model as unknown: defer the
         // decision until the body arrives (a missing endpoint answers 404
         // too). Deferring is only worth it when a rewrite is actually
@@ -6873,6 +6972,84 @@ impl ProxyHttp for AiGateway {
                     )?;
                 }
                 return Ok(None);
+            }
+
+            // A 402 deferred from the header phase: the body knows when the
+            // account's wall ends, the header phase only knew "not now".
+            if status == 402 {
+                let provider_name = ctx.provider_name.clone();
+                let hot = self.hot.load();
+                let utc_offset_minutes = hot
+                    .providers
+                    .get(&provider_name)
+                    .map(|p| p.utc_offset_minutes)
+                    .unwrap_or(0);
+                let text = String::from_utf8_lossy(&body_bytes);
+                // The wall ends when the body says it does — and only then.
+                // A body that names a BALANCE problem describes a wall no
+                // timer ends (the account needs a top-up), so the payment
+                // cooldown stays and the operator is told.
+                let reset_at_ms = if body_names_reset(&text) && !body_names_balance_problem(&text) {
+                    let (_, mut candidates) =
+                        crate::rate_limit::parse_body_text_with_offset(&text, utc_offset_minutes);
+                    crate::rate_limit::retain_plausible_reset_candidates(&mut candidates);
+                    let now = crate::rate_limit::now_ms();
+                    // A deadline in the past is a stale message, not a
+                    // deadline: the fallback below applies instead.
+                    candidates
+                        .first()
+                        .map(|c| c.at_ms)
+                        .filter(|at_ms| *at_ms > now)
+                } else {
+                    None
+                };
+                if let Some(p) = hot.providers.get(&provider_name) {
+                    match reset_at_ms {
+                        Some(reset_at_ms) => {
+                            // The body's own instant REPLACES the header
+                            // phase's fallback deadline.
+                            p.circuit_breaker.record_quota_until(reset_at_ms);
+                            info!(
+                                provider = %provider_name,
+                                reset_at_ms = reset_at_ms,
+                                "402 payment required — force-opened until the body's reset instant"
+                            );
+                        }
+                        None => {
+                            // No usable instant in the body: the payment
+                            // cooldown (10 minutes) is the fallback. The
+                            // header phase already wrote it; a probe did not.
+                            let until = crate::rate_limit::now_ms()
+                                + crate::circuit_breaker::PAYMENT_REQUIRED_COOLDOWN_MS;
+                            p.circuit_breaker.record_quota_until(until);
+                            info!(
+                                provider = %provider_name,
+                                cooldown_ms = crate::circuit_breaker::PAYMENT_REQUIRED_COOLDOWN_MS,
+                                "402 payment required — no reset instant in the body, parked on the payment cooldown"
+                            );
+                        }
+                    }
+                    METRICS
+                        .circuit_breaker_state
+                        .with_label_values(&[&provider_name])
+                        .set(p.circuit_breaker.state() as i64);
+                    self.persist_circuit_breaker(&provider_name, &p.circuit_breaker);
+                }
+                // A walled provider must not keep the session pinned.
+                self.unpin_session(ctx);
+                if let Some(err) = ctx.own_error.clone() {
+                    // No failover was possible (the header phase decided it):
+                    // the gateway answers the client itself.
+                    *body = Some(Bytes::from(err.render()));
+                    ctx.own_error_sent = true;
+                    return Ok(None);
+                }
+                return self.fail_over_from_body_filter(
+                    session,
+                    ctx,
+                    status,
+                    "402 payment required",
+                );
             }
 
             let headers: http::HeaderMap = {
