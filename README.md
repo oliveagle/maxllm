@@ -24,6 +24,7 @@ A high-performance AI gateway built on [Pingora](https://github.com/cloudflare/p
   - [Pass-Through Endpoints](#pass-through-endpoints)
 - [Supported Providers](#supported-providers)
 - [Configuration](#configuration)
+  - [Configuration center (QConfig / Nacos)](#configuration-center-qconfig--nacos)
   - [Providers](#providers)
   - [Routes](#routes)
   - [Auto model (rotation)](#auto-model-rotation)
@@ -269,6 +270,70 @@ curl http://localhost:8080/passthrough/openai/v1/embeddings \
 ## Configuration
 
 MaxLLM uses a single TOML config file with `${ENV_VAR}` expansion. See [maxllm.toml](maxllm.toml) for a full example.
+
+### Configuration center (QConfig / Nacos)
+
+MaxLLM can load the **complete TOML document** from QConfig or Nacos and keep a
+local, atomic, `0600` cache of the last known-good value. The local file then
+only needs the bootstrap section; every provider, key, route and observability
+setting comes from the center. The existing hot-reload watcher watches the
+cache, so a failed poll leaves the running pool untouched.
+
+```toml
+# maxllm.toml — Nacos bootstrap
+[config_center]
+enabled = true
+backend = "nacos"
+data_id = "maxllm.toml"
+server_url = "http://nacos.internal:8848/nacos"
+namespace = "maxllm-uat"
+group = "MAXLLM_GROUP"
+username = "${NACOS_USERNAME}"
+password = "${NACOS_PASSWORD}"
+cache_path = "generated/maxllm.center.toml"
+required = true
+poll_interval_secs = 30
+```
+
+```toml
+# maxllm.toml — QConfig bootstrap
+[config_center]
+enabled = true
+backend = "qconfig"
+data_id = "maxllm.toml"
+app_id = "${PAAS_APP_APPID}"
+env = "uat"
+subenv = "default"
+cache_path = "generated/maxllm.center.toml"
+poll_interval_secs = 30
+```
+
+QConfig identity is compatible with Foundation's normal deployment rules:
+`PAAS_APP_APPID` or `conf/app.conf` supplies the app id, and
+`/opt/settings/server.properties` plus the environment supply `env`, `subenv`,
+IDC, hostname and IP. On a deployed host, omit those fields and let discovery
+register with the QConfig service for the selected environment. `token` and
+`endpoints` may both be set for a direct data-plane endpoint, but must be set
+together.
+
+Key behaviours:
+
+- The remote value is parsed and validated with the normal `Config` rules
+  **before** the cache is replaced.
+- `required = true` fails startup if the first fetch cannot be validated.
+  With `required = false`, the last cache (or a complete local bootstrap
+  document) is used and the background poller continues retrying.
+- The poller is disabled by `--no-reload`; the gateway can still start from a
+  successful first fetch. `--no-config-center` ignores the section completely.
+- Cache replacement is atomic and private (`0600`) because the document can
+  contain provider API keys.
+- A config-center update changes the active providers, routes, aliases and
+  hot state. The listener address is read once at process start; changing
+  `[server].listen` still requires a restart.
+
+QConfig uses the v2 HTTP protocol and blocks for up to 60 seconds per long-poll
+request; Nacos uses the v1 HTTP API with periodic polling. Nacos credentials
+are exchanged once for an access token at startup.
 
 ### Providers
 

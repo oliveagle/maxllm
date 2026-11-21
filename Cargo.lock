@@ -1836,6 +1836,7 @@ dependencies = [
  "serde",
  "thiserror 2.0.18",
  "toml",
+ "url",
 ]
 
 [[package]]
@@ -1854,6 +1855,7 @@ dependencies = [
  "maxllm-config",
  "maxllm-plugin",
  "maxllm-translate",
+ "md-5",
  "notify",
  "once_cell",
  "opentelemetry",
@@ -1918,6 +1920,16 @@ dependencies = [
  "sha2",
  "thiserror 2.0.18",
  "tracing",
+]
+
+[[package]]
+name = "md-5"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
+dependencies = [
+ "cfg-if",
+ "digest",
 ]
 
 [[package]]

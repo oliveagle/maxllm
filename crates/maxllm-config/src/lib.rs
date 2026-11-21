@@ -105,6 +105,196 @@ pub struct Config {
     /// the others.
     #[serde(default)]
     pub breaker_sync: Option<BreakerSyncConfig>,
+    /// Configuration-center bootstrap (`[config_center]`).
+    ///
+    /// This section is the only part of the *local* file that is interpreted
+    /// when the center is enabled; the full effective TOML is fetched from
+    /// QConfig/Nacos and materialized to a local cache. Keeping it on the
+    /// complete [`Config`] as well makes an already-fetched cache valid input.
+    #[serde(default)]
+    pub config_center: Option<ConfigCenterConfig>,
+}
+
+/// Which configuration-center wire protocol the gateway speaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConfigCenterBackend {
+    /// Ctrip QConfig v2 HTTP protocol.
+    QConfig,
+    /// Nacos v1 HTTP API.
+    Nacos,
+}
+
+/// Bootstrap-only settings used to reach a configuration center.
+///
+/// A local bootstrap file may contain just this section. Backend-specific
+/// fields are kept flat so the file matches the operationally useful form:
+///
+/// ```toml
+/// [config_center]
+/// enabled = true
+/// backend = "qconfig"
+/// data_id = "maxllm.toml"
+/// app_id = "maxllm"
+/// env = "uat"
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ConfigCenterConfig {
+    /// Opt-in switch. `false` (the default) preserves the old file-only
+    /// behaviour and leaves unknown backend-specific fields harmless enough
+    /// to be validated only when the center is turned on.
+    #[serde(default)]
+    pub enabled: bool,
+    pub backend: ConfigCenterBackend,
+    /// Logical configuration name. QConfig calls it dataId; Nacos calls it
+    /// dataId too.
+    pub data_id: String,
+    /// Where the remote TOML is materialized. A relative path is resolved
+    /// against the bootstrap file's parent directory.
+    #[serde(default = "default_config_cache_path")]
+    pub cache_path: PathBuf,
+    /// Fail startup when the first fetch fails. With `required = false`, a
+    /// usable local cache is accepted and the background poller keeps trying.
+    #[serde(default = "default_true")]
+    pub required: bool,
+    /// Seconds between poll cycles. QConfig's cycle itself long-polls for
+    /// roughly a minute; Nacos's is a plain periodic GET.
+    #[serde(default = "default_poll_interval_secs")]
+    pub poll_interval_secs: u64,
+    /// Per-request timeout. The default leaves room for QConfig's 60 s
+    /// long-poll response.
+    #[serde(default = "default_config_timeout_secs")]
+    pub timeout_secs: u64,
+
+    // Nacos v1 fields.
+    /// Base URL, including any `/nacos` context path.
+    #[serde(default)]
+    pub server_url: Option<String>,
+    /// Nacos namespace (sent as `tenant`). Empty is the public namespace.
+    #[serde(default)]
+    pub namespace: Option<String>,
+    #[serde(default = "default_nacos_group")]
+    pub group: String,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+
+    // QConfig v2 fields. Discovery is used when they are not overridden.
+    /// QConfig application id. It is also the QConfig group.
+    #[serde(default)]
+    pub app_id: Option<String>,
+    /// Environment (`uat`, `pro`, `fws`, ...).
+    #[serde(default)]
+    pub env: Option<String>,
+    #[serde(default)]
+    pub subenv: Option<String>,
+    #[serde(default)]
+    pub idc: Option<String>,
+    #[serde(default)]
+    pub ip: Option<String>,
+    #[serde(default)]
+    pub hostname: Option<String>,
+    #[serde(default)]
+    pub app_group: Option<String>,
+    /// Pre-registered token. Mostly useful for tests/private endpoints; when
+    /// unset the gateway registers itself with Foundation's identity.
+    #[serde(default)]
+    pub token: Option<String>,
+    /// Direct data-plane endpoints. When unset, discovery starts from the
+    /// QConfig service URL selected by `env`.
+    #[serde(default)]
+    pub endpoints: Vec<String>,
+}
+
+fn default_config_cache_path() -> PathBuf {
+    PathBuf::from("maxllm.center.toml")
+}
+
+fn default_poll_interval_secs() -> u64 {
+    30
+}
+
+fn default_config_timeout_secs() -> u64 {
+    70
+}
+
+fn default_nacos_group() -> String {
+    "DEFAULT_GROUP".to_string()
+}
+
+impl ConfigCenterConfig {
+    /// Validate the section by itself, without requiring the rest of a full
+    /// gateway configuration.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.data_id.trim().is_empty() {
+            return Err(ConfigError::Validation(
+                "config_center.data_id must not be empty".into(),
+            ));
+        }
+        match self.backend {
+            ConfigCenterBackend::Nacos => {
+                let server_url = self.server_url.as_deref().unwrap_or("").trim();
+                if server_url.is_empty() {
+                    return Err(ConfigError::Validation(
+                        "config_center.server_url is required for Nacos".into(),
+                    ));
+                }
+                if let Some(url) = self.server_url.as_deref() {
+                    if url::Url::parse(url).is_err() {
+                        return Err(ConfigError::Validation(format!(
+                            "config_center.server_url is not a valid URL: {url}"
+                        )));
+                    }
+                }
+            }
+            ConfigCenterBackend::QConfig => {
+                // `endpoints + token` is an explicit direct mode. Half of the
+                // pair is almost certainly a typo: discovery cannot use the
+                // former and registration cannot use the latter.
+                if self.endpoints.is_empty() != self.token.is_none() {
+                    return Err(ConfigError::Validation(
+                        "config_center.endpoints and token must be set together".into(),
+                    ));
+                }
+                for endpoint in &self.endpoints {
+                    if endpoint.trim().is_empty() {
+                        return Err(ConfigError::Validation(
+                            "config_center.endpoints must not contain an empty entry".into(),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The only part of a bootstrap TOML that must be valid before contacting
+/// the center.
+#[derive(Debug, Clone, Deserialize)]
+struct ConfigCenterBootstrap {
+    #[serde(default)]
+    config_center: Option<ConfigCenterConfig>,
+}
+
+/// Parse just `[config_center]` from a bootstrap file.
+pub fn config_center_from_file(path: &Path) -> Result<Option<ConfigCenterConfig>, ConfigError> {
+    let raw = std::fs::read_to_string(path)?;
+    config_center_from_str(&raw)
+}
+
+/// Parse just `[config_center]` from TOML text after `${ENV_VAR}` expansion.
+pub fn config_center_from_str(raw: &str) -> Result<Option<ConfigCenterConfig>, ConfigError> {
+    let expanded = expand_env_vars(raw);
+    let bootstrap: ConfigCenterBootstrap = toml::from_str(&expanded)?;
+    if let Some(center) = &bootstrap.config_center {
+        center.validate()?;
+    }
+    Ok(bootstrap.config_center)
 }
 
 /// A provider parked until a known instant.
@@ -2656,5 +2846,80 @@ model = "groot-awq"
             err.to_string().contains("unknown provider 'ghost'"),
             "{err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod config_center_tests {
+    use super::*;
+
+    #[test]
+    fn parses_bootstrap_only_config_center() {
+        let center = config_center_from_str(
+            r#"
+[config_center]
+enabled = true
+backend = "nacos"
+data_id = "maxllm.toml"
+server_url = "http://127.0.0.1:8848/nacos"
+group = "MAXLLM"
+cache_path = "cache/maxllm.toml"
+required = false
+"#,
+        )
+        .expect("bootstrap parses");
+        let center = center.expect("center is enabled");
+        assert_eq!(center.backend, ConfigCenterBackend::Nacos);
+        assert_eq!(center.data_id, "maxllm.toml");
+        assert_eq!(center.group, "MAXLLM");
+        assert_eq!(center.cache_path, PathBuf::from("cache/maxllm.toml"));
+        assert!(!center.required);
+        assert_eq!(center.poll_interval_secs, 30);
+    }
+
+    #[test]
+    fn expands_bootstrap_environment_references() {
+        std::env::set_var("MAXLLM_QCONFIG_APP", "maxllm-app");
+        let center = config_center_from_str(
+            r#"
+[config_center]
+enabled = true
+backend = "qconfig"
+data_id = "maxllm.toml"
+app_id = "${MAXLLM_QCONFIG_APP}"
+env = "uat"
+"#,
+        )
+        .expect("bootstrap parses")
+        .expect("center is enabled");
+        assert_eq!(center.app_id.as_deref(), Some("maxllm-app"));
+    }
+
+    #[test]
+    fn rejects_half_declared_qconfig_direct_mode() {
+        let error = config_center_from_str(
+            r#"
+[config_center]
+enabled = true
+backend = "qconfig"
+data_id = "maxllm.toml"
+token = "secret"
+"#,
+        )
+        .expect_err("direct mode is incomplete");
+        assert!(error.to_string().contains("endpoints and token"));
+    }
+
+    #[test]
+    fn disabled_center_has_no_backend_requirements() {
+        config_center_from_str(
+            r#"
+[config_center]
+enabled = false
+backend = "nacos"
+data_id = "maxllm.toml"
+"#,
+        )
+        .expect("disabled section still parses");
     }
 }

@@ -8,6 +8,7 @@
 
 mod breaker_sync;
 mod circuit_breaker;
+mod config_center;
 mod ctx;
 mod gateway;
 mod key_rate_limit;
@@ -25,7 +26,7 @@ use clap::Parser;
 use maxllm_config::Config;
 use notify::{EventKind, RecursiveMode, Watcher};
 use pingora::prelude::*;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::Arc;
 use std::time::Duration;
@@ -49,18 +50,121 @@ struct Args {
     /// Disable config hot-reload file watching
     #[arg(long)]
     no_reload: bool,
+
+    /// Ignore `[config_center]` even when it is enabled in the file.
+    #[arg(long)]
+    no_config_center: bool,
 }
 
 fn main() {
     let args = Args::parse();
 
-    // Load configuration before installing the subscriber: `[otel]` decides
-    // whether the gateway ships its own logs/traces, so the settings have to
-    // be known before the first line is emitted.
-    let config = Config::from_file(&args.config).unwrap_or_else(|e| {
-        eprintln!("Failed to load config from {:?}: {e}", args.config);
-        std::process::exit(1);
-    });
+    // Resolve the center before installing the subscriber: `[otel]` lives in
+    // the remote document and decides whether the gateway ships its own
+    // logs/traces, so those settings have to be known before the first line
+    // goes to a telemetry pipeline.
+    let center = if args.no_config_center {
+        None
+    } else {
+        match maxllm_config::config_center_from_file(&args.config) {
+            Ok(center) => center,
+            Err(e) => {
+                eprintln!("Failed to load config from {:?}: {e}", args.config);
+                std::process::exit(1);
+            }
+        }
+    };
+
+    let center_enabled = center.as_ref().is_some_and(|center| center.enabled);
+    let poll_details = center
+        .as_ref()
+        .filter(|center| center.enabled)
+        .map(|center| (center.backend, center.poll_interval_secs));
+    let cache_path = center
+        .as_ref()
+        .filter(|center| center.enabled)
+        .map(|center| config_center::cache_path_for(&args.config, center));
+    if let Some(cache_path) = &cache_path {
+        let bootstrap = args
+            .config
+            .canonicalize()
+            .unwrap_or_else(|_| args.config.clone());
+        let cache = cache_path
+            .canonicalize()
+            .unwrap_or_else(|_| cache_path.clone());
+        if bootstrap == cache {
+            eprintln!(
+                "config_center.cache_path must differ from the bootstrap file {:?}",
+                args.config
+            );
+            std::process::exit(1);
+        }
+    }
+
+    let mut poller: Option<(Box<dyn config_center::ConfigCenterSource>, u64)> = None;
+    let (config, effective_config_path) = if center_enabled {
+        let center = center.expect("enabled center configuration");
+        let cache_path = config_center::cache_path_for(&args.config, &center);
+        match config_center::make_source(&center) {
+            Ok(mut source) => match config_center::fetch_and_materialize(&mut *source, &cache_path)
+            {
+                Ok(fetched) => {
+                    let config = Config::parse(&fetched.content).unwrap_or_else(|e| {
+                        eprintln!("Configuration center returned invalid config: {e}");
+                        std::process::exit(1);
+                    });
+                    poller = Some((source, fetched.version));
+                    (config, cache_path)
+                }
+                Err(e) if center.required => {
+                    eprintln!("Failed to fetch configuration center data: {e}");
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Configuration center unavailable ({e}); trying the last known-good cache"
+                    );
+                    match Config::from_file(&cache_path) {
+                        Ok(config) => {
+                            poller = Some((source, 0));
+                            (config, cache_path)
+                        }
+                        Err(cache_error) => match Config::from_file(&args.config) {
+                            // A complete bootstrap is useful as a temporary
+                            // startup configuration; the watcher below still
+                            // watches the cache so the first successful poll
+                            // takes over without a restart.
+                            Ok(config) => {
+                                eprintln!(
+                                    "Using complete bootstrap configuration ({cache_error}); \
+                                     configuration-center retry remains active"
+                                );
+                                poller = Some((source, 0));
+                                (config, cache_path)
+                            }
+                            Err(_) => {
+                                eprintln!(
+                                    "No usable configuration cache at {:?}: {cache_error}",
+                                    cache_path
+                                );
+                                std::process::exit(1);
+                            }
+                        },
+                    }
+                }
+            },
+            Err(e) => {
+                eprintln!("Failed to initialize configuration center: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        let config = Config::from_file(&args.config).unwrap_or_else(|e| {
+            eprintln!("Failed to load config from {:?}: {e}", args.config);
+            std::process::exit(1);
+        });
+        (config, args.config.clone())
+    };
 
     // OTel-enabled subscriber (fmt + OTLP logs + OTLP spans). A config without
     // `[otel]` keeps the plain formatter, byte-for-byte as before.
@@ -97,11 +201,33 @@ fn main() {
     // Start config file watcher (before gateway takes ownership)
     if !args.no_reload {
         let hot = Arc::clone(&gateway.hot);
-        let config_path = args
-            .config
+        let config_path = effective_config_path
             .canonicalize()
-            .unwrap_or_else(|_| args.config.clone());
+            .unwrap_or_else(|_| effective_config_path.clone());
+        // An optional startup can reach this point before the cache exists.
+        // Create its directory now so the non-recursive watcher observes the
+        // first atomic rename (and every later one) in that exact directory.
+        if center_enabled {
+            if let Some(cache_parent) = cache_path.as_deref().and_then(Path::parent) {
+                std::fs::create_dir_all(cache_parent).unwrap_or_else(|e| {
+                    eprintln!("Failed to create config-center cache directory: {e}");
+                    std::process::exit(1);
+                });
+            }
+        }
         start_config_watcher(config_path, hot);
+    }
+
+    // The center owns only file materialization; hot-state swapping stays in
+    // the existing watcher, which also gives it atomic last-known-good
+    // semantics. With `--no-reload` there is no consumer for later updates.
+    if center_enabled && !args.no_reload {
+        if let (Some((source, version)), Some(cache_path), Some((backend, interval))) =
+            (poller.take(), cache_path, poll_details)
+        {
+            let backend_name = config_center::backend_name(backend);
+            config_center::spawn_poller(source, version, cache_path, interval, backend_name);
+        }
     }
 
     // Configure Pingora server
