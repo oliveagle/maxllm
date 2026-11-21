@@ -1476,7 +1476,10 @@ impl Config {
         Ok(config)
     }
 
-    fn validate(&self) -> Result<(), ConfigError> {
+    /// Re-run the semantic checks after a caller has composed a configuration
+    /// from a parsed TOML document (for example after resolving KMS
+    /// references). This does not expand environment variables.
+    pub fn validate(&self) -> Result<(), ConfigError> {
         if self.providers.is_empty() {
             return Err(ConfigError::Validation(
                 "at least one provider must be configured".into(),
@@ -1652,9 +1655,24 @@ fn expand_env_vars(input: &str) -> String {
     let re = Regex::new(r"\$\{([^}]+)\}").expect("valid regex");
     re.replace_all(input, |caps: &regex::Captures| {
         let var_name = &caps[1];
+        // KMS references are resolved later, by the gateway, against `[kms]`.
+        // Expanding them here would silently turn an unresolved credential
+        // into an empty string and hide the configuration mistake.
+        if var_name.starts_with("kms.assets.") {
+            return caps[0].to_string();
+        }
         std::env::var(var_name).unwrap_or_default()
     })
     .into_owned()
+}
+
+/// Expand `${ENV_VAR}` while deliberately preserving `${kms.assets.*}`.
+///
+/// This is the composition seam for the gateway's KMS resolver: environment
+/// material is safe to expand before parsing, but credential references must
+/// survive until the resolver can validate and fetch them as a unit.
+pub fn expand_environment_references(input: &str) -> String {
+    expand_env_vars(input)
 }
 
 #[cfg(test)]
@@ -1950,6 +1968,12 @@ provider = "nonexistent"
         let result = expand_env_vars("key = \"${MAXLLM_TEST_KEY}\"");
         assert_eq!(result, "key = \"expanded-value\"");
         std::env::remove_var("MAXLLM_TEST_KEY");
+    }
+
+    #[test]
+    fn kms_references_survive_environment_expansion() {
+        let result = expand_env_vars("api_key = \"${kms.assets.provider}\"");
+        assert_eq!(result, "api_key = \"${kms.assets.provider}\"");
     }
 
     #[test]

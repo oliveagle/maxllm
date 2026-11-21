@@ -1046,6 +1046,59 @@ mod tests {
     }
 
     #[test]
+    fn cache_keeps_a_kms_reference_instead_of_resolving_it_to_plaintext() {
+        let config = r#"[server]
+listen = "127.0.0.1:1"
+
+[providers.mock]
+kind = "openai"
+base_url = "http://127.0.0.1:2"
+api_key = "${kms.assets.provider}"
+"#;
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let server = runtime.block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/auth/users/login"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "accessToken": "test-token"
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/v1/cs/configs"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(config))
+                .mount(&server)
+                .await;
+            server
+        });
+        let center = center_for(&server);
+
+        let directory = runtime.block_on(async {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let cache = directory.path().join("cache.toml");
+            let test_center = center.clone();
+            let task_cache = cache.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut client = NacosClient::new(&test_center).expect("client");
+                fetch_and_materialize(&mut client, &task_cache)
+            })
+            .await
+            .expect("blocking task")
+            .expect("fetch");
+            directory
+        });
+
+        let cache = directory.path().join("cache.toml");
+        let raw = std::fs::read_to_string(&cache).expect("cache");
+        assert!(raw.contains("api_key = \"${kms.assets.provider}\""));
+        assert!(!raw.contains("plaintext-provider-key"));
+        // A cache is valid input even before it is resolved; the gateway's
+        // KMS layer owns that final step.
+        Config::from_file(&cache).expect("cache parses");
+    }
+
+    #[test]
     fn nacos_fetches_authenticated_config_and_materializes_cache() {
         let config = "[server]\nlisten = \"127.0.0.1:1\"\n\n[providers.mock]\nkind = \"openai\"\nbase_url = \"http://127.0.0.1:2\"\napi_key = \"remote-key\"\n";
         let runtime = tokio::runtime::Runtime::new().expect("test runtime");

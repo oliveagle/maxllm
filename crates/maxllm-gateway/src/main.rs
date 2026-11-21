@@ -12,6 +12,7 @@ mod config_center;
 mod ctx;
 mod gateway;
 mod key_rate_limit;
+mod kms;
 mod laya_client;
 mod metrics;
 mod provider_stats;
@@ -109,7 +110,7 @@ fn main() {
             Ok(mut source) => match config_center::fetch_and_materialize(&mut *source, &cache_path)
             {
                 Ok(fetched) => {
-                    let config = Config::parse(&fetched.content).unwrap_or_else(|e| {
+                    let config = kms::parse_config(&fetched.content).unwrap_or_else(|e| {
                         eprintln!("Configuration center returned invalid config: {e}");
                         std::process::exit(1);
                     });
@@ -124,12 +125,12 @@ fn main() {
                     eprintln!(
                         "Configuration center unavailable ({e}); trying the last known-good cache"
                     );
-                    match Config::from_file(&cache_path) {
+                    match load_config_file(&cache_path) {
                         Ok(config) => {
                             poller = Some((source, 0));
                             (config, cache_path)
                         }
-                        Err(cache_error) => match Config::from_file(&args.config) {
+                        Err(cache_error) => match load_config_file(&args.config) {
                             // A complete bootstrap is useful as a temporary
                             // startup configuration; the watcher below still
                             // watches the cache so the first successful poll
@@ -159,7 +160,7 @@ fn main() {
             }
         }
     } else {
-        let config = Config::from_file(&args.config).unwrap_or_else(|e| {
+        let config = load_config_file(&args.config).unwrap_or_else(|e| {
             eprintln!("Failed to load config from {:?}: {e}", args.config);
             std::process::exit(1);
         });
@@ -310,6 +311,13 @@ fn config_stamp(path: &std::path::Path) -> Option<(std::time::SystemTime, u64)> 
     Some((meta.modified().ok()?, meta.len()))
 }
 
+/// Read a configuration file, expanding environment references and resolving
+/// any `${kms.assets.*}` references before validating the result.
+fn load_config_file(path: &std::path::Path) -> Result<Config, String> {
+    let raw = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
+    kms::parse_config(&raw).map_err(|error| error.to_string())
+}
+
 /// Read the config file until it parses.
 ///
 /// A write that is not atomic leaves a half-written file behind for a
@@ -317,7 +325,7 @@ fn config_stamp(path: &std::path::Path) -> Option<(std::time::SystemTime, u64)> 
 fn read_config_settled(path: &std::path::Path) -> Result<Config, String> {
     let mut last_error = String::new();
     for attempt in 1..=CONFIG_RELOAD_ATTEMPTS {
-        match Config::from_file(path) {
+        match load_config_file(path) {
             Ok(config) => return Ok(config),
             Err(e) => {
                 last_error = e.to_string();

@@ -362,6 +362,82 @@ request; Nacos and BaaS use periodic polling. Nacos credentials are exchanged
 once for an access token at startup, while BaaS sends a bearer token on every
 read.
 
+### KMS-backed secrets
+
+Configuration values can name a managed secret instead of carrying one:
+
+```toml
+[providers.openai]
+kind = "openai"
+base_url = "https://api.openai.com"
+api_key = "${kms.assets.openai}"
+```
+
+The referenced asset is declared once in `[kms]`. For home deployments using
+OpenBao/Vault KV v2:
+
+```toml
+[kms]
+enabled = true
+timeout_secs = 15
+
+[kms.openbao]
+address = "${OPENBAO_ADDRESS}"
+token = "${OPENBAO_TOKEN}"
+# namespace = "platform"                   # optional
+mount = "secret"
+
+[kms.assets.openai]
+backend = "openbao"
+path = "maxllm/providers/openai"
+field = "api_key"
+```
+
+For Ctrip KMS, the protocol is the company client contract
+(`POST /query-pwd` or `POST /query-key`,
+body `{appid, token, type="JSON", cversion="1.3.1-infra"}`, and
+`herald-token` in its dedicated header):
+
+```toml
+[kms]
+enabled = true
+
+[kms.ctrip]
+endpoint = "${KMS_ENDPOINT}"
+retry_endpoint = "${KMS_RETRY_ENDPOINT}"  # optional, used for transport/5xx
+app_id = "${PAAS_APP_APPID}"
+herald_token = "${HERALD_TOKEN}"
+
+[kms.assets.database]
+backend = "ctrip"
+asset_type = "pwd"
+token = "${KMS_DATABASE_ASSET_TOKEN}"
+# field selects one non-empty string in the pwdValue JSON object.
+# Omit field (or use "@self") to use the bare pwdValue string.
+field = "password"
+
+[kms.assets.signing_key]
+backend = "ctrip"
+asset_type = "key"
+token = "${KMS_KEY_ASSET_TOKEN}"
+```
+
+Rules and guarantees:
+
+- A KMS reference must be the complete string value; `Bearer ${kms.assets.x}`
+  is rejected instead of producing a partially resolved secret.
+- Asset names and Ctrip pwd fields use the same conservative syntax as the
+  Go runtime (`A-Z`, `a-z`, digits, dot, underscore and hyphen).
+- Responses are capped at 1 MiB. Errors name the asset and failure class, but
+  never return the KMS response body or credential.
+- The watched file and config-center cache keep `${kms.assets.*}` verbatim;
+  the resolved value exists only in the gateway's in-memory configuration.
+- Resolution happens at startup and on every successful hot reload. A reload
+  whose KMS fetch fails keeps the previous in-memory configuration; startup
+  fails closed.
+- Both OpenBao and Ctrip backends may be declared in one document, and an
+  asset explicitly selects its backend.
+
 ### Providers
 
 ```toml
