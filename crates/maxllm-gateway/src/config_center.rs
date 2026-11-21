@@ -730,6 +730,121 @@ impl ConfigCenterSource for NacosClient {
     }
 }
 
+/// Read-only PostgREST (BaaS) client.
+///
+/// This mirrors the fail-closed Go runtime client: no environment-specific
+/// default endpoint, bearer auth is mandatory, and responses are plain JSON.
+#[derive(Debug)]
+pub struct BaasClient {
+    http: Client,
+    base_url: Url,
+    table: String,
+    row_key: String,
+    row_key_column: String,
+    config_column: String,
+    version_column: Option<String>,
+    bearer_token: String,
+}
+
+impl BaasClient {
+    pub fn new(center: &ConfigCenterConfig) -> Result<Self, ConfigCenterError> {
+        let base_url = Url::parse(
+            nonempty(center.server_url.as_deref())
+                .ok_or_else(|| ConfigCenterError::Protocol("BaaS endpoint is required".into()))?
+                .as_str(),
+        )?;
+        let row_key = center
+            .row_key
+            .clone()
+            .unwrap_or_else(|| center.data_id.clone());
+        Ok(Self {
+            http: http_client(center.timeout_secs.max(1))?,
+            base_url,
+            table: center.table.clone().unwrap_or_default(),
+            row_key,
+            row_key_column: center.row_key_column.clone(),
+            config_column: center.config_column.clone().unwrap_or_default(),
+            version_column: center.version_column.clone(),
+            bearer_token: center.bearer_token.clone().unwrap_or_default(),
+        })
+    }
+
+    fn request_url(&self) -> Result<Url, ConfigCenterError> {
+        let mut url = self.base_url.clone();
+        url.set_fragment(None);
+        {
+            let mut segments = url.path_segments_mut().map_err(|()| {
+                ConfigCenterError::Protocol("BaaS endpoint cannot contain a query".into())
+            })?;
+            segments.pop_if_empty().push(&self.table);
+        }
+        {
+            let mut select = vec![self.config_column.clone()];
+            if let Some(version) = &self.version_column {
+                select.push(version.clone());
+            }
+            let mut query = url.query_pairs_mut();
+            query.append_pair("select", &select.join(","));
+            query.append_pair(&self.row_key_column, &format!("eq.{}", self.row_key));
+            query.append_pair("limit", "1");
+        }
+        Ok(url)
+    }
+
+    fn fetch_row(&self) -> Result<FetchedConfig, ConfigCenterError> {
+        let url = self.request_url()?;
+        let response = self
+            .http
+            .get(url)
+            .header("Authorization", format!("Bearer {}", self.bearer_token))
+            .header("Accept", "application/json")
+            .header("User-Agent", "maxllm-gateway/config-center")
+            .send()?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(ConfigCenterError::NotFound);
+        }
+        if !response.status().is_success() {
+            return Err(status_body(response));
+        }
+        let rows: Vec<Value> = response.json().map_err(ConfigCenterError::from)?;
+        let row = rows.first().ok_or(ConfigCenterError::NotFound)?;
+        let content = row
+            .get(&self.config_column)
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ConfigCenterError::Protocol(format!(
+                    "BaaS row is missing a string field '{}'",
+                    self.config_column
+                ))
+            })?
+            .to_string();
+        if content.is_empty() {
+            return Err(ConfigCenterError::Protocol(
+                "BaaS returned empty configuration".into(),
+            ));
+        }
+        Ok(FetchedConfig {
+            version: content_version(&content),
+            content,
+        })
+    }
+}
+
+impl ConfigCenterSource for BaasClient {
+    fn fetch_initial(&mut self) -> Result<FetchedConfig, ConfigCenterError> {
+        self.fetch_row()
+    }
+
+    fn poll_update(&mut self, current_version: u64) -> Result<PollOutcome, ConfigCenterError> {
+        let fetched = self.fetch_row()?;
+        if fetched.version == current_version {
+            Ok(PollOutcome::NotModified)
+        } else {
+            Ok(PollOutcome::Updated(fetched))
+        }
+    }
+}
+
 pub fn make_source(
     center: &ConfigCenterConfig,
 ) -> Result<Box<dyn ConfigCenterSource>, ConfigCenterError> {
@@ -739,6 +854,9 @@ pub fn make_source(
         }
         ConfigCenterBackend::Nacos => {
             Ok(Box::new(NacosClient::new(center)?) as Box<dyn ConfigCenterSource>)
+        }
+        ConfigCenterBackend::Baas => {
+            Ok(Box::new(BaasClient::new(center)?) as Box<dyn ConfigCenterSource>)
         }
     }
 }
@@ -862,6 +980,7 @@ pub fn backend_name(backend: ConfigCenterBackend) -> &'static str {
     match backend {
         ConfigCenterBackend::QConfig => "qconfig",
         ConfigCenterBackend::Nacos => "nacos",
+        ConfigCenterBackend::Baas => "baas",
     }
 }
 
@@ -885,6 +1004,12 @@ mod tests {
             group: "MAXLLM".into(),
             username: Some("nacos-user".into()),
             password: Some("nacos-password".into()),
+            table: Some("maxllm_configs".into()),
+            row_key: Some("global".into()),
+            row_key_column: "id".into(),
+            config_column: Some("config_toml".into()),
+            version_column: None,
+            bearer_token: Some("baas-token".into()),
             app_id: None,
             env: None,
             subenv: None,
@@ -1036,5 +1161,83 @@ mod tests {
         };
         assert_eq!(new_fetch.version, 8);
         assert_eq!(new_fetch.content, updated);
+    }
+
+    #[test]
+    fn baas_reads_authenticated_postgrest_row_and_polls_body_changes() {
+        let initial = "[server]\nlisten = \"127.0.0.1:5\"\n\n[providers.mock]\nkind = \"openai\"\nbase_url = \"http://127.0.0.1:6\"\napi_key = \"one\"\n";
+        let updated = initial.replace("one", "two");
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let server = runtime.block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/rest/v1/maxllm_configs"))
+                .and(query_param("select", "config_toml"))
+                .and(query_param("id", "eq.global"))
+                .and(query_param("limit", "1"))
+                .and(header("authorization", "Bearer baas-token"))
+                .and(header("accept", "application/json"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                    {"id": "global", "config_toml": initial}
+                ])))
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/rest/v1/maxllm_configs"))
+                .and(query_param("select", "config_toml"))
+                .and(query_param("id", "eq.global"))
+                .and(query_param("limit", "1"))
+                .and(header("authorization", "Bearer baas-token"))
+                .and(header("accept", "application/json"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                    {"id": "global", "config_toml": updated.clone()}
+                ])))
+                .mount(&server)
+                .await;
+            server
+        });
+
+        let mut center = center_for(&server);
+        center.server_url = Some(format!("{}/rest/v1", server.uri()));
+        let (result, received) = runtime.block_on(async {
+            let test_center = center.clone();
+            let result = tokio::task::spawn_blocking(move || -> Result<_, ConfigCenterError> {
+                let mut client = BaasClient::new(&test_center).expect("client");
+                let initial_fetch = client.fetch_initial()?;
+                let outcome = client.poll_update(initial_fetch.version)?;
+                Ok((initial_fetch, outcome))
+            })
+            .await
+            .expect("blocking task");
+            let received = server.received_requests().await.expect("requests");
+            (result, received)
+        });
+        let (initial_fetch, outcome) = result.expect("fetch");
+
+        assert_eq!(received.len(), 2);
+        assert_eq!(received[0].url.path(), "/rest/v1/maxllm_configs");
+        assert_eq!(
+            received[0]
+                .headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer baas-token")
+        );
+        let query: Vec<(String, String)> = received[0]
+            .url
+            .query_pairs()
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect();
+        assert!(query.contains(&("id".into(), "eq.global".into())));
+        assert_eq!(initial_fetch.version, content_version(initial));
+        assert_eq!(initial_fetch.content, initial);
+        assert_eq!(
+            outcome,
+            PollOutcome::Updated(FetchedConfig {
+                version: content_version(&updated),
+                content: updated,
+            })
+        );
     }
 }

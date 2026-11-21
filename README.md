@@ -316,6 +316,32 @@ register with the QConfig service for the selected environment. `token` and
 `endpoints` may both be set for a direct data-plane endpoint, but must be set
 together.
 
+PostgREST/InsForge-style BaaS storage is also supported. The row must carry
+the complete TOML document in one text column:
+
+```toml
+[config_center]
+enabled = true
+backend = "baas"
+data_id = "maxllm.toml"
+server_url = "${BAAS_ENDPOINT}"       # e.g. http://baas.internal/rest/v1
+table = "maxllm_configs"
+row_key = "global"
+row_key_column = "id"
+config_column = "config_toml"
+version_column = "updated_at"         # optional; selected for diagnostics
+bearer_token = "${BAAS_TOKEN}"
+cache_path = "generated/maxllm.center.toml"
+poll_interval_secs = 30
+```
+
+BaaS has no implicit production or QA endpoint. Every deployment must state
+its own `server_url`; this intentionally mirrors the fail-closed PostgREST
+client in the Go runtime and prevents a missing environment variable from
+silently touching the wrong environment. Changes are detected by a stable
+fingerprint of the TOML body, so a text column is sufficient even when the
+database has no numeric revision column.
+
 Key behaviours:
 
 - The remote value is parsed and validated with the normal `Config` rules
@@ -332,8 +358,9 @@ Key behaviours:
   `[server].listen` still requires a restart.
 
 QConfig uses the v2 HTTP protocol and blocks for up to 60 seconds per long-poll
-request; Nacos uses the v1 HTTP API with periodic polling. Nacos credentials
-are exchanged once for an access token at startup.
+request; Nacos and BaaS use periodic polling. Nacos credentials are exchanged
+once for an access token at startup, while BaaS sends a bearer token on every
+read.
 
 ### Providers
 

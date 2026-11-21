@@ -123,6 +123,8 @@ pub enum ConfigCenterBackend {
     QConfig,
     /// Nacos v1 HTTP API.
     Nacos,
+    /// PostgREST-backed BaaS row that stores a complete TOML document.
+    Baas,
 }
 
 /// Bootstrap-only settings used to reach a configuration center.
@@ -179,6 +181,30 @@ pub struct ConfigCenterConfig {
     pub username: Option<String>,
     #[serde(default)]
     pub password: Option<String>,
+    /// BaaS/PostgREST row storage.
+    ///
+    /// `server_url` is the PostgREST root (for example
+    /// `http://baas.example/rest/v1`). There is deliberately no environment
+    /// default: BaaS endpoints differ between prod and QA, and silently
+    /// choosing one is an incident waiting to happen.
+    #[serde(default)]
+    pub table: Option<String>,
+    /// Value matched in `row_key_column`. Defaults to `data_id`.
+    #[serde(default)]
+    pub row_key: Option<String>,
+    #[serde(default = "default_baas_key_column")]
+    pub row_key_column: String,
+    /// Column containing the complete maxllm TOML document.
+    #[serde(default)]
+    pub config_column: Option<String>,
+    /// Optional display/version column to select for diagnostics. Change
+    /// detection always uses a stable fingerprint of the document body.
+    #[serde(default)]
+    pub version_column: Option<String>,
+    /// BaaS bearer token. Required, matching the fail-closed PostgREST client
+    /// used by the Go runtime.
+    #[serde(default)]
+    pub bearer_token: Option<String>,
 
     // QConfig v2 fields. Discovery is used when they are not overridden.
     /// QConfig application id. It is also the QConfig group.
@@ -223,6 +249,10 @@ fn default_nacos_group() -> String {
     "DEFAULT_GROUP".to_string()
 }
 
+fn default_baas_key_column() -> String {
+    "id".to_string()
+}
+
 impl ConfigCenterConfig {
     /// Validate the section by itself, without requiring the rest of a full
     /// gateway configuration.
@@ -264,6 +294,72 @@ impl ConfigCenterConfig {
                     if endpoint.trim().is_empty() {
                         return Err(ConfigError::Validation(
                             "config_center.endpoints must not contain an empty entry".into(),
+                        ));
+                    }
+                }
+            }
+            ConfigCenterBackend::Baas => {
+                if self
+                    .server_url
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or_default()
+                    .is_empty()
+                {
+                    return Err(ConfigError::Validation(
+                        "config_center.server_url is required for BaaS (PostgREST root)".into(),
+                    ));
+                }
+                if let Some(url) = self.server_url.as_deref() {
+                    if url::Url::parse(url).is_err() {
+                        return Err(ConfigError::Validation(format!(
+                            "config_center.server_url is not a valid URL: {url}"
+                        )));
+                    }
+                }
+                let table = self.table.as_deref().unwrap_or("").trim();
+                if table.is_empty() {
+                    return Err(ConfigError::Validation(
+                        "config_center.table is required for BaaS".into(),
+                    ));
+                }
+                if table.split('/').count() != 1 || table.contains(['?', '#']) {
+                    return Err(ConfigError::Validation(format!(
+                        "config_center.table must be one PostgREST path segment: {table}"
+                    )));
+                }
+                let column = self.config_column.as_deref().unwrap_or("").trim();
+                if column.is_empty() {
+                    return Err(ConfigError::Validation(
+                        "config_center.config_column is required for BaaS".into(),
+                    ));
+                }
+                if self
+                    .bearer_token
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or_default()
+                    .is_empty()
+                {
+                    return Err(ConfigError::Validation(
+                        "config_center.bearer_token is required for BaaS".into(),
+                    ));
+                }
+                for field in [
+                    &self.row_key_column,
+                    self.config_column.as_deref().unwrap_or(""),
+                ] {
+                    if field.trim().is_empty() || field.contains(['/', '?', '#']) {
+                        return Err(ConfigError::Validation(
+                            "BaaS column/key names must be non-empty path/query-safe strings"
+                                .into(),
+                        ));
+                    }
+                }
+                if let Some(version) = self.version_column.as_deref() {
+                    if version.trim().is_empty() || version.contains(['/', '?', '#']) {
+                        return Err(ConfigError::Validation(
+                            "BaaS version_column must be path/query-safe".into(),
                         ));
                     }
                 }
@@ -2908,6 +3004,48 @@ token = "secret"
         )
         .expect_err("direct mode is incomplete");
         assert!(error.to_string().contains("endpoints and token"));
+    }
+
+    #[test]
+    fn baas_requires_an_explicit_environment_endpoint() {
+        let error = config_center_from_str(
+            r#"
+[config_center]
+enabled = true
+backend = "baas"
+data_id = "maxllm.toml"
+"#,
+        )
+        .expect_err("BaaS must not choose a default endpoint");
+        assert!(error.to_string().contains("server_url"));
+
+        std::env::set_var("BAAS_ENDPOINT", "http://baas.internal/rest/v1");
+        std::env::set_var("BAAS_TOKEN", "baas-token");
+        let center = config_center_from_str(
+            r#"
+[config_center]
+enabled = true
+backend = "baas"
+data_id = "maxllm.toml"
+server_url = "${BAAS_ENDPOINT}"
+table = "maxllm_configs"
+row_key = "global"
+config_column = "config_toml"
+bearer_token = "${BAAS_TOKEN}"
+"#,
+        )
+        .expect("valid BaaS bootstrap parses")
+        .expect("center is enabled");
+        assert_eq!(center.backend, ConfigCenterBackend::Baas);
+        assert_eq!(
+            center.server_url.as_deref(),
+            Some("http://baas.internal/rest/v1")
+        );
+        assert_eq!(center.table.as_deref(), Some("maxllm_configs"));
+        assert_eq!(center.row_key.as_deref(), Some("global"));
+        assert_eq!(center.row_key_column, "id");
+        assert_eq!(center.config_column.as_deref(), Some("config_toml"));
+        assert_eq!(center.bearer_token.as_deref(), Some("baas-token"));
     }
 
     #[test]
