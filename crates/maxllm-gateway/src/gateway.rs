@@ -424,6 +424,9 @@ pub struct AutoPoolState {
     /// Whether the rotation prefers the low-latency cohort inside the
     /// preferred billing tier (see `[auto_model].prefer_fast`).
     pub prefer_fast: bool,
+    /// Whether the un-pinned rotation is weighted by prompt-cache evidence.
+    /// Set false when the operator wants an exact new-session round robin.
+    pub cache_weighted: bool,
     /// Whether an unusable pool answers 503 instead of falling through to
     /// the route's own provider chain (see `[auto_models.<key>] strict`).
     pub strict: bool,
@@ -1028,6 +1031,7 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
             name,
             entries,
             prefer_fast: auto.prefer_fast,
+            cache_weighted: auto.cache_weighted,
             strict: auto.strict,
             scope: auto.scope,
         });
@@ -1582,7 +1586,13 @@ fn auto_pool_cache_weight(provider: &str) -> Option<u32> {
 /// rotates while one member serves everything. Each member instead takes the
 /// slot with the smallest served-to-weight ratio, so the shares stay
 /// proportional *and* the members keep taking turns.
-fn auto_pool_cache_order<'a>(rotation: &[&'a AutoPoolEntry]) -> Vec<&'a AutoPoolEntry> {
+fn auto_pool_cache_order<'a>(
+    rotation: &[&'a AutoPoolEntry],
+    cache_weighted: bool,
+) -> Vec<&'a AutoPoolEntry> {
+    if !cache_weighted {
+        return rotation.to_vec();
+    }
     let measured: Vec<u32> = rotation
         .iter()
         .filter_map(|e| auto_pool_cache_weight(&e.provider))
@@ -1976,6 +1986,7 @@ impl AiGateway {
         let sessions = Arc::new(SessionStore::new(
             session_cfg.max_entries,
             session_cfg.timeout_secs,
+            session_cfg.max_pin_secs,
         ));
 
         // Restore the persisted resilience state: a quota force-open (429) and
@@ -2418,10 +2429,7 @@ impl AiGateway {
                 // half-open probe slot. The old `is_open()` did exactly that,
                 // so the entries the round-robin *looked at* but never picked
                 // were left permanently half-open and answered 503.
-                .map(|p| {
-                    p.circuit_breaker.allows_traffic()
-                        && !provider_saturated(&e.provider, p)
-                })
+                .map(|p| p.circuit_breaker.allows_traffic() && !provider_saturated(&e.provider, p))
                 .unwrap_or(false)
         });
         if healthy.is_empty() {
@@ -2437,9 +2445,7 @@ impl AiGateway {
         let admits = |e: &AutoPoolEntry| -> bool {
             hot.providers
                 .get(&e.provider)
-                .map(|p| {
-                    !p.circuit_breaker.is_open() && !provider_saturated(&e.provider, p)
-                })
+                .map(|p| !p.circuit_breaker.is_open() && !provider_saturated(&e.provider, p))
                 .unwrap_or(false)
         };
         // The *read-only* twin of `admits`: it says whether the member could
@@ -2450,10 +2456,7 @@ impl AiGateway {
         let allows = |e: &AutoPoolEntry| -> bool {
             hot.providers
                 .get(&e.provider)
-                .map(|p| {
-                    p.circuit_breaker.allows_traffic()
-                        && !provider_saturated(&e.provider, p)
-                })
+                .map(|p| p.circuit_breaker.allows_traffic() && !provider_saturated(&e.provider, p))
                 .unwrap_or(false)
         };
 
@@ -2555,7 +2558,7 @@ impl AiGateway {
                 // the whole context every turn costs a full prefill per
                 // turn, so it earns fewer slots. None is ever starved —
                 // every member keeps at least one.
-                let slots = auto_pool_cache_order(&rotation);
+                let slots = auto_pool_cache_order(&rotation, pool.cache_weighted);
                 if slots.is_empty() {
                     return None;
                 }
@@ -2713,8 +2716,7 @@ impl AiGateway {
                             {
                                 METRICS.session_affinity_hits_total.inc();
                                 ctx.provider_name = pinned_name.clone();
-                                ctx.provider_allowed_models =
-                                    pinned.state.allowed_models.clone();
+                                ctx.provider_allowed_models = pinned.state.allowed_models.clone();
                                 ctx.fallback_used = pinned_name != route.provider;
                                 // The session continues on the provider it was
                                 // already talking to — see
@@ -3147,15 +3149,16 @@ impl AiGateway {
         requested: Option<&str>,
     ) -> pingora::Result<()> {
         let Some(message) =
-            Self::model_denied(&ctx.virtual_key_allowed_models, resolved, requested)
-                .or_else(|| {
+            Self::model_denied(&ctx.virtual_key_allowed_models, resolved, requested).or_else(
+                || {
                     Self::provider_model_denied(
                         &ctx.provider_name,
                         &ctx.provider_allowed_models,
                         resolved,
                         requested,
                     )
-                })
+                },
+            )
         else {
             return Ok(());
         };
@@ -3515,9 +3518,7 @@ impl AiGateway {
         // Gemini-style `/models/<model>:<method>` path) can be checked
         // before anything reaches the upstream.
         if ctx.endpoint_type == EndpointType::Passthrough {
-            if ctx.virtual_key_allowed_models.is_empty()
-                && ctx.provider_allowed_models.is_empty()
-            {
+            if ctx.virtual_key_allowed_models.is_empty() && ctx.provider_allowed_models.is_empty() {
                 return Ok(());
             }
             self.buffer_request_body_chunk(ctx, body, end_of_stream);
@@ -6873,10 +6874,7 @@ impl ProxyHttp for AiGateway {
                         .map(|p| p.utc_offset_minutes)
                         .unwrap_or(0);
                     let (is_rate_limit, mut candidates) =
-                        crate::rate_limit::parse_body_text_with_offset(
-                            &text,
-                            utc_offset_minutes,
-                        );
+                        crate::rate_limit::parse_body_text_with_offset(&text, utc_offset_minutes);
                     crate::rate_limit::retain_plausible_reset_candidates(&mut candidates);
                     if let Some(p) = hot.providers.get(&provider_name) {
                         match candidates.first().map(|c| c.at_ms) {
@@ -6890,8 +6888,7 @@ impl ProxyHttp for AiGateway {
                                 );
                             }
                             None => {
-                                let base =
-                                    self.rate_limit_resolver.default_cooldown_secs() * 1000;
+                                let base = self.rate_limit_resolver.default_cooldown_secs() * 1000;
                                 let cooldown_ms = p.circuit_breaker.record_quota_unknown(base);
                                 info!(
                                     provider = %provider_name,
@@ -6912,9 +6909,9 @@ impl ProxyHttp for AiGateway {
                         self.persist_circuit_breaker(&provider_name, &p.circuit_breaker);
                     }
                     let _ = is_rate_limit; // the markers above already decided
-                    // Learn the shape so the next wall resolves without a
-                    // regex walk (same fire-and-forget persist as the 429/500
-                    // path).
+                                           // Learn the shape so the next wall resolves without a
+                                           // regex walk (same fire-and-forget persist as the 429/500
+                                           // path).
                     if !text.trim().is_empty() {
                         let learned = crate::rate_limit_resolver::LearnedUpdate {
                             fingerprint: crate::rate_limit::fingerprint(&text),
@@ -6943,12 +6940,9 @@ impl ProxyHttp for AiGateway {
                 // receives the upstream's answer with exactly the shape it
                 // had before the deferral existed.
                 let hot = self.hot.load();
-                let normalized = hot
-                    .providers
-                    .get(&ctx.provider_name)
-                    .and_then(|p| {
-                        normalize_error_response(&body_bytes, ctx.upstream_status, p.kind)
-                    });
+                let normalized = hot.providers.get(&ctx.provider_name).and_then(|p| {
+                    normalize_error_response(&body_bytes, ctx.upstream_status, p.kind)
+                });
                 match normalized {
                     Some(n) => *body = Some(Bytes::from(n)),
                     None => {
@@ -8765,10 +8759,7 @@ impl AiGateway {
                 && hot
                     .providers
                     .get(name)
-                    .map(|p| {
-                        p.circuit_breaker.allows_traffic()
-                            && !provider_saturated(name, p)
-                    })
+                    .map(|p| p.circuit_breaker.allows_traffic() && !provider_saturated(name, p))
                     .unwrap_or(false)
         };
         let scoped_pool = hot
@@ -8830,9 +8821,7 @@ impl AiGateway {
         let admit = |provider: &str| -> bool {
             hot.providers
                 .get(provider)
-                .map(|p| {
-                    !p.circuit_breaker.is_open() && !provider_saturated(provider, p)
-                })
+                .map(|p| !p.circuit_breaker.is_open() && !provider_saturated(provider, p))
                 .unwrap_or(false)
         };
 
@@ -8967,9 +8956,7 @@ impl AiGateway {
             .find_map(|name| {
                 hot.providers
                     .get(name)
-                    .filter(|p| {
-                        !p.circuit_breaker.is_open() && !provider_saturated(name, p)
-                    })
+                    .filter(|p| !p.circuit_breaker.is_open() && !provider_saturated(name, p))
                     .map(|p| (name.clone(), Arc::clone(p)))
             })
     }
@@ -10812,7 +10799,10 @@ allowed_models = ["deepseek-v4.1-flash"]
 
     #[test]
     fn an_empty_list_permits_every_model() {
-        assert_eq!(AiGateway::provider_model_denied("p", &[], "glm-5.2", None), None);
+        assert_eq!(
+            AiGateway::provider_model_denied("p", &[], "glm-5.2", None),
+            None
+        );
     }
 
     #[test]
@@ -11888,7 +11878,7 @@ mod fallback_model_carrying_tests {
             budget_enforcer: None,
             key_rate_limiter: Arc::new(crate::key_rate_limit::KeyRateLimiter::new()),
             admin_api: None,
-            sessions: Arc::new(SessionStore::new(1024, 3600)),
+            sessions: Arc::new(SessionStore::new(1024, 3600, 0)),
             recorder: None,
             rate_limit_resolver: Arc::new(crate::rate_limit_resolver::RateLimitResolver::new(
                 Default::default(),
@@ -12248,10 +12238,19 @@ mod auto_pool_latency_tests {
     /// every test uses its own provider names — one test's recorded latencies
     /// must never leak into another's cohort.
     fn pool_with_names(prefer_fast: bool, names: &[&str]) -> AutoPoolState {
+        pool_with_rotation(prefer_fast, true, names)
+    }
+
+    fn pool_with_rotation(
+        prefer_fast: bool,
+        cache_weighted: bool,
+        names: &[&str],
+    ) -> AutoPoolState {
         AutoPoolState {
             name: "auto".to_string(),
             entries: names.iter().map(|n| entry(n)).collect(),
             prefer_fast,
+            cache_weighted,
             strict: false,
             scope: AutoPoolScope::Any,
         }
@@ -12329,7 +12328,7 @@ mod auto_pool_latency_tests {
         }
         let pool = pool_with_names(true, &["slot-fast", "slot-slow"]);
         let healthy: Vec<&AutoPoolEntry> = pool.entries.iter().collect();
-        let order = auto_pool_cache_order(&healthy);
+        let order = auto_pool_cache_order(&healthy, true);
         let fast = order.iter().filter(|e| e.provider == "slot-fast").count();
         let slow = order.iter().filter(|e| e.provider == "slot-slow").count();
         assert!(
@@ -12394,7 +12393,7 @@ mod auto_pool_latency_tests {
         crate::provider_stats::expire_decode_rate_evidence("share-mem-slow");
         let pool = pool_with_names(true, &["share-mem-fast", "share-mem-slow"]);
         let healthy: Vec<&AutoPoolEntry> = pool.entries.iter().collect();
-        let order = auto_pool_cache_order(&healthy);
+        let order = auto_pool_cache_order(&healthy, true);
         let fast = order
             .iter()
             .filter(|e| e.provider == "share-mem-fast")
@@ -12451,7 +12450,7 @@ mod auto_pool_latency_tests {
         }
         let pool = pool_with_names(true, &["slots-warm", "slots-mid", "slots-cold"]);
         let healthy: Vec<&AutoPoolEntry> = pool.entries.iter().collect();
-        let slots = auto_pool_cache_order(&healthy);
+        let slots = auto_pool_cache_order(&healthy, true);
         let share = |name: &str| slots.iter().filter(|e| e.provider == name).count();
         assert!(
             share("slots-warm") > share("slots-mid"),
@@ -12480,7 +12479,7 @@ mod auto_pool_latency_tests {
         }
         let pool = pool_with_names(true, &["order-a", "order-b", "order-c"]);
         let healthy: Vec<&AutoPoolEntry> = pool.entries.iter().collect();
-        let slots = auto_pool_cache_order(&healthy);
+        let slots = auto_pool_cache_order(&healthy, true);
         let runs = slots
             .windows(2)
             .filter(|w| w[0].provider == w[1].provider)
@@ -12499,6 +12498,27 @@ mod auto_pool_latency_tests {
         assert_eq!(share("order-b"), share("order-c"));
     }
 
+    /// Disabling cache weighting is the explicit balance mode: every healthy
+    /// member gets exactly one slot, so the un-pinned rotation is plain RR.
+    #[test]
+    fn unweighted_rotation_gives_every_member_one_slot() {
+        for _ in 0..3 {
+            crate::provider_stats::record_cache_ratio("balance-warm", 1800, 2000);
+            crate::provider_stats::record_cache_ratio("balance-cold", 20, 2000);
+        }
+        crate::provider_stats::record_total_latency("balance-warm", 1000.0, true, 1000);
+        crate::provider_stats::record_total_latency("balance-cold", 30000.0, true, 1000);
+        let pool = pool_with_rotation(
+            false,
+            false,
+            &["balance-warm", "balance-cold", "balance-new"],
+        );
+        let healthy: Vec<&AutoPoolEntry> = pool.entries.iter().collect();
+        let slots = auto_pool_cache_order(&healthy, pool.cache_weighted);
+        let providers: Vec<_> = slots.iter().map(|e| e.provider.as_str()).collect();
+        assert_eq!(providers, ["balance-warm", "balance-cold", "balance-new"]);
+    }
+
     /// A member that keeps the conversation warm earns the traffic — and the
     /// cold one still keeps a slot, because the pool has to keep measuring
     /// the members it has.
@@ -12510,7 +12530,7 @@ mod auto_pool_latency_tests {
         }
         let pool = pool_with_names(true, &["share2-warm", "share2-cold"]);
         let healthy: Vec<&AutoPoolEntry> = pool.entries.iter().collect();
-        let slots = auto_pool_cache_order(&healthy);
+        let slots = auto_pool_cache_order(&healthy, true);
         let share = |name: &str| slots.iter().filter(|e| e.provider == name).count();
         assert!(
             share("share2-warm") > share("share2-cold") * 3,
@@ -12531,7 +12551,7 @@ mod auto_pool_latency_tests {
         }
         let pool = pool_with_names(true, &["share-warm", "share-cold", "share-new"]);
         let healthy: Vec<&AutoPoolEntry> = pool.entries.iter().collect();
-        let slots = auto_pool_cache_order(&healthy);
+        let slots = auto_pool_cache_order(&healthy, true);
         let share = |name: &str| slots.iter().filter(|e| e.provider == name).count();
         assert!(
             share("share-new") >= 1,

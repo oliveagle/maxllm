@@ -51,6 +51,12 @@ const SESSION_HEADERS: [&str; 4] = [
 pub struct SessionEntry {
     /// Provider the session is pinned to.
     pub provider: String,
+    /// Time the current provider pin was created (ns epoch).
+    ///
+    /// Refreshing an unchanged pin must not update this field: an active
+    /// session refreshes `last_accessed` forever, and doing the same to the
+    /// pin age would make `max_pin_secs` impossible.
+    pub created_at: u64,
     /// Last time the session was used (ns epoch).
     pub last_accessed: u64,
     /// Strict recency order (1 = most recent). The wall clock is not enough to
@@ -67,6 +73,8 @@ pub struct SessionStore {
     max_entries: usize,
     /// Binding lifetime since last use, in seconds.
     timeout_secs: u64,
+    /// Hard lifetime of the current provider pin, in seconds (0 = unlimited).
+    max_pin_secs: u64,
     hits: AtomicU64,
     misses: AtomicU64,
     evictions: AtomicU64,
@@ -77,11 +85,12 @@ pub struct SessionStore {
 }
 
 impl SessionStore {
-    pub fn new(max_entries: usize, timeout_secs: u64) -> Self {
+    pub fn new(max_entries: usize, timeout_secs: u64, max_pin_secs: u64) -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
             max_entries: max_entries.max(1),
             timeout_secs,
+            max_pin_secs,
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             evictions: AtomicU64::new(0),
@@ -100,6 +109,14 @@ impl SessionStore {
                 if self.is_expired(entry.last_accessed, now) {
                     entries.remove(session_id);
                     self.misses.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
+                if self.is_pin_expired(entry.created_at, now) {
+                    entries.remove(session_id);
+                    self.misses.fetch_add(1, Ordering::Relaxed);
+                    crate::metrics::METRICS
+                        .session_affinity_max_age_escapes_total
+                        .inc();
                     return None;
                 }
                 entry.last_accessed = now;
@@ -138,19 +155,37 @@ impl SessionStore {
         };
 
         // Opportunistic expiry sweep: run at most once per timeout_secs/2 so a
-        // busy session store is not scanned on every request.
-        if self.timeout_secs > 0 {
+        // busy session store is not scanned on every request. A very small or
+        // disabled idle timeout must not turn the hard-pin sweep off.
+        let sweep_interval_secs = if self.timeout_secs == 0 {
+            self.max_pin_secs.max(1)
+        } else {
+            self.timeout_secs
+        };
+        {
             let last = self.last_sweep.load(Ordering::Relaxed);
-            if now.saturating_sub(last) >= self.timeout_secs * 500_000_000 {
-                entries.retain(|_, e| !self.is_expired(e.last_accessed, now));
+            if now.saturating_sub(last) >= sweep_interval_secs * 500_000_000 {
+                entries.retain(|_, e| {
+                    !self.is_expired(e.last_accessed, now)
+                        && !self.is_pin_expired(e.created_at, now)
+                });
                 self.last_sweep.store(now, Ordering::Relaxed);
             }
         }
 
+        // Refreshing the same provider is a continuation, not a new pin: keep
+        // the original creation time so active conversations can still reach
+        // the hard age cap. A genuine re-pin to another provider starts a new
+        // age clock because that new account has not carried this session yet.
+        let created_at = match entries.get(session_id) {
+            Some(entry) if entry.provider == provider => entry.created_at,
+            _ => now,
+        };
         entries.insert(
             session_id.to_string(),
             SessionEntry {
                 provider: provider.to_string(),
+                created_at,
                 last_accessed: now,
                 seq: self.next_seq(),
             },
@@ -190,7 +225,9 @@ impl SessionStore {
             Err(_) => return 0,
         };
         let before = entries.len();
-        entries.retain(|_, e| !self.is_expired(e.last_accessed, now));
+        entries.retain(|_, e| {
+            !self.is_expired(e.last_accessed, now) && !self.is_pin_expired(e.created_at, now)
+        });
         before - entries.len()
     }
 
@@ -219,6 +256,21 @@ impl SessionStore {
         }
         now.saturating_sub(last_accessed) >= self.timeout_secs * 1_000_000_000
     }
+
+    fn is_pin_expired(&self, created_at: u64, now: u64) -> bool {
+        if self.max_pin_secs == 0 {
+            return false;
+        }
+        now.saturating_sub(created_at) >= self.max_pin_secs * 1_000_000_000
+    }
+}
+
+#[cfg(test)]
+fn pin_age_expired(created_ns: u64, now_ns: u64, max_pin_secs: u64) -> bool {
+    if max_pin_secs == 0 {
+        return false;
+    }
+    now_ns.saturating_sub(created_ns) >= max_pin_secs * 1_000_000_000
 }
 
 /// Resolve the session id carried by the request headers.
@@ -290,6 +342,42 @@ mod tests {
     use super::*;
     use http::HeaderValue;
 
+    #[test]
+    fn hard_pin_age_is_measured_from_first_pin_not_last_use() {
+        let sec = 1_000_000_000;
+        assert!(!pin_age_expired(sec, 2 * sec - 1, 1));
+        assert!(pin_age_expired(sec, 2 * sec, 1));
+        assert!(!pin_age_expired(sec, u64::MAX, 0));
+    }
+
+    #[test]
+    fn refreshing_same_provider_preserves_hard_pin_age() {
+        let store = SessionStore::new(10, 3600, 1);
+        store.set("session", "provider-a");
+        let original_created = now_ns().saturating_sub(2 * 1_000_000_000);
+        {
+            let mut entries = store.entries.lock().unwrap();
+            entries.get_mut("session").unwrap().created_at = original_created;
+        }
+        // This is exactly what happens after every successful request: set is
+        // called again for the provider that just served the session.
+        store.set("session", "provider-a");
+        assert_eq!(store.get("session"), None);
+    }
+
+    #[test]
+    fn re_pin_to_another_provider_starts_a_new_hard_age_clock() {
+        let store = SessionStore::new(10, 3600, 3600);
+        store.set("session", "provider-a");
+        {
+            let mut entries = store.entries.lock().unwrap();
+            entries.get_mut("session").unwrap().created_at =
+                now_ns().saturating_sub(2 * 1_000_000_000);
+        }
+        store.set("session", "provider-b");
+        assert_eq!(store.get("session"), Some("provider-b".to_string()));
+    }
+
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut map = HeaderMap::new();
         for (name, value) in pairs {
@@ -303,7 +391,7 @@ mod tests {
 
     #[test]
     fn test_store_binds_and_returns() {
-        let store = SessionStore::new(10, 3600);
+        let store = SessionStore::new(10, 3600, 0);
         assert!(store.get("s1").is_none());
         store.set("s1", "provider-a");
         assert_eq!(store.get("s1").as_deref(), Some("provider-a"));
@@ -313,7 +401,7 @@ mod tests {
 
     #[test]
     fn test_store_evicts_lru() {
-        let store = SessionStore::new(2, 3600);
+        let store = SessionStore::new(2, 3600, 0);
         store.set("s1", "p1");
         store.set("s2", "p2");
         // Touch s1 so s2 becomes the least recently used.
@@ -330,7 +418,7 @@ mod tests {
         // Two bindings used within the same clock tick share a `last_accessed`.
         // The eviction must still pick the genuinely older one, not whichever
         // the hash map happens to yield first.
-        let store = SessionStore::new(2, 3600);
+        let store = SessionStore::new(2, 3600, 0);
         let now = now_ns();
         // Keep the store's counter ahead of the ranks we hand out by hand.
         store.seq_counter.store(2, Ordering::Relaxed);
@@ -342,6 +430,7 @@ mod tests {
                 "s1".to_string(),
                 SessionEntry {
                     provider: "p1".to_string(),
+                    created_at: now,
                     last_accessed: now,
                     seq: 2,
                 },
@@ -350,6 +439,7 @@ mod tests {
                 "s2".to_string(),
                 SessionEntry {
                     provider: "p2".to_string(),
+                    created_at: now,
                     last_accessed: now,
                     seq: 1,
                 },
@@ -367,12 +457,12 @@ mod tests {
 
     #[test]
     fn test_store_expires_entries() {
-        let store = SessionStore::new(10, 0);
+        let store = SessionStore::new(10, 0, 0);
         store.set("s1", "p1");
         // timeout 0 means "never expires"
         assert!(store.get("s1").is_some());
 
-        let store = SessionStore::new(10, 1);
+        let store = SessionStore::new(10, 1, 0);
         store.set("s1", "p1");
         std::thread::sleep(std::time::Duration::from_millis(1100));
         assert!(store.get("s1").is_none());

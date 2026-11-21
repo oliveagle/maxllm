@@ -194,6 +194,17 @@ pub struct AutoModelConfig {
     /// round-robin over the whole tier.
     #[serde(default = "default_true")]
     pub prefer_fast: bool,
+    /// Weight the un-pinned rotation by provider-side prompt-cache evidence.
+    ///
+    /// This is the right default for a generic `auto` pool: re-reading a long
+    /// agent context is expensive, so a member that keeps the cache warm earns
+    /// more of the request rotation. It is the wrong default when the operator
+    /// explicitly wants **new sessions to burn accounts evenly**: session
+    /// affinity still gives a conversation to one member, but the first turns
+    /// of new sessions must take an unweighted round-robin. Set
+    /// `cache_weighted = false` for that mode.
+    #[serde(default = "default_true")]
+    pub cache_weighted: bool,
     /// Fail closed when no member of this pool can take the traffic.
     ///
     /// A pool is normally a *preference*: when every member is
@@ -344,6 +355,7 @@ impl Default for SessionStickyConfig {
             enabled: false,
             timeout_secs: default_session_timeout_secs(),
             max_entries: default_session_max_entries(),
+            max_pin_secs: 0,
             body_affinity: false,
             body_affinity_max_bytes: default_session_body_affinity_max_bytes(),
         }
@@ -361,6 +373,17 @@ pub struct SessionStickyConfig {
     /// Max number of session entries kept in memory (LRU eviction on overflow).
     #[serde(default = "default_session_max_entries")]
     pub max_entries: usize,
+    /// Hard maximum age of a session binding, in seconds, measured from the
+    /// first successful pin (not from the last use).
+    ///
+    /// `timeout_secs` is an **idle** timeout: an active session refreshes it on
+    /// every turn and can therefore stay on one account forever. That protects
+    /// upstream prompt caches, but it also concentrates all long-running agent
+    /// sessions on whichever key first served them. `max_pin_secs` forces that
+    /// long-lived binding to expire even while it is active, returning it to
+    /// the rotation. `0` disables the cap.
+    #[serde(default)]
+    pub max_pin_secs: u64,
     /// Resolve the session identity from the **request body** when the
     /// client sends no session header.
     ///
@@ -1981,6 +2004,40 @@ pool = [{{ provider = "openai", model = "gpt-4o" }}]
         );
         let config = Config::parse(&toml).unwrap();
         assert!(!config.auto_model.as_ref().unwrap().prefer_fast);
+    }
+
+    #[test]
+    fn test_auto_model_cache_weighting_defaults_on_and_can_be_disabled() {
+        let on = format!(
+            r#"{PROVIDER_TOML}
+[auto_model]
+enabled = true
+pool = [{{ provider = "openai", model = "gpt-4o" }}]
+
+[[routes]]
+path = "/v1/auto"
+provider = "auto"
+auto_model = true
+"#
+        );
+        let config = Config::parse(&on).unwrap();
+        assert!(config.auto_model.as_ref().unwrap().cache_weighted);
+
+        let off = format!(
+            r#"{PROVIDER_TOML}
+[auto_model]
+enabled = true
+cache_weighted = false
+pool = [{{ provider = "openai", model = "gpt-4o" }}]
+
+[[routes]]
+path = "/v1/auto"
+provider = "auto"
+auto_model = true
+"#
+        );
+        let config = Config::parse(&off).unwrap();
+        assert!(!config.auto_model.as_ref().unwrap().cache_weighted);
     }
 
     #[test]

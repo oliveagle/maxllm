@@ -41,6 +41,8 @@ pub struct GatewayMetrics {
     /// cold conversation — a rising share here is a falling cache hit rate.
     pub opencode_affinity_source_total: IntCounterVec,
     pub session_affinity_misses_total: IntCounter,
+    /// Active sessions whose hard pin age expired and returned to rotation.
+    pub session_affinity_max_age_escapes_total: IntCounter,
     /// Sessions that left their pinned provider because that provider does
     /// not keep the conversation's prefix cache warm.
     pub session_affinity_cold_escapes_total: IntCounterVec,
@@ -298,6 +300,15 @@ impl GatewayMetrics {
         .expect("metric");
         registry
             .register(Box::new(session_affinity_misses_total.clone()))
+            .expect("register");
+
+        let session_affinity_max_age_escapes_total = IntCounter::new(
+            "maxllm_session_affinity_max_age_escapes_total",
+            "Active sessions whose hard pin age expired and returned to rotation",
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(session_affinity_max_age_escapes_total.clone()))
             .expect("register");
 
         let session_affinity_cold_escapes_total = IntCounterVec::new(
@@ -620,6 +631,7 @@ impl GatewayMetrics {
             opencode_affinity_source_total,
             session_affinity_hits_total,
             session_affinity_misses_total,
+            session_affinity_max_age_escapes_total,
             session_affinity_cold_escapes_total,
             provider_cache_ratio,
             provider_decode_ms_per_1k,

@@ -10205,11 +10205,14 @@ provider = "strict"
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 400, "a request fault stays the client's answer");
+    assert_eq!(
+        resp.status(),
+        400,
+        "a request fault stays the client's answer"
+    );
     let body: Value = resp.json().await.unwrap();
     assert_eq!(
-        body["error"]["message"],
-        rejection["error"]["message"],
+        body["error"]["message"], rejection["error"]["message"],
         "the body must reach the client untouched"
     );
 }
@@ -12678,11 +12681,7 @@ async fn test_a_non_strict_named_pool_still_falls_through_to_the_route() {
         "without `strict` the pool keeps falling through to the route (body: {text})"
     );
     assert_eq!(
-        fallback
-            .received_requests()
-            .await
-            .unwrap_or_default()
-            .len(),
+        fallback.received_requests().await.unwrap_or_default().len(),
         1,
         "the route's provider is the one that answered"
     );
