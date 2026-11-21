@@ -14686,6 +14686,73 @@ async fn test_moonshot_rejection_is_retried_with_degraded_tools() {
 }
 
 #[tokio::test]
+async fn test_a_second_moonshot_schema_rejection_drops_the_tool_surface() {
+    let mock = MockServer::start().await;
+
+    // Degraded schemas are the attempt to preserve function calling. If even
+    // those are refused, the final repair sacrifices that surface rather than
+    // surfacing the schema fault and ending the agent's turn.
+    Mock::given(method("POST"))
+        .and(path("/coding/v1/chat/completions"))
+        .and(body_string_contains("\"$defs\""))
+        .respond_with(ResponseTemplate::new(400).set_body_json(moonshot_rejection()))
+        .with_priority(1)
+        .expect(1)
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/coding/v1/chat/completions"))
+        .and(body_string_contains("\"parameters\":{\"type\":\"object\"}"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(moonshot_rejection()))
+        .with_priority(2)
+        .expect(1)
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/coding/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("without tools")))
+        .with_priority(3)
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let gw = TestGateway::start(MOONSHOT_TOOL_CONFIG, &mock.uri()).await;
+    let c = client();
+
+    let mut body = chat_body("kimi-for-coding", "hi");
+    body["tools"] = json!([zod_tool()]);
+    body["tool_choice"] = json!("auto");
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "the terminal tool repair must answer, not the second 400"
+    );
+    assert_eq!(
+        resp.json::<Value>().await.unwrap()["choices"][0]["message"]["content"],
+        "without tools"
+    );
+
+    let requests = mock.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 3, "project → degrade → remove");
+    for request in requests.iter().take(2) {
+        let sent: Value = serde_json::from_slice(&request.body).unwrap();
+        assert!(sent.get("tools").is_some());
+    }
+    let terminal: Value = serde_json::from_slice(&requests[2].body).unwrap();
+    assert!(terminal.get("tools").is_none());
+    assert!(terminal.get("tool_choice").is_none());
+    assert_eq!(terminal["messages"][0]["role"], "user");
+}
+
+#[tokio::test]
 async fn test_moonshot_orphaned_tool_call_is_repaired() {
     let mock = MockServer::start().await;
 

@@ -220,6 +220,11 @@ pub struct RequestCtx {
     /// must not end the agent's turn. Consumed by the next
     /// `request_body_filter` pass.
     pub tool_schema_degraded: bool,
+    /// Set when even degraded schemas were refused and the next replay must
+    /// have no tool surface at all. This is the terminal tool-schema repair:
+    /// losing function calling for one turn is preferable to letting the
+    /// upstream's schema rejection end the agent's turn.
+    pub tools_removed: bool,
     /// Set when the request must be (re)sent with its tool history repaired
     /// — the upstream refused a history whose assistant tool call was never
     /// answered (`… must be followed by tool messages responding to each
@@ -436,6 +441,7 @@ impl RequestCtx {
             pending_tool_schema_repair: false,
             tool_schema_body_buf: Vec::new(),
             tool_schema_degraded: false,
+            tools_removed: false,
             tool_calls_repaired: false,
             pending_tool_schema_status: 0,
             rate_limit_headers: Vec::new(),

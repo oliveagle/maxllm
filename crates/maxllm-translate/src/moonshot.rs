@@ -217,6 +217,27 @@ pub fn degrade_tool_schemas(body: &[u8]) -> Vec<u8> {
     serde_json::to_vec(&root).unwrap_or_else(|_| body.to_vec())
 }
 
+/// Remove the request's tool surface entirely.
+///
+/// This is the final repair after even a degraded tool schema is refused:
+/// the current turn can continue without function calling, but it cannot
+/// continue if the upstream's schema rejection reaches the client. Drop
+/// `tools` and any `tool_choice` that would name or require those tools.
+pub fn remove_tool_surface(body: &[u8]) -> Vec<u8> {
+    let Ok(mut root) = serde_json::from_slice::<Value>(body) else {
+        return body.to_vec();
+    };
+    let Some(obj) = root.as_object_mut() else {
+        return body.to_vec();
+    };
+    if !obj.contains_key("tools") {
+        return body.to_vec();
+    }
+    obj.remove("tools");
+    obj.remove("tool_choice");
+    serde_json::to_vec(&root).unwrap_or_else(|_| body.to_vec())
+}
+
 /// Project one tool schema into the Moonshot dialect.
 ///
 /// Returns whether the schema changed — the caller keeps the original bytes
@@ -1370,6 +1391,25 @@ mod tests {
         let body = br#"{"model":"m","input":"hi"}"#;
         assert_eq!(degrade_tool_schemas(body), body.to_vec());
         assert_eq!(degrade_tool_schemas(b"nope"), b"nope".to_vec());
+    }
+
+    #[test]
+    fn tool_surface_removal_drops_tools_and_tool_choice() {
+        let body = br#"{"model":"m","input":"hi","tool_choice":"auto","tools":[
+            {"type":"function","name":"f","parameters":{"type":"object"}}
+        ]}"#;
+        let out: Value = serde_json::from_slice(&remove_tool_surface(body)).unwrap();
+        assert!(out.get("tools").is_none());
+        assert!(out.get("tool_choice").is_none());
+        assert_eq!(out["model"], "m");
+        assert_eq!(out["input"], "hi");
+    }
+
+    #[test]
+    fn tool_surface_removal_without_tools_is_verbatim() {
+        let body = br#"{"model":"m","input":"hi","tool_choice":"auto"}"#;
+        assert_eq!(remove_tool_surface(body), body.to_vec());
+        assert_eq!(remove_tool_surface(b"nope"), b"nope".to_vec());
     }
 
     // ── host detection ───────────────────────────────────────────────

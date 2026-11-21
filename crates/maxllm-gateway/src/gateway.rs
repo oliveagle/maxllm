@@ -3682,9 +3682,12 @@ impl AiGateway {
                     // the body is framed (or degrade them, on the retry after
                     // a rejection).
                     let mut out = match provider.as_deref() {
-                        Some(p) => {
-                            Self::apply_tool_schema_dialect(p, normalized, ctx.tool_schema_degraded)
-                        }
+                        Some(p) => Self::apply_tool_schema_dialect(
+                            p,
+                            normalized,
+                            ctx.tools_removed,
+                            ctx.tool_schema_degraded,
+                        ),
                         None => normalized,
                     };
                     // The orphan-tool-call repair answers a call the
@@ -4077,6 +4080,7 @@ impl AiGateway {
                     outgoing = Self::apply_tool_schema_dialect(
                         provider,
                         outgoing,
+                        ctx.tools_removed,
                         ctx.tool_schema_degraded,
                     );
                 }
@@ -4378,6 +4382,7 @@ impl AiGateway {
                             outgoing = Self::apply_tool_schema_dialect(
                                 provider,
                                 outgoing,
+                                ctx.tools_removed,
                                 ctx.tool_schema_degraded,
                             );
                             if ctx.tool_calls_repaired {
@@ -4465,12 +4470,15 @@ impl AiGateway {
     fn apply_tool_schema_dialect(
         provider: &ProviderState,
         body: Vec<u8>,
+        tools_removed: bool,
         degraded: bool,
     ) -> Vec<u8> {
         if !provider.moonshot_tool_schema {
             return body;
         }
-        if degraded {
+        if tools_removed {
+            maxllm_translate::moonshot::remove_tool_surface(&body)
+        } else if degraded {
             maxllm_translate::moonshot::degrade_tool_schemas(&body)
         } else {
             maxllm_translate::moonshot::normalize_tools(&body)
@@ -6404,17 +6412,18 @@ impl ProxyHttp for AiGateway {
         // Moonshot schema dialect, or a tool call the conversation's history
         // never answered: defer the decision until the body arrives, because
         // only the body says which of the two it is. When it names the
-        // schemas, the request is replayed once with degraded tool schemas;
-        // when it names an unanswered tool call, the history is repaired and
-        // the request replayed. Either way the agent's turn continues; any
-        // other 400 passes through untouched.
+        // schemas, the request is replayed with degraded tool schemas; if the
+        // degraded schemas are also refused, the next replay drops the tool
+        // surface. When it names an unanswered tool call, the history is
+        // repaired and the request replayed. Either way the agent's turn
+        // continues; any other 400 passes through untouched.
         // The deferral only preempts the handling that would end the turn
         // (a 400 this provider takes as a request fault): a 400 the route
         // would answer by model rewrite or failover keeps that handling —
         // the request is retried anyway, and a tool-plumbing rejection that
         // survives it reaches this deferral on the next attempt.
         if status == 400
-            && !ctx.tool_schema_degraded
+            && !ctx.tools_removed
             && !ctx.tool_calls_repaired
             && !should_failover_status(status, ctx, provider)
         {
@@ -6812,9 +6821,10 @@ impl ProxyHttp for AiGateway {
         // tool schemas the other upstreams take. The gateway projected them
         // before forwarding; a rejection that survives the projection means
         // the projection missed a rule, and the turn must still not die on
-        // it: the request is replayed once with degraded tool schemas (the
-        // tool names survive, the argument contracts collapse to a bare
-        // object). A 400 that names anything else is the client's own
+        // it: the request is replayed with degraded tool schemas (the tool
+        // names survive, the argument contracts collapse to a bare object).
+        // If that last honest shape is also refused, the terminal replay has
+        // no tools at all. A 400 that names anything else is the client's own
         // fault — the buffered body is handed back untouched.
         if ctx.pending_tool_schema_repair {
             if let Some(data) = body.as_ref() {
@@ -6839,7 +6849,11 @@ impl ProxyHttp for AiGateway {
                 let hot = self.hot.load();
                 match Self::kernel_error_repair(&hot, ctx.pending_tool_schema_status, &text, ctx) {
                     maxllm_translate::kernel::KernelRepair::SchemaDegrade => {
-                        return Err(self.begin_tool_schema_repair(ctx));
+                        return Err(if ctx.tool_schema_degraded {
+                            self.begin_tool_surface_removal(ctx)
+                        } else {
+                            self.begin_tool_schema_repair(ctx)
+                        });
                     }
                     maxllm_translate::kernel::KernelRepair::OrphanRepair => {
                         return Err(self.begin_orphan_tool_call_repair(ctx));
@@ -6848,7 +6862,11 @@ impl ProxyHttp for AiGateway {
                 }
             }
             if body_reports_tool_schema(&text) {
-                return Err(self.begin_tool_schema_repair(ctx));
+                return Err(if ctx.tool_schema_degraded {
+                    self.begin_tool_surface_removal(ctx)
+                } else {
+                    self.begin_tool_schema_repair(ctx)
+                });
             }
             // The upstream refused the conversation's tool history: an
             // assistant tool call the history never answered (`… must be
@@ -9214,6 +9232,47 @@ impl AiGateway {
             pingora::ErrorType::HTTPStatus(400),
             format!(
                 "provider '{}' refused the tool schemas; retrying it with degraded tool schemas",
+                ctx.provider_name
+            ),
+        );
+        e.as_up();
+        e.set_retry(true);
+        e
+    }
+
+    /// Reset the request for the terminal tool-schema replay: no tools.
+    ///
+    /// The degradation retry exists to preserve the model's function-calling
+    /// surface. When the upstream rejects even bare object schemas, that
+    /// surface cannot be preserved on this provider; dropping it is still
+    /// better than handing the schema fault back and ending the turn.
+    fn begin_tool_surface_removal(&self, ctx: &mut RequestCtx) -> Box<pingora::Error> {
+        ctx.tools_removed = true;
+        ctx.body_translated = false;
+        ctx.upstream_responded = false;
+        ctx.request_body_buf.clear();
+        // The deferred quota decision belonged to the attempt that just
+        // failed; the terminal retry is a fresh answer and must not be
+        // swallowed by the dead attempt's bookkeeping.
+        ctx.pending_rate_limit = None;
+        ctx.replay_body = ctx.client_body.clone();
+        ctx.replay_injected = false;
+        ctx.keep_request_content_length = false;
+        if let Ok(mut guard) = ctx.stream_translator.lock() {
+            *guard = None;
+        }
+        METRICS
+            .tool_schema_repair_retries_total
+            .with_label_values(&[&ctx.provider_name])
+            .inc();
+        info!(
+            provider = %ctx.provider_name,
+            "upstream refused degraded tool schemas — retrying without the tool surface"
+        );
+        let mut e = pingora::Error::explain(
+            pingora::ErrorType::HTTPStatus(400),
+            format!(
+                "provider '{}' refused degraded tool schemas; retrying without the tool surface",
                 ctx.provider_name
             ),
         );
