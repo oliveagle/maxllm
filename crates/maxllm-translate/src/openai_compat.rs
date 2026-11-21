@@ -59,6 +59,29 @@ pub enum NativeResponsesRepair {
     /// prefill anchor; mid-history assistant turns and tool turns are left
     /// alone.
     ArkTrailingAssistantTurn,
+    /// Make every reasoning item carry a `reasoning_text`, and make every
+    /// step that carries a tool call lead with one.
+    ///
+    /// DeepSeek's native Responses endpoint reads one step of the model
+    /// (its reasoning, what it said and the calls it made, between a user
+    /// message or a tool output and the next) as a single assistant message
+    /// whose thinking is the reasoning item the step *starts* with. A step
+    /// that starts with anything else — a call, or what the model said
+    /// before the call — is refused with
+    /// `400 The `reasoning_text` in the thinking mode must be passed back to
+    /// the API` (verified live against `api.deepseek.com` on 2026-11-21:
+    /// `[message, function_call]` answers 400, `[reasoning, message,
+    /// function_call]` answers 200).
+    ///
+    /// The same refusal comes from a reasoning item that carries no
+    /// reasoning text at all: codex replays a sealed item (only
+    /// `encrypted_content`), a summary-only item, or a step whose reasoning
+    /// belongs to another model in a mixed group. The repair gives every
+    /// reasoning item a `reasoning_text` (its own text when it has one, its
+    /// summary otherwise, a single space when it has neither) and moves the
+    /// step's first reasoning item to its front, adding a placeholder item
+    /// when the step has none.
+    DeepSeekReasoningLead,
 }
 
 impl OpenAICompatTranslator {
@@ -179,6 +202,7 @@ impl ProviderTranslator for OpenAICompatTranslator {
         match self.native_responses_repair {
             NativeResponsesRepair::None => body.to_vec(),
             NativeResponsesRepair::ArkTrailingAssistantTurn => drop_trailing_assistant_turns(body),
+            NativeResponsesRepair::DeepSeekReasoningLead => with_reasoning_lead(body),
         }
     }
 
@@ -243,6 +267,242 @@ pub fn drop_trailing_assistant_turns(body: &[u8]) -> Vec<u8> {
         return body.to_vec();
     }
     serde_json::to_vec(&root).unwrap_or_else(|_| body.to_vec())
+}
+
+/// The reasoning text a step that has no reasoning of its own leads with.
+///
+/// A single space: the upstream only checks that the text is there and
+/// non-empty, and a marker word would leak into the model's context.
+const NO_REASONING: &str = " ";
+
+/// Give every reasoning item of a native Responses request a `reasoning_text`,
+/// and make every step that carries a tool call (or that follows a tool
+/// output) lead with one.
+///
+/// DeepSeek's native Responses endpoint refuses a request whose step does not
+/// start with a reasoning item that carries text — the reasoning of the
+/// turn being continued has to be passed back — answering
+/// `400 The `reasoning_text` in the thinking mode must be passed back to the
+/// API`. Three shapes reach it that way:
+///
+/// * a step that starts with an assistant message or a tool call, because
+///   codex replays the model's turns as separate items and puts the
+///   reasoning item after the message it belongs to;
+/// * a reasoning item that carries no text — codex replays it as it got it,
+///   and it got it from another model in a mixed group (summary only), from
+///   a sealed backend (`encrypted_content` only) or from a model that did
+///   not think at all;
+/// * a step that follows a tool output and does not start with a reasoning
+///   item.
+///
+/// The repair gives every reasoning item a `reasoning_text` (its own text
+/// when it has one, its summary otherwise, a single space when it has
+/// neither) and moves the step's first reasoning item to the front of the
+/// step, adding a placeholder item when the step has none.
+///
+/// A body that needs neither change comes back byte for byte.
+pub fn with_reasoning_lead(body: &[u8]) -> Vec<u8> {
+    let Ok(mut root) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return body.to_vec();
+    };
+    let Some(obj) = root.as_object_mut() else {
+        return body.to_vec();
+    };
+    let Some(items) = obj.get_mut("input").and_then(|v| v.as_array_mut()) else {
+        return body.to_vec();
+    };
+
+    let mut changed = false;
+    let mut kinds: Vec<StepKind> = Vec::with_capacity(items.len());
+    for item in items.iter_mut() {
+        let (kind, is_reasoning) = step_kind_of(item);
+        kinds.push(kind);
+        if !is_reasoning {
+            continue;
+        }
+        if has_reasoning_text(item) {
+            continue;
+        }
+        let text = summary_text(item).unwrap_or_else(|| NO_REASONING.to_string());
+        if let Some(item_obj) = item.as_object_mut() {
+            item_obj.insert(
+                "content".to_string(),
+                serde_json::json!([{ "type": "reasoning_text", "text": text }]),
+            );
+            changed = true;
+        }
+    }
+
+    if let Some(led) = reason_first(items, &kinds) {
+        *items = led;
+        changed = true;
+    }
+
+    if !changed {
+        return body.to_vec();
+    }
+    serde_json::to_vec(&root).unwrap_or_else(|_| body.to_vec())
+}
+
+/// What one Responses input item is to a step of the model's turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StepKind {
+    /// The model's own reasoning.
+    Reasoning,
+    /// Something the model said.
+    Said,
+    /// A call the model made.
+    Call,
+    /// What answered a call.
+    Output,
+    /// A message of the user (or the system) — the start of a turn.
+    Turn,
+    /// Anything else.
+    Other,
+}
+
+/// Classify one Responses input item.
+fn step_kind_of(item: &serde_json::Value) -> (StepKind, bool) {
+    let Some(obj) = item.as_object() else {
+        return (StepKind::Other, false);
+    };
+    let item_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    let role = obj.get("role").and_then(|v| v.as_str()).unwrap_or("");
+    let kind = match item_type {
+        "reasoning" => StepKind::Reasoning,
+        t if t.ends_with("_output") => StepKind::Output,
+        t if t.ends_with("_call") => StepKind::Call,
+        "message" => {
+            if role == "assistant" {
+                StepKind::Said
+            } else {
+                StepKind::Turn
+            }
+        }
+        "" => {
+            if role == "assistant" {
+                StepKind::Said
+            } else if !role.is_empty() {
+                StepKind::Turn
+            } else {
+                StepKind::Other
+            }
+        }
+        _ => StepKind::Other,
+    };
+    (kind, item_type == "reasoning")
+}
+
+/// Whether a reasoning item already carries a non-empty `reasoning_text`.
+fn has_reasoning_text(item: &serde_json::Value) -> bool {
+    item.get("content")
+        .and_then(|c| c.as_array())
+        .map(|parts| {
+            parts.iter().any(|part| {
+                part.get("type").and_then(|t| t.as_str()) == Some("reasoning_text")
+                    && part
+                        .get("text")
+                        .and_then(|t| t.as_str())
+                        .map(|t| !t.is_empty())
+                        .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// The summary text of a reasoning item, when it has one.
+fn summary_text(item: &serde_json::Value) -> Option<String> {
+    let summary = item.get("summary")?.as_array()?;
+    let mut text = String::new();
+    for part in summary {
+        if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+            text.push_str(t);
+        }
+    }
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+/// The reasoning item a step leads with when it has none of its own.
+fn placeholder_reasoning_item() -> serde_json::Value {
+    serde_json::json!({
+        "type": "reasoning",
+        "summary": [],
+        "content": [{ "type": "reasoning_text", "text": NO_REASONING }],
+    })
+}
+
+/// Move the first reasoning item of every step that needs one to the front
+/// of that step.
+///
+/// A step is a run of the model's reasoning, what it said and the calls it
+/// made, between a user message or a tool output and the next. A step that
+/// makes a call, or that follows a tool output, has to lead with a
+/// reasoning item: the upstream reads the step as one assistant message
+/// whose thinking is the item it starts with. The step's own first
+/// reasoning item is moved ahead of the rest; a step without one gets the
+/// placeholder.
+///
+/// Returns `None` when every such step already leads with a reasoning item.
+fn reason_first(items: &[serde_json::Value], kinds: &[StepKind]) -> Option<Vec<serde_json::Value>> {
+    let is_step =
+        |kind: StepKind| matches!(kind, StepKind::Reasoning | StepKind::Said | StepKind::Call);
+    let mut led: Vec<serde_json::Value> = Vec::with_capacity(items.len() + 1);
+    let mut changed = false;
+    let mut after_output = false;
+    let mut i = 0usize;
+    while i < kinds.len() {
+        if !is_step(kinds[i]) {
+            match kinds[i] {
+                StepKind::Output => after_output = true,
+                StepKind::Turn => after_output = false,
+                _ => {}
+            }
+            if changed {
+                led.push(items[i].clone());
+            }
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut end = i;
+        let mut has_call = false;
+        let mut first_reasoning: Option<usize> = None;
+        while end < kinds.len() && is_step(kinds[end]) {
+            has_call = has_call || kinds[end] == StepKind::Call;
+            if kinds[end] == StepKind::Reasoning && first_reasoning.is_none() {
+                first_reasoning = Some(end);
+            }
+            end += 1;
+        }
+        let needs_lead = (has_call || after_output) && first_reasoning != Some(start);
+        if needs_lead {
+            if !changed {
+                led = items[..start].to_vec();
+                changed = true;
+            }
+            match first_reasoning {
+                None => led.push(placeholder_reasoning_item()),
+                Some(idx) => led.push(items[idx].clone()),
+            }
+            for (x, item) in items.iter().enumerate().take(end).skip(start) {
+                if Some(x) != first_reasoning {
+                    led.push(item.clone());
+                }
+            }
+        } else if changed {
+            led.extend_from_slice(&items[start..end]);
+        }
+        i = end;
+    }
+    if changed {
+        Some(led)
+    } else {
+        None
+    }
 }
 
 /// Whether one Responses input item is an assistant **message** — the only
@@ -459,6 +719,114 @@ mod tests {
         ]}"#;
         let out = ark().normalize_native_responses_request(body);
         assert_eq!(out, body.to_vec());
+    }
+
+    #[test]
+    fn test_deepseek_reasoning_lead_puts_a_reasoning_item_in_front() {
+        // The shape DeepSeek refuses: the step starts with what the model
+        // said and only then makes the call.
+        let body = br#"{"model":"deepseek-flash","input":[
+            {"role":"user","content":[{"type":"input_text","text":"hi"}]},
+            {"type":"message","role":"assistant","content":[{"type":"output_text","text":"let me look"}]},
+            {"type":"function_call","name":"get_time","arguments":"{}","call_id":"call_1"}
+        ]}"#;
+        let out = with_reasoning_lead(body);
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let input = parsed["input"].as_array().unwrap();
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[1]["type"], "reasoning");
+        assert_eq!(input[1]["content"][0]["type"], "reasoning_text");
+        assert_eq!(input[1]["content"][0]["text"], " ");
+        assert_eq!(input[2]["type"], "message");
+        assert_eq!(input[3]["type"], "function_call");
+    }
+
+    #[test]
+    fn test_deepseek_reasoning_lead_moves_an_existing_reasoning_item_ahead() {
+        // Codex replays the model's turn with the reasoning item behind the
+        // message it belongs to; the upstream wants it in front.
+        let body = br#"{"model":"deepseek-flash","input":[
+            {"role":"user","content":[{"type":"input_text","text":"hi"}]},
+            {"type":"message","role":"assistant","content":[{"type":"output_text","text":"let me look"}]},
+            {"type":"reasoning","id":"rs_1","summary":[],"content":[{"type":"reasoning_text","text":"thinking"}]},
+            {"type":"function_call","name":"get_time","arguments":"{}","call_id":"call_1"}
+        ]}"#;
+        let out = with_reasoning_lead(body);
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let input = parsed["input"].as_array().unwrap();
+        assert_eq!(input[1]["type"], "reasoning");
+        assert_eq!(input[1]["content"][0]["text"], "thinking");
+        assert_eq!(input[2]["type"], "message");
+        assert_eq!(input[3]["type"], "function_call");
+    }
+
+    #[test]
+    fn test_deepseek_reasoning_lead_gives_a_summary_only_item_its_text() {
+        // A summary-only item (translated from another model) has no
+        // reasoning_text; the upstream refuses the whole request over it.
+        let body = br#"{"model":"deepseek-flash","input":[
+            {"role":"user","content":[{"type":"input_text","text":"hi"}]},
+            {"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"thinking"}]},
+            {"type":"function_call","name":"get_time","arguments":"{}","call_id":"call_1"}
+        ]}"#;
+        let out = with_reasoning_lead(body);
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let input = parsed["input"].as_array().unwrap();
+        assert_eq!(input[1]["content"][0]["type"], "reasoning_text");
+        assert_eq!(input[1]["content"][0]["text"], "thinking");
+    }
+
+    #[test]
+    fn test_deepseek_reasoning_lead_gives_a_sealed_item_a_placeholder() {
+        // A sealed item (encrypted_content only) is refused as well.
+        let body = br#"{"model":"deepseek-flash","input":[
+            {"role":"user","content":[{"type":"input_text","text":"hi"}]},
+            {"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"opaque"},
+            {"type":"function_call","name":"get_time","arguments":"{}","call_id":"call_1"}
+        ]}"#;
+        let out = with_reasoning_lead(body);
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let input = parsed["input"].as_array().unwrap();
+        assert_eq!(input[1]["content"][0]["type"], "reasoning_text");
+        assert_eq!(input[1]["content"][0]["text"], " ");
+        assert_eq!(input[1]["encrypted_content"], "opaque");
+    }
+
+    #[test]
+    fn test_deepseek_reasoning_lead_leads_a_step_after_a_tool_output() {
+        let body = br#"{"model":"deepseek-flash","input":[
+            {"role":"user","content":[{"type":"input_text","text":"hi"}]},
+            {"type":"function_call","name":"get_time","arguments":"{}","call_id":"call_1"},
+            {"type":"function_call_output","call_id":"call_1","output":"12:00"},
+            {"type":"message","role":"assistant","content":[{"type":"output_text","text":"it is noon"}]}
+        ]}"#;
+        let out = with_reasoning_lead(body);
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let input = parsed["input"].as_array().unwrap();
+        // The call step leads with a reasoning item, and so does the step
+        // that follows the tool output.
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[1]["type"], "reasoning");
+        assert_eq!(input[2]["type"], "function_call");
+        assert_eq!(input[3]["type"], "function_call_output");
+        assert_eq!(input[4]["type"], "reasoning");
+        assert_eq!(input[5]["type"], "message");
+    }
+
+    #[test]
+    fn test_deepseek_reasoning_lead_leaves_a_plain_body_alone() {
+        let body = br#"{"model":"deepseek-flash","input":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}]}"#;
+        assert_eq!(with_reasoning_lead(body), body.to_vec());
+    }
+
+    #[test]
+    fn test_deepseek_reasoning_lead_leaves_a_leading_reasoning_step_alone() {
+        let body = br#"{"model":"deepseek-flash","input":[
+            {"role":"user","content":[{"type":"input_text","text":"hi"}]},
+            {"type":"reasoning","id":"rs_1","summary":[],"content":[{"type":"reasoning_text","text":"thinking"}]},
+            {"type":"function_call","name":"get_time","arguments":"{}","call_id":"call_1"}
+        ]}"#;
+        assert_eq!(with_reasoning_lead(body), body.to_vec());
     }
 
     #[test]

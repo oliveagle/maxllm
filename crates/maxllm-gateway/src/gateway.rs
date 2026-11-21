@@ -621,6 +621,36 @@ pub fn apply_quota_parking(config: &Config, hot: &HotState) {
 /// The config decides first (`tool_schema = "moonshot"` / `"none"`); unset,
 /// the upstream host decides — a Moonshot-family host runs the stricter
 /// validator, every other provider takes the tool schemas as they are.
+/// The native-Responses repair a provider needs on its request body.
+///
+/// The provider's own declaration wins; an unset declaration falls back to
+/// the upstream host: ark (`*.volces.com`) needs the trailing-assistant-turn
+/// repair, DeepSeek (`*.deepseek.com`) needs the reasoning-lead repair, and
+/// every other upstream keeps the body byte-for-byte. `ark_default` is off
+/// for a provider whose kind already names its upstream family.
+fn native_responses_repair_for(
+    declared: Option<&str>,
+    base_url: &str,
+    ark_default: bool,
+) -> maxllm_translate::openai_compat::NativeResponsesRepair {
+    use maxllm_translate::openai_compat::NativeResponsesRepair as Repair;
+    match declared {
+        Some("ark_trailing_assistant") => Repair::ArkTrailingAssistantTurn,
+        Some("deepseek_reasoning_lead") => Repair::DeepSeekReasoningLead,
+        Some("none") => Repair::None,
+        _ => {
+            let host = base_url.to_ascii_lowercase();
+            if ark_default && host.contains("volces.com") {
+                Repair::ArkTrailingAssistantTurn
+            } else if host.contains("deepseek.com") {
+                Repair::DeepSeekReasoningLead
+            } else {
+                Repair::None
+            }
+        }
+    }
+}
+
 fn wants_moonshot_tool_schema(conf: &maxllm_config::ProviderConfig) -> bool {
     match conf.tool_schema.as_deref() {
         Some("moonshot") => true,
@@ -696,7 +726,15 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
                 Box::new(maxllm_translate::openai_compat::OpenAICompatTranslator::xai())
             }
             ProviderKind::DeepSeek => {
-                Box::new(maxllm_translate::openai_compat::OpenAICompatTranslator::deepseek())
+                let translator =
+                    maxllm_translate::openai_compat::OpenAICompatTranslator::deepseek();
+                Box::new(
+                    translator.with_native_responses_repair(native_responses_repair_for(
+                        conf.native_responses_repair.as_deref(),
+                        &conf.base_url,
+                        false,
+                    )),
+                )
             }
             ProviderKind::Ollama => {
                 Box::new(maxllm_translate::openai_compat::OpenAICompatTranslator::ollama())
@@ -712,24 +750,31 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
                     path.to_string(),
                     maxllm_translate::openai_compat::AuthStyle::Bearer,
                 );
-                // Volcengine Ark's Responses prefill validator rejects an
-                // input list ending in an assistant text turn with a
-                // misleading MissingParameter `partial`. Codex compaction
-                // sends exactly that shape, so ark providers repair it before
-                // forwarding; every other openai_compat upstream keeps the
-                // body byte-for-byte.
-                let wants_ark_repair = match conf.native_responses_repair.as_deref() {
-                    Some("ark_trailing_assistant") => true,
-                    Some("none") => false,
-                    _ => conf.base_url.to_ascii_lowercase().contains("volces.com"),
-                };
-                let translator = if wants_ark_repair {
-                    translator.with_native_responses_repair(
-                        maxllm_translate::openai_compat::NativeResponsesRepair::ArkTrailingAssistantTurn,
-                    )
-                } else {
-                    translator
-                };
+                // Two upstreams refuse part of the Responses contract, and
+                // each needs its own repair:
+                //
+                // * Volcengine Ark's Responses prefill validator rejects an
+                //   input list ending in an assistant text turn with a
+                //   misleading MissingParameter `partial`. Codex compaction
+                //   sends exactly that shape, so ark providers drop the
+                //   trailing turn before forwarding.
+                // * DeepSeek's Responses endpoint refuses a request whose
+                //   step does not start with a reasoning item that carries
+                //   text (`The reasoning_text in the thinking mode must be
+                //   passed back to the API`) — codex replays a sealed
+                //   reasoning item (encrypted_content only) and puts the
+                //   reasoning behind the message it belongs to, so the
+                //   repair gives every reasoning item its text back and
+                //   moves the step's first reasoning item to its front.
+                //
+                // Every other openai_compat upstream keeps the body
+                // byte-for-byte.
+                let translator =
+                    translator.with_native_responses_repair(native_responses_repair_for(
+                        conf.native_responses_repair.as_deref(),
+                        &conf.base_url,
+                        true,
+                    ));
                 Box::new(translator)
             }
             ProviderKind::OpenCode => {
@@ -10777,6 +10822,68 @@ api_key = "sk-test"
         let p = &state.providers["opencode"];
         assert_eq!(p.connect_timeout, Duration::from_secs(30));
         assert_eq!(p.total_connect_timeout, Some(Duration::from_secs(60)));
+    }
+}
+
+#[cfg(test)]
+mod native_responses_repair_selection_tests {
+    use super::*;
+    use maxllm_translate::openai_compat::NativeResponsesRepair;
+
+    #[test]
+    fn test_ark_host_gets_the_trailing_assistant_repair() {
+        assert_eq!(
+            native_responses_repair_for(None, "https://ark.cn-beijing.volces.com", true),
+            NativeResponsesRepair::ArkTrailingAssistantTurn
+        );
+    }
+
+    #[test]
+    fn test_deepseek_host_gets_the_reasoning_lead_repair() {
+        assert_eq!(
+            native_responses_repair_for(None, "https://api.deepseek.com", true),
+            NativeResponsesRepair::DeepSeekReasoningLead
+        );
+    }
+
+    #[test]
+    fn test_other_hosts_get_no_repair() {
+        assert_eq!(
+            native_responses_repair_for(None, "https://api.kimi.com", true),
+            NativeResponsesRepair::None
+        );
+    }
+
+    #[test]
+    fn test_the_declaration_wins_over_the_host() {
+        assert_eq!(
+            native_responses_repair_for(Some("none"), "https://api.deepseek.com", true),
+            NativeResponsesRepair::None
+        );
+        assert_eq!(
+            native_responses_repair_for(
+                Some("ark_trailing_assistant"),
+                "https://api.deepseek.com",
+                true
+            ),
+            NativeResponsesRepair::ArkTrailingAssistantTurn
+        );
+        assert_eq!(
+            native_responses_repair_for(
+                Some("deepseek_reasoning_lead"),
+                "https://ark.cn-beijing.volces.com",
+                true
+            ),
+            NativeResponsesRepair::DeepSeekReasoningLead
+        );
+    }
+
+    #[test]
+    fn test_a_provider_kind_that_names_its_family_never_gets_the_ark_default() {
+        assert_eq!(
+            native_responses_repair_for(None, "https://ark.cn-beijing.volces.com", false),
+            NativeResponsesRepair::None
+        );
     }
 }
 

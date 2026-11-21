@@ -13594,7 +13594,7 @@ fn trailing_assistant_input() -> Value {
     ])
 }
 
-async fn native_responses_upstream_reply(mock: &MockServer) {
+async fn native_responses_upstream_reply_at(mock: &MockServer, responses_path: &str) {
     let upstream_body = json!({
         "id": "resp_ark",
         "object": "response",
@@ -13604,11 +13604,15 @@ async fn native_responses_upstream_reply(mock: &MockServer) {
         "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
     });
     Mock::given(method("POST"))
-        .and(path("/api/coding/v3/responses"))
+        .and(path(responses_path))
         .respond_with(ResponseTemplate::new(200).set_body_json(upstream_body))
         .expect(1)
         .mount(mock)
         .await;
+}
+
+async fn native_responses_upstream_reply(mock: &MockServer) {
+    native_responses_upstream_reply_at(mock, "/api/coding/v3/responses").await;
 }
 
 #[tokio::test]
@@ -13641,6 +13645,87 @@ async fn test_ark_native_responses_drops_trailing_assistant_text_turn() {
         "the trailing assistant text turn must be dropped, got {input:?}"
     );
     assert_eq!(input[0]["role"], "user");
+}
+
+/// A native-Responses provider that declares the DeepSeek reasoning-lead
+/// repair. `base_url` points at the mock, so the repair can only come from
+/// the named config field.
+const DEEPSEEK_REPAIR_NATIVE_RESPONSES_CONFIG: &str = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[metrics]
+enabled = true
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.mock_deepseek]
+kind = "openai_compat"
+base_url = "{MOCK_URL}"
+upstream_path = "/v1/chat/completions"
+responses_path = "/v1/responses"
+native_responses = true
+native_responses_repair = "deepseek_reasoning_lead"
+api_key = "fake-key"
+
+[[routes]]
+path = "/v1/responses"
+provider = "mock_deepseek"
+endpoint_type = "responses"
+"#;
+
+/// The body codex sends when it replays a turn whose reasoning came back
+/// sealed (only `encrypted_content`) and whose message came before the
+/// reasoning item.
+fn sealed_reasoning_input() -> Value {
+    json!([
+        {"role": "user", "content": [{"type": "input_text", "text": "what time is it"}]},
+        {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "let me look"}]},
+        {"type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": "opaque"},
+        {"type": "function_call", "name": "get_time", "arguments": "{}", "call_id": "call_1"}
+    ])
+}
+
+#[tokio::test]
+async fn test_deepseek_native_responses_leads_with_a_reasoning_item() {
+    let mock = MockServer::start().await;
+    native_responses_upstream_reply_at(&mock, "/v1/responses").await;
+
+    let gw = TestGateway::start(DEEPSEEK_REPAIR_NATIVE_RESPONSES_CONFIG, &mock.uri()).await;
+    let request_body = json!({
+        "model": "deepseek-flash",
+        "input": sealed_reasoning_input(),
+        "stream": false
+    });
+
+    let resp = client()
+        .post(gw.url("/v1/responses"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&request_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let requests = mock.received_requests().await.unwrap();
+    let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let input = sent["input"].as_array().expect("input must stay an array");
+    // The step that makes the call leads with a reasoning item, and that
+    // item carries the text the upstream asks for.
+    assert_eq!(input[1]["type"], "reasoning");
+    assert_eq!(input[1]["content"][0]["type"], "reasoning_text");
+    assert_eq!(input[1]["content"][0]["text"], " ");
+    // The sealed blob is kept: it is the item's own id.
+    assert_eq!(input[1]["encrypted_content"], "opaque");
+    assert_eq!(input[2]["type"], "message");
+    assert_eq!(input[3]["type"], "function_call");
 }
 
 #[tokio::test]

@@ -549,10 +549,19 @@ pub struct ProviderConfig {
     ///   `400 MissingParameter \`partial\`` for such an input (the parameter
     ///   is a red herring; the rejected thing is the trailing turn), which is
     ///   the shape codex remote compaction sends.
+    /// * `"deepseek_reasoning_lead"` — give every reasoning item a
+    ///   `reasoning_text` and make every step that carries a tool call lead
+    ///   with one. DeepSeek's Responses endpoint refuses a request whose
+    ///   step does not start with a reasoning item that carries text
+    ///   (`400 The reasoning_text in the thinking mode must be passed back
+    ///   to the API`): codex replays a sealed reasoning item
+    ///   (`encrypted_content` only) and puts the reasoning behind the
+    ///   message it belongs to.
     /// * `"none"` — force no repair, overriding the host-based default.
     ///
     /// Unset means the gateway picks by upstream host: ark (`*.volces.com`)
-    /// providers get `ark_trailing_assistant`, every other provider gets no
+    /// providers get `ark_trailing_assistant`, DeepSeek (`*.deepseek.com`)
+    /// providers get `deepseek_reasoning_lead`, every other provider gets no
     /// repair.
     #[serde(default)]
     pub native_responses_repair: Option<String>,
