@@ -394,6 +394,7 @@ fn repair_chat_messages(messages: &mut Vec<Value>) -> bool {
 /// * Kimi (flat form): `tool_call_id … is not found`
 /// * OpenAI: `No tool output found for function call …`
 /// * DeepSeek Responses: `No tool call found for tool output with call_id …`
+/// * DeepSeek Responses: `No tool output found for tool call …`
 ///
 /// Deliberately narrow: a genuine request fault reaches the client exactly
 /// as before.
@@ -403,6 +404,7 @@ pub fn body_reports_orphan_tool_call(body: &str) -> bool {
         "tool_call_id",
         "no tool call found for tool output",
         "no tool output found for function call",
+        "no tool output found for tool call",
     ];
     let lower = body.to_ascii_lowercase();
     MARKERS.iter().any(|m| lower.contains(m))
@@ -776,6 +778,11 @@ mod orphan_tool_call_tests {
         ));
         assert!(body_reports_orphan_tool_call(
             "No tool output found for function call call_abc"
+        ));
+        // DeepSeek's complementary phrasing: a call the history never
+        // answered (vs. an output whose call is missing).
+        assert!(body_reports_orphan_tool_call(
+            "No tool output found for tool call call_dc6e0ec7e9da434e93a9fcc8."
         ));
         // A genuine request fault is never mistaken for one.
         assert!(!body_reports_orphan_tool_call(
