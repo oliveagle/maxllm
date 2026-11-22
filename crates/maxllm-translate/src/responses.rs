@@ -960,6 +960,8 @@ pub fn body_has_synthetic_call_id(body: &[u8]) -> bool {
 /// A call in the input, with the id its answer must carry.
 struct CallSlot {
     id: String,
+    /// The input index of the call itself.
+    source_index: usize,
     /// An output has already claimed this call.
     answered: bool,
 }
@@ -1029,12 +1031,16 @@ fn synthetic_call_item(call_id: &str, output: &Value, seq: usize) -> Value {
 /// The repair mirrors the chat-side `repair_tool_call_ids`:
 /// * a call item with an empty/missing `call_id` gets a synthetic
 ///   `call_maxllm_<n>` and waits for an answer;
-/// * an output item with an empty/missing `call_id` answers the oldest call
-///   that is still waiting for an answer — so a call and its answer stay
-///   paired — and gets a fresh synthetic id when no call is waiting;
-/// * an output item that already carries a `call_id` keeps it: rewriting a
-///   call id the client chose would break the pairing with the item that
-///   issued the call.
+/// * an output item with an empty/missing `call_id` answers the oldest
+///   **earlier** call that is still waiting for an answer — so a call and
+///   its answer stay paired — and gets a fresh synthetic id when no call is
+///   waiting;
+/// * an output item that already carries a `call_id` keeps it and only
+///   pairs with an **earlier** call of that id: rewriting a call id the
+///   client chose would break the pairing with the item that issued the
+///   call. If that chosen id belongs to a later call, the orphan also gets
+///   a fresh gateway id: preserving the later id would leave two calls with
+///   one id and mis-pair the real answer.
 ///
 /// A tool output whose call is **not in the request** is an orphan, and an
 /// orphan is not enough for a strict upstream: kimi rejects an answer whose
@@ -1075,11 +1081,13 @@ pub fn repair_input_call_ids(root: &mut Value) -> bool {
             synthetic_calls.push((idx, id.clone()));
             calls.push(CallSlot {
                 id,
+                source_index: idx,
                 answered: false,
             });
         } else {
             calls.push(CallSlot {
                 id: current,
+                source_index: idx,
                 answered: false,
             });
         }
@@ -1092,8 +1100,9 @@ pub fn repair_input_call_ids(root: &mut Value) -> bool {
     }
 
     // ── Pass 2: every output gets a `call_id`, and a call to answer ─────
-    // (index, call id, whether the output needs a call of its own)
-    let mut plans: Vec<(usize, String, bool)> = Vec::new();
+    // (index, call id, whether the output needs a call of its own, whether
+    // to rewrite the output's existing id)
+    let mut plans: Vec<(usize, String, bool, bool)> = Vec::new();
     for (idx, item) in original.iter().enumerate() {
         let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
         if !matches!(
@@ -1109,31 +1118,46 @@ pub fn repair_input_call_ids(root: &mut Value) -> bool {
             .trim()
             .to_string();
         if !current.is_empty() {
-            // The answer names a call. When that call is in the request the
-            // pair is complete; otherwise the answer is an orphan and gets a
-            // call of its own (carrying the id the client chose).
-            let mut matched = false;
-            for slot in calls.iter_mut() {
-                if slot.id == current {
-                    matched = true;
-                    if !slot.answered {
-                        slot.answered = true;
-                        break;
-                    }
-                }
-            }
-            plans.push((idx, current, !matched));
+            // The answer names a call. That call must already have been seen:
+            // a later call cannot answer this output. When the earlier call is
+            // in the request and waiting, the pair is complete; otherwise the
+            // answer is an orphan and gets a call of its own. Normally that
+            // call carries the client-chosen id; if that id names a later
+            // call, the orphan gets a fresh gateway id instead.
+            let matched = calls
+                .iter_mut()
+                .find(|slot| slot.source_index < idx && slot.id == current && !slot.answered)
+                .is_some_and(|slot| {
+                    slot.answered = true;
+                    true
+                });
+            let assigned = if calls
+                .iter()
+                .any(|slot| slot.source_index > idx && slot.id == current)
+            {
+                seq += 1;
+                format!("{SYNTHETIC_CALL_ID_PREFIX}{seq}")
+            } else {
+                current.clone()
+            };
+            let rewrite = assigned != current;
+            plans.push((idx, assigned, !matched, rewrite));
         } else {
-            // The answer does not name its call: it answers the oldest call
-            // that is still waiting for an answer.
-            match calls.iter_mut().find(|slot| !slot.answered) {
+            // The answer does not name its call: it answers the oldest
+            // earlier call that is still waiting for an answer. A later call
+            // belongs to a later output and must not be claimed here.
+            match calls
+                .iter_mut()
+                .find(|slot| slot.source_index < idx && !slot.answered)
+            {
                 Some(slot) => {
                     slot.answered = true;
-                    plans.push((idx, slot.id.clone(), false));
+                    plans.push((idx, slot.id.clone(), false, false));
                 }
                 None => {
                     seq += 1;
-                    plans.push((idx, format!("{SYNTHETIC_CALL_ID_PREFIX}{seq}"), true));
+                    let id = format!("{SYNTHETIC_CALL_ID_PREFIX}{seq}");
+                    plans.push((idx, id, true, true));
                 }
             }
         }
@@ -1145,7 +1169,7 @@ pub fn repair_input_call_ids(root: &mut Value) -> bool {
     let mut call_seq = 0usize;
     for (idx, mut item) in original.into_iter().enumerate() {
         while plan_at < plans.len() && plans[plan_at].0 == idx {
-            let (_, call_id, needs_own_call) = plans[plan_at].clone();
+            let (_, call_id, needs_own_call, rewrite) = plans[plan_at].clone();
             plan_at += 1;
             if needs_own_call {
                 call_seq += 1;
@@ -1159,7 +1183,7 @@ pub fn repair_input_call_ids(root: &mut Value) -> bool {
                     .unwrap_or("")
                     .trim()
                     .to_string();
-                if current.is_empty() {
+                if current.is_empty() || rewrite {
                     obj.insert("call_id".into(), Value::String(call_id));
                     modified = true;
                 }
@@ -4867,6 +4891,47 @@ mod tests {
         assert_eq!(root["input"][0]["type"], json!("function_call"));
         assert_eq!(root["input"][0]["call_id"], json!("call_x"));
         assert_eq!(root["input"][1]["call_id"], json!("call_x"));
+    }
+
+    #[test]
+    fn test_a_leading_output_never_claims_a_later_call() {
+        // This is the codex goal-output shape that broke DeepSeek: the
+        // leading host-side output names the id of a *later* model call. It
+        // must not consume that call; otherwise the real output becomes an
+        // orphan and the upstream rejects "No tool call found".
+        let mut root = json!({
+            "input": [
+                {"type": "message", "role": "user", "content": "hi"},
+                {"type": "function_call_output", "id": "fco_goal",
+                 "call_id": "call_later", "name": "goal_objective",
+                 "output": "the goal"},
+                {"type": "function_call", "id": "fc_later",
+                 "call_id": "call_later", "name": "exec",
+                 "arguments": "{}"},
+                {"type": "function_call_output", "id": "fco_later",
+                 "call_id": "call_later", "output": "done"}
+            ]
+        });
+
+        assert!(repair_input_call_ids(&mut root));
+        let items = root["input"].as_array().unwrap();
+
+        // The leading orphan gets its own synthetic call immediately before
+        // it. The later call's id is not safe to preserve, so both members of
+        // the synthetic pair use a fresh gateway id.
+        assert_eq!(items[1]["type"], json!("function_call"));
+        assert_eq!(items[1]["name"], json!("goal_objective"));
+        assert_eq!(items[1]["call_id"], json!("call_maxllm_1"));
+        assert_eq!(items[2]["type"], json!("function_call_output"));
+        assert_eq!(items[2]["call_id"], json!("call_maxllm_1"));
+
+        // The genuine later call keeps its id, and the following output
+        // answers that call without another invented call.
+        assert_eq!(items[3]["type"], json!("function_call"));
+        assert_eq!(items[3]["call_id"], json!("call_later"));
+        assert_eq!(items[4]["type"], json!("function_call_output"));
+        assert_eq!(items[4]["call_id"], json!("call_later"));
+        assert_eq!(items.len(), 5);
     }
 
     #[test]
