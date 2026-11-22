@@ -14534,6 +14534,42 @@ path = "/v1/chat/completions"
 provider = "kimi_mock"
 "#;
 
+/// The same Kimi route with a provider that can preserve the original tools.
+const MOONSHOT_TOOL_FALLBACK_CONFIG: &str = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[metrics]
+enabled = true
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.kimi_mock]
+kind = "openai_compat"
+base_url = "{MOCK_URL}"
+upstream_path = "/coding/v1/chat/completions"
+api_key = "fake-key"
+tool_schema = "moonshot"
+
+[providers.toolful]
+kind = "openai_compat"
+base_url = "{FALLBACK_URL}"
+api_key = "fake-key"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "kimi_mock"
+fallback = ["toolful"]
+strategy = "fallback"
+"#;
+
 /// codex sends zod 4 tool schemas: reused shapes live in `$defs`, refined
 /// ones are written as `$ref` beside their own keywords, and recursive ones
 /// never terminate — the shapes Kimi's "moonshot flavored json schema"
@@ -14686,19 +14722,20 @@ async fn test_moonshot_rejection_is_retried_with_degraded_tools() {
 }
 
 #[tokio::test]
-async fn test_a_second_moonshot_schema_rejection_drops_the_tool_surface() {
-    let mock = MockServer::start().await;
+async fn test_a_second_moonshot_schema_rejection_fails_over_with_tools() {
+    let kimi = MockServer::start().await;
+    let fallback = MockServer::start().await;
 
-    // Degraded schemas are the attempt to preserve function calling. If even
-    // those are refused, the final repair sacrifices that surface rather than
-    // surfacing the schema fault and ending the agent's turn.
+    // Degraded schemas are the last attempt to preserve function calling on
+    // this provider. If even those are refused, do not return a text-only
+    // answer: walk to a provider that can still call the client's tools.
     Mock::given(method("POST"))
         .and(path("/coding/v1/chat/completions"))
         .and(body_string_contains("\"$defs\""))
         .respond_with(ResponseTemplate::new(400).set_body_json(moonshot_rejection()))
         .with_priority(1)
         .expect(1)
-        .mount(&mock)
+        .mount(&kimi)
         .await;
     Mock::given(method("POST"))
         .and(path("/coding/v1/chat/completions"))
@@ -14706,17 +14743,22 @@ async fn test_a_second_moonshot_schema_rejection_drops_the_tool_surface() {
         .respond_with(ResponseTemplate::new(400).set_body_json(moonshot_rejection()))
         .with_priority(2)
         .expect(1)
-        .mount(&mock)
+        .mount(&kimi)
         .await;
     Mock::given(method("POST"))
-        .and(path("/coding/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("without tools")))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("with tools")))
         .with_priority(3)
         .expect(1)
-        .mount(&mock)
+        .mount(&fallback)
         .await;
 
-    let gw = TestGateway::start(MOONSHOT_TOOL_CONFIG, &mock.uri()).await;
+    let gw = TestGateway::start_with_fallback(
+        MOONSHOT_TOOL_FALLBACK_CONFIG,
+        &kimi.uri(),
+        &fallback.uri(),
+    )
+    .await;
     let c = client();
 
     let mut body = chat_body("kimi-for-coding", "hi");
@@ -14733,23 +14775,35 @@ async fn test_a_second_moonshot_schema_rejection_drops_the_tool_surface() {
     assert_eq!(
         resp.status(),
         200,
-        "the terminal tool repair must answer, not the second 400"
+        "the schema rejection must fail over, not silently remove tools"
+    );
+    assert_eq!(resp.headers().get("X-MaxLLM-Provider").unwrap(), "toolful");
+    assert_eq!(
+        resp.headers().get("X-MaxLLM-Fallback-From").unwrap(),
+        "kimi_mock"
     );
     assert_eq!(
         resp.json::<Value>().await.unwrap()["choices"][0]["message"]["content"],
-        "without tools"
+        "with tools"
     );
 
-    let requests = mock.received_requests().await.unwrap();
-    assert_eq!(requests.len(), 3, "project → degrade → remove");
-    for request in requests.iter().take(2) {
+    // Kimi sees the projected and degraded schemas. The fallback sees the
+    // client's original zod schema so its tool call retains the argument
+    // contract.
+    let kimi_reqs = kimi.received_requests().await.unwrap();
+    assert_eq!(kimi_reqs.len(), 2, "project → degrade, then fail over");
+    for request in &kimi_reqs {
         let sent: Value = serde_json::from_slice(&request.body).unwrap();
         assert!(sent.get("tools").is_some());
     }
-    let terminal: Value = serde_json::from_slice(&requests[2].body).unwrap();
-    assert!(terminal.get("tools").is_none());
-    assert!(terminal.get("tool_choice").is_none());
-    assert_eq!(terminal["messages"][0]["role"], "user");
+    let fallback_reqs = fallback.received_requests().await.unwrap();
+    assert_eq!(fallback_reqs.len(), 1);
+    let preserved: Value = serde_json::from_slice(&fallback_reqs[0].body).unwrap();
+    assert_eq!(preserved["tools"][0]["function"]["name"], "memory_feedback");
+    assert!(preserved["tools"][0]["function"]["parameters"]
+        .get("$defs")
+        .is_some());
+    assert_eq!(preserved["tool_choice"], "auto");
 }
 
 #[tokio::test]

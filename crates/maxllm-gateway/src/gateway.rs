@@ -6456,10 +6456,10 @@ impl ProxyHttp for AiGateway {
         // never answered: defer the decision until the body arrives, because
         // only the body says which of the two it is. When it names the
         // schemas, the request is replayed with degraded tool schemas; if the
-        // degraded schemas are also refused, the next replay drops the tool
-        // surface. When it names an unanswered tool call, the history is
-        // repaired and the request replayed. Either way the agent's turn
-        // continues; any other 400 passes through untouched.
+        // degraded schemas are also refused, the request walks to a provider
+        // that can preserve function calling. When it names an unanswered tool
+        // call, the history is repaired and the request replayed. Either way
+        // the agent's turn continues; any other 400 passes through untouched.
         // The deferral only preempts the handling that would end the turn
         // (a 400 this provider takes as a request fault): a 400 the route
         // would answer by model rewrite or failover keeps that handling —
@@ -6862,8 +6862,10 @@ impl ProxyHttp for AiGateway {
         // the projection missed a rule, and the turn must still not die on
         // it: the request is replayed with degraded tool schemas (the tool
         // names survive, the argument contracts collapse to a bare object).
-        // If that last honest shape is also refused, the terminal replay has
-        // no tools at all. A 400 that names anything else is the client's own
+        // If that last honest shape is also refused, this provider cannot
+        // serve the request as an agent request; preserve the tool surface by
+        // walking the fallback chain rather than silently returning a
+        // text-only answer. A 400 that names anything else is the client's own
         // fault — the buffered body is handed back untouched.
         if ctx.pending_tool_schema_repair {
             if let Some(data) = body.as_ref() {
@@ -6888,11 +6890,15 @@ impl ProxyHttp for AiGateway {
                 let hot = self.hot.load();
                 match Self::kernel_error_repair(&hot, ctx.pending_tool_schema_status, &text, ctx) {
                     maxllm_translate::kernel::KernelRepair::SchemaDegrade => {
-                        return Err(if ctx.tool_schema_degraded {
-                            self.begin_tool_surface_removal(ctx)
-                        } else {
-                            self.begin_tool_schema_repair(ctx)
-                        });
+                        if !ctx.tool_schema_degraded {
+                            return Err(self.begin_tool_schema_repair(ctx));
+                        }
+                        return self.fail_over_from_body_filter(
+                            session,
+                            ctx,
+                            ctx.pending_tool_schema_status,
+                            "provider refused degraded tool schemas",
+                        );
                     }
                     maxllm_translate::kernel::KernelRepair::OrphanRepair => {
                         return Err(if !ctx.tool_calls_repaired {
@@ -6912,18 +6918,15 @@ impl ProxyHttp for AiGateway {
                 }
             }
             if body_reports_tool_schema(&text) {
-                return Err(if !ctx.tool_schema_degraded {
-                    self.begin_tool_schema_repair(ctx)
-                } else if !ctx.tools_removed {
-                    self.begin_tool_surface_removal(ctx)
-                } else {
-                    return self.fail_over_from_body_filter(
-                        session,
-                        ctx,
-                        ctx.pending_tool_schema_status,
-                        "tool-schema repair ladder exhausted",
-                    );
-                });
+                if !ctx.tool_schema_degraded {
+                    return Err(self.begin_tool_schema_repair(ctx));
+                }
+                return self.fail_over_from_body_filter(
+                    session,
+                    ctx,
+                    ctx.pending_tool_schema_status,
+                    "provider refused degraded tool schemas",
+                );
             }
             // The upstream refused the conversation's tool history: an
             // assistant tool call the history never answered (`… must be
@@ -9403,47 +9406,6 @@ impl AiGateway {
             pingora::ErrorType::HTTPStatus(400),
             format!(
                 "provider '{}' refused the tool schemas; retrying it with degraded tool schemas",
-                ctx.provider_name
-            ),
-        );
-        e.as_up();
-        e.set_retry(true);
-        e
-    }
-
-    /// Reset the request for the terminal tool-schema replay: no tools.
-    ///
-    /// The degradation retry exists to preserve the model's function-calling
-    /// surface. When the upstream rejects even bare object schemas, that
-    /// surface cannot be preserved on this provider; dropping it is still
-    /// better than handing the schema fault back and ending the turn.
-    fn begin_tool_surface_removal(&self, ctx: &mut RequestCtx) -> Box<pingora::Error> {
-        ctx.tools_removed = true;
-        ctx.body_translated = false;
-        ctx.upstream_responded = false;
-        ctx.request_body_buf.clear();
-        // The deferred quota decision belonged to the attempt that just
-        // failed; the terminal retry is a fresh answer and must not be
-        // swallowed by the dead attempt's bookkeeping.
-        ctx.pending_rate_limit = None;
-        ctx.replay_body = ctx.client_body.clone();
-        ctx.replay_injected = false;
-        ctx.keep_request_content_length = false;
-        if let Ok(mut guard) = ctx.stream_translator.lock() {
-            *guard = None;
-        }
-        METRICS
-            .tool_schema_repair_retries_total
-            .with_label_values(&[&ctx.provider_name])
-            .inc();
-        info!(
-            provider = %ctx.provider_name,
-            "upstream refused degraded tool schemas — retrying without the tool surface"
-        );
-        let mut e = pingora::Error::explain(
-            pingora::ErrorType::HTTPStatus(400),
-            format!(
-                "provider '{}' refused degraded tool schemas; retrying without the tool surface",
                 ctx.provider_name
             ),
         );
