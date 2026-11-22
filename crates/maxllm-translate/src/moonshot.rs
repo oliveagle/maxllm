@@ -39,6 +39,13 @@
 //!   be defined in anyOf items`; the keyword is dropped from the parent and
 //!   given to the branches that lack one.
 //! * **an `enum`/`const` without a `type`** — the value's type is added.
+//! * **deeply nested `properties` chains** — Kimi's validator walks nested
+//!   subschemas with a depth limit of 30 and answers deeper plain nesting
+//!   (no `$ref` involved) with `detected infinite recursion without
+//!   termination condition` at the path of the first over-limit hop
+//!   (verified live: 29 levels accepted, 30 rejected). Branches deeper than
+//!   [`MAX_NESTING_DEPTH`] are cut to a terminating object before the body
+//!   leaves.
 //!
 //! And one last guard before a body is forwarded (see [`normalize_tools`]):
 //! a reference cycle that survives the projection — hidden under an
@@ -133,6 +140,15 @@ const CYCLE_WALK_BUDGET: usize = 100_000;
 /// only fences the pathological ones.
 const MAX_REF_DEPTH: usize = 8;
 
+/// How deep a plain (reference-free) subschema nest may go before the
+/// projection cuts it. Kimi's validator walks nested subschemas with a depth
+/// limit of 30 — at 30 it answers `detected infinite recursion without
+/// termination condition` even though no `$ref` is involved (verified live
+/// 2026-11-23 against `api.kimi.com/coding/v1/responses`: 29 levels accepted,
+/// 30 rejected). 16 leaves comfortable headroom below the wall while keeping
+/// honest tool contracts several levels deep.
+const MAX_NESTING_DEPTH: usize = 16;
+
 /// Inline budget per tool schema: every inlined reference counts against it,
 /// so a fan-out of refined references cannot blow the request up.
 const INLINE_BUDGET: usize = 512;
@@ -166,6 +182,12 @@ pub fn normalize_tools(body: &[u8]) -> Vec<u8> {
         };
         if let Some(schema) = schema {
             if project_schema(schema) {
+                changed = true;
+            }
+            // Plain nesting beyond the upstream's walk limit is reported as
+            // "infinite recursion" even without a `$ref`; cut it here, before
+            // the request leaves.
+            if cut_deep_nesting(schema) {
                 changed = true;
             }
             // The projection repairs the shapes it knows; a cycle that
@@ -595,6 +617,63 @@ fn break_cycles_in(
 /// validator sees. A document too large to prove safe within the budget is
 /// reported as cyclic: the schema is degraded, and a degraded schema is
 /// always legal.
+/// Cut plain subschema nests deeper than [`MAX_NESTING_DEPTH`].
+///
+/// Every value counts — the upstream's walker descends into any keyword, any
+/// nesting, exactly like [`has_reference_cycle`]. A node past the bound is
+/// replaced with a terminating object (the tool's argument contract ends one
+/// level deeper than the cut, which is the honest shape of a bounded
+/// recursion). Returns true when anything was cut.
+fn cut_deep_nesting(schema: &mut Value) -> bool {
+    cut_deep_node(schema, 0)
+}
+
+fn cut_deep_node(node: &mut Value, depth: usize) -> bool {
+    if depth > MAX_NESTING_DEPTH {
+        *node = terminating_schema(node);
+        return true;
+    }
+    let Some(object) = node.as_object_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    for (keyword, value) in object.iter_mut() {
+        if SUBSCHEMA_KEYWORDS.contains(&keyword.as_str()) {
+            if cut_deep_node(value, depth + 1) {
+                changed = true;
+            }
+        } else if SUBSCHEMA_MAP_KEYWORDS.contains(&keyword.as_str()) {
+            if let Some(map) = value.as_object_mut() {
+                for sub in map.values_mut() {
+                    if cut_deep_node(sub, depth + 1) {
+                        changed = true;
+                    }
+                }
+            }
+        } else if COMBINATORS.contains(&keyword.as_str()) {
+            if let Some(items) = value.as_array_mut() {
+                for sub in items.iter_mut() {
+                    if cut_deep_node(sub, depth + 1) {
+                        changed = true;
+                    }
+                }
+            }
+        } else if keyword == "prefixItems" {
+            if let Some(items) = value.as_array_mut() {
+                for sub in items.iter_mut() {
+                    if cut_deep_node(sub, depth + 1) {
+                        changed = true;
+                    }
+                }
+            }
+        }
+        // Every other keyword (enum/const/required/type/description/…)
+        // carries data, not subschemas: the upstream's depth walk does not
+        // descend into it, and cutting there would corrupt the contract.
+    }
+    changed
+}
+
 pub fn has_reference_cycle(schema: &Value) -> bool {
     let mut budget = CYCLE_WALK_BUDGET;
     let mut stack = Vec::new();
@@ -1486,5 +1565,89 @@ mod tests {
             "the inline budget must cap the expansion ({before_len} → {after_len})"
         );
         assert!(after_len > before_len);
+    }
+
+    #[test]
+    fn deep_plain_nesting_is_cut_to_a_terminating_object() {
+        // Kimi's validator walks nested subschemas with a depth limit of 30
+        // and answers deeper plain nesting with `detected infinite recursion
+        // without termination condition` — no `$ref` involved (verified live
+        // 2026-11-23: 29 levels accepted, 30 rejected).
+        let mut deep = json!({"type": "object"});
+        let mut node = &mut deep;
+        for _ in 0..64 {
+            *node = json!({"type": "object", "properties": {"show": {"type": "object"}}});
+            node = &mut node["properties"]["show"];
+        }
+        *node = json!({"type": "object", "properties": {"show": {"type": "string"}}});
+        assert!(cut_deep_nesting(&mut deep));
+
+        // Every branch bottoms out at a terminating object well inside the
+        // upstream's 30-level walk limit.
+        fn max_depth(v: &Value) -> usize {
+            let mut best = 0;
+            if let Some(obj) = v.as_object() {
+                for (k, val) in obj {
+                    let d = if SUBSCHEMA_KEYWORDS.contains(&k.as_str())
+                        || SUBSCHEMA_MAP_KEYWORDS.contains(&k.as_str())
+                    {
+                        1 + max_depth(val)
+                    } else if COMBINATORS.contains(&k.as_str()) || k == "prefixItems" {
+                        val.as_array()
+                            .map(|a| a.iter().map(|s| 1 + max_depth(s)).max().unwrap_or(0))
+                            .unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    best = best.max(d);
+                }
+            }
+            best
+        }
+        assert!(
+            max_depth(&deep) <= MAX_NESTING_DEPTH,
+            "the cut must keep the nest inside the upstream's walk limit"
+        );
+    }
+
+    #[test]
+    fn shallow_schemas_and_data_arrays_are_not_cut() {
+        // Honest contracts several levels deep survive untouched.
+        let mut shallow = json!({
+            "type": "object",
+            "properties": {
+                "show": {
+                    "type": "object",
+                    "properties": {
+                        "items": {
+                            "type": "array",
+                            "items": {"type": "string"}
+                        }
+                    },
+                    "anyOf": [
+                        {"type": "object", "properties": {"a": {"type": "integer"}}}
+                    ]
+                }
+            },
+            "required": ["show"]
+        });
+        let before = shallow.clone();
+        assert!(!cut_deep_nesting(&mut shallow));
+        assert_eq!(shallow, before);
+
+        // Data keywords are not subschema positions: a long enum value list
+        // must not be mistaken for deep nesting.
+        let mut with_enum = json!({
+            "type": "object",
+            "properties": {
+                "show": {
+                    "type": "string",
+                    "enum": (0..40).map(|i| format!("v{i}")).collect::<Vec<_>>()
+                }
+            }
+        });
+        let before = with_enum.clone();
+        assert!(!cut_deep_nesting(&mut with_enum));
+        assert_eq!(with_enum, before);
     }
 }

@@ -196,8 +196,14 @@ pub fn responses_request_to_chat(body: &[u8]) -> Result<TranslatedRequest, Trans
         }
     }
 
+    let serialized = serde_json::to_vec(&Value::Object(chat))?;
+    // The chat contract rejects the same history fault the Responses one
+    // does — an assistant tool call nobody answered (`No tool output found
+    // for tool call …`) — so the orphan is answered here, at translation
+    // time, instead of after a failed upstream round trip.
+    let body = crate::repair_orphan_tool_calls(&serialized).unwrap_or(serialized);
     Ok(TranslatedRequest {
-        body: serde_json::to_vec(&Value::Object(chat))?,
+        body,
         is_streaming: req.stream == Some(true),
     })
 }
@@ -3123,7 +3129,10 @@ mod tests {
 
     #[test]
     fn test_trailing_function_call_run_is_flushed() {
-        // A run that reaches the end of the input still becomes one message.
+        // A run that reaches the end of the input still becomes one
+        // message; the two unanswered calls it carries are then answered
+        // with sentinel tool messages (a chat upstream rejects a dangling
+        // assistant tool call), one reply per call, right after the run.
         let body = br#"{
             "model":"gpt-4o",
             "input":[
@@ -3135,8 +3144,12 @@ mod tests {
         let out = responses_request_to_chat(body).unwrap();
         let v: Value = serde_json::from_slice(&out.body).unwrap();
         let msgs = v["messages"].as_array().unwrap();
-        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs.len(), 4);
         assert_eq!(msgs[1]["tool_calls"].as_array().unwrap().len(), 2);
+        assert_eq!(msgs[2]["role"], "tool");
+        assert_eq!(msgs[2]["tool_call_id"], "c1");
+        assert_eq!(msgs[3]["role"], "tool");
+        assert_eq!(msgs[3]["tool_call_id"], "c2");
     }
 
     #[test]
@@ -4955,6 +4968,32 @@ mod tests {
         assert_eq!(root["input"][1]["call_id"], json!("call_real"));
         // No extra call was invented.
         assert_eq!(root["input"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_the_chat_form_answers_an_unanswered_call() {
+        // The Responses input carries a call whose result was never
+        // recorded; the chat form must not leave the assistant tool call
+        // dangling (chat upstreams answer it with
+        // `No tool output found for tool call …`).
+        let body = br#"{
+            "model": "m",
+            "input": [
+                {"type": "message", "role": "user", "content": "hi"},
+                {"type": "function_call", "id": "fc_1", "call_id": "call_9pslteul",
+                 "name": "exec", "arguments": "{}"}
+            ]
+        }"#;
+        let out = responses_request_to_chat(body).unwrap();
+        let v: Value = serde_json::from_slice(&out.body).unwrap();
+        let msgs = v["messages"].as_array().unwrap();
+        let assistant_idx = msgs
+            .iter()
+            .position(|m| m.get("tool_calls").is_some())
+            .expect("no assistant tool call in the chat form");
+        let tool = &msgs[assistant_idx + 1];
+        assert_eq!(tool["role"], json!("tool"));
+        assert_eq!(tool["tool_call_id"], json!("call_9pslteul"));
     }
 
     #[test]
