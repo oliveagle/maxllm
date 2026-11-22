@@ -103,7 +103,12 @@ pub fn responses_request_to_chat(body: &[u8]) -> Result<TranslatedRequest, Trans
     //  is not found", verified live against kimi). Repair the ids before the
     // translation: the chat form then carries a complete call/answer pair.
     let body = repair_body_call_ids(body);
-    let req: ResponsesRequest = serde_json::from_slice(&body)?;
+    // Tool schemas from real agent traffic nest deeper than serde_json's
+    // default recursion limit; parse through the depth-capped helper.
+    let req: ResponsesRequest = match deep_parse::<ResponsesRequest>(&body) {
+        Some(req) => req,
+        None => serde_json::from_slice(&body)?,
+    };
 
     let model = req
         .model
@@ -905,6 +910,21 @@ fn expand_tool_to_chat<'a>(tool: &'a Value, out: &mut Vec<Value>, dropped: &mut 
 /// Responses contract natively (the opencode.ai "zen" `/zen/go/v1/responses`
 /// endpoint).
 ///
+/// Deserialize with serde_json's recursion limit raised: real tool schemas
+/// nest deeper than the default 128 (verified live: a 64-level nest), and a
+/// parse failure would skip every repair. The byte-level depth cap in
+/// [`crate::parse_body`] keeps the raised limit off the stack, so this is
+/// only reached for bodies that provably nest shallower than
+/// [`crate::MAX_PARSE_DEPTH`].
+fn deep_parse<T: serde::de::DeserializeOwned>(body: &[u8]) -> Option<T> {
+    if crate::max_nesting_depth_pub(body) > crate::MAX_PARSE_DEPTH {
+        return None;
+    }
+    let mut de = serde_json::Deserializer::from_slice(body);
+    de.disable_recursion_limit();
+    T::deserialize(&mut de).ok()
+}
+
 /// The endpoint accepts the official Responses tool shape
 /// (`{"type":"function","name":…,"parameters":…}`) but rejects the
 /// chat-completions nesting (`{"type":"function","function":{…}}`) with a 503
@@ -918,7 +938,7 @@ fn expand_tool_to_chat<'a>(tool: &'a Value, out: &mut Vec<Value>, dropped: &mut 
 /// is left untouched, and a body with nothing to rewrite is returned
 /// unchanged so the native passthrough stays byte-for-byte.
 pub fn normalize_responses_request(body: &[u8]) -> Vec<u8> {
-    let Ok(mut root) = serde_json::from_slice::<Value>(body) else {
+    let Some(mut root) = crate::parse_body(body) else {
         return body.to_vec();
     };
     let Some(obj) = root.as_object_mut() else {

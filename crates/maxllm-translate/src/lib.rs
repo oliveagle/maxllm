@@ -8,6 +8,7 @@
 
 pub mod anthropic;
 
+use serde::Deserialize;
 use serde_json::Value;
 pub mod anthropic_stream;
 pub mod aws_sigv4;
@@ -118,6 +119,68 @@ impl StreamTranslator for NativePassthroughStream {
 /// conversation says so instead of fabricating one.
 const ORPHAN_TOOL_CALL_SENTINEL: &str = "[tool call interrupted: no result was recorded]";
 
+/// Parse a request body whose tool schemas may nest far deeper than
+/// serde_json's default recursion limit (128) — Moonshot caps schema depth
+/// at 30, but other upstreams take deeper nests, and a parse failure here
+/// would silently skip every repair (verified live: a 64-level nest made
+/// `normalize_tools` return the body byte-for-byte, and Kimi rejected the
+/// uncut schema).
+///
+/// A cheap byte-scan caps the nesting depth *before* deserializing, so the
+/// raised limit cannot be turned into a stack overflow by a pathological
+/// body: anything deeper than [`MAX_PARSE_DEPTH`] is refused here and left
+/// for the repair ladder (degrade / remove tool surface) instead.
+pub fn parse_body(body: &[u8]) -> Option<serde_json::Value> {
+    if max_nesting_depth(body) > MAX_PARSE_DEPTH {
+        return None;
+    }
+    let mut de = serde_json::Deserializer::from_slice(body);
+    de.disable_recursion_limit();
+    serde_json::Value::deserialize(&mut de).ok()
+}
+
+/// The deepest `{`/`[` nesting in the body, ignoring string contents.
+pub fn max_nesting_depth_pub(body: &[u8]) -> usize {
+    max_nesting_depth(body)
+}
+
+fn max_nesting_depth(body: &[u8]) -> usize {
+    let mut depth = 0usize;
+    let mut max = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for &b in body {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' | b'[' => {
+                depth += 1;
+                if depth > max {
+                    max = depth;
+                }
+            }
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    max
+}
+
+/// Honest tool schemas nest a handful of levels (Moonshot caps at 30); this
+/// bound only fences the pathological ones. serde_json's default limit of
+/// 128 is lower than real agent traffic nests, so parsing goes through
+/// [`parse_body`], and this cap keeps the raised limit off the stack.
+pub const MAX_PARSE_DEPTH: usize = 512;
+
 /// Repair a history that carries an orphaned tool call.
 ///
 /// An upstream that validates tool-call pairing (Kimi:
@@ -136,7 +199,7 @@ const ORPHAN_TOOL_CALL_SENTINEL: &str = "[tool call interrupted: no result was r
 /// contract (`messages` with assistant `tool_calls` and `role: "tool"`
 /// replies). A body without either array is left alone.
 pub fn repair_orphan_tool_calls(body: &[u8]) -> Option<Vec<u8>> {
-    let Ok(mut root) = serde_json::from_slice::<serde_json::Value>(body) else {
+    let Some(mut root) = parse_body(body) else {
         return None;
     };
 
@@ -160,7 +223,7 @@ pub fn repair_orphan_tool_calls(body: &[u8]) -> Option<Vec<u8>> {
 /// The last resort of [`shrink_orphan_tool_calls`]: an unanswered call is
 /// dropped outright, so the pairing rule has nothing left to reject.
 pub fn remove_orphan_tool_calls(body: &[u8]) -> Option<Vec<u8>> {
-    let Ok(mut root) = serde_json::from_slice::<serde_json::Value>(body) else {
+    let Some(mut root) = parse_body(body) else {
         return None;
     };
 

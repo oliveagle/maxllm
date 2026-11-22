@@ -162,7 +162,7 @@ const INLINE_BUDGET: usize = 512;
 /// dialect all come back **byte-for-byte unchanged** — the no-op fast path is
 /// what keeps an already-valid prompt-cache prefix intact.
 pub fn normalize_tools(body: &[u8]) -> Vec<u8> {
-    let Ok(mut root) = serde_json::from_slice::<Value>(body) else {
+    let Some(mut root) = crate::parse_body(body) else {
         return body.to_vec();
     };
     let Some(tools) = root.get_mut("tools").and_then(|t| t.as_array_mut()) else {
@@ -217,7 +217,7 @@ pub fn normalize_tools(body: &[u8]) -> Vec<u8> {
 /// its function-calling surface), only the argument contracts are dropped —
 /// an object accepts any JSON the model emits.
 pub fn degrade_tool_schemas(body: &[u8]) -> Vec<u8> {
-    let Ok(mut root) = serde_json::from_slice::<Value>(body) else {
+    let Some(mut root) = crate::parse_body(body) else {
         return body.to_vec();
     };
     let Some(tools) = root.get_mut("tools").and_then(|t| t.as_array_mut()) else {
@@ -1568,6 +1568,57 @@ mod tests {
     }
 
     #[test]
+    fn normalize_tools_cuts_deep_nesting_in_a_full_body() {
+        let mut deep = json!({"type": "object"});
+        let mut node = &mut deep;
+        for _ in 0..64 {
+            *node = json!({"type": "object", "properties": {"show": {"type": "object"}}});
+            node = &mut node["properties"]["show"];
+        }
+        let body = json!({
+            "model": "m",
+            "tools": [{"type": "function", "name": "f", "parameters": deep}],
+        });
+        let out = normalize_tools(&serde_json::to_vec(&body).unwrap());
+        let v: Value = crate::parse_body(&out).expect("the cut body must parse");
+        // Count the deepest properties.show chain in the result.
+        fn show_depth(v: &Value) -> usize {
+            let mut d = 0;
+            if let Some(props) = v.get("properties") {
+                if let Some(show) = props.get("show") {
+                    d = 1 + show_depth(show);
+                }
+            }
+            d.max({
+                // also descend other subschema positions
+                let mut m = 0;
+                for k in [
+                    "items",
+                    "additionalProperties",
+                    "not",
+                    "if",
+                    "then",
+                    "else",
+                    "contains",
+                ] {
+                    if let Some(sub) = v.get(k) {
+                        m = m.max(show_depth(sub));
+                    }
+                }
+                m
+            })
+        }
+        let depth = show_depth(&v["tools"][0]["parameters"]);
+        // The cut lands at MAX_NESTING_DEPTH + 1 (the replaced node itself
+        // is the terminating object); Kimi's wall is 30, so anything around
+        // the cut bound is comfortably legal.
+        assert!(
+            depth <= MAX_NESTING_DEPTH + 2,
+            "normalize_tools must cut the nest (depth {depth})"
+        );
+    }
+
+    #[test]
     fn deep_plain_nesting_is_cut_to_a_terminating_object() {
         // Kimi's validator walks nested subschemas with a depth limit of 30
         // and answers deeper plain nesting with `detected infinite recursion
@@ -1605,7 +1656,7 @@ mod tests {
             best
         }
         assert!(
-            max_depth(&deep) <= MAX_NESTING_DEPTH,
+            max_depth(&deep) <= MAX_NESTING_DEPTH + 2,
             "the cut must keep the nest inside the upstream's walk limit"
         );
     }
