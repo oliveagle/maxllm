@@ -14833,6 +14833,285 @@ async fn test_moonshot_orphaned_tool_call_is_repaired() {
     );
 }
 
+/// A repaired orphan can be followed by a different translation fault: the
+/// repair state must not turn every later 400 into an opaque request fault.
+#[tokio::test]
+async fn test_tool_schema_then_orphan_repairs_are_cross_class() {
+    let mock = MockServer::start().await;
+
+    // Attempt 1: the projected zod schema is still rejected. Attempt 2:
+    // the degraded schema is accepted, but the orphaned call is refused.
+    // Attempt 3: the repaired history is accepted. Each retry class must
+    // hand control back to the classifier instead of passing the next 400
+    // straight to the client.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+    Mock::given(method("POST"))
+        .and(path("/coding/v1/chat/completions"))
+        .respond_with(move |req: &wiremock::Request| {
+            let attempt = counter.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                return ResponseTemplate::new(400).set_body_json(moonshot_rejection());
+            }
+            if attempt == 1 {
+                return ResponseTemplate::new(400).set_body_json(json!({
+                    "error": {
+                        "code": "invalid_request_error",
+                        "message": "Invalid request: an assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id'. The following tool_call_ids did not have response messages: call_abc123",
+                        "type": "invalid_request_error"
+                    }
+                }));
+            }
+            let sent: Value = serde_json::from_slice(&req.body).expect("json body");
+            let messages = sent["messages"].as_array().expect("chat history");
+            assert!(
+                messages
+                    .iter()
+                    .any(|message| message["content"]
+                        == "[tool call interrupted: no result was recorded]"),
+                "the final replay must carry the orphan repair: {sent}"
+            );
+            ResponseTemplate::new(200).set_body_json(openai_response("after both repairs"))
+        })
+        .mount(&mock)
+        .await;
+
+    let gw = TestGateway::start(MOONSHOT_TOOL_CONFIG, &mock.uri()).await;
+    let c = client();
+
+    let mut body = chat_body("kimi-for-coding", "two fault classes");
+    body["tools"] = json!([zod_tool()]);
+    body["messages"] = json!([
+        {"role": "user", "content": "fetch the thing"},
+        {"role": "assistant", "content": null, "tool_calls": [{
+            "id": "call_abc123",
+            "type": "function",
+            "function": {"name": "memory_feedback", "arguments": "{}"}
+        }]}
+    ]);
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "the second translation fault must be classified, not passed through"
+    );
+    assert_eq!(
+        resp.json::<Value>().await.unwrap()["choices"][0]["message"]["content"],
+        "after both repairs"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 3, "schema → orphan → success");
+}
+
+const ORPHAN_LADDER_FAILOVER_CONFIG: &str = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[metrics]
+enabled = true
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.kimi_mock]
+kind = "openai_compat"
+base_url = "{MOCK_URL}"
+upstream_path = "/coding/v1/chat/completions"
+api_key = "fake-key"
+tool_schema = "moonshot"
+
+[providers.backup]
+kind = "openai"
+base_url = "{FALLBACK_URL}"
+api_key = "fake-key"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "kimi_mock"
+fallback = ["backup"]
+strategy = "fallback"
+max_failover_attempts = 4
+"#;
+
+#[tokio::test]
+async fn test_orphan_repair_exhaustion_fails_over_to_fallback() {
+    let primary = MockServer::start().await;
+    let fallback = MockServer::start().await;
+
+    // Repair, then terminal removal, then failover: the primary sees three
+    // attempts. A fourth would mean the terminal ladder looped instead of
+    // walking the fallback chain.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+    Mock::given(method("POST"))
+        .respond_with(move |_req: &wiremock::Request| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            ResponseTemplate::new(400).set_body_json(json!({
+                "error": {
+                    "code": "invalid_request_error",
+                    "message": "Invalid request: an assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id'. The following tool_call_ids did not have response messages: call_abc123",
+                    "type": "invalid_request_error"
+                }
+            }))
+        })
+        .mount(&primary)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from fallback")))
+        .mount(&fallback)
+        .await;
+
+    let config = ORPHAN_LADDER_FAILOVER_CONFIG
+        .replace("{MOCK_URL}", &primary.uri())
+        .replace("{FALLBACK_URL}", &fallback.uri());
+    let gw = TestGateway::start(&config, &primary.uri()).await;
+    let c = client();
+
+    let mut body = chat_body("kimi-for-coding", "orphan exhaustion");
+    body["messages"] = json!([
+        {"role": "user", "content": "fetch the thing"},
+        {"role": "assistant", "content": null, "tool_calls": [{
+            "id": "call_abc123",
+            "type": "function",
+            "function": {"name": "memory_feedback", "arguments": "{}"}
+        }]}
+    ]);
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers().get("X-MaxLLM-Provider").unwrap(), "backup");
+    assert_eq!(
+        resp.json::<Value>().await.unwrap()["choices"][0]["message"]["content"],
+        "from fallback"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "normal → repaired → removed"
+    );
+
+    let fallback_requests = fallback.received_requests().await.unwrap();
+    assert_eq!(fallback_requests.len(), 1);
+    let sent: Value = serde_json::from_slice(&fallback_requests[0].body).unwrap();
+    let messages = sent["messages"].as_array().unwrap();
+    // The fallback starts from the client's history: it may accept the same
+    // orphaned call, so the exhausted provider's terminal rewrite is not
+    // carried across the provider boundary.
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0]["role"], "user");
+    assert_eq!(messages[1]["role"], "assistant");
+}
+
+#[tokio::test]
+async fn test_unsupported_reasoning_effort_is_dropped_before_failing_over() {
+    let primary = MockServer::start().await;
+    let fallback = MockServer::start().await;
+
+    // The first native Responses attempt carries the contract field. The
+    // strict provider rejects only the optional effort value, so the retry
+    // omits the whole knob and succeeds on the same provider.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(move |req: &wiremock::Request| {
+            let attempt = counter.fetch_add(1, Ordering::SeqCst);
+            let sent: Value = serde_json::from_slice(&req.body).expect("json body");
+            if attempt == 0 {
+                assert_eq!(sent["reasoning"]["effort"], "none");
+                return ResponseTemplate::new(400).set_body_json(json!({
+                    "error": {
+                        "code": "invalid_request_error",
+                        "message": "reasoning.effort value \"none\" is not supported",
+                        "type": "invalid_request_error"
+                    }
+                }));
+            }
+            assert!(
+                sent.get("reasoning_effort").is_none(),
+                "the chat retry must omit the rejected knob: {sent}"
+            );
+            assert_eq!(
+                sent["reasoning"],
+                json!({"summary": "auto"}),
+                "only the rejected value is dropped; the rest of reasoning survives: {sent}"
+            );
+            ResponseTemplate::new(200).set_body_json(json!({
+                "id": "resp_ok",
+                "object": "response",
+                "status": "completed",
+                "model": "strict-model",
+                "output": [],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+            }))
+        })
+        .mount(&primary)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "resp_never",
+            "object": "response",
+            "status": "completed",
+            "model": "strict-model",
+            "output": [],
+            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+        })))
+        .mount(&fallback)
+        .await;
+
+    let config = CALL_ID_FAILOVER_CONFIG
+        .replace("{MOCK_URL}", &primary.uri())
+        .replace("{FALLBACK_URL}", &fallback.uri());
+    let gw = TestGateway::start(&config, &primary.uri()).await;
+    let c = client();
+
+    let body = json!({
+        "model": "strict-model",
+        "input": [
+            {"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "hi"}]}
+        ],
+        "reasoning": {"effort": "none", "summary": "auto"},
+        "stream": false
+    });
+
+    let resp = c
+        .post(gw.url("/v1/responses"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["id"], "resp_ok");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+    let fallback_requests = fallback.received_requests().await.unwrap_or_default();
+    assert!(
+        fallback_requests.is_empty(),
+        "the optional-knob repair must happen on the same provider"
+    );
+}
+
 /// The translation kernel: a Rhai script that owns the provider-dialect
 /// decision surface. Saving the script is the deploy — no release cycle.
 const KERNEL_TEST_CONFIG: &str = r#"

@@ -3694,11 +3694,20 @@ impl AiGateway {
                     // history never did; the answered history must not grow
                     // past the frame the client sent, so the orphans are
                     // dropped instead when they do not fit.
-                    if ctx.tool_calls_repaired {
+                    if ctx.tool_calls_removed {
+                        if let Some(repaired) = maxllm_translate::remove_orphan_tool_calls(&out) {
+                            out = repaired;
+                        }
+                    } else if ctx.tool_calls_repaired {
                         if let Some(repaired) = maxllm_translate::shrink_orphan_tool_calls(
                             &out,
                             ctx.request_body_buf.len(),
                         ) {
+                            out = repaired;
+                        }
+                    }
+                    if ctx.reasoning_effort_dropped {
+                        if let Some(repaired) = maxllm_translate::drop_reasoning_effort(&out) {
                             out = repaired;
                         }
                     }
@@ -4084,10 +4093,19 @@ impl AiGateway {
                         ctx.tool_schema_degraded,
                     );
                 }
-                if ctx.tool_calls_repaired {
+                if ctx.tool_calls_removed {
+                    if let Some(repaired) = maxllm_translate::remove_orphan_tool_calls(&outgoing) {
+                        outgoing = repaired;
+                    }
+                } else if ctx.tool_calls_repaired {
                     // The orphan-tool-call repair — the history is replayed
                     // with its unanswered calls answered.
                     if let Some(repaired) = maxllm_translate::repair_orphan_tool_calls(&outgoing) {
+                        outgoing = repaired;
+                    }
+                }
+                if ctx.reasoning_effort_dropped {
+                    if let Some(repaired) = maxllm_translate::drop_reasoning_effort(&outgoing) {
                         outgoing = repaired;
                     }
                 }
@@ -4385,12 +4403,25 @@ impl AiGateway {
                                 ctx.tools_removed,
                                 ctx.tool_schema_degraded,
                             );
-                            if ctx.tool_calls_repaired {
-                                if let Some(repaired) =
-                                    maxllm_translate::repair_orphan_tool_calls(&outgoing)
-                                {
-                                    outgoing = repaired;
-                                }
+                        }
+                        if ctx.tool_calls_removed {
+                            if let Some(repaired) =
+                                maxllm_translate::remove_orphan_tool_calls(&outgoing)
+                            {
+                                outgoing = repaired;
+                            }
+                        } else if ctx.tool_calls_repaired {
+                            if let Some(repaired) =
+                                maxllm_translate::repair_orphan_tool_calls(&outgoing)
+                            {
+                                outgoing = repaired;
+                            }
+                        }
+                        if ctx.reasoning_effort_dropped {
+                            if let Some(repaired) =
+                                maxllm_translate::drop_reasoning_effort(&outgoing)
+                            {
+                                outgoing = repaired;
                             }
                         }
                         // The kernel's rewrite is the last word on the body.
@@ -4980,6 +5011,18 @@ fn body_reports_tool_schema(body: &str) -> bool {
 /// gateway's classification next to the schema one's.
 fn body_reports_orphan_tool_call(body: &str) -> bool {
     maxllm_translate::body_reports_orphan_tool_call(body)
+}
+
+/// Whether an upstream error body rejects the reasoning-effort knob.
+///
+/// Kimi answers `400 … reasoning.effort value "none" is not supported`. The
+/// knob is optional and the gateway can omit it without altering the
+/// conversation, so this rejection is a translation/dialect fault, not a
+/// genuine client request fault.
+fn body_reports_unsupported_reasoning_effort(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    (lower.contains("reasoning.effort") || lower.contains("reasoning_effort"))
+        && (lower.contains("is not supported") || lower.contains("unsupported"))
 }
 
 /// Whether the gateway answers such an upstream status itself.
@@ -6422,11 +6465,7 @@ impl ProxyHttp for AiGateway {
         // would answer by model rewrite or failover keeps that handling —
         // the request is retried anyway, and a tool-plumbing rejection that
         // survives it reaches this deferral on the next attempt.
-        if status == 400
-            && !ctx.tools_removed
-            && !ctx.tool_calls_repaired
-            && !should_failover_status(status, ctx, provider)
-        {
+        if status == 400 && !should_failover_status(status, ctx, provider) {
             ctx.pending_tool_schema_repair = true;
             ctx.pending_tool_schema_status = status;
             ctx.tool_schema_body_buf.clear();
@@ -6856,16 +6895,34 @@ impl ProxyHttp for AiGateway {
                         });
                     }
                     maxllm_translate::kernel::KernelRepair::OrphanRepair => {
-                        return Err(self.begin_orphan_tool_call_repair(ctx));
+                        return Err(if !ctx.tool_calls_repaired {
+                            self.begin_orphan_tool_call_repair(ctx)
+                        } else if !ctx.tool_calls_removed {
+                            self.begin_orphan_call_removal(ctx)
+                        } else {
+                            return self.fail_over_from_body_filter(
+                                session,
+                                ctx,
+                                ctx.pending_tool_schema_status,
+                                "translation repair ladder exhausted",
+                            );
+                        });
                     }
                     maxllm_translate::kernel::KernelRepair::None => {}
                 }
             }
             if body_reports_tool_schema(&text) {
-                return Err(if ctx.tool_schema_degraded {
+                return Err(if !ctx.tool_schema_degraded {
+                    self.begin_tool_schema_repair(ctx)
+                } else if !ctx.tools_removed {
                     self.begin_tool_surface_removal(ctx)
                 } else {
-                    self.begin_tool_schema_repair(ctx)
+                    return self.fail_over_from_body_filter(
+                        session,
+                        ctx,
+                        ctx.pending_tool_schema_status,
+                        "tool-schema repair ladder exhausted",
+                    );
                 });
             }
             // The upstream refused the conversation's tool history: an
@@ -6873,9 +6930,39 @@ impl ProxyHttp for AiGateway {
             // followed by tool messages responding to each 'tool_call_id'`).
             // The fault is in the history the client replayed, and a
             // request-fault 400 would end the agent's turn — so the orphan
-            // is answered and the request is replayed once.
+            // is answered first. If that repair is also refused, the
+            // terminal replay drops the orphaned calls; if even that is
+            // refused, this provider cannot speak the conversation and the
+            // request walks the fallback chain.
             if body_reports_orphan_tool_call(&text) {
-                return Err(self.begin_orphan_tool_call_repair(ctx));
+                return Err(if !ctx.tool_calls_repaired {
+                    self.begin_orphan_tool_call_repair(ctx)
+                } else if !ctx.tool_calls_removed {
+                    self.begin_orphan_call_removal(ctx)
+                } else {
+                    return self.fail_over_from_body_filter(
+                        session,
+                        ctx,
+                        ctx.pending_tool_schema_status,
+                        "orphan-tool-call repair ladder exhausted",
+                    );
+                });
+            }
+            // Some upstreams reject one of Codex's optional knobs even when
+            // its value is part of the Responses contract. Dropping the knob
+            // preserves the whole conversation; if the rejection somehow
+            // survives, no further same-provider repair exists.
+            if body_reports_unsupported_reasoning_effort(&text) {
+                return Err(if !ctx.reasoning_effort_dropped {
+                    self.begin_reasoning_effort_repair(ctx)
+                } else {
+                    return self.fail_over_from_body_filter(
+                        session,
+                        ctx,
+                        ctx.pending_tool_schema_status,
+                        "reasoning-effort repair ladder exhausted",
+                    );
+                });
             }
             if !buffered.is_empty() {
                 *body = Some(Bytes::from(buffered));
@@ -9134,6 +9221,16 @@ impl AiGateway {
         }
         ctx.body_translated = false;
         ctx.upstream_responded = false;
+        // The provider-specific repair ladder belonged to the attempt that
+        // just failed. A fallback starts from the client's honest request:
+        // it may accept the schemas/tool calls/effort value the failed
+        // provider could not, and carrying a terminal rewrite would silently
+        // take capability away from a healthy provider.
+        ctx.tool_schema_degraded = false;
+        ctx.tools_removed = false;
+        ctx.tool_calls_repaired = false;
+        ctx.tool_calls_removed = false;
+        ctx.reasoning_effort_dropped = false;
         ctx.request_body_buf.clear();
         // The deferred quota decision belonged to the attempt that just
         // failed; the next provider's answer must not be swallowed by the
@@ -9198,9 +9295,83 @@ impl AiGateway {
         e
     }
 
-    /// Reset the request for an in-place retry with degraded tool schemas.
+    /// Reset the request for the terminal orphan replay: no orphaned calls.
     ///
-    /// The upstream refused the tool schemas the gateway forwarded it. Rather
+    /// The repaired history is the honest first attempt: it says the result
+    /// was lost. When an upstream refuses even that sentinel, the orphaned
+    /// calls are dropped outright. This loses an interrupted turn's calls for
+    /// this request, but it still lets the conversation continue instead of
+    /// handing the upstream's pairing fault back to the agent.
+    fn begin_orphan_call_removal(&self, ctx: &mut RequestCtx) -> Box<pingora::Error> {
+        ctx.tool_calls_removed = true;
+        ctx.body_translated = false;
+        ctx.upstream_responded = false;
+        ctx.request_body_buf.clear();
+        ctx.pending_rate_limit = None;
+        ctx.replay_body = ctx.client_body.clone();
+        ctx.replay_injected = false;
+        ctx.keep_request_content_length = false;
+        if let Ok(mut guard) = ctx.stream_translator.lock() {
+            *guard = None;
+        }
+        METRICS
+            .tool_call_repair_retries_total
+            .with_label_values(&[&ctx.provider_name])
+            .inc();
+        info!(
+            provider = %ctx.provider_name,
+            "upstream refused the repaired tool history — retrying with orphaned tool calls removed"
+        );
+        let mut e = pingora::Error::explain(
+            pingora::ErrorType::HTTPStatus(400),
+            format!(
+                "provider '{}' refused the repaired orphaned tool calls; retrying with them removed",
+                ctx.provider_name
+            ),
+        );
+        e.as_up();
+        e.set_retry(true);
+        e
+    }
+
+    /// Reset the request for an in-place retry without `reasoning.effort`.
+    ///
+    /// The effort knob is optional and says nothing about the conversation
+    /// payload. A provider that rejects one of its contract values gets a
+    /// replay with the knob omitted, preserving the turn instead of exposing
+    /// a dialect fault to the client.
+    fn begin_reasoning_effort_repair(&self, ctx: &mut RequestCtx) -> Box<pingora::Error> {
+        ctx.reasoning_effort_dropped = true;
+        ctx.body_translated = false;
+        ctx.upstream_responded = false;
+        ctx.request_body_buf.clear();
+        ctx.pending_rate_limit = None;
+        ctx.replay_body = ctx.client_body.clone();
+        ctx.replay_injected = false;
+        ctx.keep_request_content_length = false;
+        if let Ok(mut guard) = ctx.stream_translator.lock() {
+            *guard = None;
+        }
+        METRICS
+            .reasoning_effort_repair_retries_total
+            .with_label_values(&[&ctx.provider_name])
+            .inc();
+        info!(
+            provider = %ctx.provider_name,
+            "upstream refused reasoning effort — retrying with the effort knob omitted"
+        );
+        let mut e = pingora::Error::explain(
+            pingora::ErrorType::HTTPStatus(400),
+            format!(
+                "provider '{}' refused reasoning effort; retrying with the effort knob omitted",
+                ctx.provider_name
+            ),
+        );
+        e.as_up();
+        e.set_retry(true);
+        e
+    }
+
     /// than ending the agent's turn with the upstream's error, the request is
     /// replayed once with every tool schema reduced to a bare object: the
     /// tool names and the tool list survive, so the conversation keeps its

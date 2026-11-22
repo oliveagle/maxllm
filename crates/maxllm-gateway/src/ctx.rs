@@ -232,6 +232,14 @@ pub struct RequestCtx {
     /// the orphan is answered and the request is replayed. One-shot, like
     /// the schema degradation.
     pub tool_calls_repaired: bool,
+    /// Set when even the orphan repair was refused and the next replay must
+    /// drop the orphaned calls outright. This is the terminal orphan repair:
+    /// losing one interrupted tool result is preferable to ending the turn
+    /// on the upstream's pairing rejection.
+    pub tool_calls_removed: bool,
+    /// Set when the upstream rejected `reasoning.effort` (or
+    /// `reasoning_effort`) and the next replay must omit the optional knob.
+    pub reasoning_effort_dropped: bool,
     /// The status of the upstream error the tool-plumbing decision is
     /// deferred on. The kernel classifier wants the true status, and the
     /// deferral is what carries it to the body filter.
@@ -443,6 +451,8 @@ impl RequestCtx {
             tool_schema_degraded: false,
             tools_removed: false,
             tool_calls_repaired: false,
+            tool_calls_removed: false,
+            reasoning_effort_dropped: false,
             pending_tool_schema_status: 0,
             rate_limit_headers: Vec::new(),
             pending_model_404: false,

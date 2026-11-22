@@ -123,6 +123,10 @@ pub struct GatewayMetrics {
     /// never got, so the agent's turn continues instead of dying on a
     /// translation fault.
     pub tool_call_repair_retries_total: IntCounterVec,
+    /// Same-provider retries that omitted the reasoning-effort knob after the
+    /// upstream rejected that optional value. The conversation and the tool
+    /// surface stay intact; the request loses only a latency/cost hint.
+    pub reasoning_effort_repair_retries_total: IntCounterVec,
     /// Requests currently in flight per provider — the live view of the
     /// least-connections routing decision.
     pub provider_inflight_requests: IntGaugeVec,
@@ -569,6 +573,18 @@ impl GatewayMetrics {
             .register(Box::new(tool_call_repair_retries_total.clone()))
             .expect("register");
 
+        let reasoning_effort_repair_retries_total = IntCounterVec::new(
+            Opts::new(
+                "maxllm_reasoning_effort_repair_retries_total",
+                "Same-provider retries without the reasoning-effort knob after the upstream rejected it",
+            ),
+            &["provider"],
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(reasoning_effort_repair_retries_total.clone()))
+            .expect("register");
+
         let provider_inflight_requests = IntGaugeVec::new(
             Opts::new(
                 "maxllm_provider_inflight_requests",
@@ -647,6 +663,7 @@ impl GatewayMetrics {
             model_rewrite_retries_total,
             tool_schema_repair_retries_total,
             tool_call_repair_retries_total,
+            reasoning_effort_repair_retries_total,
             provider_inflight_requests,
             recording_redactions_total,
             cached_input_tokens_total,
