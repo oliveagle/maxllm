@@ -393,6 +393,7 @@ fn repair_chat_messages(messages: &mut Vec<Value>) -> bool {
 ///   did not have response messages: …`
 /// * Kimi (flat form): `tool_call_id … is not found`
 /// * OpenAI: `No tool output found for function call …`
+/// * DeepSeek Responses: `No tool call found for tool output with call_id …`
 ///
 /// Deliberately narrow: a genuine request fault reaches the client exactly
 /// as before.
@@ -400,6 +401,7 @@ pub fn body_reports_orphan_tool_call(body: &str) -> bool {
     const MARKERS: &[&str] = &[
         "did not have response messages",
         "tool_call_id",
+        "no tool call found for tool output",
         "no tool output found for function call",
     ];
     let lower = body.to_ascii_lowercase();

@@ -11788,6 +11788,9 @@ mod failover_policy_tests {
         assert!(body_reports_orphan_tool_call(
             "No tool output found for function call call_abc"
         ));
+        assert!(body_reports_orphan_tool_call(
+            r#"{"error":{"message":"No tool call found for tool output with call_id exec_command_92_de90c474","type":"invalid_request_error","param":null,"code":"invalid_request_error"}}"#
+        ));
 
         // The schema rejection names the schemas, never an orphaned call —
         // the two repair classes must not shadow each other.
