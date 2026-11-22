@@ -5986,6 +5986,150 @@ async fn test_429_retry_after_header_fails_over_immediately() {
 /// 5xx nor a 429), so the breaker kept calling the provider healthy and every
 /// rotation paid one extra upstream round trip before the fallback chain took
 /// over. A 402 must force-open the circuit for a cooldown instead.
+/// A 402 whose body names the reset instant: the gateway must park the
+/// provider until THAT moment. The 402 path never read the body before —
+/// the deadline was a flat 10-minute payment cooldown, so a wall that
+/// states its own end was re-probed every ten minutes for as long as it
+/// lasted. open-design's real body carries `"reset_at"`.
+#[tokio::test]
+async fn test_402_body_reset_instant_replaces_the_payment_cooldown() {
+    let primary = MockServer::start().await;
+    let fallback = MockServer::start().await;
+
+    // Three days out — far beyond the 10-minute payment cooldown, so the
+    // two readings are distinguishable.
+    let reset_at = chrono::Utc::now() + chrono::Duration::days(3);
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(402).set_body_json(json!({
+            "code": "quota_exhausted",
+            "details": {
+                "reset_at": reset_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            },
+            "message": "Your monthly plan is exhausted; it resets at the instant below",
+        })))
+        .expect(1)
+        .mount(&primary)
+        .await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from fallback")))
+        .expect(1)
+        .mount(&fallback)
+        .await;
+
+    let gw =
+        TestGateway::start_with_fallback(HTTP_FAILOVER_CONFIG, &primary.uri(), &fallback.uri())
+            .await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&chat_body("deepseek-v4.1-flash", "hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers().get("X-MaxLLM-Provider").unwrap(), "fallback");
+
+    // /health says WHEN the walled provider comes back: the body's own
+    // instant, not the flat payment cooldown.
+    let health: Value = c
+        .get(gw.url("/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let reset = health["quota_reset_at"]["primary"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no reset instant reported: {health}"));
+    let reported = chrono::DateTime::parse_from_rfc3339(reset)
+        .unwrap()
+        .timestamp_millis();
+    let expected = reset_at.timestamp_millis();
+    assert!(
+        (reported - expected).abs() < 1000,
+        "expected {expected}, reported {reported} ({reset})"
+    );
+}
+
+/// The counterpart: a 402 whose body names a BALANCE problem. open-design's
+/// real body says "Coding Plan quota is exhausted and wallet balance is
+/// insufficient" and carries a `reset_at` — but its own words say the
+/// reset does NOT refill the wallet: the wall ends when the account is
+/// topped up, not on a date. Parking the provider until that date would
+/// keep it out of the rotation for days after it was paid for, so the
+/// payment cooldown (10 minutes) stays.
+#[tokio::test]
+async fn test_402_balance_problem_keeps_the_payment_cooldown() {
+    let primary = MockServer::start().await;
+    let fallback = MockServer::start().await;
+
+    let reset_at = chrono::Utc::now() + chrono::Duration::days(3);
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(402).set_body_json(json!({
+            "code": "insufficient_balance",
+            "details": {
+                "coding_plan_exhausted": true,
+                "reset_at": reset_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            },
+            "message": "Coding Plan quota is exhausted and wallet balance is insufficient",
+        })))
+        .expect(1)
+        .mount(&primary)
+        .await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from fallback")))
+        .expect(1)
+        .mount(&fallback)
+        .await;
+
+    let gw =
+        TestGateway::start_with_fallback(HTTP_FAILOVER_CONFIG, &primary.uri(), &fallback.uri())
+            .await;
+    let c = client();
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&chat_body("deepseek-v4.1-flash", "hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers().get("X-MaxLLM-Provider").unwrap(), "fallback");
+
+    let health: Value = c
+        .get(gw.url("/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let reset = health["quota_reset_at"]["primary"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no reset instant reported: {health}"));
+    let reported = chrono::DateTime::parse_from_rfc3339(reset)
+        .unwrap()
+        .timestamp_millis();
+    let expected = reset_at.timestamp_millis();
+    assert!(
+        (reported - expected).abs() > 86_400_000,
+        "the body's date must NOT become the deadline (reported {reset})"
+    );
+    // The payment cooldown is 10 minutes.
+    let now = chrono::Utc::now().timestamp_millis();
+    let remaining = reported - now;
+    assert!(
+        (300_000..=900_000).contains(&remaining),
+        "expected the 10-minute payment cooldown, got {remaining} ms"
+    );
+}
+
 #[tokio::test]
 async fn test_402_payment_required_force_opens_the_provider() {
     let primary = MockServer::start().await;
@@ -10061,11 +10205,14 @@ provider = "strict"
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 400, "a request fault stays the client's answer");
+    assert_eq!(
+        resp.status(),
+        400,
+        "a request fault stays the client's answer"
+    );
     let body: Value = resp.json().await.unwrap();
     assert_eq!(
-        body["error"]["message"],
-        rejection["error"]["message"],
+        body["error"]["message"], rejection["error"]["message"],
         "the body must reach the client untouched"
     );
 }
@@ -12353,6 +12500,193 @@ async fn test_quota_429_in_the_auto_pool_without_a_healthy_member_is_answered_by
     assert_eq!(parsed["error"]["type"], "gateway_error");
 }
 
+/// A pool that *names a channel* (`/model` in codex: the body model is
+/// `deepseek-flash` and that name is the whole request).
+const STRICT_NAMED_POOL_CONFIG: &str = r#"
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[session_sticky]
+enabled = true
+body_affinity = true
+
+[providers.channel]
+kind = "openai"
+base_url = "{POOL_A_URL}"
+api_key = "fake-key"
+
+[providers.fallback]
+kind = "openai"
+base_url = "{MOCK_URL}"
+api_key = "fake-key"
+
+[auto_models."deepseek-flash"]
+strict = true
+
+[[auto_models."deepseek-flash".pool]]
+provider = "channel"
+model = "real-model"
+
+[[routes]]
+path = "/v1/responses"
+provider = "fallback"
+session_sticky = true
+"#;
+
+/// The same config without `strict`: the fall-through every pool had before
+/// the flag existed, kept here so the compatibility guarantee is pinned.
+fn non_strict_variant() -> String {
+    STRICT_NAMED_POOL_CONFIG.replace("strict = true\n", "")
+}
+
+/// A channel pool whose only member is quota-dead must answer 503 from the
+/// gateway — it must *not* be served by whatever provider the route names.
+///
+/// 2026-11-16 (LPT): `{"model":"open_design"}` on the pooled `/v1/responses`
+/// route fell through to `opencode_1` once the open_design breaker was
+/// force-opened by a 402, and the client got
+/// `model 'open_design' is not allowed on provider 'opencode_1'` — a 403
+/// about a model it never asked for. The channel name IS the request, so an
+/// unusable pool has to fail closed and say which pool is down.
+#[tokio::test]
+async fn test_a_strict_named_pool_fails_closed_instead_of_falling_through() {
+    let dead = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .set_body_string(quota_429_body())
+                .insert_header("content-type", "application/json"),
+        )
+        .mount(&dead)
+        .await;
+    let fallback = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from-fallback")))
+        .mount(&fallback)
+        .await;
+
+    let dead_uri = dead.uri();
+    let fallback_uri = fallback.uri();
+    let (mut child, base, _cfg) = spawn_gateway_with_pool(
+        STRICT_NAMED_POOL_CONFIG,
+        [fallback_uri.as_str(), dead_uri.as_str(), dead_uri.as_str()],
+    )
+    .await;
+
+    let body = json!({"model": "deepseek-flash", "input": "hi"});
+    // 1st request: the pool member is still "healthy", so the request goes
+    // there and its quota wall force-opens the circuit.
+    let first = client()
+        .post(format!("{base}/v1/responses"))
+        .json(&body)
+        .send()
+        .await
+        .expect("request completes");
+    let first_status = first.status();
+    let first_text = first.text().await.unwrap_or_default();
+    assert!(
+        !first_status.is_success(),
+        "a quota-walled channel is not a success (body: {first_text})"
+    );
+
+    // 2nd request: the pool is now unusable. A strict pool must answer 503
+    // naming the pool, not hand the request to the route's `fallback`.
+    let second = client()
+        .post(format!("{base}/v1/responses"))
+        .json(&body)
+        .send()
+        .await
+        .expect("request completes");
+    let status = second.status();
+    let text = second.text().await.unwrap_or_default();
+    let _ = child.kill();
+
+    assert_eq!(
+        status, 503,
+        "an unusable strict channel pool must be the gateway's own 503 (body: {text})"
+    );
+    assert!(
+        text.contains("pool 'deepseek-flash'"),
+        "the 503 must name the pool the client asked for: {text}"
+    );
+    assert!(
+        text.contains("quota force-open"),
+        "the 503 must carry the members' circuit state: {text}"
+    );
+    assert!(
+        !text.contains("is not allowed"),
+        "a dead channel must not read as a model-allowlist denial: {text}"
+    );
+    assert!(
+        fallback
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "the route's own provider must never be asked to serve a named channel"
+    );
+}
+
+/// Without `strict`, the same config keeps the old fall-through: the route's
+/// provider answers. This is the behaviour every pre-existing pool relies on,
+/// so it may not change silently.
+#[tokio::test]
+async fn test_a_non_strict_named_pool_still_falls_through_to_the_route() {
+    let dead = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .set_body_string(quota_429_body())
+                .insert_header("content-type", "application/json"),
+        )
+        .mount(&dead)
+        .await;
+    let fallback = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from-fallback")))
+        .mount(&fallback)
+        .await;
+
+    let dead_uri = dead.uri();
+    let fallback_uri = fallback.uri();
+    let config = non_strict_variant();
+    let (mut child, base, _cfg) = spawn_gateway_with_pool(
+        &config,
+        [fallback_uri.as_str(), dead_uri.as_str(), dead_uri.as_str()],
+    )
+    .await;
+
+    let body = json!({"model": "deepseek-flash", "input": "hi"});
+    let _ = client()
+        .post(format!("{base}/v1/responses"))
+        .json(&body)
+        .send()
+        .await
+        .expect("request completes")
+        .text()
+        .await;
+    let second = client()
+        .post(format!("{base}/v1/responses"))
+        .json(&body)
+        .send()
+        .await
+        .expect("request completes");
+    let status = second.status();
+    let text = second.text().await.unwrap_or_default();
+    let _ = child.kill();
+
+    assert_eq!(
+        status, 200,
+        "without `strict` the pool keeps falling through to the route (body: {text})"
+    );
+    assert_eq!(
+        fallback.received_requests().await.unwrap_or_default().len(),
+        1,
+        "the route's provider is the one that answered"
+    );
+}
+
 /// A client's own mistake keeps the upstream's answer: a 404 that names the
 /// model as unknown is the client's answer to hear, not the gateway's.
 #[tokio::test]
@@ -13260,7 +13594,7 @@ fn trailing_assistant_input() -> Value {
     ])
 }
 
-async fn native_responses_upstream_reply(mock: &MockServer) {
+async fn native_responses_upstream_reply_at(mock: &MockServer, responses_path: &str) {
     let upstream_body = json!({
         "id": "resp_ark",
         "object": "response",
@@ -13270,11 +13604,15 @@ async fn native_responses_upstream_reply(mock: &MockServer) {
         "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
     });
     Mock::given(method("POST"))
-        .and(path("/api/coding/v3/responses"))
+        .and(path(responses_path))
         .respond_with(ResponseTemplate::new(200).set_body_json(upstream_body))
         .expect(1)
         .mount(mock)
         .await;
+}
+
+async fn native_responses_upstream_reply(mock: &MockServer) {
+    native_responses_upstream_reply_at(mock, "/api/coding/v3/responses").await;
 }
 
 #[tokio::test]
@@ -13307,6 +13645,87 @@ async fn test_ark_native_responses_drops_trailing_assistant_text_turn() {
         "the trailing assistant text turn must be dropped, got {input:?}"
     );
     assert_eq!(input[0]["role"], "user");
+}
+
+/// A native-Responses provider that declares the DeepSeek reasoning-lead
+/// repair. `base_url` points at the mock, so the repair can only come from
+/// the named config field.
+const DEEPSEEK_REPAIR_NATIVE_RESPONSES_CONFIG: &str = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[metrics]
+enabled = true
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.mock_deepseek]
+kind = "openai_compat"
+base_url = "{MOCK_URL}"
+upstream_path = "/v1/chat/completions"
+responses_path = "/v1/responses"
+native_responses = true
+native_responses_repair = "deepseek_reasoning_lead"
+api_key = "fake-key"
+
+[[routes]]
+path = "/v1/responses"
+provider = "mock_deepseek"
+endpoint_type = "responses"
+"#;
+
+/// The body codex sends when it replays a turn whose reasoning came back
+/// sealed (only `encrypted_content`) and whose message came before the
+/// reasoning item.
+fn sealed_reasoning_input() -> Value {
+    json!([
+        {"role": "user", "content": [{"type": "input_text", "text": "what time is it"}]},
+        {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "let me look"}]},
+        {"type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": "opaque"},
+        {"type": "function_call", "name": "get_time", "arguments": "{}", "call_id": "call_1"}
+    ])
+}
+
+#[tokio::test]
+async fn test_deepseek_native_responses_leads_with_a_reasoning_item() {
+    let mock = MockServer::start().await;
+    native_responses_upstream_reply_at(&mock, "/v1/responses").await;
+
+    let gw = TestGateway::start(DEEPSEEK_REPAIR_NATIVE_RESPONSES_CONFIG, &mock.uri()).await;
+    let request_body = json!({
+        "model": "deepseek-flash",
+        "input": sealed_reasoning_input(),
+        "stream": false
+    });
+
+    let resp = client()
+        .post(gw.url("/v1/responses"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&request_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let requests = mock.received_requests().await.unwrap();
+    let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let input = sent["input"].as_array().expect("input must stay an array");
+    // The step that makes the call leads with a reasoning item, and that
+    // item carries the text the upstream asks for.
+    assert_eq!(input[1]["type"], "reasoning");
+    assert_eq!(input[1]["content"][0]["type"], "reasoning_text");
+    assert_eq!(input[1]["content"][0]["text"], " ");
+    // The sealed blob is kept: it is the item's own id.
+    assert_eq!(input[1]["encrypted_content"], "opaque");
+    assert_eq!(input[2]["type"], "message");
+    assert_eq!(input[3]["type"], "function_call");
 }
 
 #[tokio::test]
@@ -14266,78 +14685,43 @@ async fn test_moonshot_rejection_is_retried_with_degraded_tools() {
     assert_eq!(degraded["messages"][0]["role"], "user");
 }
 
-/// The dialect rejection survives the degraded replay: the provider refuses
-/// the schemas twice — once projected, once degraded — so the request is
-/// sound and the *provider* is the one that cannot serve it. The chain must
-/// walk on; the 400 must never reach the client (it would end the agent's
-/// turn on a request fault the request does not carry).
-const MOONSHOT_PERSISTENT_REJECTION_CONFIG: &str = r#"
-global_plugins = ["api_auth"]
-
-[server]
-listen = "127.0.0.1:{PORT}"
-threads = 1
-
-[metrics]
-enabled = true
-
-[plugins.api_auth]
-category = "key_auth"
-header = "Authorization"
-strip_prefix = "Bearer "
-keys = ["test-key-123"]
-
-[providers.kimi_mock]
-kind = "openai_compat"
-base_url = "{MOCK_URL}"
-upstream_path = "/coding/v1/chat/completions"
-api_key = "fake-key"
-tool_schema = "moonshot"
-
-[providers.backup_openai]
-kind = "openai"
-base_url = "{FALLBACK_URL}"
-api_key = "fake-key"
-
-[[routes]]
-path = "/v1/chat/completions"
-provider = "kimi_mock"
-fallback = ["backup_openai"]
-strategy = "fallback"
-"#;
-
 #[tokio::test]
-async fn test_moonshot_rejection_that_survives_the_degraded_retry_walks_the_chain() {
+async fn test_a_second_moonshot_schema_rejection_drops_the_tool_surface() {
     let mock = MockServer::start().await;
-    let fallback = MockServer::start().await;
 
-    // The upstream refuses every attempt with the dialect rejection: the
-    // projected one AND the degraded one. The repair has done all it can.
+    // Degraded schemas are the attempt to preserve function calling. If even
+    // those are refused, the final repair sacrifices that surface rather than
+    // surfacing the schema fault and ending the agent's turn.
     Mock::given(method("POST"))
         .and(path("/coding/v1/chat/completions"))
+        .and(body_string_contains("\"$defs\""))
         .respond_with(ResponseTemplate::new(400).set_body_json(moonshot_rejection()))
-        .expect(2)
+        .with_priority(1)
+        .expect(1)
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/coding/v1/chat/completions"))
+        .and(body_string_contains("\"parameters\":{\"type\":\"object\"}"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(moonshot_rejection()))
+        .with_priority(2)
+        .expect(1)
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/coding/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("without tools")))
+        .with_priority(3)
+        .expect(1)
         .mount(&mock)
         .await;
 
-    // The next link of the chain answers.
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from fallback")))
-        .expect(1)
-        .mount(&fallback)
-        .await;
-
-    let gw = TestGateway::start_with_fallback(
-        MOONSHOT_PERSISTENT_REJECTION_CONFIG,
-        &mock.uri(),
-        &fallback.uri(),
-    )
-    .await;
+    let gw = TestGateway::start(MOONSHOT_TOOL_CONFIG, &mock.uri()).await;
     let c = client();
 
     let mut body = chat_body("kimi-for-coding", "hi");
     body["tools"] = json!([zod_tool()]);
+    body["tool_choice"] = json!("auto");
 
     let resp = c
         .post(gw.url("/v1/chat/completions"))
@@ -14349,27 +14733,23 @@ async fn test_moonshot_rejection_that_survives_the_degraded_retry_walks_the_chai
     assert_eq!(
         resp.status(),
         200,
-        "the refusal must not end the agent's turn — the chain walks on"
+        "the terminal tool repair must answer, not the second 400"
     );
     assert_eq!(
         resp.json::<Value>().await.unwrap()["choices"][0]["message"]["content"],
-        "from fallback"
+        "without tools"
     );
 
-    // The provider that persisted in its rejection got exactly the two
-    // attempts the repair allows: the projected one and the degraded one.
     let requests = mock.received_requests().await.unwrap();
-    assert_eq!(
-        requests.len(),
-        2,
-        "the repair is applied once — no third attempt on the same provider"
-    );
-    let degraded: Value = serde_json::from_slice(&requests[1].body).unwrap();
-    assert_eq!(
-        degraded["tools"][0]["function"]["parameters"],
-        json!({"type": "object"}),
-        "the second attempt is the degraded one: {degraded}"
-    );
+    assert_eq!(requests.len(), 3, "project → degrade → remove");
+    for request in requests.iter().take(2) {
+        let sent: Value = serde_json::from_slice(&request.body).unwrap();
+        assert!(sent.get("tools").is_some());
+    }
+    let terminal: Value = serde_json::from_slice(&requests[2].body).unwrap();
+    assert!(terminal.get("tools").is_none());
+    assert!(terminal.get("tool_choice").is_none());
+    assert_eq!(terminal["messages"][0]["role"], "user");
 }
 
 #[tokio::test]
@@ -14450,6 +14830,285 @@ async fn test_moonshot_orphaned_tool_call_is_repaired() {
     assert_eq!(
         messages[2]["content"],
         "[tool call interrupted: no result was recorded]"
+    );
+}
+
+/// A repaired orphan can be followed by a different translation fault: the
+/// repair state must not turn every later 400 into an opaque request fault.
+#[tokio::test]
+async fn test_tool_schema_then_orphan_repairs_are_cross_class() {
+    let mock = MockServer::start().await;
+
+    // Attempt 1: the projected zod schema is still rejected. Attempt 2:
+    // the degraded schema is accepted, but the orphaned call is refused.
+    // Attempt 3: the repaired history is accepted. Each retry class must
+    // hand control back to the classifier instead of passing the next 400
+    // straight to the client.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+    Mock::given(method("POST"))
+        .and(path("/coding/v1/chat/completions"))
+        .respond_with(move |req: &wiremock::Request| {
+            let attempt = counter.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                return ResponseTemplate::new(400).set_body_json(moonshot_rejection());
+            }
+            if attempt == 1 {
+                return ResponseTemplate::new(400).set_body_json(json!({
+                    "error": {
+                        "code": "invalid_request_error",
+                        "message": "Invalid request: an assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id'. The following tool_call_ids did not have response messages: call_abc123",
+                        "type": "invalid_request_error"
+                    }
+                }));
+            }
+            let sent: Value = serde_json::from_slice(&req.body).expect("json body");
+            let messages = sent["messages"].as_array().expect("chat history");
+            assert!(
+                messages
+                    .iter()
+                    .any(|message| message["content"]
+                        == "[tool call interrupted: no result was recorded]"),
+                "the final replay must carry the orphan repair: {sent}"
+            );
+            ResponseTemplate::new(200).set_body_json(openai_response("after both repairs"))
+        })
+        .mount(&mock)
+        .await;
+
+    let gw = TestGateway::start(MOONSHOT_TOOL_CONFIG, &mock.uri()).await;
+    let c = client();
+
+    let mut body = chat_body("kimi-for-coding", "two fault classes");
+    body["tools"] = json!([zod_tool()]);
+    body["messages"] = json!([
+        {"role": "user", "content": "fetch the thing"},
+        {"role": "assistant", "content": null, "tool_calls": [{
+            "id": "call_abc123",
+            "type": "function",
+            "function": {"name": "memory_feedback", "arguments": "{}"}
+        }]}
+    ]);
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "the second translation fault must be classified, not passed through"
+    );
+    assert_eq!(
+        resp.json::<Value>().await.unwrap()["choices"][0]["message"]["content"],
+        "after both repairs"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 3, "schema → orphan → success");
+}
+
+const ORPHAN_LADDER_FAILOVER_CONFIG: &str = r#"
+global_plugins = ["api_auth"]
+
+[server]
+listen = "127.0.0.1:{PORT}"
+threads = 1
+
+[metrics]
+enabled = true
+
+[plugins.api_auth]
+category = "key_auth"
+header = "Authorization"
+strip_prefix = "Bearer "
+keys = ["test-key-123"]
+
+[providers.kimi_mock]
+kind = "openai_compat"
+base_url = "{MOCK_URL}"
+upstream_path = "/coding/v1/chat/completions"
+api_key = "fake-key"
+tool_schema = "moonshot"
+
+[providers.backup]
+kind = "openai"
+base_url = "{FALLBACK_URL}"
+api_key = "fake-key"
+
+[[routes]]
+path = "/v1/chat/completions"
+provider = "kimi_mock"
+fallback = ["backup"]
+strategy = "fallback"
+max_failover_attempts = 4
+"#;
+
+#[tokio::test]
+async fn test_orphan_repair_exhaustion_fails_over_to_fallback() {
+    let primary = MockServer::start().await;
+    let fallback = MockServer::start().await;
+
+    // Repair, then terminal removal, then failover: the primary sees three
+    // attempts. A fourth would mean the terminal ladder looped instead of
+    // walking the fallback chain.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+    Mock::given(method("POST"))
+        .respond_with(move |_req: &wiremock::Request| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            ResponseTemplate::new(400).set_body_json(json!({
+                "error": {
+                    "code": "invalid_request_error",
+                    "message": "Invalid request: an assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id'. The following tool_call_ids did not have response messages: call_abc123",
+                    "type": "invalid_request_error"
+                }
+            }))
+        })
+        .mount(&primary)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_response("from fallback")))
+        .mount(&fallback)
+        .await;
+
+    let config = ORPHAN_LADDER_FAILOVER_CONFIG
+        .replace("{MOCK_URL}", &primary.uri())
+        .replace("{FALLBACK_URL}", &fallback.uri());
+    let gw = TestGateway::start(&config, &primary.uri()).await;
+    let c = client();
+
+    let mut body = chat_body("kimi-for-coding", "orphan exhaustion");
+    body["messages"] = json!([
+        {"role": "user", "content": "fetch the thing"},
+        {"role": "assistant", "content": null, "tool_calls": [{
+            "id": "call_abc123",
+            "type": "function",
+            "function": {"name": "memory_feedback", "arguments": "{}"}
+        }]}
+    ]);
+
+    let resp = c
+        .post(gw.url("/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers().get("X-MaxLLM-Provider").unwrap(), "backup");
+    assert_eq!(
+        resp.json::<Value>().await.unwrap()["choices"][0]["message"]["content"],
+        "from fallback"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "normal → repaired → removed"
+    );
+
+    let fallback_requests = fallback.received_requests().await.unwrap();
+    assert_eq!(fallback_requests.len(), 1);
+    let sent: Value = serde_json::from_slice(&fallback_requests[0].body).unwrap();
+    let messages = sent["messages"].as_array().unwrap();
+    // The fallback starts from the client's history: it may accept the same
+    // orphaned call, so the exhausted provider's terminal rewrite is not
+    // carried across the provider boundary.
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0]["role"], "user");
+    assert_eq!(messages[1]["role"], "assistant");
+}
+
+#[tokio::test]
+async fn test_unsupported_reasoning_effort_is_dropped_before_failing_over() {
+    let primary = MockServer::start().await;
+    let fallback = MockServer::start().await;
+
+    // The first native Responses attempt carries the contract field. The
+    // strict provider rejects only the optional effort value, so the retry
+    // omits the whole knob and succeeds on the same provider.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(move |req: &wiremock::Request| {
+            let attempt = counter.fetch_add(1, Ordering::SeqCst);
+            let sent: Value = serde_json::from_slice(&req.body).expect("json body");
+            if attempt == 0 {
+                assert_eq!(sent["reasoning"]["effort"], "none");
+                return ResponseTemplate::new(400).set_body_json(json!({
+                    "error": {
+                        "code": "invalid_request_error",
+                        "message": "reasoning.effort value \"none\" is not supported",
+                        "type": "invalid_request_error"
+                    }
+                }));
+            }
+            assert!(
+                sent.get("reasoning_effort").is_none(),
+                "the chat retry must omit the rejected knob: {sent}"
+            );
+            assert_eq!(
+                sent["reasoning"],
+                json!({"summary": "auto"}),
+                "only the rejected value is dropped; the rest of reasoning survives: {sent}"
+            );
+            ResponseTemplate::new(200).set_body_json(json!({
+                "id": "resp_ok",
+                "object": "response",
+                "status": "completed",
+                "model": "strict-model",
+                "output": [],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+            }))
+        })
+        .mount(&primary)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "resp_never",
+            "object": "response",
+            "status": "completed",
+            "model": "strict-model",
+            "output": [],
+            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+        })))
+        .mount(&fallback)
+        .await;
+
+    let config = CALL_ID_FAILOVER_CONFIG
+        .replace("{MOCK_URL}", &primary.uri())
+        .replace("{FALLBACK_URL}", &fallback.uri());
+    let gw = TestGateway::start(&config, &primary.uri()).await;
+    let c = client();
+
+    let body = json!({
+        "model": "strict-model",
+        "input": [
+            {"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "hi"}]}
+        ],
+        "reasoning": {"effort": "none", "summary": "auto"},
+        "stream": false
+    });
+
+    let resp = c
+        .post(gw.url("/v1/responses"))
+        .header("Authorization", "Bearer test-key-123")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["id"], "resp_ok");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+    let fallback_requests = fallback.received_requests().await.unwrap_or_default();
+    assert!(
+        fallback_requests.is_empty(),
+        "the optional-knob repair must happen on the same provider"
     );
 }
 

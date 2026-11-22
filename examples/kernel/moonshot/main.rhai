@@ -34,23 +34,6 @@ fn on_request_body(ctx) {
         }
     }
 
-    // DeepSeek (api.deepseek.com) speaks the Responses contract but refuses
-    // every tool_choice but "auto"/"none":
-    //   * "any" does not even deserialize — HTTP 422
-    //     "tool_choice: expected one of `none`, `auto`, `required` or a tool choice object";
-    //   * "required" and a named function choice are refused by thinking mode
-    //     — HTTP 400 "Thinking mode does not support this tool_choice".
-    // Both statuses reached the client and ended the agent's turn: the 400
-    // was the last leg of the chain, so no failover was left. The choice is
-    // degraded to "auto" — the model decides whether to call a tool, and
-    // the turn continues.
-    if provider.contains("deepseek") {
-        let choice = body["tool_choice"];
-        if choice == "any" || choice == "required" || type_of(choice) == "map" {
-            body["tool_choice"] = "auto";
-        }
-    }
-
     body
 }
 

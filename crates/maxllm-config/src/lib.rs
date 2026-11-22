@@ -34,6 +34,10 @@ pub struct Config {
     pub rate_limit: Option<RateLimitConfig>,
     #[serde(default)]
     pub metrics: MetricsConfig,
+    /// Native OpenTelemetry export (logs + traces over OTLP/HTTP).
+    /// Omitted ⇒ disabled, exactly the pre-0.3.25 behaviour.
+    #[serde(default)]
+    pub otel: OtelConfig,
     /// Named plugin definitions.
     #[serde(default)]
     pub plugins: HashMap<String, PluginConfig>,
@@ -190,6 +194,36 @@ pub struct AutoModelConfig {
     /// round-robin over the whole tier.
     #[serde(default = "default_true")]
     pub prefer_fast: bool,
+    /// Weight the un-pinned rotation by provider-side prompt-cache evidence.
+    ///
+    /// This is the right default for a generic `auto` pool: re-reading a long
+    /// agent context is expensive, so a member that keeps the cache warm earns
+    /// more of the request rotation. It is the wrong default when the operator
+    /// explicitly wants **new sessions to burn accounts evenly**: session
+    /// affinity still gives a conversation to one member, but the first turns
+    /// of new sessions must take an unweighted round-robin. Set
+    /// `cache_weighted = false` for that mode.
+    #[serde(default = "default_true")]
+    pub cache_weighted: bool,
+    /// Fail closed when no member of this pool can take the traffic.
+    ///
+    /// A pool is normally a *preference*: when every member is
+    /// circuit-open the request falls through to the route's own provider
+    /// chain, so a single-pool route still has somewhere to go. That is the
+    /// right answer for `auto` ("pick one for me"), and the wrong answer for
+    /// a pool that exists to name a **channel** — a client's model field
+    /// says `deepseek-flash` or `open_design` and that name *is* the whole
+    /// request. Falling through then answers with an upstream nobody asked
+    /// for, or with a 403 from a provider whose allow-list rejects the name,
+    /// which reads as "model not allowed" instead of "that channel is down"
+    /// (2026-11-16: `/model open_design` on LPT came back as `model
+    /// 'open_design' is not allowed on provider 'opencode_1'`).
+    ///
+    /// With `strict = true` an unusable pool answers a 503 that names its
+    /// own members and their circuit state. Defaults to `false` so every
+    /// existing pool keeps the fall-through.
+    #[serde(default)]
+    pub strict: bool,
     /// Which side of the deployment boundary this pool may draw from.
     /// Checked at load: a member that violates it is a startup error, not a
     /// silent misroute. Defaults to `any` so existing configs keep working.
@@ -321,6 +355,7 @@ impl Default for SessionStickyConfig {
             enabled: false,
             timeout_secs: default_session_timeout_secs(),
             max_entries: default_session_max_entries(),
+            max_pin_secs: 0,
             body_affinity: false,
             body_affinity_max_bytes: default_session_body_affinity_max_bytes(),
         }
@@ -338,6 +373,17 @@ pub struct SessionStickyConfig {
     /// Max number of session entries kept in memory (LRU eviction on overflow).
     #[serde(default = "default_session_max_entries")]
     pub max_entries: usize,
+    /// Hard maximum age of a session binding, in seconds, measured from the
+    /// first successful pin (not from the last use).
+    ///
+    /// `timeout_secs` is an **idle** timeout: an active session refreshes it on
+    /// every turn and can therefore stay on one account forever. That protects
+    /// upstream prompt caches, but it also concentrates all long-running agent
+    /// sessions on whichever key first served them. `max_pin_secs` forces that
+    /// long-lived binding to expire even while it is active, returning it to
+    /// the rotation. `0` disables the cap.
+    #[serde(default)]
+    pub max_pin_secs: u64,
     /// Resolve the session identity from the **request body** when the
     /// client sends no session header.
     ///
@@ -503,10 +549,19 @@ pub struct ProviderConfig {
     ///   `400 MissingParameter \`partial\`` for such an input (the parameter
     ///   is a red herring; the rejected thing is the trailing turn), which is
     ///   the shape codex remote compaction sends.
+    /// * `"deepseek_reasoning_lead"` — give every reasoning item a
+    ///   `reasoning_text` and make every step that carries a tool call lead
+    ///   with one. DeepSeek's Responses endpoint refuses a request whose
+    ///   step does not start with a reasoning item that carries text
+    ///   (`400 The reasoning_text in the thinking mode must be passed back
+    ///   to the API`): codex replays a sealed reasoning item
+    ///   (`encrypted_content` only) and puts the reasoning behind the
+    ///   message it belongs to.
     /// * `"none"` — force no repair, overriding the host-based default.
     ///
     /// Unset means the gateway picks by upstream host: ark (`*.volces.com`)
-    /// providers get `ark_trailing_assistant`, every other provider gets no
+    /// providers get `ark_trailing_assistant`, DeepSeek (`*.deepseek.com`)
+    /// providers get `deepseek_reasoning_lead`, every other provider gets no
     /// repair.
     #[serde(default)]
     pub native_responses_repair: Option<String>,
@@ -976,6 +1031,107 @@ pub struct RateLimitConfig {
     pub requests_per_minute: u64,
 }
 
+/// Native OpenTelemetry export.
+///
+/// The gateway emits OTLP/HTTP **directly** to the configured endpoint — the
+/// same process that produces the log line ships it, so no log file tailing is
+/// involved and `severity_text`/`severity_number` are real. GreptimeDB needs
+/// two different header sets for the two signals (its trace pipeline requires
+/// `X-Greptime-Pipeline-Name: greptime_trace_v1`, while the *same* header on
+/// the logs endpoint is rejected), which is why `logs_headers` and
+/// `traces_headers` are separate.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OtelConfig {
+    /// Master switch. Everything else is ignored unless this is true.
+    #[serde(default)]
+    pub enabled: bool,
+    /// OTLP/HTTP **base** URL. `/v1/logs` and `/v1/traces` are appended.
+    /// GreptimeDB: `http://10.126.126.6:4000/v1/otlp`.
+    #[serde(default = "default_otel_endpoint")]
+    pub endpoint: String,
+    /// `service.name` resource attribute.
+    #[serde(default = "default_otel_service_name")]
+    pub service_name: String,
+    /// Host identity. Written as the `machine` attribute on every record and
+    /// in the resource; defaults to the machine's hostname.
+    #[serde(default)]
+    pub machine: String,
+    /// HTTP basic auth (GreptimeDB user is `otel`). `MAXLLM_OTEL_USERNAME` /
+    /// `MAXLLM_OTEL_PASSWORD` override these, so the secret can live in the
+    /// service's 0600 EnvironmentFile instead of this file.
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
+    /// Export log records (tracing events).
+    #[serde(default = "default_true")]
+    pub logs: bool,
+    /// Export spans.
+    #[serde(default = "default_true")]
+    pub traces: bool,
+    /// Head-based sampling ratio for spans (1.0 = every request).
+    #[serde(default = "default_otel_sample_ratio")]
+    pub sample_ratio: f64,
+    /// Value of the `log_source` log attribute. GreptimeDB extracts it into a
+    /// real column when the exporter sends `X-Greptime-Log-Extract-Keys`.
+    #[serde(default = "default_otel_log_source")]
+    pub log_source: String,
+    /// Headers sent to both exporters.
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    /// Headers sent only to the logs exporter.
+    #[serde(default)]
+    pub logs_headers: HashMap<String, String>,
+    /// Headers sent only to the traces exporter.
+    #[serde(default)]
+    pub traces_headers: HashMap<String, String>,
+    /// `tracing` filter for the exported signals. The file/stdout log keeps
+    /// the process-wide `RUST_LOG`; this only shapes what leaves the process.
+    #[serde(default = "default_otel_filter")]
+    pub filter: String,
+}
+
+impl Default for OtelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: default_otel_endpoint(),
+            service_name: default_otel_service_name(),
+            machine: String::new(),
+            username: String::new(),
+            password: String::new(),
+            logs: true,
+            traces: true,
+            sample_ratio: default_otel_sample_ratio(),
+            log_source: default_otel_log_source(),
+            headers: HashMap::new(),
+            logs_headers: HashMap::new(),
+            traces_headers: HashMap::new(),
+            filter: default_otel_filter(),
+        }
+    }
+}
+
+fn default_otel_endpoint() -> String {
+    "http://127.0.0.1:4318".to_string()
+}
+
+fn default_otel_service_name() -> String {
+    "maxllm".to_string()
+}
+
+fn default_otel_sample_ratio() -> f64 {
+    1.0
+}
+
+fn default_otel_log_source() -> String {
+    "maxllm_logs".to_string()
+}
+
+fn default_otel_filter() -> String {
+    "info".to_string()
+}
+
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct MetricsConfig {
     #[serde(default)]
@@ -1227,6 +1383,76 @@ fn expand_env_vars(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `[otel]` is opt-in and its defaults must be safe: a config that never
+    /// mentions it must behave exactly like 0.3.24 (no exporter, no headers).
+    #[test]
+    fn otel_defaults_are_opt_in() {
+        let cfg: Config = toml::from_str(
+            r#"
+[server]
+listen = "0.0.0.0:1"
+
+[providers.mock]
+kind = "openai"
+base_url = "http://127.0.0.1:1"
+api_key = "k"
+"#,
+        )
+        .expect("config parses");
+        assert!(!cfg.otel.enabled);
+        assert!(cfg.otel.logs && cfg.otel.traces);
+        assert_eq!(cfg.otel.endpoint, "http://127.0.0.1:4318");
+        assert_eq!(cfg.otel.service_name, "maxllm");
+        assert_eq!(cfg.otel.log_source, "maxllm_logs");
+        assert_eq!(cfg.otel.sample_ratio, 1.0);
+        assert!(cfg.otel.logs_headers.is_empty());
+        assert!(cfg.otel.traces_headers.is_empty());
+
+        let cfg: Config = toml::from_str(
+            r#"
+[server]
+listen = "0.0.0.0:1"
+
+[providers.mock]
+kind = "openai"
+base_url = "http://127.0.0.1:1"
+api_key = "k"
+
+[otel]
+enabled = true
+endpoint = "http://10.126.126.6:4000/v1/otlp"
+username = "otel"
+password = "pw"
+machine = "oleNas01"
+sample_ratio = 0.25
+
+[otel.logs_headers]
+X-Greptime-Log-Extract-Keys = "log_source,machine,event,provider,model"
+
+[otel.traces_headers]
+X-Greptime-Pipeline-Name = "greptime_trace_v1"
+"#,
+        )
+        .expect("config parses");
+        assert!(cfg.otel.enabled);
+        assert_eq!(cfg.otel.machine, "oleNas01");
+        assert_eq!(cfg.otel.sample_ratio, 0.25);
+        assert_eq!(
+            cfg.otel
+                .logs_headers
+                .get("X-Greptime-Log-Extract-Keys")
+                .map(String::as_str),
+            Some("log_source,machine,event,provider,model")
+        );
+        assert_eq!(
+            cfg.otel
+                .traces_headers
+                .get("X-Greptime-Pipeline-Name")
+                .map(String::as_str),
+            Some("greptime_trace_v1")
+        );
+    }
 
     /// The body affinity is opt-in: a config that does not ask for it keeps
     /// the old behaviour (headers only), and the size cap has a usable
@@ -1787,6 +2013,40 @@ pool = [{{ provider = "openai", model = "gpt-4o" }}]
         );
         let config = Config::parse(&toml).unwrap();
         assert!(!config.auto_model.as_ref().unwrap().prefer_fast);
+    }
+
+    #[test]
+    fn test_auto_model_cache_weighting_defaults_on_and_can_be_disabled() {
+        let on = format!(
+            r#"{PROVIDER_TOML}
+[auto_model]
+enabled = true
+pool = [{{ provider = "openai", model = "gpt-4o" }}]
+
+[[routes]]
+path = "/v1/auto"
+provider = "auto"
+auto_model = true
+"#
+        );
+        let config = Config::parse(&on).unwrap();
+        assert!(config.auto_model.as_ref().unwrap().cache_weighted);
+
+        let off = format!(
+            r#"{PROVIDER_TOML}
+[auto_model]
+enabled = true
+cache_weighted = false
+pool = [{{ provider = "openai", model = "gpt-4o" }}]
+
+[[routes]]
+path = "/v1/auto"
+provider = "auto"
+auto_model = true
+"#
+        );
+        let config = Config::parse(&off).unwrap();
+        assert!(!config.auto_model.as_ref().unwrap().cache_weighted);
     }
 
     #[test]

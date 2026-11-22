@@ -424,6 +424,12 @@ pub struct AutoPoolState {
     /// Whether the rotation prefers the low-latency cohort inside the
     /// preferred billing tier (see `[auto_model].prefer_fast`).
     pub prefer_fast: bool,
+    /// Whether the un-pinned rotation is weighted by prompt-cache evidence.
+    /// Set false when the operator wants an exact new-session round robin.
+    pub cache_weighted: bool,
+    /// Whether an unusable pool answers 503 instead of falling through to
+    /// the route's own provider chain (see `[auto_models.<key>] strict`).
+    pub strict: bool,
     /// Which side of the deployment boundary this pool may draw from.
     /// Checked at load (a violating member is a startup error) *and* at
     /// request time: a path pin or a fallback hop can name a provider that
@@ -615,6 +621,36 @@ pub fn apply_quota_parking(config: &Config, hot: &HotState) {
 /// The config decides first (`tool_schema = "moonshot"` / `"none"`); unset,
 /// the upstream host decides — a Moonshot-family host runs the stricter
 /// validator, every other provider takes the tool schemas as they are.
+/// The native-Responses repair a provider needs on its request body.
+///
+/// The provider's own declaration wins; an unset declaration falls back to
+/// the upstream host: ark (`*.volces.com`) needs the trailing-assistant-turn
+/// repair, DeepSeek (`*.deepseek.com`) needs the reasoning-lead repair, and
+/// every other upstream keeps the body byte-for-byte. `ark_default` is off
+/// for a provider whose kind already names its upstream family.
+fn native_responses_repair_for(
+    declared: Option<&str>,
+    base_url: &str,
+    ark_default: bool,
+) -> maxllm_translate::openai_compat::NativeResponsesRepair {
+    use maxllm_translate::openai_compat::NativeResponsesRepair as Repair;
+    match declared {
+        Some("ark_trailing_assistant") => Repair::ArkTrailingAssistantTurn,
+        Some("deepseek_reasoning_lead") => Repair::DeepSeekReasoningLead,
+        Some("none") => Repair::None,
+        _ => {
+            let host = base_url.to_ascii_lowercase();
+            if ark_default && host.contains("volces.com") {
+                Repair::ArkTrailingAssistantTurn
+            } else if host.contains("deepseek.com") {
+                Repair::DeepSeekReasoningLead
+            } else {
+                Repair::None
+            }
+        }
+    }
+}
+
 fn wants_moonshot_tool_schema(conf: &maxllm_config::ProviderConfig) -> bool {
     match conf.tool_schema.as_deref() {
         Some("moonshot") => true,
@@ -690,7 +726,15 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
                 Box::new(maxllm_translate::openai_compat::OpenAICompatTranslator::xai())
             }
             ProviderKind::DeepSeek => {
-                Box::new(maxllm_translate::openai_compat::OpenAICompatTranslator::deepseek())
+                let translator =
+                    maxllm_translate::openai_compat::OpenAICompatTranslator::deepseek();
+                Box::new(
+                    translator.with_native_responses_repair(native_responses_repair_for(
+                        conf.native_responses_repair.as_deref(),
+                        &conf.base_url,
+                        false,
+                    )),
+                )
             }
             ProviderKind::Ollama => {
                 Box::new(maxllm_translate::openai_compat::OpenAICompatTranslator::ollama())
@@ -706,24 +750,31 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
                     path.to_string(),
                     maxllm_translate::openai_compat::AuthStyle::Bearer,
                 );
-                // Volcengine Ark's Responses prefill validator rejects an
-                // input list ending in an assistant text turn with a
-                // misleading MissingParameter `partial`. Codex compaction
-                // sends exactly that shape, so ark providers repair it before
-                // forwarding; every other openai_compat upstream keeps the
-                // body byte-for-byte.
-                let wants_ark_repair = match conf.native_responses_repair.as_deref() {
-                    Some("ark_trailing_assistant") => true,
-                    Some("none") => false,
-                    _ => conf.base_url.to_ascii_lowercase().contains("volces.com"),
-                };
-                let translator = if wants_ark_repair {
-                    translator.with_native_responses_repair(
-                        maxllm_translate::openai_compat::NativeResponsesRepair::ArkTrailingAssistantTurn,
-                    )
-                } else {
-                    translator
-                };
+                // Two upstreams refuse part of the Responses contract, and
+                // each needs its own repair:
+                //
+                // * Volcengine Ark's Responses prefill validator rejects an
+                //   input list ending in an assistant text turn with a
+                //   misleading MissingParameter `partial`. Codex compaction
+                //   sends exactly that shape, so ark providers drop the
+                //   trailing turn before forwarding.
+                // * DeepSeek's Responses endpoint refuses a request whose
+                //   step does not start with a reasoning item that carries
+                //   text (`The reasoning_text in the thinking mode must be
+                //   passed back to the API`) — codex replays a sealed
+                //   reasoning item (encrypted_content only) and puts the
+                //   reasoning behind the message it belongs to, so the
+                //   repair gives every reasoning item its text back and
+                //   moves the step's first reasoning item to its front.
+                //
+                // Every other openai_compat upstream keeps the body
+                // byte-for-byte.
+                let translator =
+                    translator.with_native_responses_repair(native_responses_repair_for(
+                        conf.native_responses_repair.as_deref(),
+                        &conf.base_url,
+                        true,
+                    ));
                 Box::new(translator)
             }
             ProviderKind::OpenCode => {
@@ -1025,6 +1076,8 @@ pub fn build_hot_state(config: &Config) -> Result<HotState, Box<dyn std::error::
             name,
             entries,
             prefer_fast: auto.prefer_fast,
+            cache_weighted: auto.cache_weighted,
+            strict: auto.strict,
             scope: auto.scope,
         });
     }
@@ -1578,7 +1631,13 @@ fn auto_pool_cache_weight(provider: &str) -> Option<u32> {
 /// rotates while one member serves everything. Each member instead takes the
 /// slot with the smallest served-to-weight ratio, so the shares stay
 /// proportional *and* the members keep taking turns.
-fn auto_pool_cache_order<'a>(rotation: &[&'a AutoPoolEntry]) -> Vec<&'a AutoPoolEntry> {
+fn auto_pool_cache_order<'a>(
+    rotation: &[&'a AutoPoolEntry],
+    cache_weighted: bool,
+) -> Vec<&'a AutoPoolEntry> {
+    if !cache_weighted {
+        return rotation.to_vec();
+    }
     let measured: Vec<u32> = rotation
         .iter()
         .filter_map(|e| auto_pool_cache_weight(&e.provider))
@@ -1972,6 +2031,7 @@ impl AiGateway {
         let sessions = Arc::new(SessionStore::new(
             session_cfg.max_entries,
             session_cfg.timeout_secs,
+            session_cfg.max_pin_secs,
         ));
 
         // Restore the persisted resilience state: a quota force-open (429) and
@@ -2414,10 +2474,7 @@ impl AiGateway {
                 // half-open probe slot. The old `is_open()` did exactly that,
                 // so the entries the round-robin *looked at* but never picked
                 // were left permanently half-open and answered 503.
-                .map(|p| {
-                    p.circuit_breaker.allows_traffic()
-                        && !provider_saturated(&e.provider, p)
-                })
+                .map(|p| p.circuit_breaker.allows_traffic() && !provider_saturated(&e.provider, p))
                 .unwrap_or(false)
         });
         if healthy.is_empty() {
@@ -2433,9 +2490,7 @@ impl AiGateway {
         let admits = |e: &AutoPoolEntry| -> bool {
             hot.providers
                 .get(&e.provider)
-                .map(|p| {
-                    !p.circuit_breaker.is_open() && !provider_saturated(&e.provider, p)
-                })
+                .map(|p| !p.circuit_breaker.is_open() && !provider_saturated(&e.provider, p))
                 .unwrap_or(false)
         };
         // The *read-only* twin of `admits`: it says whether the member could
@@ -2446,10 +2501,7 @@ impl AiGateway {
         let allows = |e: &AutoPoolEntry| -> bool {
             hot.providers
                 .get(&e.provider)
-                .map(|p| {
-                    p.circuit_breaker.allows_traffic()
-                        && !provider_saturated(&e.provider, p)
-                })
+                .map(|p| p.circuit_breaker.allows_traffic() && !provider_saturated(&e.provider, p))
                 .unwrap_or(false)
         };
 
@@ -2551,7 +2603,7 @@ impl AiGateway {
                 // the whole context every turn costs a full prefill per
                 // turn, so it earns fewer slots. None is ever starved —
                 // every member keeps at least one.
-                let slots = auto_pool_cache_order(&rotation);
+                let slots = auto_pool_cache_order(&rotation, pool.cache_weighted);
                 if slots.is_empty() {
                     return None;
                 }
@@ -2630,21 +2682,24 @@ impl AiGateway {
                 if let Some(provider) = self.select_from_auto_pool(hot, pool, route, ctx) {
                     return Some(provider);
                 }
-                if scoped {
+                if scoped || pool.strict {
                     // Every pool member is unhealthy. Falling through to the
                     // route's own chain would hand the request to whatever the
                     // route names — for a scoped pool that is by definition the
-                    // wrong side of the deployment boundary, so fail closed
-                    // with a 503 instead of misrouting to a vendor.
+                    // wrong side of the deployment boundary, and for a `strict`
+                    // pool (a named *channel*) it is an upstream the client did
+                    // not ask for. Fail closed with a 503 that names the pool
+                    // and its members' state instead.
                     warn!(
                         pool = %pool.name,
                         scope = ?pool.scope,
-                        "every member of the scoped auto pool is unhealthy — no route-chain fallback allowed"
+                        strict = pool.strict,
+                        "every member of the auto pool is unhealthy — no route-chain fallback allowed"
                     );
                     return None;
                 }
-                // An unscoped pool may still fall through to the route's own
-                // selection so the request has somewhere to go.
+                // An unscoped, non-strict pool may still fall through to the
+                // route's own selection so the request has somewhere to go.
                 ctx.auto_pool = None;
             }
         }
@@ -2706,8 +2761,7 @@ impl AiGateway {
                             {
                                 METRICS.session_affinity_hits_total.inc();
                                 ctx.provider_name = pinned_name.clone();
-                                ctx.provider_allowed_models =
-                                    pinned.state.allowed_models.clone();
+                                ctx.provider_allowed_models = pinned.state.allowed_models.clone();
                                 ctx.fallback_used = pinned_name != route.provider;
                                 // The session continues on the provider it was
                                 // already talking to — see
@@ -3026,7 +3080,14 @@ impl AiGateway {
         }
         let scope = match ctx.path_pinned_provider.as_deref() {
             Some(pin) => format!("the provider '{pin}' named by the request path"),
-            None => format!("every candidate of route '{}'", route.path),
+            // A request that names a pool asked for that pool's members, not
+            // for the route's chain: say so, or the 503 reads as "every
+            // candidate of route '/v1/responses' is down" while the pool's own
+            // members are the only thing that was ever tried.
+            None => match hot.request_pool(route, ctx) {
+                Some(pool) => format!("every member of pool '{}'", pool.name),
+                None => format!("every candidate of route '{}'", route.path),
+            },
         };
         format!(
             "no provider available: {} — {scope} is rejecting traffic",
@@ -3133,15 +3194,16 @@ impl AiGateway {
         requested: Option<&str>,
     ) -> pingora::Result<()> {
         let Some(message) =
-            Self::model_denied(&ctx.virtual_key_allowed_models, resolved, requested)
-                .or_else(|| {
+            Self::model_denied(&ctx.virtual_key_allowed_models, resolved, requested).or_else(
+                || {
                     Self::provider_model_denied(
                         &ctx.provider_name,
                         &ctx.provider_allowed_models,
                         resolved,
                         requested,
                     )
-                })
+                },
+            )
         else {
             return Ok(());
         };
@@ -3501,9 +3563,7 @@ impl AiGateway {
         // Gemini-style `/models/<model>:<method>` path) can be checked
         // before anything reaches the upstream.
         if ctx.endpoint_type == EndpointType::Passthrough {
-            if ctx.virtual_key_allowed_models.is_empty()
-                && ctx.provider_allowed_models.is_empty()
-            {
+            if ctx.virtual_key_allowed_models.is_empty() && ctx.provider_allowed_models.is_empty() {
                 return Ok(());
             }
             self.buffer_request_body_chunk(ctx, body, end_of_stream);
@@ -3622,20 +3682,32 @@ impl AiGateway {
                     // the body is framed (or degrade them, on the retry after
                     // a rejection).
                     let mut out = match provider.as_deref() {
-                        Some(p) => {
-                            Self::apply_tool_schema_dialect(p, normalized, ctx.tool_schema_degraded)
-                        }
+                        Some(p) => Self::apply_tool_schema_dialect(
+                            p,
+                            normalized,
+                            ctx.tools_removed,
+                            ctx.tool_schema_degraded,
+                        ),
                         None => normalized,
                     };
                     // The orphan-tool-call repair answers a call the
                     // history never did; the answered history must not grow
                     // past the frame the client sent, so the orphans are
                     // dropped instead when they do not fit.
-                    if ctx.tool_calls_repaired {
+                    if ctx.tool_calls_removed {
+                        if let Some(repaired) = maxllm_translate::remove_orphan_tool_calls(&out) {
+                            out = repaired;
+                        }
+                    } else if ctx.tool_calls_repaired {
                         if let Some(repaired) = maxllm_translate::shrink_orphan_tool_calls(
                             &out,
                             ctx.request_body_buf.len(),
                         ) {
+                            out = repaired;
+                        }
+                    }
+                    if ctx.reasoning_effort_dropped {
+                        if let Some(repaired) = maxllm_translate::drop_reasoning_effort(&out) {
                             out = repaired;
                         }
                     }
@@ -4017,13 +4089,23 @@ impl AiGateway {
                     outgoing = Self::apply_tool_schema_dialect(
                         provider,
                         outgoing,
+                        ctx.tools_removed,
                         ctx.tool_schema_degraded,
                     );
                 }
-                if ctx.tool_calls_repaired {
+                if ctx.tool_calls_removed {
+                    if let Some(repaired) = maxllm_translate::remove_orphan_tool_calls(&outgoing) {
+                        outgoing = repaired;
+                    }
+                } else if ctx.tool_calls_repaired {
                     // The orphan-tool-call repair — the history is replayed
                     // with its unanswered calls answered.
                     if let Some(repaired) = maxllm_translate::repair_orphan_tool_calls(&outgoing) {
+                        outgoing = repaired;
+                    }
+                }
+                if ctx.reasoning_effort_dropped {
+                    if let Some(repaired) = maxllm_translate::drop_reasoning_effort(&outgoing) {
                         outgoing = repaired;
                     }
                 }
@@ -4318,14 +4400,28 @@ impl AiGateway {
                             outgoing = Self::apply_tool_schema_dialect(
                                 provider,
                                 outgoing,
+                                ctx.tools_removed,
                                 ctx.tool_schema_degraded,
                             );
-                            if ctx.tool_calls_repaired {
-                                if let Some(repaired) =
-                                    maxllm_translate::repair_orphan_tool_calls(&outgoing)
-                                {
-                                    outgoing = repaired;
-                                }
+                        }
+                        if ctx.tool_calls_removed {
+                            if let Some(repaired) =
+                                maxllm_translate::remove_orphan_tool_calls(&outgoing)
+                            {
+                                outgoing = repaired;
+                            }
+                        } else if ctx.tool_calls_repaired {
+                            if let Some(repaired) =
+                                maxllm_translate::repair_orphan_tool_calls(&outgoing)
+                            {
+                                outgoing = repaired;
+                            }
+                        }
+                        if ctx.reasoning_effort_dropped {
+                            if let Some(repaired) =
+                                maxllm_translate::drop_reasoning_effort(&outgoing)
+                            {
+                                outgoing = repaired;
                             }
                         }
                         // The kernel's rewrite is the last word on the body.
@@ -4405,12 +4501,15 @@ impl AiGateway {
     fn apply_tool_schema_dialect(
         provider: &ProviderState,
         body: Vec<u8>,
+        tools_removed: bool,
         degraded: bool,
     ) -> Vec<u8> {
         if !provider.moonshot_tool_schema {
             return body;
         }
-        if degraded {
+        if tools_removed {
+            maxllm_translate::moonshot::remove_tool_surface(&body)
+        } else if degraded {
             maxllm_translate::moonshot::degrade_tool_schemas(&body)
         } else {
             maxllm_translate::moonshot::normalize_tools(&body)
@@ -4693,6 +4792,22 @@ fn model_from_request_path(path: &str) -> Option<String> {
 /// Resolve the upstream time budget for a request: a route may declare
 /// `timeout_secs`, which overrides the hard-coded read/write defaults.
 /// Returns `None` when the route does not configure one (or is unmatched).
+/// Close the current upstream attempt's span with its outcome.
+///
+/// The provider/model are recorded here rather than at span creation: the
+/// model is not known until the request body has been parsed, and the model a
+/// provider is tried with is the one the attempt actually used.
+fn close_upstream_span(ctx: &mut RequestCtx, status: u16, error: Option<&str>) {
+    if let Some(span) = ctx.upstream_span.take() {
+        span.record("http.response.status_code", status as i64);
+        span.record("maxllm.provider", ctx.provider_name.as_str());
+        span.record("maxllm.model", ctx.model.as_str());
+        if let Some(error) = error {
+            span.record("maxllm.error", error);
+        }
+    }
+}
+
 fn route_timeout_secs(routes: &[RouteConfig], route_index: Option<usize>) -> Option<Duration> {
     route_index
         .and_then(|i| routes.get(i))
@@ -4844,6 +4959,47 @@ fn body_reports_tier_limit(body: &str) -> bool {
     MARKERS.iter().any(|m| lower.contains(m))
 }
 
+/// Whether an upstream body names the moment a wall ends.
+///
+/// A 402 says "the account has no balance"; only the body can say WHEN that
+/// changes (`"reset_at": "…"`, "resets at …"). The guard keeps an unrelated
+/// date in the body — a support deadline, a build stamp, a "valid until"
+/// field about something else — from becoming the provider's parking
+/// deadline.
+fn body_names_reset(body: &str) -> bool {
+    const MARKERS: &[&str] = &["reset", "renew", "expir", "valid until", "available at"];
+    let lower = body.to_ascii_lowercase();
+    MARKERS.iter().any(|m| lower.contains(m))
+}
+
+/// Whether an upstream body names a BALANCE problem — a wall no timer ends.
+///
+/// A 402 says "the account has no balance"; only the body can say whether
+/// that clears itself (the plan's quota resets on a date) or whether it
+/// needs a top-up. open-design answers both at once — "Coding Plan quota
+/// is exhausted and wallet balance is insufficient", with a `reset_at`
+/// that is the coding plan's window — and its own words say the reset does
+/// NOT refill the wallet. Parking such a provider until that date would
+/// keep it out of the rotation for days after the account was paid for.
+fn body_names_balance_problem(body: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "insufficient balance",
+        "insufficient credit",
+        "insufficient funds",
+        "balance is insufficient",
+        "recharge",
+        "top up",
+        "top-up",
+        "billing",
+        "余额不足",
+        "欠费",
+    ];
+    // The JSON error code spells it with an underscore
+    // ("insufficient_balance") — normalise it to the spaced form.
+    let lower = body.to_ascii_lowercase().replace('_', " ");
+    MARKERS.iter().any(|m| lower.contains(m))
+}
+
 fn body_reports_tool_schema(body: &str) -> bool {
     let lower = body.to_ascii_lowercase();
     lower.contains("tools.function.parameters") || lower.contains("moonshot flavored json schema")
@@ -4857,74 +5013,16 @@ fn body_reports_orphan_tool_call(body: &str) -> bool {
     maxllm_translate::body_reports_orphan_tool_call(body)
 }
 
-/// What the gateway does with an upstream 400 whose body has been
-/// collected and classified.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ToolPlumbingAction {
-    /// The body names neither the tool schemas nor an orphaned tool call:
-    /// it is the client's own fault and is handed back untouched.
-    None,
-    /// The upstream refused the tool schemas: replay the request once with
-    /// every tool schema reduced to a bare object.
-    DegradeSchema,
-    /// The upstream refused the conversation's tool history: answer the
-    /// orphaned call and replay the request once.
-    RepairOrphan,
-    /// The repair was already applied and the same refusal survived it.
-    /// The request is sound — the provider persists in its dialect
-    /// rejection — so the fault is the provider's and the chain walks on.
-    /// The reason says which refusal survived.
-    FailOver(&'static str),
-}
-
-/// Classify a collected 400 body against the repair the gateway already
-/// applied.
+/// Whether an upstream error body rejects the reasoning-effort knob.
 ///
-/// The kernel's decision comes first (it is the operator's live policy and
-/// may escalate to a repair the built-in rules do not know), the built-in
-/// rules second. Either way the *same* repair is never applied twice: a
-/// second refusal of the same class is not a request fault, it is a provider
-/// that does not accept this conversation — so the request walks to the next
-/// provider instead of ending the agent's turn.
-fn classify_tool_plumbing(
-    kernel_repair: maxllm_translate::kernel::KernelRepair,
-    body: &str,
-    schema_degraded: bool,
-    orphan_repaired: bool,
-) -> ToolPlumbingAction {
-    use maxllm_translate::kernel::KernelRepair;
-    match kernel_repair {
-        KernelRepair::SchemaDegrade => {
-            return if schema_degraded {
-                ToolPlumbingAction::FailOver("the tool-schema refusal survives the degraded replay")
-            } else {
-                ToolPlumbingAction::DegradeSchema
-            };
-        }
-        KernelRepair::OrphanRepair => {
-            return if orphan_repaired {
-                ToolPlumbingAction::FailOver("the orphan-call refusal survives the repaired replay")
-            } else {
-                ToolPlumbingAction::RepairOrphan
-            };
-        }
-        KernelRepair::None => {}
-    }
-    if body_reports_tool_schema(body) {
-        return if schema_degraded {
-            ToolPlumbingAction::FailOver("the tool-schema refusal survives the degraded replay")
-        } else {
-            ToolPlumbingAction::DegradeSchema
-        };
-    }
-    if body_reports_orphan_tool_call(body) {
-        return if orphan_repaired {
-            ToolPlumbingAction::FailOver("the orphan-call refusal survives the repaired replay")
-        } else {
-            ToolPlumbingAction::RepairOrphan
-        };
-    }
-    ToolPlumbingAction::None
+/// Kimi answers `400 … reasoning.effort value "none" is not supported`. The
+/// knob is optional and the gateway can omit it without altering the
+/// conversation, so this rejection is a translation/dialect fault, not a
+/// genuine client request fault.
+fn body_reports_unsupported_reasoning_effort(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    (lower.contains("reasoning.effort") || lower.contains("reasoning_effort"))
+        && (lower.contains("is not supported") || lower.contains("unsupported"))
 }
 
 /// Whether the gateway answers such an upstream status itself.
@@ -5051,6 +5149,21 @@ impl ProxyHttp for AiGateway {
             }
             open_providers.sort_unstable();
             half_open_providers.sort_unstable();
+            // WHEN does each walled provider recover? The question an
+            // operator asks first, and the one the gateway used to answer
+            // with a flat cooldown (the 402 path never even read the body).
+            // The deadline the breaker holds is the upstream's own answer
+            // when it gave one — "reset_at": "…", "resets in 15d 23h".
+            let mut quota_reset_at = serde_json::Map::new();
+            let now = crate::rate_limit::now_ms();
+            for (name, provider) in hot.providers.iter() {
+                let until = provider.circuit_breaker.force_open_until_ms();
+                if until > now {
+                    if let Some(at) = chrono::DateTime::from_timestamp_millis(until as i64) {
+                        quota_reset_at.insert(name.clone(), serde_json::json!(at.to_rfc3339()));
+                    }
+                }
+            }
             let mut health = serde_json::json!({
                 "status": if degraded { "degraded" } else { "ok" },
                 "layer": 2,
@@ -5063,6 +5176,7 @@ impl ProxyHttp for AiGateway {
                 "pools": pools,
                 "open_providers": open_providers,
                 "half_open_providers": half_open_providers,
+                "quota_reset_at": quota_reset_at,
             });
             if let Some(id) = build_id() {
                 health["build_id"] = id.into();
@@ -5363,6 +5477,26 @@ impl ProxyHttp for AiGateway {
         let route = &hot.routes[route_index];
         ctx.endpoint_type = route.endpoint_type;
 
+        // One span per client request (`[otel].traces`). The outcome fields are
+        // recorded as the request progresses and the span is exported when the
+        // context drops. A disabled OTel pipeline makes this a no-op span.
+        ctx.otel_span = Some(tracing::info_span!(
+            "http.server.request",
+            "otel.kind" = "server",
+            "http.request.method" = %session.req_header().method,
+            "url.path" = %path,
+            "maxllm.route" = %route.path,
+            "maxllm.provider" = tracing::field::Empty,
+            "maxllm.model" = tracing::field::Empty,
+            "maxllm.streaming" = tracing::field::Empty,
+            "http.response.status_code" = tracing::field::Empty,
+            "maxllm.tokens_in" = tracing::field::Empty,
+            "maxllm.tokens_out" = tracing::field::Empty,
+            "maxllm.cost_usd" = tracing::field::Empty,
+            "maxllm.fallback" = tracing::field::Empty,
+            "maxllm.latency_ms" = tracing::field::Empty,
+        ));
+
         // `/v1/responses` is a prefix route on purpose: a client points its
         // base URL at `/v1/responses/<provider-or-pool>` and appends
         // `/responses`. The same prefix match silently swallowed retired
@@ -5618,6 +5752,24 @@ impl ProxyHttp for AiGateway {
                 ));
             }
         };
+
+        // One span per upstream *attempt*; it is closed in `response_filter`,
+        // so its duration is send → response headers (TTFB), the number the
+        // failover decision actually cares about.
+        {
+            let _parent = ctx.otel_span.as_ref().map(|span| span.enter());
+            ctx.upstream_span = Some(tracing::info_span!(
+                "upstream.request",
+                "otel.kind" = "client",
+                "server.address" = %provider.host,
+                "server.port" = provider.port as i64,
+                "maxllm.provider" = %ctx.provider_name,
+                "maxllm.model" = %ctx.model,
+                "maxllm.attempt" = (ctx.failover_count + 1) as i64,
+                "http.response.status_code" = tracing::field::Empty,
+                "maxllm.error" = tracing::field::Empty,
+            ));
+        }
 
         // Set upstream path based on endpoint type
         let path = match ctx.endpoint_type {
@@ -6079,11 +6231,14 @@ impl ProxyHttp for AiGateway {
         // does, the force-open deadline is set here and the failover proceeds
         // immediately (the body never arrives on the retried attempt).
         //
-        // When it does not, and the learning resolver is enabled, the error's
-        // body is awaited in `upstream_response_body_filter` — that is where
-        // the layered decision (learned patterns → body regex → laya) runs.
-        // Without the resolver the pre-learning behaviour applies: a plain
-        // Retry-After (or the default) cooldown, decided here.
+        // When it does not, the error's body is awaited in
+        // `upstream_response_body_filter` — that is where the layered
+        // decision (learned patterns → body regex → laya) runs. The body is
+        // awaited for a 429 whether or not learning is on: the layers that
+        // read the upstream's own reset instant are local and deterministic,
+        // and gating them on the learning switch left every deployment
+        // without laya (the corp fleet) re-probing a monthly wall on the
+        // 5-minute ladder instead of parking on the day the wall ends.
         //
         // The same deferral covers a 500: its status alone proves nothing
         // (MiniMax wears its quota wall as `500 server_error`), so the body's
@@ -6097,7 +6252,10 @@ impl ProxyHttp for AiGateway {
         // the breaker and counted a quota open, so that block must not run
         // again (it would double-count the failure and the quota-open).
         let mut quota_resolved_by_header = false;
-        if (quota_open || status == 500) && self.rate_limit_resolver.is_enabled() {
+        // A 429 always waits for its body when the headers are inconclusive;
+        // a 500 does so only with the learning resolver on — the 5xx path
+        // owns a same-provider retry that the deferral would skip.
+        if quota_open || (status == 500 && self.rate_limit_resolver.is_enabled()) {
             let header_reset = if quota_open {
                 crate::rate_limit::resolve_from_headers(&upstream_response.headers)
             } else {
@@ -6248,6 +6406,42 @@ impl ProxyHttp for AiGateway {
         let Some(provider) = hot.providers.get(&ctx.provider_name) else {
             return Ok(());
         };
+        // A 402 is an account wall whose END the upstream states in the body:
+        // open-design answers an exhausted coding plan with
+        // `{"code":"insufficient_balance","details":{"reset_at":"…"}}`, and
+        // the header phase cannot see it — the deadline it wrote above is
+        // only the fallback (the payment cooldown, 10 minutes). So the
+        // decision is deferred to the body filter: the body names the real
+        // instant and the breaker is re-parked on it. The client sees the
+        // same answer either way — the failover still happens, one
+        // body-read later.
+        if payment_required {
+            let can_fail_over = self.has_usable_fallback(ctx)
+                && ctx.failover_count < self.failover_budget(&hot, ctx)
+                && body_is_replayable(session, ctx);
+            ctx.pending_rate_limit = Some(status);
+            ctx.rate_limit_body_buf.clear();
+            // Keep the headers around: the resolver's header layer may still
+            // pin the reset instant from them.
+            ctx.rate_limit_headers = upstream_response
+                .headers
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.as_str().to_string(),
+                        v.to_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect();
+            if !can_fail_over {
+                // No failover possible: the gateway answers the client
+                // itself (a 402 is the gateway's status to answer), never
+                // the upstream's billing message.
+                let message = self.no_provider_message_after_failure(&hot, ctx, status);
+                self.own_the_error(upstream_response, ctx, status, message, None);
+            }
+            return Ok(()); // let the body flow to the body filter
+        }
         // A 404 whose body may name the requested model as unknown: defer the
         // decision until the body arrives (a missing endpoint answers 404
         // too). Deferring is only worth it when a rewrite is actually
@@ -6261,23 +6455,16 @@ impl ProxyHttp for AiGateway {
         // Moonshot schema dialect, or a tool call the conversation's history
         // never answered: defer the decision until the body arrives, because
         // only the body says which of the two it is. When it names the
-        // schemas, the request is replayed once with degraded tool schemas;
-        // when it names an unanswered tool call, the history is repaired and
-        // the request replayed. Either way the agent's turn continues; any
-        // other 400 passes through untouched.
+        // schemas, the request is replayed with degraded tool schemas; if the
+        // degraded schemas are also refused, the next replay drops the tool
+        // surface. When it names an unanswered tool call, the history is
+        // repaired and the request replayed. Either way the agent's turn
+        // continues; any other 400 passes through untouched.
         // The deferral only preempts the handling that would end the turn
         // (a 400 this provider takes as a request fault): a 400 the route
         // would answer by model rewrite or failover keeps that handling —
         // the request is retried anyway, and a tool-plumbing rejection that
         // survives it reaches this deferral on the next attempt.
-        //
-        // EVERY such 400 is classified — also the one that arrives after a
-        // repair was already applied. That second 400 is the one that used
-        // to end the agent's turn: the degraded replay was refused just like
-        // the first attempt, and the refusal was handed to the client as the
-        // request's own fault. The body has to be read to tell a surviving
-        // tool-plumbing refusal from an ordinary request fault, so the
-        // deferral cannot stop at the first repair.
         if status == 400 && !should_failover_status(status, ctx, provider) {
             ctx.pending_tool_schema_repair = true;
             ctx.pending_tool_schema_status = status;
@@ -6435,6 +6622,10 @@ impl ProxyHttp for AiGateway {
         // answer is recorded by `response_filter` on the surviving attempt).
         // Recorded before the switch so the provider label matches the status.
         self.record_event(EVENT_PROVIDER_RESPONSE, ctx, Some(status), None, None, None);
+        // This attempt ends here (Pingora skips `response_filter` when the
+        // response is handed back for failover), so its span has to be closed
+        // and labelled now — otherwise it reads as an unanswered attempt.
+        close_upstream_span(ctx, status, Some("upstream_status"));
         ctx.attempt_trail
             .push(format!("{}={}", ctx.provider_name, status));
         let Some((failed_provider, next_provider)) = self.switch_to_fallback(ctx) else {
@@ -6493,6 +6684,9 @@ impl ProxyHttp for AiGateway {
             .map(|e| e.upstream_status)
             .unwrap_or(status);
         ctx.upstream_status = upstream_status;
+        // Time-to-first-byte for this attempt: the span opened in
+        // `upstream_request_filter` ends here.
+        close_upstream_span(ctx, upstream_status, None);
         let provider = hot.providers.get(&ctx.provider_name);
 
         // Circuit breaker bookkeeping happens in `upstream_response_filter`,
@@ -6666,9 +6860,10 @@ impl ProxyHttp for AiGateway {
         // tool schemas the other upstreams take. The gateway projected them
         // before forwarding; a rejection that survives the projection means
         // the projection missed a rule, and the turn must still not die on
-        // it: the request is replayed once with degraded tool schemas (the
-        // tool names survive, the argument contracts collapse to a bare
-        // object). A 400 that names anything else is the client's own
+        // it: the request is replayed with degraded tool schemas (the tool
+        // names survive, the argument contracts collapse to a bare object).
+        // If that last honest shape is also refused, the terminal replay has
+        // no tools at all. A 400 that names anything else is the client's own
         // fault — the buffered body is handed back untouched.
         if ctx.pending_tool_schema_repair {
             if let Some(data) = body.as_ref() {
@@ -6689,33 +6884,85 @@ impl ProxyHttp for AiGateway {
             // baseline repair: "the kernel said nothing" falls through to
             // the built-in rules, which are the ones that keep a
             // translation fault from ending the agent's turn.
-            //
-            // One repair per request. When the replay meets the same
-            // refusal again, the request is NOT the fault: the provider
-            // persists in its dialect rejection, and the next link of the
-            // chain may well accept the conversation. Such a 400 walks the
-            // chain instead of ending the agent's turn as a request fault.
             {
                 let hot = self.hot.load();
-                let kernel_repair =
-                    Self::kernel_error_repair(&hot, ctx.pending_tool_schema_status, &text, ctx);
-                match classify_tool_plumbing(
-                    kernel_repair,
-                    &text,
-                    ctx.tool_schema_degraded,
-                    ctx.tool_calls_repaired,
-                ) {
-                    ToolPlumbingAction::DegradeSchema => {
-                        return Err(self.begin_tool_schema_repair(ctx));
+                match Self::kernel_error_repair(&hot, ctx.pending_tool_schema_status, &text, ctx) {
+                    maxllm_translate::kernel::KernelRepair::SchemaDegrade => {
+                        return Err(if ctx.tool_schema_degraded {
+                            self.begin_tool_surface_removal(ctx)
+                        } else {
+                            self.begin_tool_schema_repair(ctx)
+                        });
                     }
-                    ToolPlumbingAction::RepairOrphan => {
-                        return Err(self.begin_orphan_tool_call_repair(ctx));
+                    maxllm_translate::kernel::KernelRepair::OrphanRepair => {
+                        return Err(if !ctx.tool_calls_repaired {
+                            self.begin_orphan_tool_call_repair(ctx)
+                        } else if !ctx.tool_calls_removed {
+                            self.begin_orphan_call_removal(ctx)
+                        } else {
+                            return self.fail_over_from_body_filter(
+                                session,
+                                ctx,
+                                ctx.pending_tool_schema_status,
+                                "translation repair ladder exhausted",
+                            );
+                        });
                     }
-                    ToolPlumbingAction::FailOver(reason) => {
-                        return self.fail_over_tool_repair(session, ctx, reason);
-                    }
-                    ToolPlumbingAction::None => {}
+                    maxllm_translate::kernel::KernelRepair::None => {}
                 }
+            }
+            if body_reports_tool_schema(&text) {
+                return Err(if !ctx.tool_schema_degraded {
+                    self.begin_tool_schema_repair(ctx)
+                } else if !ctx.tools_removed {
+                    self.begin_tool_surface_removal(ctx)
+                } else {
+                    return self.fail_over_from_body_filter(
+                        session,
+                        ctx,
+                        ctx.pending_tool_schema_status,
+                        "tool-schema repair ladder exhausted",
+                    );
+                });
+            }
+            // The upstream refused the conversation's tool history: an
+            // assistant tool call the history never answered (`… must be
+            // followed by tool messages responding to each 'tool_call_id'`).
+            // The fault is in the history the client replayed, and a
+            // request-fault 400 would end the agent's turn — so the orphan
+            // is answered first. If that repair is also refused, the
+            // terminal replay drops the orphaned calls; if even that is
+            // refused, this provider cannot speak the conversation and the
+            // request walks the fallback chain.
+            if body_reports_orphan_tool_call(&text) {
+                return Err(if !ctx.tool_calls_repaired {
+                    self.begin_orphan_tool_call_repair(ctx)
+                } else if !ctx.tool_calls_removed {
+                    self.begin_orphan_call_removal(ctx)
+                } else {
+                    return self.fail_over_from_body_filter(
+                        session,
+                        ctx,
+                        ctx.pending_tool_schema_status,
+                        "orphan-tool-call repair ladder exhausted",
+                    );
+                });
+            }
+            // Some upstreams reject one of Codex's optional knobs even when
+            // its value is part of the Responses contract. Dropping the knob
+            // preserves the whole conversation; if the rejection somehow
+            // survives, no further same-provider repair exists.
+            if body_reports_unsupported_reasoning_effort(&text) {
+                return Err(if !ctx.reasoning_effort_dropped {
+                    self.begin_reasoning_effort_repair(ctx)
+                } else {
+                    return self.fail_over_from_body_filter(
+                        session,
+                        ctx,
+                        ctx.pending_tool_schema_status,
+                        "reasoning-effort repair ladder exhausted",
+                    );
+                });
             }
             if !buffered.is_empty() {
                 *body = Some(Bytes::from(buffered));
@@ -6777,10 +7024,7 @@ impl ProxyHttp for AiGateway {
                         .map(|p| p.utc_offset_minutes)
                         .unwrap_or(0);
                     let (is_rate_limit, mut candidates) =
-                        crate::rate_limit::parse_body_text_with_offset(
-                            &text,
-                            utc_offset_minutes,
-                        );
+                        crate::rate_limit::parse_body_text_with_offset(&text, utc_offset_minutes);
                     crate::rate_limit::retain_plausible_reset_candidates(&mut candidates);
                     if let Some(p) = hot.providers.get(&provider_name) {
                         match candidates.first().map(|c| c.at_ms) {
@@ -6794,8 +7038,7 @@ impl ProxyHttp for AiGateway {
                                 );
                             }
                             None => {
-                                let base =
-                                    self.rate_limit_resolver.default_cooldown_secs() * 1000;
+                                let base = self.rate_limit_resolver.default_cooldown_secs() * 1000;
                                 let cooldown_ms = p.circuit_breaker.record_quota_unknown(base);
                                 info!(
                                     provider = %provider_name,
@@ -6816,9 +7059,9 @@ impl ProxyHttp for AiGateway {
                         self.persist_circuit_breaker(&provider_name, &p.circuit_breaker);
                     }
                     let _ = is_rate_limit; // the markers above already decided
-                    // Learn the shape so the next wall resolves without a
-                    // regex walk (same fire-and-forget persist as the 429/500
-                    // path).
+                                           // Learn the shape so the next wall resolves without a
+                                           // regex walk (same fire-and-forget persist as the 429/500
+                                           // path).
                     if !text.trim().is_empty() {
                         let learned = crate::rate_limit_resolver::LearnedUpdate {
                             fingerprint: crate::rate_limit::fingerprint(&text),
@@ -6847,12 +7090,9 @@ impl ProxyHttp for AiGateway {
                 // receives the upstream's answer with exactly the shape it
                 // had before the deferral existed.
                 let hot = self.hot.load();
-                let normalized = hot
-                    .providers
-                    .get(&ctx.provider_name)
-                    .and_then(|p| {
-                        normalize_error_response(&body_bytes, ctx.upstream_status, p.kind)
-                    });
+                let normalized = hot.providers.get(&ctx.provider_name).and_then(|p| {
+                    normalize_error_response(&body_bytes, ctx.upstream_status, p.kind)
+                });
                 match normalized {
                     Some(n) => *body = Some(Bytes::from(n)),
                     None => {
@@ -6876,6 +7116,94 @@ impl ProxyHttp for AiGateway {
                     )?;
                 }
                 return Ok(None);
+            }
+
+            // A 402 deferred from the header phase: the body knows when the
+            // account's wall ends, the header phase only knew "not now".
+            if status == 402 {
+                let provider_name = ctx.provider_name.clone();
+                let hot = self.hot.load();
+                let utc_offset_minutes = hot
+                    .providers
+                    .get(&provider_name)
+                    .map(|p| p.utc_offset_minutes)
+                    .unwrap_or(0);
+                let text = String::from_utf8_lossy(&body_bytes);
+                // The wall ends when the body says it does — and only then.
+                // A body that names a BALANCE problem describes a wall no
+                // timer ends (the account needs a top-up), so the payment
+                // cooldown stays and the operator is told which of the two
+                // reasons applies.
+                let balance_problem = body_names_balance_problem(&text);
+                let reset_at_ms = if body_names_reset(&text) && !balance_problem {
+                    let (_, mut candidates) =
+                        crate::rate_limit::parse_body_text_with_offset(&text, utc_offset_minutes);
+                    crate::rate_limit::retain_plausible_reset_candidates(&mut candidates);
+                    let now = crate::rate_limit::now_ms();
+                    // A deadline in the past is a stale message, not a
+                    // deadline: the fallback below applies instead.
+                    candidates
+                        .first()
+                        .map(|c| c.at_ms)
+                        .filter(|at_ms| *at_ms > now)
+                } else {
+                    None
+                };
+                if let Some(p) = hot.providers.get(&provider_name) {
+                    match reset_at_ms {
+                        Some(reset_at_ms) => {
+                            // The body's own instant REPLACES the header
+                            // phase's fallback deadline.
+                            p.circuit_breaker.record_quota_until(reset_at_ms);
+                            info!(
+                                provider = %provider_name,
+                                reset_at_ms = reset_at_ms,
+                                "402 payment required — force-opened until the body's reset instant"
+                            );
+                        }
+                        None => {
+                            // No usable instant in the body: the payment
+                            // cooldown (10 minutes) is the fallback. The
+                            // header phase already wrote it; a probe did not.
+                            let until = crate::rate_limit::now_ms()
+                                + crate::circuit_breaker::PAYMENT_REQUIRED_COOLDOWN_MS;
+                            p.circuit_breaker.record_quota_until(until);
+                            if balance_problem {
+                                info!(
+                                    provider = %provider_name,
+                                    cooldown_ms = crate::circuit_breaker::PAYMENT_REQUIRED_COOLDOWN_MS,
+                                    "402 payment required — the body names a balance problem: the account needs a top-up, no timer ends this wall (payment cooldown)"
+                                );
+                            } else {
+                                info!(
+                                    provider = %provider_name,
+                                    cooldown_ms = crate::circuit_breaker::PAYMENT_REQUIRED_COOLDOWN_MS,
+                                    "402 payment required — no reset instant in the body, parked on the payment cooldown"
+                                );
+                            }
+                        }
+                    }
+                    METRICS
+                        .circuit_breaker_state
+                        .with_label_values(&[&provider_name])
+                        .set(p.circuit_breaker.state() as i64);
+                    self.persist_circuit_breaker(&provider_name, &p.circuit_breaker);
+                }
+                // A walled provider must not keep the session pinned.
+                self.unpin_session(ctx);
+                if let Some(err) = ctx.own_error.clone() {
+                    // No failover was possible (the header phase decided it):
+                    // the gateway answers the client itself.
+                    *body = Some(Bytes::from(err.render()));
+                    ctx.own_error_sent = true;
+                    return Ok(None);
+                }
+                return self.fail_over_from_body_filter(
+                    session,
+                    ctx,
+                    status,
+                    "402 payment required",
+                );
             }
 
             let headers: http::HeaderMap = {
@@ -7847,6 +8175,7 @@ impl ProxyHttp for AiGateway {
         // provider's circuit breaker so the fallback chain stops using it.
         self.record_provider_connect_failure(ctx);
         self.unpin_session(ctx);
+        close_upstream_span(ctx, 502, Some("connect"));
         self.record_event(EVENT_ERROR, ctx, Some(502), None, Some(e.to_string()), None);
         ctx.attempt_trail
             .push(format!("{}=connect", ctx.provider_name));
@@ -8373,6 +8702,21 @@ impl ProxyHttp for AiGateway {
             }
         }
 
+        // Fill the request span with the outcome, then enter it so the
+        // `request completed` log record carries the same trace_id.
+        if let Some(span) = ctx.otel_span.as_ref() {
+            span.record("maxllm.provider", ctx.provider_name.as_str());
+            span.record("maxllm.model", ctx.model.as_str());
+            span.record("maxllm.streaming", ctx.is_streaming);
+            span.record("http.response.status_code", logged_status as i64);
+            span.record("maxllm.tokens_in", ctx.tokens_in);
+            span.record("maxllm.tokens_out", ctx.tokens_out);
+            span.record("maxllm.cost_usd", cost);
+            span.record("maxllm.fallback", ctx.fallback_used);
+            span.record("maxllm.latency_ms", latency_ms);
+        }
+        let _otel_guard = ctx.otel_span.as_ref().map(|span| span.enter());
+
         info!(
             provider = %ctx.provider_name,
             model = %ctx.model,
@@ -8565,10 +8909,7 @@ impl AiGateway {
                 && hot
                     .providers
                     .get(name)
-                    .map(|p| {
-                        p.circuit_breaker.allows_traffic()
-                            && !provider_saturated(name, p)
-                    })
+                    .map(|p| p.circuit_breaker.allows_traffic() && !provider_saturated(name, p))
                     .unwrap_or(false)
         };
         let scoped_pool = hot
@@ -8630,9 +8971,7 @@ impl AiGateway {
         let admit = |provider: &str| -> bool {
             hot.providers
                 .get(provider)
-                .map(|p| {
-                    !p.circuit_breaker.is_open() && !provider_saturated(provider, p)
-                })
+                .map(|p| !p.circuit_breaker.is_open() && !provider_saturated(provider, p))
                 .unwrap_or(false)
         };
 
@@ -8767,9 +9106,7 @@ impl AiGateway {
             .find_map(|name| {
                 hot.providers
                     .get(name)
-                    .filter(|p| {
-                        !p.circuit_breaker.is_open() && !provider_saturated(name, p)
-                    })
+                    .filter(|p| !p.circuit_breaker.is_open() && !provider_saturated(name, p))
                     .map(|p| (name.clone(), Arc::clone(p)))
             })
     }
@@ -8884,6 +9221,16 @@ impl AiGateway {
         }
         ctx.body_translated = false;
         ctx.upstream_responded = false;
+        // The provider-specific repair ladder belonged to the attempt that
+        // just failed. A fallback starts from the client's honest request:
+        // it may accept the schemas/tool calls/effort value the failed
+        // provider could not, and carrying a terminal rewrite would silently
+        // take capability away from a healthy provider.
+        ctx.tool_schema_degraded = false;
+        ctx.tools_removed = false;
+        ctx.tool_calls_repaired = false;
+        ctx.tool_calls_removed = false;
+        ctx.reasoning_effort_dropped = false;
         ctx.request_body_buf.clear();
         // The deferred quota decision belonged to the attempt that just
         // failed; the next provider's answer must not be swallowed by the
@@ -8948,9 +9295,83 @@ impl AiGateway {
         e
     }
 
-    /// Reset the request for an in-place retry with degraded tool schemas.
+    /// Reset the request for the terminal orphan replay: no orphaned calls.
     ///
-    /// The upstream refused the tool schemas the gateway forwarded it. Rather
+    /// The repaired history is the honest first attempt: it says the result
+    /// was lost. When an upstream refuses even that sentinel, the orphaned
+    /// calls are dropped outright. This loses an interrupted turn's calls for
+    /// this request, but it still lets the conversation continue instead of
+    /// handing the upstream's pairing fault back to the agent.
+    fn begin_orphan_call_removal(&self, ctx: &mut RequestCtx) -> Box<pingora::Error> {
+        ctx.tool_calls_removed = true;
+        ctx.body_translated = false;
+        ctx.upstream_responded = false;
+        ctx.request_body_buf.clear();
+        ctx.pending_rate_limit = None;
+        ctx.replay_body = ctx.client_body.clone();
+        ctx.replay_injected = false;
+        ctx.keep_request_content_length = false;
+        if let Ok(mut guard) = ctx.stream_translator.lock() {
+            *guard = None;
+        }
+        METRICS
+            .tool_call_repair_retries_total
+            .with_label_values(&[&ctx.provider_name])
+            .inc();
+        info!(
+            provider = %ctx.provider_name,
+            "upstream refused the repaired tool history — retrying with orphaned tool calls removed"
+        );
+        let mut e = pingora::Error::explain(
+            pingora::ErrorType::HTTPStatus(400),
+            format!(
+                "provider '{}' refused the repaired orphaned tool calls; retrying with them removed",
+                ctx.provider_name
+            ),
+        );
+        e.as_up();
+        e.set_retry(true);
+        e
+    }
+
+    /// Reset the request for an in-place retry without `reasoning.effort`.
+    ///
+    /// The effort knob is optional and says nothing about the conversation
+    /// payload. A provider that rejects one of its contract values gets a
+    /// replay with the knob omitted, preserving the turn instead of exposing
+    /// a dialect fault to the client.
+    fn begin_reasoning_effort_repair(&self, ctx: &mut RequestCtx) -> Box<pingora::Error> {
+        ctx.reasoning_effort_dropped = true;
+        ctx.body_translated = false;
+        ctx.upstream_responded = false;
+        ctx.request_body_buf.clear();
+        ctx.pending_rate_limit = None;
+        ctx.replay_body = ctx.client_body.clone();
+        ctx.replay_injected = false;
+        ctx.keep_request_content_length = false;
+        if let Ok(mut guard) = ctx.stream_translator.lock() {
+            *guard = None;
+        }
+        METRICS
+            .reasoning_effort_repair_retries_total
+            .with_label_values(&[&ctx.provider_name])
+            .inc();
+        info!(
+            provider = %ctx.provider_name,
+            "upstream refused reasoning effort — retrying with the effort knob omitted"
+        );
+        let mut e = pingora::Error::explain(
+            pingora::ErrorType::HTTPStatus(400),
+            format!(
+                "provider '{}' refused reasoning effort; retrying with the effort knob omitted",
+                ctx.provider_name
+            ),
+        );
+        e.as_up();
+        e.set_retry(true);
+        e
+    }
+
     /// than ending the agent's turn with the upstream's error, the request is
     /// replayed once with every tool schema reduced to a bare object: the
     /// tool names and the tool list survive, so the conversation keeps its
@@ -8990,24 +9411,45 @@ impl AiGateway {
         e
     }
 
-    /// A tool-plumbing 400 arrived after the matching repair was already
-    /// applied: the request itself is sound (the repaired replay is a fresh
-    /// answer), so the provider's dialect is the fault now, not the client's.
-    /// The chain walks on like any other provider failure — a tool-plumbing
-    /// 400 must never reach the client as a request fault, because that is
-    /// what ends the agent's turn.
-    fn fail_over_tool_repair(
-        &self,
-        session: &mut Session,
-        ctx: &mut RequestCtx,
-        reason: &str,
-    ) -> pingora::Result<Option<std::time::Duration>> {
-        // The deferral that parked the body for classification belonged to
-        // the attempt that just failed: the next provider's attempt must
-        // not inherit it.
+    /// Reset the request for the terminal tool-schema replay: no tools.
+    ///
+    /// The degradation retry exists to preserve the model's function-calling
+    /// surface. When the upstream rejects even bare object schemas, that
+    /// surface cannot be preserved on this provider; dropping it is still
+    /// better than handing the schema fault back and ending the turn.
+    fn begin_tool_surface_removal(&self, ctx: &mut RequestCtx) -> Box<pingora::Error> {
+        ctx.tools_removed = true;
+        ctx.body_translated = false;
+        ctx.upstream_responded = false;
+        ctx.request_body_buf.clear();
+        // The deferred quota decision belonged to the attempt that just
+        // failed; the terminal retry is a fresh answer and must not be
+        // swallowed by the dead attempt's bookkeeping.
         ctx.pending_rate_limit = None;
-        ctx.rate_limit_body_buf.clear();
-        self.fail_over_from_body_filter(session, ctx, 400, reason)
+        ctx.replay_body = ctx.client_body.clone();
+        ctx.replay_injected = false;
+        ctx.keep_request_content_length = false;
+        if let Ok(mut guard) = ctx.stream_translator.lock() {
+            *guard = None;
+        }
+        METRICS
+            .tool_schema_repair_retries_total
+            .with_label_values(&[&ctx.provider_name])
+            .inc();
+        info!(
+            provider = %ctx.provider_name,
+            "upstream refused degraded tool schemas — retrying without the tool surface"
+        );
+        let mut e = pingora::Error::explain(
+            pingora::ErrorType::HTTPStatus(400),
+            format!(
+                "provider '{}' refused degraded tool schemas; retrying without the tool surface",
+                ctx.provider_name
+            ),
+        );
+        e.as_up();
+        e.set_retry(true);
+        e
     }
 
     /// Persist a provider's circuit-breaker state.
@@ -10614,6 +11056,68 @@ api_key = "sk-test"
 }
 
 #[cfg(test)]
+mod native_responses_repair_selection_tests {
+    use super::*;
+    use maxllm_translate::openai_compat::NativeResponsesRepair;
+
+    #[test]
+    fn test_ark_host_gets_the_trailing_assistant_repair() {
+        assert_eq!(
+            native_responses_repair_for(None, "https://ark.cn-beijing.volces.com", true),
+            NativeResponsesRepair::ArkTrailingAssistantTurn
+        );
+    }
+
+    #[test]
+    fn test_deepseek_host_gets_the_reasoning_lead_repair() {
+        assert_eq!(
+            native_responses_repair_for(None, "https://api.deepseek.com", true),
+            NativeResponsesRepair::DeepSeekReasoningLead
+        );
+    }
+
+    #[test]
+    fn test_other_hosts_get_no_repair() {
+        assert_eq!(
+            native_responses_repair_for(None, "https://api.kimi.com", true),
+            NativeResponsesRepair::None
+        );
+    }
+
+    #[test]
+    fn test_the_declaration_wins_over_the_host() {
+        assert_eq!(
+            native_responses_repair_for(Some("none"), "https://api.deepseek.com", true),
+            NativeResponsesRepair::None
+        );
+        assert_eq!(
+            native_responses_repair_for(
+                Some("ark_trailing_assistant"),
+                "https://api.deepseek.com",
+                true
+            ),
+            NativeResponsesRepair::ArkTrailingAssistantTurn
+        );
+        assert_eq!(
+            native_responses_repair_for(
+                Some("deepseek_reasoning_lead"),
+                "https://ark.cn-beijing.volces.com",
+                true
+            ),
+            NativeResponsesRepair::DeepSeekReasoningLead
+        );
+    }
+
+    #[test]
+    fn test_a_provider_kind_that_names_its_family_never_gets_the_ark_default() {
+        assert_eq!(
+            native_responses_repair_for(None, "https://ark.cn-beijing.volces.com", false),
+            NativeResponsesRepair::None
+        );
+    }
+}
+
+#[cfg(test)]
 mod provider_model_allowlist_tests {
     use super::*;
     use maxllm_config::Config;
@@ -10632,7 +11136,10 @@ allowed_models = ["deepseek-v4.1-flash"]
 
     #[test]
     fn an_empty_list_permits_every_model() {
-        assert_eq!(AiGateway::provider_model_denied("p", &[], "glm-5.2", None), None);
+        assert_eq!(
+            AiGateway::provider_model_denied("p", &[], "glm-5.2", None),
+            None
+        );
     }
 
     #[test]
@@ -11333,118 +11840,6 @@ mod failover_policy_tests {
         assert!(!body_reports_orphan_tool_call(""));
     }
 
-    /// The tool-schema rejection Kimi answers with.
-    const SCHEMA_REJECTION: &str = r#"{"error":{"code":"invalid_request_error","message":"Invalid request: tools.function.parameters is not a valid moonshot flavored json schema, details: <At path 'properties.show': detected infinite recursion without termination condition>","type":"invalid_request_error"}}"#;
-
-    /// The orphaned-tool-call rejection Kimi answers with.
-    const ORPHAN_REJECTION: &str = r#"{"error":{"code":"invalid_request_error","message":"Invalid request: an assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id'. The following tool_call_ids did not have response messages: f:0","type":"invalid_request_error"}}"#;
-
-    #[test]
-    fn a_tool_plumbing_400_is_repaired_once() {
-        use maxllm_translate::kernel::KernelRepair;
-        // The first rejection of each class is repaired: the request is
-        // replayed with the tool schemas degraded / the history repaired.
-        assert_eq!(
-            classify_tool_plumbing(KernelRepair::None, SCHEMA_REJECTION, false, false),
-            ToolPlumbingAction::DegradeSchema
-        );
-        assert_eq!(
-            classify_tool_plumbing(KernelRepair::None, ORPHAN_REJECTION, false, false),
-            ToolPlumbingAction::RepairOrphan
-        );
-        // The kernel's own decision escalates the same way, even when the
-        // built-in rules would not recognise the phrasing.
-        assert_eq!(
-            classify_tool_plumbing(
-                KernelRepair::SchemaDegrade,
-                "some new dialect",
-                false,
-                false
-            ),
-            ToolPlumbingAction::DegradeSchema
-        );
-        assert_eq!(
-            classify_tool_plumbing(KernelRepair::OrphanRepair, "some new dialect", false, false),
-            ToolPlumbingAction::RepairOrphan
-        );
-    }
-
-    #[test]
-    fn a_tool_plumbing_400_that_survives_the_repair_walks_the_chain() {
-        use maxllm_translate::kernel::KernelRepair;
-        // The degraded replay was refused just like the first attempt: the
-        // request is not the fault, the provider's dialect is — the chain
-        // walks on instead of the 400 ending the agent's turn.
-        assert_eq!(
-            classify_tool_plumbing(KernelRepair::None, SCHEMA_REJECTION, true, false),
-            ToolPlumbingAction::FailOver("the tool-schema refusal survives the degraded replay")
-        );
-        assert_eq!(
-            classify_tool_plumbing(KernelRepair::None, ORPHAN_REJECTION, false, true),
-            ToolPlumbingAction::FailOver("the orphan-call refusal survives the repaired replay")
-        );
-        // The kernel's decision says the same: it may escalate a repair, it
-        // may not demand a second one.
-        assert_eq!(
-            classify_tool_plumbing(KernelRepair::SchemaDegrade, SCHEMA_REJECTION, true, false),
-            ToolPlumbingAction::FailOver("the tool-schema refusal survives the degraded replay")
-        );
-        assert_eq!(
-            classify_tool_plumbing(KernelRepair::OrphanRepair, ORPHAN_REJECTION, false, true),
-            ToolPlumbingAction::FailOver("the orphan-call refusal survives the repaired replay")
-        );
-    }
-
-    #[test]
-    fn a_genuine_request_fault_is_still_the_clients_own() {
-        use maxllm_translate::kernel::KernelRepair;
-        // Nothing in the body blames the tool plumbing: the 400 stays the
-        // client's answer, whatever the repairs did before.
-        let fault = r#"{"error":{"message":"Invalid request: missing 'messages' parameter"}}"#;
-        assert_eq!(
-            classify_tool_plumbing(KernelRepair::None, fault, true, true),
-            ToolPlumbingAction::None
-        );
-        assert_eq!(
-            classify_tool_plumbing(KernelRepair::None, fault, false, false),
-            ToolPlumbingAction::None
-        );
-        // A quota wall is not a tool-plumbing rejection either — it is
-        // parked by the quota path, not repaired here.
-        assert_eq!(
-            classify_tool_plumbing(
-                KernelRepair::None,
-                r#"{"error":{"code":"tier_limit_exceeded","message":"[code=tier_limit_exceeded] membership rpm limit exceeded: 101/100 resets 2026-11-14T10:38:00Z","type":"tier_limit_exceeded"}}"#,
-                false,
-                false
-            ),
-            ToolPlumbingAction::None
-        );
-    }
-
-    #[test]
-    fn a_repair_never_repeats_itself() {
-        use maxllm_translate::kernel::KernelRepair;
-        // The decision is a walk, not a loop: every repair is applied at
-        // most once, and the second refusal of the same class walks the
-        // chain. No sequence of refusals can ask for a third repair.
-        let mut degraded = false;
-        let mut repaired = false;
-        for _ in 0..4 {
-            match classify_tool_plumbing(KernelRepair::None, SCHEMA_REJECTION, degraded, repaired) {
-                ToolPlumbingAction::DegradeSchema => degraded = true,
-                ToolPlumbingAction::RepairOrphan => repaired = true,
-                ToolPlumbingAction::FailOver(_) => break,
-                ToolPlumbingAction::None => panic!("the schema rejection is never unclassified"),
-            }
-        }
-        assert!(degraded, "the first refusal is repaired");
-        assert!(
-            !repaired,
-            "the schema repair never becomes the orphan repair"
-        );
-    }
-
     #[test]
     fn tier_limit_bodies_are_classified() {
         let rpm = r#"{"error":{"code":"tier_limit_exceeded","message":"[code=tier_limit_exceeded] membership rpm limit exceeded: 101/100 resets 2026-11-14T10:38:00Z","type":"tier_limit_exceeded"}}"#;
@@ -11820,7 +12215,7 @@ mod fallback_model_carrying_tests {
             budget_enforcer: None,
             key_rate_limiter: Arc::new(crate::key_rate_limit::KeyRateLimiter::new()),
             admin_api: None,
-            sessions: Arc::new(SessionStore::new(1024, 3600)),
+            sessions: Arc::new(SessionStore::new(1024, 3600, 0)),
             recorder: None,
             rate_limit_resolver: Arc::new(crate::rate_limit_resolver::RateLimitResolver::new(
                 Default::default(),
@@ -12180,10 +12575,20 @@ mod auto_pool_latency_tests {
     /// every test uses its own provider names — one test's recorded latencies
     /// must never leak into another's cohort.
     fn pool_with_names(prefer_fast: bool, names: &[&str]) -> AutoPoolState {
+        pool_with_rotation(prefer_fast, true, names)
+    }
+
+    fn pool_with_rotation(
+        prefer_fast: bool,
+        cache_weighted: bool,
+        names: &[&str],
+    ) -> AutoPoolState {
         AutoPoolState {
             name: "auto".to_string(),
             entries: names.iter().map(|n| entry(n)).collect(),
             prefer_fast,
+            cache_weighted,
+            strict: false,
             scope: AutoPoolScope::Any,
         }
     }
@@ -12260,7 +12665,7 @@ mod auto_pool_latency_tests {
         }
         let pool = pool_with_names(true, &["slot-fast", "slot-slow"]);
         let healthy: Vec<&AutoPoolEntry> = pool.entries.iter().collect();
-        let order = auto_pool_cache_order(&healthy);
+        let order = auto_pool_cache_order(&healthy, true);
         let fast = order.iter().filter(|e| e.provider == "slot-fast").count();
         let slow = order.iter().filter(|e| e.provider == "slot-slow").count();
         assert!(
@@ -12325,7 +12730,7 @@ mod auto_pool_latency_tests {
         crate::provider_stats::expire_decode_rate_evidence("share-mem-slow");
         let pool = pool_with_names(true, &["share-mem-fast", "share-mem-slow"]);
         let healthy: Vec<&AutoPoolEntry> = pool.entries.iter().collect();
-        let order = auto_pool_cache_order(&healthy);
+        let order = auto_pool_cache_order(&healthy, true);
         let fast = order
             .iter()
             .filter(|e| e.provider == "share-mem-fast")
@@ -12382,7 +12787,7 @@ mod auto_pool_latency_tests {
         }
         let pool = pool_with_names(true, &["slots-warm", "slots-mid", "slots-cold"]);
         let healthy: Vec<&AutoPoolEntry> = pool.entries.iter().collect();
-        let slots = auto_pool_cache_order(&healthy);
+        let slots = auto_pool_cache_order(&healthy, true);
         let share = |name: &str| slots.iter().filter(|e| e.provider == name).count();
         assert!(
             share("slots-warm") > share("slots-mid"),
@@ -12411,7 +12816,7 @@ mod auto_pool_latency_tests {
         }
         let pool = pool_with_names(true, &["order-a", "order-b", "order-c"]);
         let healthy: Vec<&AutoPoolEntry> = pool.entries.iter().collect();
-        let slots = auto_pool_cache_order(&healthy);
+        let slots = auto_pool_cache_order(&healthy, true);
         let runs = slots
             .windows(2)
             .filter(|w| w[0].provider == w[1].provider)
@@ -12430,6 +12835,27 @@ mod auto_pool_latency_tests {
         assert_eq!(share("order-b"), share("order-c"));
     }
 
+    /// Disabling cache weighting is the explicit balance mode: every healthy
+    /// member gets exactly one slot, so the un-pinned rotation is plain RR.
+    #[test]
+    fn unweighted_rotation_gives_every_member_one_slot() {
+        for _ in 0..3 {
+            crate::provider_stats::record_cache_ratio("balance-warm", 1800, 2000);
+            crate::provider_stats::record_cache_ratio("balance-cold", 20, 2000);
+        }
+        crate::provider_stats::record_total_latency("balance-warm", 1000.0, true, 1000);
+        crate::provider_stats::record_total_latency("balance-cold", 30000.0, true, 1000);
+        let pool = pool_with_rotation(
+            false,
+            false,
+            &["balance-warm", "balance-cold", "balance-new"],
+        );
+        let healthy: Vec<&AutoPoolEntry> = pool.entries.iter().collect();
+        let slots = auto_pool_cache_order(&healthy, pool.cache_weighted);
+        let providers: Vec<_> = slots.iter().map(|e| e.provider.as_str()).collect();
+        assert_eq!(providers, ["balance-warm", "balance-cold", "balance-new"]);
+    }
+
     /// A member that keeps the conversation warm earns the traffic — and the
     /// cold one still keeps a slot, because the pool has to keep measuring
     /// the members it has.
@@ -12441,7 +12867,7 @@ mod auto_pool_latency_tests {
         }
         let pool = pool_with_names(true, &["share2-warm", "share2-cold"]);
         let healthy: Vec<&AutoPoolEntry> = pool.entries.iter().collect();
-        let slots = auto_pool_cache_order(&healthy);
+        let slots = auto_pool_cache_order(&healthy, true);
         let share = |name: &str| slots.iter().filter(|e| e.provider == name).count();
         assert!(
             share("share2-warm") > share("share2-cold") * 3,
@@ -12462,7 +12888,7 @@ mod auto_pool_latency_tests {
         }
         let pool = pool_with_names(true, &["share-warm", "share-cold", "share-new"]);
         let healthy: Vec<&AutoPoolEntry> = pool.entries.iter().collect();
-        let slots = auto_pool_cache_order(&healthy);
+        let slots = auto_pool_cache_order(&healthy, true);
         let share = |name: &str| slots.iter().filter(|e| e.provider == name).count();
         assert!(
             share("share-new") >= 1,

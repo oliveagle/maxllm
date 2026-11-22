@@ -220,6 +220,11 @@ pub struct RequestCtx {
     /// must not end the agent's turn. Consumed by the next
     /// `request_body_filter` pass.
     pub tool_schema_degraded: bool,
+    /// Set when even degraded schemas were refused and the next replay must
+    /// have no tool surface at all. This is the terminal tool-schema repair:
+    /// losing function calling for one turn is preferable to letting the
+    /// upstream's schema rejection end the agent's turn.
+    pub tools_removed: bool,
     /// Set when the request must be (re)sent with its tool history repaired
     /// — the upstream refused a history whose assistant tool call was never
     /// answered (`… must be followed by tool messages responding to each
@@ -227,6 +232,14 @@ pub struct RequestCtx {
     /// the orphan is answered and the request is replayed. One-shot, like
     /// the schema degradation.
     pub tool_calls_repaired: bool,
+    /// Set when even the orphan repair was refused and the next replay must
+    /// drop the orphaned calls outright. This is the terminal orphan repair:
+    /// losing one interrupted tool result is preferable to ending the turn
+    /// on the upstream's pairing rejection.
+    pub tool_calls_removed: bool,
+    /// Set when the upstream rejected `reasoning.effort` (or
+    /// `reasoning_effort`) and the next replay must omit the optional knob.
+    pub reasoning_effort_dropped: bool,
     /// The status of the upstream error the tool-plumbing decision is
     /// deferred on. The kernel classifier wants the true status, and the
     /// deferral is what carries it to the body filter.
@@ -365,6 +378,17 @@ pub struct RequestCtx {
     /// fallback chain had been walked. A pinned request is served by that
     /// provider alone.
     pub path_pinned_provider: Option<String>,
+    /// The OpenTelemetry span for this request (`http.server.request`).
+    ///
+    /// Held in the context — rather than entered around a block — because the
+    /// request is handled across several `ProxyHttp` callbacks. It is dropped
+    /// (and therefore exported) when the context is, i.e. at the end of the
+    /// request. `None` when `[otel].traces` is off.
+    pub otel_span: Option<tracing::Span>,
+    /// The span of the *current* upstream attempt (`upstream.request`). Set in
+    /// `upstream_request_filter`, closed in `response_filter` so its duration
+    /// is time-to-first-byte rather than the whole request.
+    pub upstream_span: Option<tracing::Span>,
 }
 
 impl RequestCtx {
@@ -420,10 +444,15 @@ impl RequestCtx {
             upstream_body: None,
             pending_rate_limit: None,
             rate_limit_body_buf: Vec::new(),
+            otel_span: None,
+            upstream_span: None,
             pending_tool_schema_repair: false,
             tool_schema_body_buf: Vec::new(),
             tool_schema_degraded: false,
+            tools_removed: false,
             tool_calls_repaired: false,
+            tool_calls_removed: false,
+            reasoning_effort_dropped: false,
             pending_tool_schema_status: 0,
             rate_limit_headers: Vec::new(),
             pending_model_404: false,

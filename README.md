@@ -913,13 +913,6 @@ invalid_request_error … At path 'properties.show': detected infinite recursion
 without termination condition`, and the same body after the projection
 answers `200` with a normal completion.
 
-A repair is applied **once**. When the replay meets the same refusal again —
-the degraded schemas refused like the projected ones — the request is not the
-fault: the provider persists in its dialect rejection, and the failover chain
-walks on to a provider that may accept the conversation. The surviving 400
-never reaches the client as a request fault, because that is what ends the
-agent's turn.
-
 ### The translation kernel (the updatable half)
 
 The gateway runs in two layers. The **runtime** (this binary) holds the
@@ -1740,6 +1733,50 @@ and put it behind a firewall when you do:
 enabled = true
 allow_remote = false   # default; loopback scrapers always work
 ```
+
+### OpenTelemetry
+
+The gateway exports its own telemetry over OTLP/HTTP: **logs** (every
+`tracing` event, with real `severity_text` / `severity_number`) and **traces**
+(one `http.server.request` span per request, one `upstream.request` span per
+upstream attempt). Nothing has to tail `maxllm.log` for them to reach a
+backend. The feature is opt-in; a config without `[otel]` behaves exactly as
+before, and the file/stdout log keeps working unchanged.
+
+```toml
+[otel]
+enabled = true
+# OTLP/HTTP base URL. `/v1/logs` and `/v1/traces` are appended.
+endpoint = "http://10.126.126.6:4000/v1/otlp"   # GreptimeDB
+service_name = "maxllm"
+machine = "oleNas01"        # default: hostname; also the `machine` log attribute
+logs = true
+traces = true
+sample_ratio = 1.0          # head sampling; parent-based
+log_source = "maxllm_logs"  # GreptimeDB column, not just an attribute
+filter = "info"             # what leaves the process (RUST_LOG still drives the file)
+
+# GreptimeDB: log attributes named here become queryable *columns*.
+[otel.logs_headers]
+X-Greptime-Log-Extract-Keys = "log_source,machine,event,provider,model"
+
+# GreptimeDB: the trace pipeline is selected by this header. The *same*
+# header on /v1/logs is rejected (400 Unsupported pipeline for logs) — that is
+# why logs and traces use two separate exporters.
+[otel.traces_headers]
+X-Greptime-Pipeline-Name = "greptime_trace_v1"
+```
+
+Credentials can stay out of the config: `MAXLLM_OTEL_USERNAME` /
+`MAXLLM_OTEL_PASSWORD` (plus `MAXLLM_OTEL_ENDPOINT`, `MAXLLM_OTEL_MACHINE`,
+`MAXLLM_OTEL_ENABLED`) override the file, so the password can live in the
+service's `0600` EnvironmentFile.
+
+The `upstream.request` span is closed when the response headers arrive, so its
+duration is time-to-first-byte — the figure failover decisions care about.
+Because the log records are emitted while the request span is current, they
+carry its `trace_id`/`span_id`: `opentelemetry_logs` joins `opentelemetry_traces`
+in GreptimeDB without a separate correlation step.
 
 ### Health and version
 

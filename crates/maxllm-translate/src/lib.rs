@@ -174,6 +174,16 @@ pub fn remove_orphan_tool_calls(body: &[u8]) -> Option<Vec<u8>> {
         }
         return serde_json::to_vec(&root).ok();
     }
+    if let Some(messages) = root.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        let orphans = orphaned_chat_messages(messages);
+        if orphans.is_empty() {
+            return None;
+        }
+        for index in orphans.into_iter().rev() {
+            messages.remove(index);
+        }
+        return serde_json::to_vec(&root).ok();
+    }
     None
 }
 
@@ -190,6 +200,35 @@ pub fn shrink_orphan_tool_calls(body: &[u8], max_len: usize) -> Option<Vec<u8>> 
         }
     }
     remove_orphan_tool_calls(body).filter(|repaired| repaired.len() <= max_len)
+}
+
+/// Drop the reasoning-effort knob from a Responses or Chat request.
+///
+/// Codex sends `reasoning: {"effort": …}` on the Responses contract; the
+/// Chat contract calls the same knob `reasoning_effort`. A provider that
+/// rejects a supported-looking value (Kimi refuses `"none"`) still accepts
+/// the request when the optional knob is omitted: dropping it is the least
+/// destructive repair, and it never changes the conversation history.
+///
+/// Returns `None` when the body is not JSON or has no effort knob to drop.
+pub fn drop_reasoning_effort(body: &[u8]) -> Option<Vec<u8>> {
+    let mut root: Value = serde_json::from_slice(body).ok()?;
+    let obj = root.as_object_mut()?;
+    let mut changed = obj.remove("reasoning_effort").is_some();
+
+    if let Some(reasoning) = obj.get_mut("reasoning").and_then(Value::as_object_mut) {
+        if reasoning.remove("effort").is_some() {
+            changed = true;
+            if reasoning.is_empty() {
+                obj.remove("reasoning");
+            }
+        }
+    }
+
+    if !changed {
+        return None;
+    }
+    serde_json::to_vec(&root).ok()
 }
 
 /// The indexes of the Responses items whose call was never answered.
@@ -226,7 +265,43 @@ fn orphaned_responses_calls(items: &[Value]) -> Vec<usize> {
         .collect()
 }
 
-/// Answer the orphaned calls of a Responses `input` item list.
+/// The indexes of chat messages whose assistant tool call was never answered.
+///
+/// A call is answered by a later `role: "tool"` message carrying the same
+/// `tool_call_id`; an assistant message is dropped only when **every** call
+/// it made is still orphaned.
+fn orphaned_chat_messages(messages: &[Value]) -> Vec<usize> {
+    let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut candidates: Vec<(usize, Vec<String>)> = Vec::new();
+    for (index, message) in messages.iter().enumerate() {
+        if message.get("role").and_then(Value::as_str) == Some("assistant") {
+            let ids = message
+                .get("tool_calls")
+                .and_then(|calls| calls.as_array())
+                .map(|calls| {
+                    calls
+                        .iter()
+                        .filter_map(|call| call.get("id").and_then(Value::as_str).map(String::from))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if !ids.is_empty() {
+                candidates.push((index, ids.clone()));
+                pending.extend(ids);
+            }
+        } else if message.get("role").and_then(Value::as_str) == Some("tool") {
+            if let Some(id) = message.get("tool_call_id").and_then(Value::as_str) {
+                pending.remove(id);
+            }
+        }
+    }
+    candidates
+        .into_iter()
+        .filter(|(_, ids)| ids.iter().any(|id| pending.contains(id)))
+        .map(|(index, _)| index)
+        .collect()
+}
+
 ///
 /// A call is orphaned when no later item answers its `call_id`; the repair
 /// appends the sentinel output directly after it.
@@ -580,6 +655,7 @@ pub fn extract_native_response_content(kind: &str, body: &serde_json::Value) -> 
 #[cfg(test)]
 mod orphan_tool_call_tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn an_unanswered_responses_call_is_answered() {
@@ -662,6 +738,22 @@ mod orphan_tool_call_tests {
     }
 
     #[test]
+    fn the_chat_last_resort_drops_the_unanswered_assistant_call() {
+        let body = br#"{"model":"m","messages":[
+            {"role":"user","content":"run it"},
+            {"role":"assistant","content":"working","tool_calls":[
+                {"id":"call_1","type":"function","function":{"name":"shell","arguments":"{}"}}
+            ]}
+        ]}"#;
+
+        let shrunk = remove_orphan_tool_calls(body).expect("the orphan is dropped");
+        let out: Value = serde_json::from_slice(&shrunk).unwrap();
+        let messages = out["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+    }
+
+    #[test]
     fn the_shrunk_repair_keeps_a_body_that_already_fits() {
         let body = br#"{"model":"m","input":[
             {"type":"function_call","call_id":"f:0","name":"shell","arguments":"{}"}
@@ -700,5 +792,36 @@ mod orphan_tool_call_tests {
         // ids.
         let schema = "tools.function.parameters is not a valid moonshot flavored json schema, details: <At path 'properties.show': detected infinite recursion without termination condition>";
         assert!(!body_reports_orphan_tool_call(schema));
+    }
+
+    #[test]
+    fn dropping_reasoning_effort_removes_both_contract_spellings() {
+        let responses =
+            br#"{"model":"m","reasoning":{"effort":"none","summary":"auto"},"input":[]}"#;
+        let dropped = drop_reasoning_effort(responses).expect("the effort knob is dropped");
+        let out: Value = serde_json::from_slice(&dropped).unwrap();
+        assert_eq!(out["reasoning"], json!({"summary":"auto"}));
+
+        let chat = br#"{"model":"m","reasoning_effort":"none","messages":[]}"#;
+        let dropped = drop_reasoning_effort(chat).expect("the effort knob is dropped");
+        let out: Value = serde_json::from_slice(&dropped).unwrap();
+        assert!(out.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn an_empty_reasoning_object_is_removed_too() {
+        let body = br#"{"model":"m","reasoning":{"effort":"none"},"input":[]}"#;
+        let dropped = drop_reasoning_effort(body).expect("the effort knob is dropped");
+        let out: Value = serde_json::from_slice(&dropped).unwrap();
+        assert!(out.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn a_body_without_reasoning_effort_is_left_alone() {
+        assert!(drop_reasoning_effort(br#"{"model":"m"}"#).is_none());
+        assert!(
+            drop_reasoning_effort(br#"{"model":"m","reasoning":{"summary":"auto"}}"#).is_none()
+        );
+        assert!(drop_reasoning_effort(b"not json").is_none());
     }
 }
