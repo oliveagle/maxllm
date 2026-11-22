@@ -939,11 +939,17 @@ pub fn normalize_responses_request(body: &[u8]) -> Vec<u8> {
     // Responses upstream, so it is repaired before the body leaves.
     changed |= repair_input_call_ids(&mut root);
 
-    if changed {
+    // The same strict upstreams reject the mirror fault just as hard:
+    // DeepSeek answers `No tool output found for tool call …` when the
+    // history carries a call whose result was never recorded (codex's
+    // host-side goal tool produces exactly this shape). Answer the orphan
+    // here, at normalization time, instead of letting the 400 end the turn.
+    let serialized = if changed {
         serde_json::to_vec(&root).unwrap_or_else(|_| body.to_vec())
     } else {
         body.to_vec()
-    }
+    };
+    crate::repair_orphan_tool_calls(&serialized).unwrap_or(serialized)
 }
 
 /// The marker of a call id the gateway invented. A body that carries it was
@@ -5048,6 +5054,28 @@ mod tests {
         // The call it names was added right before the answer.
         assert_eq!(root["input"][2]["type"], json!("function_call"));
         assert_eq!(root["input"][2]["call_id"], json!("call_other"));
+    }
+
+    #[test]
+    fn test_normalize_responses_request_answers_an_unanswered_call() {
+        // DeepSeek rejects this history with
+        // `No tool output found for tool call …` — the mirror of the orphan
+        // output. Normalization answers the call so the first upstream
+        // attempt already carries a complete pair.
+        let body = br#"{
+            "model": "m",
+            "input": [
+                {"type": "message", "role": "user", "content": "hi"},
+                {"type": "function_call", "id": "fc_1", "call_id": "call_later",
+                 "name": "exec", "arguments": "{}"}
+            ]
+        }"#;
+        let out = normalize_responses_request(body);
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        let items = v["input"].as_array().unwrap();
+        assert_eq!(items.len(), 3, "the sentinel output follows the call");
+        assert_eq!(items[2]["type"], json!("function_call_output"));
+        assert_eq!(items[2]["call_id"], json!("call_later"));
     }
 
     #[test]
