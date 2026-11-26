@@ -14,6 +14,7 @@ COPY crates/maxllm-translate/Cargo.toml crates/maxllm-translate/Cargo.toml
 COPY crates/maxllm-gateway/Cargo.toml crates/maxllm-gateway/Cargo.toml
 COPY crates/maxllm-admin/Cargo.toml crates/maxllm-admin/Cargo.toml
 COPY crates/maxllm-cli/Cargo.toml crates/maxllm-cli/Cargo.toml
+COPY crates/maxllm-supervisor/Cargo.toml crates/maxllm-supervisor/Cargo.toml
 
 # Create dummy source files for dependency caching
 RUN mkdir -p crates/maxllm-config/src && echo "fn main() {}" > crates/maxllm-config/src/lib.rs \
@@ -21,7 +22,8 @@ RUN mkdir -p crates/maxllm-config/src && echo "fn main() {}" > crates/maxllm-con
     && mkdir -p crates/maxllm-translate/src && echo "fn main() {}" > crates/maxllm-translate/src/lib.rs \
     && mkdir -p crates/maxllm-gateway/src && echo "fn main() {}" > crates/maxllm-gateway/src/main.rs \
     && mkdir -p crates/maxllm-admin/src && echo "fn main() {}" > crates/maxllm-admin/src/lib.rs \
-    && mkdir -p crates/maxllm-cli/src && echo "fn main() {}" > crates/maxllm-cli/src/main.rs
+    && mkdir -p crates/maxllm-cli/src && echo "fn main() {}" > crates/maxllm-cli/src/main.rs \
+    && mkdir -p crates/maxllm-supervisor/src && echo "fn main() {}" > crates/maxllm-supervisor/src/main.rs
 
 # Build dependencies only (cached layer)
 RUN cargo build --release 2>/dev/null || true
@@ -33,7 +35,7 @@ COPY crates/ crates/
 RUN touch crates/*/src/*.rs crates/*/src/**/*.rs 2>/dev/null || true
 
 # Build the real binaries
-RUN cargo build --release --bin maxllm --bin maxllm-server
+RUN cargo build --release --bin maxllm --bin maxllm-server --bin maxllm-supervisor
 
 # Stage 2: Minimal runtime image
 FROM debian:bookworm-slim
@@ -51,6 +53,7 @@ WORKDIR /app
 # Copy binaries from builder
 COPY --from=builder /build/target/release/maxllm /usr/local/bin/maxllm
 COPY --from=builder /build/target/release/maxllm-server /usr/local/bin/maxllm-server
+COPY --from=builder /build/target/release/maxllm-supervisor /usr/local/bin/maxllm-supervisor
 
 # Copy default config if it exists
 COPY maxllm.toml /app/maxllm.toml

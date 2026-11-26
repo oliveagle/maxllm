@@ -71,21 +71,70 @@ logging:
 Client receives response
 ```
 
+### Two-Layer Deployment (zero-downtime upgrades)
+
+The pipeline above runs inside one `maxllm-server` process. To replace that
+process without dropping the public listener, run `maxllm-supervisor` in front
+of it:
+
+```
+client ──TCP/TLS──▶ maxllm-supervisor (layer 1, stable)
+                      · owns [server].listen
+                      · URL path → backend table (longest prefix, segment boundary)
+                      · starts/health-checks/swaps/drains worker generations
+                      · loopback control API: /status /routes /upgrade /reload
+                        │ private Unix socket, one per generation
+                        ▼
+                    maxllm-server generation N (layer 2)
+                      · everything in the Request Flow above
+                      · its own config watcher (providers, routes, aliases)
+```
+
+- Layer 1 never parses a body: it resolves the path, takes the active
+  generation of the matching backend, and proxies the request unchanged.
+- An upgrade = spawn a new generation on a new socket, wait for `/health`,
+  atomically `ArcSwap` the active pointer, then drain the old one. In-flight
+  requests hold an `InflightGuard` on their generation; the old worker is
+  SIGTERMed only when its count reaches zero (`drain_timeout_secs` bounds it).
+- Worker processes are spawned from one long-lived `supervisor-lifecycle`
+  thread. Do **not** move spawning into a tokio blocking task: on Linux
+  `PR_SET_PDEATHSIG` is tied to the parent *thread*, and a reaped pool thread
+  would SIGTERM a perfectly healthy worker ~10s later.
+- Both watchers coalesce events on the trailing edge (quiet 1s, max delay 3s);
+  never use a "ignore events within 1s of the last reload" debounce, which
+  silently drops the last write of a rapid pair of edits.
+- Daemonisation must happen before any thread exists. Pingora's `--daemon`
+  forks inside `Server::run()` — after the lifecycle/control/watcher threads —
+  and a fork there drops them (and `PR_SET_PDEATHSIG` kills every worker).
+  The supervisor therefore forks in `main` (`daemonize_detached`), and
+  `maxllm start --daemon` detaches at the CLI instead of passing `--daemon`
+  through, which keeps the PID file pointing at the real process.
+- Both layers take the same config file; `[supervisor]` is ignored by the
+  worker. `maxllm start` launches the supervisor when the section is present.
+- A path needs two declarations when it targets a dedicated backend:
+  `[[routes]]` makes layer 2 *serve* it, `[[supervisor.routes]]` tells layer 1
+  *which backend* receives it. Without the first, the worker answers 404.
+- The control API can replace binaries and rewrite routes and has no auth:
+  bind it to loopback.
+
 ### Crate Structure
 
 ```
 maxllm/
-  Cargo.toml              # Workspace root (6 crates)
+  Cargo.toml              # Workspace root (7 crates)
   maxllm.toml             # Gateway configuration
   crates/
     maxllm-config/        # TOML config parsing, env var expansion, validation
     maxllm-plugin/        # Plugin trait, chain executor, 14 built-in plugins
     maxllm-translate/     # Provider translation (OpenAI <-> 17 providers)
     maxllm-admin/         # Virtual keys, teams, cost tracking, budget enforcement, admin API
-    maxllm-gateway/       # Main binary: Pingora ProxyHttp implementation + routing
+    maxllm-gateway/       # Binary `maxllm-server`: Pingora ProxyHttp implementation + routing
+    maxllm-cli/           # Binary `maxllm`: `start`, admin, supervisor control commands
+    maxllm-supervisor/    # Binary `maxllm-supervisor`: layer 1 (public socket, routes,
+                          #   worker generations, control API)
 ```
 
-**Dependency flow:** `maxllm-gateway` depends on all four crates. `maxllm-plugin` and `maxllm-translate` are independent of each other. `maxllm-config` and `maxllm-admin` have no internal dependencies.
+**Dependency flow:** `maxllm-gateway`, `maxllm-cli` and `maxllm-supervisor` depend on `maxllm-config`; the gateway also depends on `maxllm-plugin`, `maxllm-translate` and `maxllm-admin`. `maxllm-plugin` and `maxllm-translate` are independent of each other. `maxllm-config` and `maxllm-admin` have no internal dependencies.
 
 ### Key Design Decisions
 
@@ -93,6 +142,7 @@ maxllm/
 - **Proxy, not client**: Body translation happens in Pingora's `request_body_filter` and `upstream_response_body_filter` hooks. We never call `read_request_body()` in `request_filter` — doing so consumes the body stream and causes Pingora to send headers with end-of-stream, preventing body forwarding.
 - **Plugin system over hardcoded middleware**: Auth, rate limiting, CORS, caching, guardrails, etc. are config-driven plugins, not compiled-in logic. Plugins hook into 5 lifecycle phases.
 - **Lock-free circuit breaker**: Uses AtomicU32/AtomicU64 for per-provider failure tracking. No mutexes in the hot path.
+- **Stable entry, replaceable workers**: `maxllm-supervisor` owns the public socket and the URL table; layer-2 versions are swapped behind a Unix socket, so a binary update never closes the listener and never drops an in-flight request.
 - **StreamTranslator wrapped in Mutex**: Pingora requires `CTX: Send + Sync`. The `StreamTranslator` trait object is `Send` but not `Sync`, so it's wrapped in `Mutex<Option<Box<dyn StreamTranslator>>>`.
 
 ## Supported Providers (17)
@@ -384,6 +434,7 @@ Config is TOML with `${ENV_VAR}` expansion. Key sections:
 - `[admin]` — master key and admin API toggle
 - `[model_costs.*]` — override built-in model pricing
 - `[metrics]` — Prometheus metrics toggle
+- `[supervisor]` — layer-1 settings: `control_listen`, `worker_binary`/`worker_config`, `socket_dir`, `routes_file`, timeouts, `[supervisor.backends.*]` and `[[supervisor.routes]]`
 
 ## Building and Running
 
@@ -395,6 +446,11 @@ cargo build --release
 export OPENAI_API_KEY="sk-..."
 export ANTHROPIC_API_KEY="sk-ant-..."
 ./target/release/maxllm --config maxllm.toml
+
+# Two-layer zero-downtime mode: add a [supervisor] section, then
+./target/release/maxllm start --config maxllm.toml   # picks maxllm-supervisor
+# ...or run layer 1 directly:
+./target/release/maxllm-supervisor --config maxllm.toml
 
 # Test
 curl -H "Authorization: Bearer sk-maxllm-dev-key" \
@@ -414,13 +470,14 @@ Benchmarked on macOS (Apple Silicon), 4 Pingora worker threads:
 
 ## Test Coverage
 
-798 tests across 6 crates:
+Tests across 7 crates:
 - `maxllm-admin`: 51 tests (keys, teams, costs, budget, API)
 - `maxllm-translate`: 239 tests (all provider translators + streaming)
 - `maxllm-plugin`: 193 tests (all 14 plugins + the plugin contract)
-- `maxllm-config`: 32 tests (parsing, validation, env vars)
+- `maxllm-config`: 37 tests (parsing, validation, env vars, supervisor section)
 - `maxllm-gateway`: 283 tests (159 unit + 124 mock integration; 4 live tests are gated behind `#[ignore]`) + 1 doc-test
 - `maxllm-cli`: 1 test
+- `maxllm-supervisor`: 3 unit tests + 3 end-to-end tests (in-flight drain, hot route/provider reload, independent backend add/upgrade)
 
 ## Development Notes
 

@@ -29,6 +29,7 @@ A high-performance AI gateway built on [Pingora](https://github.com/cloudflare/p
   - [Auto model (rotation)](#auto-model-rotation)
   - [Plugins](#plugins)
   - [Model Aliases](#model-aliases)
+- [Zero-downtime upgrades (two-layer supervisor)](#zero-downtime-upgrades-two-layer-supervisor)
 - [Routing Strategies](#routing-strategies)
 - [Resilience: Session Stickiness, Circuit Breaking & Recording](#resilience-session-stickiness-circuit-breaking--recording)
   - [Circuit breaker](#circuit-breaker)
@@ -118,8 +119,13 @@ cargo build --release
 export OPENAI_API_KEY="sk-..."
 export ANTHROPIC_API_KEY="sk-ant-..."
 
-# Start the gateway
+# Start the gateway (foreground; Ctrl-C to stop)
 ./target/release/maxllm start
+
+# ...or in the background. `start --daemon` detaches the process itself (new
+# process group, stdio to /dev/null), so the PID file `maxllm status` / `maxllm
+# stop` read is the process that actually serves — no stale pingora daemon PID.
+./target/release/maxllm start --daemon
 
 # Check status
 ./target/release/maxllm status
@@ -1012,6 +1018,139 @@ key = "client_ip"
 "gpt-4" = "gpt-4o"
 "claude-3" = "claude-sonnet-4-20250514"
 ```
+
+## Zero-downtime upgrades (two-layer supervisor)
+
+A single `maxllm-server` process owns both the public socket and the provider
+logic, so replacing its binary means dropping the listener (and every in-flight
+request) for at least a few seconds. `maxllm-supervisor` splits that into two
+layers so the public socket outlives every layer-2 version:
+
+```
+                        layer 1 (stable)                  layer 2 (replaceable)
+client ── TCP/TLS ──▶  maxllm-supervisor  ── unix ──▶   maxllm-server  gen N
+                       · owns 0.0.0.0:8080              · provider routing/translation
+                       · URL path table                · plugins, admin, metrics
+                       · worker lifecycle              · its own config watcher
+                       · /healthz /status /upgrade
+```
+
+Layer 1 never parses a request body. It resolves the URL path against its route
+table, picks the active generation of the matching backend, and proxies the
+request unchanged to that worker over a private Unix domain socket. Every
+generation gets its own socket, so a new one can bind while the old still
+serves.
+
+An upgrade is: spawn the new binary → poll its `/health` until it answers (new
+providers loaded) → atomically swap the backend's active generation → drain the
+old one. New requests use the new generation immediately; requests already in
+flight keep the generation they started on and the old worker is only stopped
+when its in-flight count reaches zero (bounded by `drain_timeout_secs`). Port
+8080 is never closed.
+
+Layer 1 adds `X-MaxLLM-Layer: 1`, `X-MaxLLM-Generation`,
+`X-MaxLLM-Layer2-Version` and `X-MaxLLM-Build-Id` to every response.
+
+### Configuration
+
+`[supervisor]` is ignored by `maxllm-server`, so one file can describe both
+layers. `maxllm start` picks the supervisor automatically when the section
+exists; without it, the old single-process behaviour is unchanged.
+
+```toml
+[server]
+listen = "0.0.0.0:8080"
+grace_period_secs = 30
+
+[supervisor]
+# Control API. Keep it loopback-only: it can replace worker binaries and
+# rewrite the route table, and it is not authenticated.
+control_listen = "127.0.0.1:8081"
+# Defaults: `maxllm-server` next to the supervisor binary, and this config.
+# worker_binary = "/usr/local/bin/maxllm-server"
+# worker_config = "/app/maxllm.toml"
+# socket_dir    = "/run/maxllm/sock"
+# routes_file   = "/app/maxllm.toml.supervisor-routes.json"
+health_timeout_secs = 20
+drain_timeout_secs = 30
+
+# Optional: extra backends (voice, image, a canary version, …). Each gets its
+# own process, socket and generation counter, and is upgraded independently.
+[supervisor.backends.voice]
+binary = "/usr/local/bin/maxllm-server"
+config = "/app/voice.toml"
+env = { MAXLLM_BUILD_ID = "voice-2026-11-08" }
+args = ["--no-reload"]
+
+[[supervisor.routes]]
+path = "/v1/audio"        # longest prefix wins, on a segment boundary
+backend = "voice"
+```
+
+The effective route table is: built-in paths (`/health`, `/healthz`,
+`/version`, `/v1/models`, `/metrics`, `/admin`) + every gateway
+`[[routes]].path` + `[supervisor].routes`. Matching is longest-prefix on a
+segment boundary, so `/v1/audio` matches `/v1/audio/speech` but not
+`/v1/audioXYZ`. When no `[supervisor.backends]` are declared, a single
+`default` backend is derived from `worker_binary` / `worker_config`.
+
+> **Declare a path in two places.** `[[routes]]` is what layer 2 uses to
+> *serve* a path; `[[supervisor.routes]]` only tells layer 1 *which backend*
+> receives it. A path listed only in `[supervisor].routes` reaches a worker
+> that has no route for it and answers 404, so declare both (as in the example
+> above) when pointing a prefix at a dedicated backend.
+
+Adding a provider or a `[[routes]]` entry needs **no** worker restart: both
+processes watch the file and reload atomically (changes are coalesced on the
+trailing edge, so a rapid second write is never dropped). Changing a backend's
+`binary` / `config` / `args` / `env` rolls only that backend to a new
+generation; every other backend keeps running.
+
+### Operating it
+
+```bash
+# Build both layers; the binaries sit next to each other in target/release.
+cargo build --release
+
+# Start (auto-detects [supervisor]) or run layer 1 directly
+maxllm start --config /app/maxllm.toml
+maxllm-supervisor --config /app/maxllm.toml [--daemon]
+
+# Inspect
+maxllm supervisor status --config /app/maxllm.toml
+maxllm supervisor routes --config /app/maxllm.toml
+maxllm supervisor reload --config /app/maxllm.toml
+
+# Roll layer 2 without touching the public listener
+maxllm supervisor upgrade --config /app/maxllm.toml \
+  --backend default \
+  --binary /usr/local/bin/maxllm-server-v2 \
+  --build-id "v2-$(date +%s)"
+
+# Point one prefix at a backend (persisted to routes_file)
+maxllm supervisor routes set --config /app/maxllm.toml --route /v1/audio=voice
+# ...and drop the overlay again, back to the config-derived table
+maxllm supervisor routes set --config /app/maxllm.toml --clear
+```
+
+`--url` overrides the control address derived from the config.
+
+| Method | Control path | Purpose |
+|---|---|---|
+| `GET` | `/healthz` | liveness |
+| `GET` | `/status` | pid, uptime, routes, per-backend generations and in-flight counts |
+| `GET` | `/routes` | effective route table |
+| `PUT`/`POST` | `/routes` | replace the route overlay (appended after config routes, later wins) |
+| `POST` | `/upgrade` | `{"backend", "binary"?, "env"?}` — spawn, health-check, swap, drain |
+| `POST` | `/reload` | re-read the config now (the same path the watcher uses) |
+
+The overlay written by `PUT /routes` is persisted to `routes_file`, so a
+control-registered prefix survives a supervisor restart.
+
+`make test-supervisor` runs the unit tests plus an end-to-end suite that spawns
+real workers and asserts that (1) an in-flight request finishes on the
+generation it started on, (2) a new route and provider appear without a
+restart, and (3) a new `voice` backend can be added and upgraded independently.
 
 ## Routing Strategies
 

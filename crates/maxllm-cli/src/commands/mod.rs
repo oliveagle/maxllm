@@ -10,6 +10,7 @@ pub mod keys;
 pub mod start;
 pub mod status;
 pub mod stop;
+pub mod supervisor;
 pub mod test;
 
 use std::path::PathBuf;

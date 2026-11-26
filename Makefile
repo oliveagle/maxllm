@@ -1,4 +1,4 @@
-.PHONY: build run dev test test-all test-integration test-live clean fmt check perf perf-stream perf-health perf-mock perf-proxy
+.PHONY: build run dev test test-all test-integration test-supervisor test-live clean fmt check perf perf-stream perf-health perf-mock perf-proxy
 
 # Build release binary
 build:
@@ -26,6 +26,13 @@ test:
 test-integration:
 	cargo test --workspace
 	cargo test -p maxllm-gateway --test integration
+
+# Layer-1 supervisor: unit tests plus the end-to-end suite. The E2E tests
+# spawn real `maxllm-server` workers, so the debug binaries must be built.
+test-supervisor:
+	cargo build -p maxllm-gateway -p maxllm-supervisor
+	cargo test -p maxllm-supervisor --bins
+	cargo test -p maxllm-supervisor --test e2e -- --test-threads=1
 
 # Run real provider tests (requires Ollama + GEMINI_API_KEY)
 test-live:

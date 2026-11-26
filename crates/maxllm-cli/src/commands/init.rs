@@ -90,6 +90,27 @@ provider = "openai"
 # [admin]
 # master_key = "${MAXLLM_ADMIN_KEY}"
 # enabled = true
+
+# --- Two-layer zero-downtime mode (optional) ---
+# With this section, `maxllm start` launches `maxllm-supervisor` instead of
+# `maxllm-server`. Layer 1 owns the public socket and replaces layer-2 worker
+# generations without dropping connections. Keep the control API on loopback:
+# it can replace worker binaries and rewrite routes, and it has no auth.
+# [supervisor]
+# control_listen = "127.0.0.1:8081"
+# health_timeout_secs = 20
+# drain_timeout_secs = 30
+#
+# # Extra backends (voice, image, a canary build, ...). Each gets its own
+# # process, Unix socket and generation counter, upgraded independently.
+# [supervisor.backends.voice]
+# binary = "/usr/local/bin/maxllm-server"
+# config = "/app/voice.toml"
+# env = { MAXLLM_BUILD_ID = "voice-2026-11-08" }
+#
+# [[supervisor.routes]]
+# path = "/v1/audio"     # longest prefix wins, on a segment boundary
+# backend = "voice"
 "#;
 
 /// Generate a starter configuration file.

@@ -16,15 +16,17 @@ MaxLLM is a high-performance AI gateway built on Pingora (Cloudflare's reverse p
 
 ```
 maxllm/
-├── Cargo.toml                    # Workspace root (5 crates)
+├── Cargo.toml                    # Workspace root (7 crates)
 ├── maxllm.toml                   # Gateway configuration (TOML)
 ├── Makefile                      # Build/test/run automation
 ├── crates/
 │   ├── maxllm-config/            # Configuration parsing & validation
 │   ├── maxllm-plugin/            # Plugin system & builtin plugins
 │   ├── maxllm-translate/         # Provider format translation layer
-│   ├── maxllm-gateway/           # Main gateway (Pingora integration)
-│   └── maxllm-admin/             # Virtual key/budget/cost management
+│   ├── maxllm-gateway/           # Layer-2 worker binary (Pingora integration)
+│   ├── maxllm-admin/             # Virtual key/budget/cost management
+│   ├── maxllm-cli/               # `maxllm` CLI (start, admin, supervisor control)
+│   └── maxllm-supervisor/        # Layer-1 entry: public socket, routes, worker lifecycle
 └── target/                       # Build artifacts
 ```
 
@@ -485,9 +487,57 @@ pub trait AdminStore: Send + Sync {
 | GET | `/admin/spend` | Spend summary |
 | GET | `/admin/spend/logs` | Spend records |
 
+### 6. maxllm-supervisor (Layer 1)
+
+**Purpose:** Own the public listen socket and the URL path table so a layer-2
+binary can be replaced without dropping connections.
+
+**Modules:**
+
+| File | Role |
+|------|------|
+| `main.rs` | CLI, config load, Pingora server, control-listener bind before daemonise |
+| `state.rs` | `Supervisor`, `Backend`, `Generation`, `RouteTable`, lifecycle thread, config reconcile |
+| `worker.rs` | spawn a worker (`--listen unix:<path>`), UDS health poll, drain (SIGTERM → reap) |
+| `proxy.rs` | `ProxyHttp` impl: path → backend → active generation, `InflightGuard`, response headers |
+| `control.rs` | loopback control API: `/healthz` `/status` `/routes` `/upgrade` `/reload` |
+| `watch.rs` | config watcher with trailing-edge coalescing |
+
+**Invariants:**
+
+- Layer 1 never reads a request body; the body and response stream are proxied
+  byte-for-byte.
+- Every generation has its own Unix socket, so a new one binds while the old
+  still serves.
+- The active pointer is an `ArcSwap<Generation>`; a swap is atomic and new
+  requests never see a half-started worker (health is checked first).
+- `InflightGuard` (RAII) keeps the old generation alive until its last request
+  finishes; `drain_timeout_secs` bounds the wait.
+- All workers are spawned from one long-lived `supervisor-lifecycle` thread,
+  because Linux `PR_SET_PDEATHSIG` follows the parent *thread*.
+- The control API is unauthenticated and can replace binaries: bind it to
+  loopback. It is a separate listener from `[server].listen`.
+- A path needs two declarations to be served by a dedicated backend:
+  `[[routes]]` (layer 2 serves it) and `[[supervisor.routes]]` (layer 1 picks
+  the backend). Layer 1 only decides *where* a request goes; layer 2 still
+  needs its own route for the path.
+
+Configuration lives in the `[supervisor]` section of the same TOML file
+(`control_listen`, `worker_binary`/`worker_config`, `socket_dir`,
+`routes_file`, timeouts, `[supervisor.backends.*]`, `[[supervisor.routes]]`);
+`maxllm-server` ignores it.
+
 ---
 
 ## Request Lifecycle
+
+In single-process mode the whole pipeline runs in `maxllm-server`. In the
+two-layer deployment the same pipeline runs in layer 2, behind
+`maxllm-supervisor`, which only does path resolution + proxying:
+
+```
+Client ──▶ layer 1: path → backend → active generation ──unix──▶ layer 2 (below)
+```
 
 ```
 Client Request (OpenAI format)

@@ -105,6 +105,11 @@ pub struct Config {
     /// the others.
     #[serde(default)]
     pub breaker_sync: Option<BreakerSyncConfig>,
+    /// Layer-1 supervisor settings. Only read by the `maxllm-supervisor`
+    /// binary; the layer-2 gateway ignores this section, so one file can
+    /// describe both layers.
+    #[serde(default)]
+    pub supervisor: Option<SupervisorConfig>,
 }
 
 /// A provider parked until a known instant.
@@ -164,6 +169,92 @@ pub struct BreakerSyncConfig {
 
 fn default_breaker_sync_interval() -> u64 {
     15
+}
+
+/// Layer-1 (entry / supervisor) configuration.
+///
+/// The supervisor owns the public listen socket and routes each request to a
+/// worker generation over a Unix domain socket. It can start a new worker
+/// generation, health-check it, swap the route atomically and drain the old
+/// one — so a layer-2 version update never closes the public listener and
+/// never drops an in-flight request.
+#[derive(Debug, Deserialize, Clone)]
+pub struct SupervisorConfig {
+    /// Address of the supervisor control API. Keep it loopback-only: the
+    /// endpoint can replace the worker binary and rewrite the route table.
+    pub control_listen: SocketAddr,
+    /// Default worker binary. Defaults to `maxllm-server` next to the
+    /// supervisor binary.
+    #[serde(default)]
+    pub worker_binary: Option<PathBuf>,
+    /// Default worker configuration. Defaults to the supervisor's `--config`.
+    #[serde(default)]
+    pub worker_config: Option<PathBuf>,
+    /// Directory for the per-generation Unix sockets. Defaults to
+    /// `<config dir>/maxllm-supervisor.sock.d`.
+    #[serde(default)]
+    pub socket_dir: Option<PathBuf>,
+    /// File where hot-registered routes are persisted. Defaults to
+    /// `<config file>.supervisor-routes.json`.
+    #[serde(default)]
+    pub routes_file: Option<PathBuf>,
+    /// Seconds to wait for a freshly spawned generation to answer `/health`.
+    #[serde(default = "default_supervisor_health_timeout_secs")]
+    pub health_timeout_secs: u64,
+    /// Seconds an old generation may keep serving in-flight requests before
+    /// it is asked to shut down.
+    #[serde(default = "default_supervisor_drain_timeout_secs")]
+    pub drain_timeout_secs: u64,
+    /// Named layer-2 backends. Each can have its own binary/config, so a
+    /// future `voice` or `image` worker can be hot-registered without
+    /// touching the entry layer. When empty, a single backend named
+    /// `default` is derived from `worker_binary` / `worker_config`.
+    #[serde(default)]
+    pub backends: HashMap<String, SupervisorBackendConfig>,
+    /// Path-prefix routes owned by the entry layer. When empty, the route
+    /// table is derived from the gateway `[[routes]]` (plus built-in paths),
+    /// all pointed at the default backend.
+    #[serde(default)]
+    pub routes: Vec<SupervisorRouteConfig>,
+}
+
+/// One layer-2 backend the supervisor can run.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct SupervisorBackendConfig {
+    /// Worker binary. `None` inherits `[supervisor].worker_binary`.
+    #[serde(default)]
+    pub binary: Option<PathBuf>,
+    /// Worker config file. `None` inherits `[supervisor].worker_config`.
+    #[serde(default)]
+    pub config: Option<PathBuf>,
+    /// Extra command-line arguments passed to the worker.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Extra environment variables for the worker process.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+}
+
+/// One path-prefix registration in the layer-1 route table.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SupervisorRouteConfig {
+    /// Path prefix, e.g. `/v1/chat/completions` or `/v1/audio`.
+    pub path: String,
+    /// Backend name. Defaults to `default`.
+    #[serde(default = "default_supervisor_backend")]
+    pub backend: String,
+}
+
+pub fn default_supervisor_backend() -> String {
+    "default".to_string()
+}
+
+fn default_supervisor_health_timeout_secs() -> u64 {
+    20
+}
+
+fn default_supervisor_drain_timeout_secs() -> u64 {
+    30
 }
 
 /// Configuration for one auto sentinel model.
@@ -1361,6 +1452,34 @@ impl Config {
                     return Err(ConfigError::Validation(format!(
                         "route '{}' references unknown plugin '{name}'",
                         route.path
+                    )));
+                }
+            }
+        }
+
+        if let Some(sup) = &self.supervisor {
+            if sup.control_listen == self.server.listen {
+                return Err(ConfigError::Validation(format!(
+                    "supervisor.control_listen ({}) must differ from server.listen ({}); the control API can replace worker binaries",
+                    sup.control_listen, self.server.listen
+                )));
+            }
+            for route in &sup.routes {
+                if !route.path.starts_with('/') {
+                    return Err(ConfigError::Validation(format!(
+                        "supervisor route '{}' must start with '/'",
+                        route.path
+                    )));
+                }
+                // `default` is always derived, so it needs no declaration;
+                // every other backend must exist or layer 1 would route to a
+                // backend it never starts (a permanent 503).
+                if route.backend != default_supervisor_backend()
+                    && !sup.backends.contains_key(&route.backend)
+                {
+                    return Err(ConfigError::Validation(format!(
+                        "supervisor route '{}' references unknown backend '{}'",
+                        route.path, route.backend
                     )));
                 }
             }
@@ -2665,5 +2784,69 @@ model = "groot-awq"
             err.to_string().contains("unknown provider 'ghost'"),
             "{err}"
         );
+    }
+
+    const SUPERVISOR_BASE: &str = r#"
+[server]
+listen = "127.0.0.1:8080"
+
+[providers.mock]
+kind = "openai"
+base_url = "http://127.0.0.1:1"
+api_key = "fake"
+"#;
+
+    #[test]
+    fn supervisor_config_parses_defaults_and_implicit_default_backend() {
+        let toml =
+            format!("{SUPERVISOR_BASE}\n[supervisor]\ncontrol_listen = \"127.0.0.1:8081\"\n");
+        let config = Config::parse(&toml).unwrap();
+        let sup = config.supervisor.expect("supervisor section");
+        assert_eq!(sup.control_listen.to_string(), "127.0.0.1:8081");
+        assert_eq!(sup.health_timeout_secs, 20);
+        assert_eq!(sup.drain_timeout_secs, 30);
+        // `default` is derived, not declared, and a route may name it without
+        // a matching `[supervisor.backends.default]` block.
+        assert!(sup.backends.is_empty());
+        let toml = format!("{toml}\n[[supervisor.routes]]\npath = \"/v1/chat\"\n");
+        let config = Config::parse(&toml).unwrap();
+        let sup = config.supervisor.unwrap();
+        assert_eq!(sup.routes[0].backend, "default");
+    }
+
+    #[test]
+    fn supervisor_control_listen_must_differ_from_public_listen() {
+        let toml =
+            format!("{SUPERVISOR_BASE}\n[supervisor]\ncontrol_listen = \"127.0.0.1:8080\"\n");
+        let err = Config::parse(&toml).unwrap_err().to_string();
+        assert!(err.contains("control_listen"), "{err}");
+        assert!(err.contains("must differ"), "{err}");
+    }
+
+    #[test]
+    fn supervisor_route_must_reference_a_known_backend() {
+        let toml = format!(
+            "{SUPERVISOR_BASE}\n[supervisor]\ncontrol_listen = \"127.0.0.1:8081\"\n\n\
+             [[supervisor.routes]]\npath = \"/v1/voice\"\nbackend = \"voice\"\n"
+        );
+        let err = Config::parse(&toml).unwrap_err().to_string();
+        assert!(err.contains("unknown backend 'voice'"), "{err}");
+
+        // Declaring the backend makes the same route valid.
+        let toml = format!(
+            "{toml}\n[supervisor.backends.voice]\nenv = {{ MAXLLM_BUILD_ID = \"voice-v1\" }}\n"
+        );
+        let config = Config::parse(&toml).unwrap();
+        assert!(config.supervisor.unwrap().backends.contains_key("voice"));
+    }
+
+    #[test]
+    fn supervisor_route_path_must_start_with_a_slash() {
+        let toml = format!(
+            "{SUPERVISOR_BASE}\n[supervisor]\ncontrol_listen = \"127.0.0.1:8081\"\n\n\
+             [[supervisor.routes]]\npath = \"v1/voice\"\n"
+        );
+        let err = Config::parse(&toml).unwrap_err().to_string();
+        assert!(err.contains("must start with '/'"), "{err}");
     }
 }

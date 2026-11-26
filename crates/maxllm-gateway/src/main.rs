@@ -49,6 +49,12 @@ struct Args {
     /// Disable config hot-reload file watching
     #[arg(long)]
     no_reload: bool,
+
+    /// Override the listen address. Accepts `host:port` or
+    /// `unix:/path/to.sock`. A socket path is how the layer-1 supervisor
+    /// gives every worker generation a private, conflict-free endpoint.
+    #[arg(long)]
+    listen: Option<String>,
 }
 
 fn main() {
@@ -81,10 +87,16 @@ fn main() {
             .init();
     }
 
+    let listen = args
+        .listen
+        .clone()
+        .unwrap_or_else(|| config.server.listen.to_string());
+
     tracing::info!(
-        listen = %config.server.listen,
+        listen = %listen,
         providers = config.providers.len(),
         routes = config.routes.len(),
+        build_id = std::env::var("MAXLLM_BUILD_ID").unwrap_or_default(),
         "Starting MaxLLM gateway"
     );
 
@@ -138,11 +150,24 @@ fn main() {
     let mut sock_opt = pingora::listeners::TcpSocketOptions::default();
     sock_opt.so_reuseport = Some(config.server.tcp_reuseport);
     sock_opt.tcp_fastopen = config.server.tcp_fastopen;
-    service.add_tcp_with_settings(&config.server.listen.to_string(), sock_opt);
+    if let Some(path) = listen.strip_prefix("unix:") {
+        // The supervisor owns the public TCP listener and speaks to each
+        // worker generation over a private Unix socket. A unique path per
+        // generation means a new generation can bind while the old one is
+        // still draining.
+        service.add_uds(path, None);
+    } else {
+        // Fail early with a useful message instead of a pingora panic.
+        if let Err(e) = listen.parse::<std::net::SocketAddr>() {
+            eprintln!("Invalid --listen address {listen:?}: {e}");
+            std::process::exit(2);
+        }
+        service.add_tcp_with_settings(&listen, sock_opt);
+    }
 
     server.add_service(service);
 
-    tracing::info!("MaxLLM gateway is running on {}", config.server.listen);
+    tracing::info!("MaxLLM gateway is running on {}", listen);
     // `run` (not `run_forever`) returns after the drain path, so the batch
     // exporters can be flushed before the process exits; `run_forever` ends in
     // `std::process::exit(0)` and would drop whatever is still queued.
